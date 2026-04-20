@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dattri-llm"
+version = "0.1.0"
+description = "Gradient collection utilities for LLM training workflows."
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+transformers = [
+    "transformers>=4.40",
+    "accelerate>=0.28",
+]
+olmo = [
+    "ai2-olmo",
+]
+dev = [
+    "pytest>=8",
+    "transformers>=4.40",
+    "accelerate>=0.28",
+    "ai2-olmo",
+]
+
+[tool.setuptools.packages.find]
+include = ["dattri_llm*"]
