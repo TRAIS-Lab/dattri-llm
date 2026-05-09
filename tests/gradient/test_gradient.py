@@ -526,3 +526,11 @@ class TestSimilarity:
         g = make_gradient()
         with pytest.raises(ValueError, match="reduce"):
             g.similarity(g, reduce="mean")  # type: ignore[arg-type]
+
+    def test_similarity_layer_types_mismatch(self):
+        data = {"l1": mat_tensor(), "l2": mat_tensor()}
+        rep = {"l1": "materialized", "l2": "materialized"}
+        g1 = Gradient(representation=rep, data=data, layer_types={"l1": "Linear", "l2": "Linear"})
+        g2 = Gradient(representation=rep, data=data, layer_types={"l1": "Linear", "l2": "Conv"})
+        with pytest.raises(ValueError, match="Layer types differ"):
+            g1.similarity(g2)

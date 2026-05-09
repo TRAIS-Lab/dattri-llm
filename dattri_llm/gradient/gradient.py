@@ -399,6 +399,11 @@ class Gradient:
         if self.projection_dim != other.projection_dim:
             raise ValueError("Projection dimensions differ")
 
+        if self.layer_types != other.layer_types:
+            raise ValueError(
+                f"Layer types differ: {self.layer_types} vs {other.layer_types}"
+            )
+
         if require_same_batch and self.batch_size != other.batch_size:
             raise ValueError("Batch sizes differ")
 
