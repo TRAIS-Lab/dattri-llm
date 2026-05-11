@@ -10,10 +10,21 @@ import os
 import pytest
 import torch
 import torch.nn as nn
-from transformers import GPT2Config, GPT2LMHeadModel, TrainingArguments
-from transformers import set_seed
 
-from dattri_llm.gradient.trainers.transformers import GradientCollectingTrainer
+try:
+    from transformers import GPT2Config, GPT2LMHeadModel, TrainingArguments
+    from transformers import set_seed
+    from dattri_llm.trainers.transformers import GradientCollectingTrainer
+    # Verify that accelerate is available by exercising TrainingArguments device setup
+    import accelerate  # noqa: F401
+    _HAS_TRANSFORMERS_STACK = True
+except (ImportError, Exception):
+    _HAS_TRANSFORMERS_STACK = False
+
+pytestmark = pytest.mark.skipif(
+    not _HAS_TRANSFORMERS_STACK,
+    reason="transformers[torch] / accelerate>=1.1.0 not installed",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -62,7 +73,6 @@ def training_args(tmp_path):
         num_train_epochs=1,
         per_device_train_batch_size=2,
         max_steps=2,
-        no_cuda=True,
         use_cpu=True,
         logging_steps=1,
         save_steps=100,  # no checkpoint saves

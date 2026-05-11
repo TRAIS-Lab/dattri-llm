@@ -6,7 +6,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from dattri_llm.gradient.hooks import _is_mlp_linear, register_mlp_hooks, remove_hooks
+from dattri_llm.gradient.hooks import (
+    _is_mlp_linear,
+    register_mlp_hooks,
+    register_param_grad_hooks,
+    remove_hooks,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -109,4 +114,101 @@ class TestRegisterMlpHooks:
         dp_model = nn.DataParallel(tiny_model)
         buffers, handles = register_mlp_hooks(dp_model)
         assert len(buffers) == 2
+        remove_hooks(handles)
+
+
+# --------------------------------------------------------------------------- #
+# register_param_grad_hooks                                                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestRegisterParamGradHooks:
+    def test_leaf_modules_hooked_by_default(self, tiny_model):
+        # Default (no patterns): hooks all leaf modules with trainable params.
+        # TinyMLP leaves: embedding, attn_proj, mlp.0, mlp.2, lm_head (mlp.1 is ReLU — no params)
+        buffers, handles = register_param_grad_hooks(tiny_model)
+        assert len(buffers) > 0
+        assert all("weight" in buf or "bias" in buf for buf in buffers.values())
+        remove_hooks(handles)
+
+    def test_buffers_none_before_backward(self, tiny_model):
+        buffers, handles = register_param_grad_hooks(tiny_model)
+        for buf in buffers.values():
+            for grad in buf.values():
+                assert grad is None
+        remove_hooks(handles)
+
+    def test_buffers_populated_after_backward(self, tiny_model, tiny_batch):
+        buffers, handles = register_param_grad_hooks(tiny_model)
+        tiny_model(tiny_batch["input_ids"]).mean().backward()
+        for layer_name, buf in buffers.items():
+            for pname, grad in buf.items():
+                assert grad is not None, f"{layer_name}.{pname}: grad is None after backward"
+                assert isinstance(grad, torch.Tensor)
+        remove_hooks(handles)
+
+    def test_grad_is_fresh_not_stale(self, tiny_model, tiny_batch):
+        """Grad captured by hook matches param.grad immediately after backward."""
+        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        tiny_model(tiny_batch["input_ids"]).mean().backward()
+        # The hook-captured grad and param.grad should be identical tensors.
+        hook_grad = buffers["mlp.0"]["weight"]
+        param_grad = dict(tiny_model.named_parameters())["mlp.0.weight"].grad
+        assert torch.allclose(hook_grad, param_grad.cpu())
+        remove_hooks(handles)
+
+    def test_grad_shape_matches_param(self, tiny_model, tiny_batch):
+        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        tiny_model(tiny_batch["input_ids"]).mean().backward()
+        weight_grad = buffers["mlp.0"]["weight"]
+        weight = dict(tiny_model.named_parameters())["mlp.0.weight"]
+        assert weight_grad.shape == weight.shape
+        remove_hooks(handles)
+
+    def test_grad_is_finite(self, tiny_model, tiny_batch):
+        buffers, handles = register_param_grad_hooks(tiny_model)
+        tiny_model(tiny_batch["input_ids"]).mean().backward()
+        for layer_name, buf in buffers.items():
+            for pname, grad in buf.items():
+                assert torch.isfinite(grad).all(), f"{layer_name}.{pname} has NaN/Inf"
+        remove_hooks(handles)
+
+    def test_custom_name_patterns(self, tiny_model, tiny_batch):
+        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.[02]"])
+        assert set(buffers.keys()) == {"mlp.0", "mlp.2"}
+        remove_hooks(handles)
+
+    def test_frozen_params_not_hooked(self, tiny_model):
+        # Freeze mlp.0 and verify it produces no buffer entry.
+        tiny_model.mlp[0].weight.requires_grad_(False)
+        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        # mlp.0 has no trainable params → no buffer created for it.
+        assert "mlp.0" not in buffers
+        tiny_model.mlp[0].weight.requires_grad_(True)  # restore
+        remove_hooks(handles)
+
+    def test_on_param_grad_callback(self, tiny_model, tiny_batch):
+        fired: list[tuple[str, str]] = []
+
+        def cb(layer_name, param_name, grad):
+            fired.append((layer_name, param_name))
+
+        buffers, handles = register_param_grad_hooks(
+            tiny_model, name_patterns=[r"mlp\.0"], on_param_grad=cb
+        )
+        tiny_model(tiny_batch["input_ids"]).mean().backward()
+        assert ("mlp.0", "weight") in fired
+        remove_hooks(handles)
+
+    def test_remove_hooks_stops_updates(self, tiny_model, tiny_batch):
+        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        remove_hooks(handles)
+        # Run backward after removal — buffer should stay None.
+        tiny_model(tiny_batch["input_ids"]).mean().backward()
+        assert buffers["mlp.0"]["weight"] is None
+
+    def test_dataparallel_unwrapping(self, tiny_model):
+        dp_model = nn.DataParallel(tiny_model)
+        buffers, handles = register_param_grad_hooks(dp_model)
+        assert len(buffers) > 0
         remove_hooks(handles)

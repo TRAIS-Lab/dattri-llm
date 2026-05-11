@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, Literal, Optional, Union
 
 import torch
 
 
-GradientRepresentation = Literal["materialized", "factorized", "projected"]
+GradientRepresentation = Literal["materialized", "factorized"]
 Indexing = Literal["batch", "batch_token"]
 
 
@@ -56,7 +57,6 @@ class Gradient:
     data: Dict[str, GradientData]
     layer_types: Optional[Dict[str, str]] = None
     indexing: Indexing = "batch"
-    projection_dim: Optional[int] = None
 
     @property
     def layer_names(self) -> set[str]:
@@ -122,12 +122,6 @@ class Gradient:
                 if value.ndim != expected_ndim:
                     raise ValueError(f"{name} expected {expected_ndim}D tensor")
 
-                if layer_repr == "projected":
-                    if self.projection_dim is None:
-                        raise ValueError("projected gradients require projection_dim")
-                    if value.shape[-1] != self.projection_dim:
-                        raise ValueError(f"{name} has wrong projection dimension")
-
                 cur_batch = value.shape[0]
                 cur_token = value.shape[1] if self.indexing == "batch_token" else None
 
@@ -158,7 +152,6 @@ class Gradient:
             data=new_data,
             layer_types=dict(self.layer_types) if self.layer_types else None,
             indexing=self.indexing,
-            projection_dim=self.projection_dim,
         )
 
     def to(self, device=None, dtype=None) -> "Gradient":
@@ -172,11 +165,10 @@ class Gradient:
             data=new_data,
             layer_types=self.layer_types,
             indexing=self.indexing,
-            projection_dim=self.projection_dim,
         )
 
     def materialize(self) -> "Gradient":
-        if all(r in {"materialized", "projected"} for r in self.representation.values()):
+        if all(r == "materialized" for r in self.representation.values()):
             return self
 
         new_data = {}
@@ -196,7 +188,6 @@ class Gradient:
             data=new_data,
             layer_types=self.layer_types,
             indexing=self.indexing,
-            projection_dim=self.projection_dim,
         )
 
     def select_layers(self, layer_names: Iterable[str]) -> "Gradient":
@@ -214,7 +205,6 @@ class Gradient:
                 else None
             ),
             indexing=self.indexing,
-            projection_dim=self.projection_dim,
         )
 
     def concatenate(
@@ -255,7 +245,6 @@ class Gradient:
             data=new_data,
             layer_types=self.layer_types,
             indexing=self.indexing,
-            projection_dim=self.projection_dim,
         )
         out.validate()
         return out
@@ -293,7 +282,6 @@ class Gradient:
             data=new_data,
             layer_types=self.layer_types,
             indexing="batch",
-            projection_dim=self.projection_dim,
         )
 
     def slice(
@@ -331,7 +319,6 @@ class Gradient:
             data=new_data,
             layer_types=self.layer_types,
             indexing=self.indexing,
-            projection_dim=self.projection_dim,
         )
 
     def similarity(
@@ -396,9 +383,6 @@ class Gradient:
         if self.indexing != other.indexing:
             raise ValueError(f"Different indexing: {self.indexing} vs {other.indexing}")
 
-        if self.projection_dim != other.projection_dim:
-            raise ValueError("Projection dimensions differ")
-
         if self.layer_types != other.layer_types:
             raise ValueError(
                 f"Layer types differ: {self.layer_types} vs {other.layer_types}"
@@ -413,3 +397,72 @@ class Gradient:
             and self.token_dim != other.token_dim
         ):
             raise ValueError("Token dimensions differ")
+
+
+# --------------------------------------------------------------------------- #
+# Sample hashing                                                               #
+# --------------------------------------------------------------------------- #
+
+
+def hash_sample(inputs: dict[str, torch.Tensor], sample_idx: int) -> str:
+    """Compute a SHA-256 hash that uniquely identifies one sample in a batch.
+
+    All tensor fields in *inputs* are included, sorted by key for
+    determinism.  Non-tensor values are skipped.  The hash is content-based
+    and stable: the same sample always produces the same hash regardless of
+    batch position, epoch, or whether the trainer has stripped metadata fields
+    like dataset indices.
+
+    Args:
+        inputs: The full input dict passed to the model (e.g.
+            ``{"input_ids": ..., "attention_mask": ..., "labels": ...}``).
+        sample_idx: Index of the sample within the batch dimension.
+
+    Returns:
+        A 64-character hex string (SHA-256 digest).
+    """
+    h = hashlib.sha256()
+    for key in sorted(inputs):
+        val = inputs[key]
+        if isinstance(val, torch.Tensor) and val.ndim > 0:
+            h.update(key.encode())
+            h.update(val[sample_idx].cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Gradient record                                                               #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class GradientRecord:
+    """A gradient snapshot with its identity baked in.
+
+    Attributes:
+        step: Global batch-step counter, incremented once per completed
+            backward pass.
+        input_hash: Content-based identifier for the sample(s) in this record.
+
+            * **Per-sample** (``recording_type="per_sample"``): a single
+              64-character SHA-256 hex string identifying the one sample whose
+              gradient is stored.
+            * **Per-batch** (``recording_type="per_batch"``): a list of
+              64-character SHA-256 hex strings, one per sample in the batch,
+              in batch order.  The :class:`GradientFileManager` indexes every
+              hash in the list so per-sample lookup works even when many
+              records are bundled in one file.
+
+        gradient: The collected :class:`Gradient`.
+    """
+
+    step: int
+    input_hash: str | list[str]
+    gradient: Gradient
+
+    def __repr__(self) -> str:
+        if isinstance(self.input_hash, list):
+            h_repr = f"[{self.input_hash[0][:16]}…+{len(self.input_hash)-1}]"
+        else:
+            h_repr = f"{self.input_hash[:16]}…"
+        return f"GradientRecord(step={self.step}, input_hash={h_repr})"

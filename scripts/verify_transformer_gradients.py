@@ -35,7 +35,7 @@ from transformers import GPT2Config, GPT2LMHeadModel, TrainingArguments, set_see
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dattri_llm.gradient.collector import GradientCollector  # noqa: E402
-from dattri_llm.gradient.trainers.transformers import GradientCollectingTrainer  # noqa: E402
+from dattri_llm.trainers.transformers import GradientCollectingTrainer  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Config                                                                        #

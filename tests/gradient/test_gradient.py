@@ -45,16 +45,10 @@ def make_gradient(
     layers=("l1", "l2"),
     repr_type="materialized",
     indexing="batch",
-    projection_dim=None,
 ) -> Gradient:
     if repr_type == "factorized":
         fn = factorized_bt if indexing == "batch_token" else factorized
         data = {name: fn() for name in layers}
-    elif repr_type == "projected":
-        assert projection_dim is not None
-        feat = projection_dim
-        fn = mat_tensor_bt if indexing == "batch_token" else mat_tensor
-        data = {name: fn(feat=feat) for name in layers}
     else:
         fn = mat_tensor_bt if indexing == "batch_token" else mat_tensor
         data = {name: fn() for name in layers}
@@ -64,7 +58,6 @@ def make_gradient(
         representation=representation,
         data=data,
         indexing=indexing,
-        projection_dim=projection_dim,
     )
 
 
@@ -116,10 +109,6 @@ class TestValidate:
         g = make_gradient(repr_type="factorized")
         g.validate()
 
-    def test_valid_projected(self):
-        g = make_gradient(repr_type="projected", projection_dim=32)
-        g.validate()
-
     def test_valid_batch_token(self):
         g = make_gradient(repr_type="materialized", indexing="batch_token")
         g.validate()
@@ -147,20 +136,6 @@ class TestValidate:
         rep = {"l1": "materialized"}
         g = Gradient(representation=rep, data=data)
         with pytest.raises(TypeError, match="Tensor"):
-            g.validate()
-
-    def test_projected_missing_projection_dim(self):
-        data = {"l1": mat_tensor()}
-        rep = {"l1": "projected"}
-        g = Gradient(representation=rep, data=data, projection_dim=None)
-        with pytest.raises(ValueError, match="projection_dim"):
-            g.validate()
-
-    def test_projected_wrong_last_dim(self):
-        data = {"l1": mat_tensor(feat=16)}
-        rep = {"l1": "projected"}
-        g = Gradient(representation=rep, data=data, projection_dim=32)
-        with pytest.raises(ValueError, match="wrong projection dimension"):
             g.validate()
 
     def test_batch_size_mismatch(self):
@@ -291,10 +266,6 @@ class TestMaterialize:
 
     def test_materialized_returns_self(self):
         g = make_gradient(repr_type="materialized")
-        assert g.materialize() is g
-
-    def test_projected_returns_self(self):
-        g = make_gradient(repr_type="projected", projection_dim=32)
         assert g.materialize() is g
 
     def test_mixed_representation(self):
@@ -499,7 +470,7 @@ class TestSimilarity:
 
     def test_similarity_incompatible_representation(self):
         g1 = make_gradient(repr_type="materialized")
-        g2 = make_gradient(repr_type="projected", projection_dim=O * I)
+        g2 = make_gradient(repr_type="factorized")
         with pytest.raises(ValueError, match="representations"):
             g1.similarity(g2)
 

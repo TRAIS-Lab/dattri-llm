@@ -1,42 +1,42 @@
-"""verify_olmo_gradients.py — verify GradientCollector hooks work with OLMo models.
+"""verify_verl_gradients.py — verify GradientCollector works with verl-style RL training.
 
-Checks that ``GradientCollector`` correctly captures MLP activations and output
-gradients from OLMo's ``OLMoSequentialBlock`` feed-forward layers in two
-parallelism settings:
+Checks that :class:`~dattri_llm.gradient.collector.GradientCollector` correctly
+captures MLP activations and output gradients when the backward pass is driven by
+a *response-masked* NLL loss, as used in verl's actor policy-gradient update.
 
-* **single** — plain ``OLMo`` on CPU / single GPU.
-* **fsdp**   — model wrapped with ``torch.distributed.fsdp.FullyShardedDataParallel``
-  (``full_shard``, ``use_orig_params=True``).
+Unlike standard language model training (cross-entropy over all tokens), verl's
+actor computes the loss only over *response* tokens.  This script verifies that
+the collector captures the correct gradient signal under that regime.
 
-Why ``OLMO_MLP_PATTERNS`` is needed
--------------------------------------
-OLMo names its block-level feed-forward linears ``ff_proj`` and ``ff_out``.
-Their parent path is ``transformer.blocks.<i>``, which does not contain any of
-the default heuristic keywords (``mlp``, ``ffn``, ``dense``, …), so
-``GradientCollector`` must be given explicit ``name_patterns`` via
-:data:`~dattri_llm.gradient.trainers.olmo.OLMO_MLP_PATTERNS`.
+GPT-2 is used as a stand-in for the transformer families verl typically operates
+on (LLaMA-2/3, Qwen-2, Mistral, DeepSeek).  GPT-2's ``mlp.c_fc`` and
+``mlp.c_proj`` layers share the same parent-path naming convention as those
+families, so the default MLP heuristics apply and no explicit patterns are needed.
 
-The top-level ``transformer.ff_out`` (vocabulary projection, present only when
-``weight_tying=False``) is excluded by anchoring patterns to ``blocks.\\d+``.
+Two parallelism settings are verified:
 
-FSDP notes
-----------
-The collector is registered on the bare ``OLMo`` module **before** FSDP
-wrapping.  ``use_orig_params=True`` tells FSDP to keep the original parameter
-objects in place, which preserves the hooked modules and allows the forward /
-backward hooks to fire normally.
+* **single** — plain GPT-2 on CPU / single GPU (the reference baseline).
+* **fsdp**   — FSDP-wrapped model with ``full_shard`` + ``use_orig_params=True``,
+  which is verl's primary distributed strategy.
+
+Response-mask design
+---------------------
+Each batch has ``SEQ_LEN = PROMPT_LEN + RESPONSE_LEN`` tokens.  The response
+mask is 0 for the first ``PROMPT_LEN`` positions and 1 for the remaining
+``RESPONSE_LEN`` positions.  The loss (and hence gradient) is restricted to
+those response positions, just as in verl's actor update.
 
 Usage::
 
     # Single GPU / CPU
-    python scripts/verify_olmo_gradients.py
+    python scripts/verify_verl_gradients.py
 
     # FSDP (2 processes, adjust nproc_per_node as needed)
-    torchrun --nproc_per_node=2 scripts/verify_olmo_gradients.py --setup fsdp
+    torchrun --nproc_per_node=2 scripts/verify_verl_gradients.py --setup fsdp
 
 Requirements::
 
-    pip install ai2-olmo
+    pip install transformers torch
 """
 
 from __future__ import annotations
@@ -47,22 +47,23 @@ import sys
 from typing import Dict
 
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 try:
-    from olmo.config import ActivationType, ModelConfig
-    from olmo.model import OLMo
+    from transformers import GPT2Config, GPT2LMHeadModel
 except ImportError as exc:
     raise SystemExit(
-        "OLMo is required for this script.\n"
-        "Install with:  pip install ai2-olmo\n"
+        "transformers is required for this script.\n"
+        "Install with:  pip install transformers\n"
         f"Original error: {exc}"
     ) from exc
 
 from dattri_llm.gradient.collector import GradientCollector  # noqa: E402
-from dattri_llm.trainers.olmo import OLMO_MLP_PATTERNS  # noqa: E402
+from dattri_llm.trainers.verl import (  # noqa: E402
+    VERL_MLP_PATTERNS,
+    compute_response_nll_loss,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -70,37 +71,42 @@ from dattri_llm.trainers.olmo import OLMO_MLP_PATTERNS  # noqa: E402
 
 SEED = 42
 VOCAB_SIZE = 64
-SEQ_LEN = 16
+PROMPT_LEN = 8
+RESPONSE_LEN = 8
+SEQ_LEN = PROMPT_LEN + RESPONSE_LEN   # 16
 BATCH_SIZE = 2
 N_LAYERS = 2
-D_MODEL = 64
-N_HEADS = 2
-MLP_RATIO = 4
+N_EMBD = 64
+N_HEAD = 2
+MLP_HIDDEN = N_EMBD * 4               # GPT-2 default 4x MLP expansion
 ATOL = 1e-5
 RTOL = 1e-4
 
+GPT2_CFG = GPT2Config(
+    vocab_size=VOCAB_SIZE,
+    n_positions=SEQ_LEN,
+    n_embd=N_EMBD,
+    n_layer=N_LAYERS,
+    n_head=N_HEAD,
+)
+
+
+def _make_response_mask(batch_size: int = BATCH_SIZE) -> torch.Tensor:
+    """Return a response mask: 0 for prompt tokens, 1 for response tokens."""
+    mask = torch.zeros(batch_size, SEQ_LEN)
+    mask[:, PROMPT_LEN:] = 1.0
+    return mask
+
 
 # ---------------------------------------------------------------------------
-# Tiny OLMo model
+# Tiny GPT-2 model factory
 # ---------------------------------------------------------------------------
 
 
-def make_tiny_olmo(seed: int = SEED) -> OLMo:
+def make_tiny_gpt2(seed: int = SEED) -> GPT2LMHeadModel:
+    """Create a reproducible tiny GPT-2 model for testing."""
     torch.manual_seed(seed)
-    cfg = ModelConfig(
-        d_model=D_MODEL,
-        n_layers=N_LAYERS,
-        n_heads=N_HEADS,
-        vocab_size=VOCAB_SIZE,
-        max_sequence_length=SEQ_LEN,
-        mlp_ratio=MLP_RATIO,
-        activation_type=ActivationType.swiglu,
-        rope=True,
-        flash_attention=False,
-        include_bias=False,
-        weight_tying=True,
-    )
-    model = OLMo(cfg)
+    model = GPT2LMHeadModel(GPT2_CFG)
     model.train()
     return model
 
@@ -113,31 +119,32 @@ def make_tiny_olmo(seed: int = SEED) -> OLMo:
 def collect_reference(
     device: torch.device,
     sample_ids: torch.Tensor,
+    response_mask: torch.Tensor,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Run forward+backward on *sample_ids* with a fresh model and return a/g.
+    """Run a verl-style forward+backward on *sample_ids* and return a/g.
 
-    This is the ground truth we compare distributed runs against.  A new model
-    is built from the same seed so weights are identical.
+    A fresh model is built from the same seed so weights are identical to
+    the primary run being compared.
 
     Args:
         device: Device to run the reference on.
-        sample_ids: Token IDs ``(B, T)`` — the exact same tokens that the
-            distributed run processed.
+        sample_ids: Token IDs ``(B, T)`` — the same tokens used by the
+            primary run.
+        response_mask: Float mask ``(B, T)`` — 1 for response tokens.
     """
-    ref_model = make_tiny_olmo(seed=SEED).to(device)
+    ref_model = make_tiny_gpt2(seed=SEED).to(device)
     ref_model.train()
-    ref_collector = GradientCollector(ref_model, name_patterns=OLMO_MLP_PATTERNS)
+    ref_collector = GradientCollector(ref_model, name_patterns=VERL_MLP_PATTERNS)
+
     ids = sample_ids.to(device)
+    mask = response_mask.to(device)
+
     ref_model.zero_grad()
     with ref_collector:
         out = ref_model(input_ids=ids)
-        shift_logits = out.logits[:, :-1, :].contiguous()
-        shift_labels = ids[:, 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.shape[-1]),
-            shift_labels.view(-1),
-        )
+        loss = compute_response_nll_loss(out.logits, ids, mask)
         loss.backward()
+
     ag = ref_collector.get_activations_and_grad_outputs()
     ref_collector.remove()
     return ag
@@ -207,7 +214,7 @@ def _sanity_checks(
     *,
     batch_size: int = BATCH_SIZE,
 ) -> bool:
-    """Layer count, finiteness, and SwiGLU shape checks."""
+    """Layer count, finiteness, and GPT-2 MLP shape checks."""
     ok = True
     ok &= _check(len(ag) > 0, f"at least one layer hooked  (found {len(ag)})")
     ok &= _check(
@@ -224,30 +231,29 @@ def _sanity_checks(
                 f"{layer}[{key}]: all finite  {_tensor_stats(t)}",
             )
 
-    # Expected SwiGLU shapes:
-    #   ff_proj  activation : (B, T, D)    grad_output : (B, T, 4D)
-    #   ff_out   activation : (B, T, 2D)   grad_output : (B, T, D)
+    # Expected GPT-2 MLP shapes:
+    #   c_fc   activation : (B, T, N_EMBD)     grad_output : (B, T, 4*N_EMBD)
+    #   c_proj activation : (B, T, 4*N_EMBD)   grad_output : (B, T, N_EMBD)
     for layer, entry in ag.items():
         act = entry["activation"]
         go = entry["grad_output"]
-        if "ff_proj" in layer:
+        if "c_fc" in layer:
             ok &= _check(
-                act.shape == (batch_size, SEQ_LEN, D_MODEL),
-                f"{layer}  ff_proj activation shape == (B, T, D_MODEL)",
+                act.shape == (batch_size, SEQ_LEN, N_EMBD),
+                f"{layer}  c_fc activation shape == (B, T, N_EMBD)",
             )
             ok &= _check(
-                go.shape == (batch_size, SEQ_LEN, MLP_RATIO * D_MODEL),
-                f"{layer}  ff_proj grad_output shape == (B, T, 4*D_MODEL)",
+                go.shape == (batch_size, SEQ_LEN, MLP_HIDDEN),
+                f"{layer}  c_fc grad_output shape == (B, T, 4*N_EMBD)",
             )
-        elif "ff_out" in layer:
-            hidden = MLP_RATIO * D_MODEL // 2  # SwiGLU halves
+        elif "c_proj" in layer:
             ok &= _check(
-                act.shape == (batch_size, SEQ_LEN, hidden),
-                f"{layer}  ff_out activation shape == (B, T, 2*D_MODEL)",
+                act.shape == (batch_size, SEQ_LEN, MLP_HIDDEN),
+                f"{layer}  c_proj activation shape == (B, T, 4*N_EMBD)",
             )
             ok &= _check(
-                go.shape == (batch_size, SEQ_LEN, D_MODEL),
-                f"{layer}  ff_out grad_output shape == (B, T, D_MODEL)",
+                go.shape == (batch_size, SEQ_LEN, N_EMBD),
+                f"{layer}  c_proj grad_output shape == (B, T, N_EMBD)",
             )
     return ok
 
@@ -264,25 +270,25 @@ def run_single() -> bool:
     device = torch.device(device_str)
     torch.manual_seed(SEED)
     ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
+    response_mask = _make_response_mask(BATCH_SIZE)
 
     # ---- Primary run ----
-    model = make_tiny_olmo(seed=SEED).to(device)
-    collector = GradientCollector(model, name_patterns=OLMO_MLP_PATTERNS)
+    model = make_tiny_gpt2(seed=SEED).to(device)
+    collector = GradientCollector(model, name_patterns=VERL_MLP_PATTERNS)
 
     model.zero_grad()
     with collector:
         out = model(input_ids=ids.to(device))
-        shift_logits = out.logits[:, :-1, :].contiguous()
-        shift_labels = ids.to(device)[:, 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.shape[-1]),
-            shift_labels.view(-1),
+        loss = compute_response_nll_loss(
+            out.logits, ids.to(device), response_mask.to(device)
         )
         loss.backward()
 
     ok = True
-    ok &= _check(collector.get_activations_and_grad_outputs() is not None,
-                 "collector populated after forward/backward")
+    ok &= _check(
+        collector.get_activations_and_grad_outputs() is not None,
+        "collector populated after verl-style forward/backward",
+    )
 
     ag = collector.get_activations_and_grad_outputs()
     ok &= _sanity_checks(ag)
@@ -290,21 +296,30 @@ def run_single() -> bool:
 
     # ---- Compare against a fresh reference model on the same tokens ----
     print("\n  Comparing against raw GradientCollector reference ...")
-    ref_ag = collect_reference(device, ids)
+    ref_ag = collect_reference(device, ids, response_mask)
     ok &= _compare_ag(ref_ag, ag, "single-GPU run vs raw collector reference")
+
+    # ---- Verify that a response-masked loss gives non-zero gradients ----
+    print("\n  Checking response mask effect: response grad_outputs must be non-zero ...")
+    any_nonzero = any(
+        entry["grad_output"].abs().max().item() > 0
+        for entry in ag.values()
+    )
+    ok &= _check(any_nonzero, "at least one layer has non-zero grad_output (response mask applied)")
 
     # ---- Confirm a different batch yields different activations ----
     print("\n  Checking that a different batch produces different activations ...")
     torch.manual_seed(SEED + 1)
     ids_diff = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
-    model2 = make_tiny_olmo(seed=SEED).to(device)
-    collector2 = GradientCollector(model2, name_patterns=OLMO_MLP_PATTERNS)
+    model2 = make_tiny_gpt2(seed=SEED).to(device)
+    collector2 = GradientCollector(model2, name_patterns=VERL_MLP_PATTERNS)
     model2.zero_grad()
     with collector2:
         out2 = model2(input_ids=ids_diff.to(device))
-        sl2 = out2.logits[:, :-1, :].contiguous()
-        lb2 = ids_diff.to(device)[:, 1:].contiguous()
-        F.cross_entropy(sl2.view(-1, sl2.shape[-1]), lb2.view(-1)).backward()
+        loss2 = compute_response_nll_loss(
+            out2.logits, ids_diff.to(device), response_mask.to(device)
+        )
+        loss2.backward()
     ag2 = collector2.get_activations_and_grad_outputs()
     collector2.remove()
 
@@ -338,10 +353,11 @@ def run_fsdp() -> bool:
     device = torch.device(device_str)
 
     # --- Build bare model and register hooks BEFORE FSDP wrapping ---
-    # use_orig_params=True preserves original module objects (and their hooks).
+    # use_orig_params=True preserves original module objects (and their hooks),
+    # matching the recommended verl FSDP configuration.
     torch.manual_seed(SEED)
-    model = make_tiny_olmo(seed=SEED).to(device)
-    collector = GradientCollector(model, name_patterns=OLMO_MLP_PATTERNS)
+    model = make_tiny_gpt2(seed=SEED).to(device)
+    collector = GradientCollector(model, name_patterns=VERL_MLP_PATTERNS)
 
     fsdp_model = FSDP(
         model,
@@ -350,19 +366,15 @@ def run_fsdp() -> bool:
         device_id=device if torch.cuda.is_available() else None,
     )
 
-    # --- Forward / backward ---
+    # --- verl-style forward / backward ---
     torch.manual_seed(SEED)
     ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(device)
+    response_mask = _make_response_mask(BATCH_SIZE).to(device)
 
     fsdp_model.zero_grad()
     with collector:
         out = fsdp_model(input_ids=ids)
-        shift_logits = out.logits[:, :-1, :].contiguous()
-        shift_labels = ids[:, 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.shape[-1]),
-            shift_labels.view(-1),
-        )
+        loss = compute_response_nll_loss(out.logits, ids, response_mask)
         loss.backward()
 
     dist.barrier()
@@ -371,7 +383,7 @@ def run_fsdp() -> bool:
     if rank == 0:
         ok &= _check(
             len(collector.get_activations_and_grad_outputs()) > 0,
-            "[rank 0] collector populated after FSDP forward/backward",
+            "[rank 0] collector populated after FSDP verl-style forward/backward",
         )
         ag = collector.get_activations_and_grad_outputs()
 
@@ -379,10 +391,8 @@ def run_fsdp() -> bool:
         ok &= _sanity_checks(ag)
 
         # Compare rank-0 tensors against a single-GPU reference.
-        # Tiny floating-point differences from shard-level all-reduce are expected;
-        # the comparison is informational.
         print("\n  [rank 0] Comparing against raw GradientCollector reference ...")
-        ref_ag = collect_reference(device, ids.cpu())
+        ref_ag = collect_reference(device, ids.cpu(), response_mask.cpu())
         ok &= _compare_ag(
             ref_ag,
             ag,
@@ -401,7 +411,7 @@ def run_fsdp() -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify GradientCollector hooks work with OLMo models"
+        description="Verify GradientCollector hooks work with verl-style RL training"
     )
     parser.add_argument(
         "--setup",
@@ -414,11 +424,12 @@ def main() -> None:
 
     if rank == 0:
         print("=" * 60)
-        print("OLMo GradientCollector — model-level hook verification")
+        print("verl GradientCollector — response-masked gradient verification")
         print("=" * 60)
-        print(f"  d_model={D_MODEL}  n_layers={N_LAYERS}  mlp_ratio={MLP_RATIO}")
+        print(f"  model=GPT-2  n_embd={N_EMBD}  n_layers={N_LAYERS}")
         print(f"  vocab={VOCAB_SIZE}  seq_len={SEQ_LEN}  batch={BATCH_SIZE}")
-        print(f"  OLMO_MLP_PATTERNS = {OLMO_MLP_PATTERNS}")
+        print(f"  prompt_len={PROMPT_LEN}  response_len={RESPONSE_LEN}")
+        print(f"  VERL_MLP_PATTERNS = {VERL_MLP_PATTERNS!r}  (None → default heuristics)")
 
     if cli.setup == "single":
         ok = run_single()
