@@ -1,4 +1,4 @@
-"""verify_olmo_gradients_hooks.py — verify HookManager works with OLMo models.
+"""verify_hookmanager_with_olmo.py — verify HookManager works with OLMo models.
 
 Checks that :class:`~dattri_llm.gradient.hooks.HookManager` correctly captures
 MLP activations and output gradients from OLMo's ``OLMoSequentialBlock``
