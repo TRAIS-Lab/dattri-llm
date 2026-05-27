@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from dattri_llm.gradient.hooks import (
-    _is_mlp_linear,
+    _is_hookable_layer,
     register_mlp_hooks,
     register_param_grad_hooks,
     remove_hooks,
@@ -15,27 +15,60 @@ from dattri_llm.gradient.hooks import (
 
 
 # --------------------------------------------------------------------------- #
-# _is_mlp_linear                                                               #
+# _is_hookable_layer                                                            #
 # --------------------------------------------------------------------------- #
 
 
-class TestIsMlpLinear:
+class TestIsHookableLayer:
+    # --- nn.Linear / Conv1D: require an MLP-family parent keyword ----------- #
+
     def test_linear_inside_mlp(self):
-        assert _is_mlp_linear("transformer.h.0.mlp.fc1", nn.Linear(4, 4))
+        assert _is_hookable_layer("transformer.h.0.mlp.fc1", nn.Linear(4, 4))
 
     def test_linear_inside_ffn(self):
-        assert _is_mlp_linear("model.layers.1.ffn.gate_proj", nn.Linear(4, 4))
+        assert _is_hookable_layer("model.layers.1.ffn.gate_proj", nn.Linear(4, 4))
 
     def test_linear_not_in_mlp(self):
         # attn projection — parent path has no MLP keyword
-        assert not _is_mlp_linear("transformer.h.0.attn.c_proj", nn.Linear(4, 4))
+        assert not _is_hookable_layer("transformer.h.0.attn.c_proj", nn.Linear(4, 4))
 
     def test_non_linear_inside_mlp(self):
-        assert not _is_mlp_linear("model.mlp.act", nn.ReLU())
+        assert not _is_hookable_layer("model.mlp.act", nn.ReLU())
 
     def test_top_level_linear(self):
         # No parent path at all
-        assert not _is_mlp_linear("lm_head", nn.Linear(4, 4))
+        assert not _is_hookable_layer("lm_head", nn.Linear(4, 4))
+
+    # --- nn.Embedding: always included regardless of parent path ------------ #
+
+    def test_embedding_top_level(self):
+        assert _is_hookable_layer("embedding", nn.Embedding(32, 8))
+
+    def test_embedding_nested(self):
+        assert _is_hookable_layer("model.transformer.wte", nn.Embedding(50257, 768))
+
+    def test_embedding_inside_attn(self):
+        # Even under a non-MLP parent, Embedding is hooked.
+        assert _is_hookable_layer("model.attn.embed", nn.Embedding(16, 16))
+
+    # --- nn.LayerNorm: always included regardless of parent path ------------ #
+
+    def test_layernorm_top_level(self):
+        assert _is_hookable_layer("ln_f", nn.LayerNorm(64))
+
+    def test_layernorm_nested(self):
+        assert _is_hookable_layer("model.layers.0.ln1", nn.LayerNorm(128))
+
+    def test_layernorm_inside_attn(self):
+        assert _is_hookable_layer("model.h.3.attn.ln", nn.LayerNorm(256))
+
+    # --- Other module types are still excluded ------------------------------ #
+
+    def test_relu_excluded(self):
+        assert not _is_hookable_layer("model.mlp.act", nn.ReLU())
+
+    def test_dropout_excluded(self):
+        assert not _is_hookable_layer("model.dropout", nn.Dropout())
 
 
 # --------------------------------------------------------------------------- #
@@ -46,11 +79,15 @@ class TestIsMlpLinear:
 class TestRegisterMlpHooks:
     def test_hooks_registered_on_mlp_layers(self, tiny_model):
         buffers, handles = register_mlp_hooks(tiny_model)
-        # TinyMLP has mlp.0 (Linear) and mlp.2 (Linear); mlp.1 is ReLU → skipped
-        assert len(buffers) == 2
-        assert all(k.startswith("mlp.") for k in buffers)
+        # TinyMLP has: embedding (Embedding — always hooked),
+        # mlp.0 and mlp.2 (Linear inside an MLP block).
+        # mlp.1 is ReLU → skipped; attn_proj and lm_head lack an MLP parent → skipped.
+        assert len(buffers) == 3
+        assert "embedding" in buffers
+        assert "mlp.0" in buffers
+        assert "mlp.2" in buffers
         # Each layer has 2 handles (forward + backward)
-        assert len(handles) == 4
+        assert len(handles) == 6
         remove_hooks(handles)
 
     def test_attn_proj_not_hooked(self, tiny_model):
@@ -113,7 +150,8 @@ class TestRegisterMlpHooks:
     def test_dataparallel_unwrapping(self, tiny_model):
         dp_model = nn.DataParallel(tiny_model)
         buffers, handles = register_mlp_hooks(dp_model)
-        assert len(buffers) == 2
+        # Same 3 layers as the plain-model case: embedding, mlp.0, mlp.2
+        assert len(buffers) == 3
         remove_hooks(handles)
 
 

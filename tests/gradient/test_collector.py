@@ -32,7 +32,7 @@ class RecordingCallback(HookManagerCallback):
         self.records: list[GradientRecord] = []
         self.context_ended: int = 0
 
-    def on_collect_end(self, record: GradientRecord) -> None:
+    def on_step_end(self, record: GradientRecord) -> None:
         self.records.append(record)
 
     def on_context_end(self) -> None:
@@ -119,10 +119,10 @@ class TestGradientRecord:
         with collector.collect():
             tiny_model(tiny_batch["input_ids"]).mean().backward()
         collector.remove()
-        rec0, rec1 = cb.records[0], cb.records[1]
-        # Same sample seen twice should share input_hash
-        assert rec0.input_hash != rec1.input_hash  # different samples
-        assert rec0.step == rec1.step              # same step
+        # One record per step; input_hash is a list of B hashes
+        rec = cb.records[0]
+        assert isinstance(rec.input_hash, list)
+        assert len(set(rec.input_hash)) == len(rec.input_hash)  # all hashes distinct
 
 
 # --------------------------------------------------------------------------- #
@@ -133,7 +133,13 @@ class TestGradientRecord:
 class TestHookManagerInit:
     def test_layer_names_populated(self, tiny_model):
         collector = HookManager(tiny_model)
-        assert len(collector.layer_names) == 2
+        # TinyMLP has: embedding (Embedding — always hooked),
+        # mlp.0 and mlp.2 (Linear inside an MLP block).
+        # attn_proj and lm_head (Linear without an MLP-family parent) are skipped.
+        assert len(collector.layer_names) == 3
+        assert "embedding" in collector.layer_names
+        assert "mlp.0" in collector.layer_names
+        assert "mlp.2" in collector.layer_names
         collector.remove()
 
     def test_custom_patterns(self, tiny_model):
@@ -162,14 +168,13 @@ class TestCollectContextManager:
         assert cb.context_ended == 1
         collector.remove()
 
-    def test_records_emitted_per_sample(self, tiny_model, tiny_batch):
-        B = tiny_batch["input_ids"].shape[0]
+    def test_one_record_per_step(self, tiny_model, tiny_batch):
         cb = RecordingCallback()
         collector = HookManager(tiny_model, callbacks=[cb])
         with collector.collect():
             logits = tiny_model(tiny_batch["input_ids"])
             logits.mean().backward()
-        assert len(cb.records) == B
+        assert len(cb.records) == 1
         collector.remove()
 
     def test_context_end_fires_once(self, tiny_model, tiny_batch):
@@ -190,7 +195,6 @@ class TestCollectContextManager:
         collector.remove()
 
     def test_multiple_steps_within_one_collect(self, tiny_model, tiny_batch):
-        B = tiny_batch["input_ids"].shape[0]
         cb = RecordingCallback()
         collector = HookManager(tiny_model, callbacks=[cb])
         n_steps = 3
@@ -198,7 +202,7 @@ class TestCollectContextManager:
             for _ in range(n_steps):
                 logits = tiny_model(tiny_batch["input_ids"])
                 logits.mean().backward()
-        assert len(cb.records) == B * n_steps
+        assert len(cb.records) == n_steps
         assert collector.steps_collected == n_steps
         collector.remove()
 
@@ -225,35 +229,36 @@ class TestRecordContent:
         for rec in cb.records:
             assert isinstance(rec, GradientRecord)
             assert isinstance(rec.step, int)
-            assert isinstance(rec.input_hash, str)
+            assert isinstance(rec.input_hash, list)   # list of B hashes
             assert isinstance(rec.gradient, Gradient)
 
-    def test_record_batch_size_one(self, tiny_model, tiny_batch):
+    def test_record_batch_size(self, tiny_model, tiny_batch):
+        B = tiny_batch["input_ids"].shape[0]
         cb = RecordingCallback()
         _run_one_step(tiny_model, tiny_batch["input_ids"], callbacks=[cb])
         for rec in cb.records:
-            assert rec.gradient.batch_size == 1
+            assert rec.gradient.batch_size == B
 
     def test_record_step_ids(self, tiny_model, tiny_batch):
         cb = RecordingCallback()
         collector = HookManager(tiny_model, callbacks=[cb])
         n_steps = 2
-        B = tiny_batch["input_ids"].shape[0]
         with collector.collect():
             for _ in range(n_steps):
                 logits = tiny_model(tiny_batch["input_ids"])
                 logits.mean().backward()
         steps = [rec.step for rec in cb.records]
-        # Step 0: B records; step 1: B records
-        assert steps[:B] == [0] * B
-        assert steps[B:] == [1] * B
+        # One record per step
+        assert steps == [0, 1]
         collector.remove()
 
     def test_record_has_layer_data(self, tiny_model, tiny_batch):
         cb = RecordingCallback()
         _run_one_step(tiny_model, tiny_batch["input_ids"], callbacks=[cb])
         for rec in cb.records:
-            assert len(rec.gradient.layer_names) == 2
+            # embedding (Embedding), mlp.0, mlp.2 (Linear inside mlp block)
+            assert len(rec.gradient.layer_names) == 3
+            assert "embedding" in rec.gradient.layer_names
 
     def test_gradient_finite(self, tiny_model, tiny_batch):
         cb = RecordingCallback()
@@ -277,9 +282,10 @@ class TestSampleHashing:
         collector = HookManager(tiny_model, callbacks=[cb])
         with collector.collect():
             tiny_model(ids).mean().backward()
-        hashes = [rec.input_hash for rec in cb.records]
-        # All three samples should have distinct hashes
-        assert len(set(hashes)) == 3
+        # One record per step; input_hash is a list of 3 hashes
+        rec = cb.records[0]
+        assert isinstance(rec.input_hash, list)
+        assert len(set(rec.input_hash)) == 3  # all three samples distinct
         collector.remove()
 
     def test_same_sample_across_two_steps_same_hash(self, tiny_model):
@@ -291,13 +297,11 @@ class TestSampleHashing:
         with collector.collect():
             for _ in range(2):
                 tiny_model(ids).mean().backward()
-        # Records 0..1 from step 0; records 2..3 from step 1
-        # Same sample idx across steps → same hash
-        assert cb.records[0].input_hash == cb.records[2].input_hash
-        assert cb.records[1].input_hash == cb.records[3].input_hash
-        # But different steps
+        # Two records (one per step), each with 2 hashes
+        assert len(cb.records) == 2
+        assert cb.records[0].input_hash == cb.records[1].input_hash  # same inputs → same hashes
         assert cb.records[0].step == 0
-        assert cb.records[2].step == 1
+        assert cb.records[1].step == 1
         collector.remove()
 
 
@@ -368,7 +372,8 @@ class TestGradientFileManager:
         inputs = {"input_ids": tiny_batch["input_ids"]}
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(every_n_steps=100, file_manager=manager)
+            offload = OffloadCallback(offload_interval=100, file_manager=manager,
+                                      recording_type="per_sample")
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
@@ -383,7 +388,8 @@ class TestGradientFileManager:
         inputs = {"input_ids": tiny_batch["input_ids"]}
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(every_n_steps=100, file_manager=manager)
+            offload = OffloadCallback(offload_interval=100, file_manager=manager,
+                                      recording_type="per_sample")
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
@@ -411,15 +417,14 @@ class TestGradientFileManager:
     def test_load_all_by_inputs(self, tiny_model, tiny_batch):
         """load_all() loads all records for all samples in the batch.
 
-        The model must be called with keyword arguments so that the collector
-        captures named keys (e.g. "input_ids") rather than positional "_arg0".
-        The query dict must use the same keys.
+        Uses per_sample recording so each sample gets its own record.
         """
         inputs = {"input_ids": tiny_batch["input_ids"]}
         B = tiny_batch["input_ids"].shape[0]
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(every_n_steps=100, file_manager=manager)
+            offload = OffloadCallback(offload_interval=100, file_manager=manager,
+                                      recording_type="per_sample")
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
@@ -429,19 +434,19 @@ class TestGradientFileManager:
             collector.remove()
 
     def test_load_all_covers_all_samples(self, tiny_model, tiny_batch):
-        """load_all() returns one record per unique sample in the batch."""
+        """load_all() returns one record per unique sample in the batch (per_sample mode)."""
         inputs = {"input_ids": tiny_batch["input_ids"]}
         B = tiny_batch["input_ids"].shape[0]
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(every_n_steps=100, file_manager=manager)
+            offload = OffloadCallback(offload_interval=100, file_manager=manager,
+                                      recording_type="per_sample")
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
             records = manager.load_all(inputs)
-            # Each record should correspond to exactly one sample
             input_hashes = {hash_sample(inputs, i) for i in range(B)}
-            record_hashes = {r.input_hash for r in records}
+            record_hashes = {r.input_hash for r in records}  # str per per_sample record
             assert record_hashes == input_hashes
             collector.remove()
 
@@ -539,8 +544,8 @@ class TestBatchSaving:
         inputs = {"input_ids": tiny_batch["input_ids"]}
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(every_n_steps=100, file_manager=manager)
-            cfg = HookManagerConfig(recording_type="per_batch", hook_types=["mlp_io"])
+            offload = OffloadCallback(offload_interval=100, file_manager=manager)
+            cfg = HookManagerConfig(hook_types={"mlp_io": None})
             collector = HookManager(tiny_model, config=cfg, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
@@ -551,10 +556,10 @@ class TestBatchSaving:
             collector.remove()
 
     def test_offload_groups_one_step_into_one_file(self, tiny_model, tiny_batch):
-        """One batch step → one batch file (every_n_steps=1)."""
+        """One batch step → one batch file (offload_interval=1)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(every_n_steps=1, file_manager=manager)
+            offload = OffloadCallback(offload_interval=1, file_manager=manager)
             collector = HookManager(tiny_model, callbacks=[offload])
             B = tiny_batch["input_ids"].shape[0]
             with collector.collect():
@@ -565,24 +570,26 @@ class TestBatchSaving:
             collector.remove()
 
     def test_offload_load_by_hash_after_batch_write(self, tiny_model, tiny_batch):
-        """Records written by OffloadCallback can be loaded by sample hash."""
+        """Records written by OffloadCallback(per_sample) can be loaded by sample hash."""
         inputs = {"input_ids": tiny_batch["input_ids"]}
+        B = tiny_batch["input_ids"].shape[0]
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(every_n_steps=1, file_manager=manager)
+            offload = OffloadCallback(offload_interval=1, file_manager=manager,
+                                      recording_type="per_sample")
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
             records = manager.load_all(inputs)
-            assert len(records) == tiny_batch["input_ids"].shape[0]
+            assert len(records) == B
             assert all(isinstance(r, GradientRecord) for r in records)
             collector.remove()
 
 
 class TestOffloadCallback:
-    def _make_offload(self, tmpdir, every_n_steps=100):
+    def _make_offload(self, tmpdir, offload_interval=100):
         manager = GradientFileManager(tmpdir)
-        offload = OffloadCallback(every_n_steps=every_n_steps, file_manager=manager)
+        offload = OffloadCallback(offload_interval=offload_interval, file_manager=manager)
         return manager, offload
 
     def test_files_written_after_context(self, tiny_model, tiny_batch):
@@ -645,9 +652,9 @@ class TestOffloadCallback:
             collector.remove()
 
     def test_periodic_flush(self, tiny_model, tiny_batch):
-        # every_n_steps=2: flush every 2 batch steps → 4 steps / 2 = 2 batch files
+        # offload_interval=2: flush every 2 batch steps → 4 steps / 2 = 2 batch files
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager, offload = self._make_offload(tmpdir, every_n_steps=2)
+            manager, offload = self._make_offload(tmpdir, offload_interval=2)
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 for _ in range(4):
@@ -661,7 +668,7 @@ class TestOffloadCallback:
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(tiny_batch["input_ids"]).mean().backward()
-                assert len(offload.staged) == tiny_batch["input_ids"].shape[0]
+                assert len(offload.staged) == 1  # one per-batch record per step
             assert len(offload.staged) == 0
             collector.remove()
 
@@ -710,57 +717,86 @@ class TestHookManagerRemove:
 
 
 class TestHookManagerConfig:
+    # ── default ─────────────────────────────────────────────────────────────
+
     def test_default_hook_types(self):
         cfg = HookManagerConfig()
         assert cfg.hook_types == ["mlp_io"]
+        assert cfg.mlp_name_patterns is None   # default heuristic
+        assert cfg.param_name_patterns is None  # param_grad not active
 
-    def test_default_recording_type(self):
-        cfg = HookManagerConfig(hook_types=["mlp_io"])
-        assert cfg.recording_type == "per_sample"
+    # ── dict form ────────────────────────────────────────────────────────────
 
-    def test_explicit_mlp_io(self):
-        cfg = HookManagerConfig(hook_types=["mlp_io"])
-        assert "mlp_io" in cfg.hook_types
+    def test_dict_mlp_io_only(self):
+        cfg = HookManagerConfig(hook_types={"mlp_io": None})
+        assert cfg.hook_types == ["mlp_io"]
+        assert cfg.mlp_name_patterns is None
 
-    def test_explicit_param_grad_requires_per_batch(self):
-        with pytest.raises(ValueError, match="per_batch"):
-            HookManagerConfig(hook_types=["param_grad"])  # per_sample default → error
+    def test_dict_param_grad_only(self):
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        assert cfg.hook_types == ["param_grad"]
+        assert cfg.param_name_patterns is None
 
-    def test_explicit_param_grad_per_batch(self):
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
-        assert "param_grad" in cfg.hook_types
-
-    def test_both_hook_types_per_batch(self):
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["mlp_io", "param_grad"])
+    def test_dict_both_hook_types(self):
+        cfg = HookManagerConfig(hook_types={"mlp_io": None, "param_grad": None})
         assert set(cfg.hook_types) == {"mlp_io", "param_grad"}
 
-    def test_unknown_hook_type_raises(self):
-        with pytest.raises(ValueError, match="Unknown hook_types"):
-            HookManagerConfig(hook_types=["mlp_io", "bogus"])
-
-    def test_empty_hook_types_raises(self):
-        with pytest.raises(ValueError, match="hook_types must contain"):
-            HookManagerConfig(hook_types=[])
-
-    def test_invalid_recording_type_raises(self):
-        with pytest.raises(ValueError, match="recording_type"):
-            HookManagerConfig(recording_type="per_token")
-
-    def test_mlp_name_patterns_stored(self):
-        cfg = HookManagerConfig(hook_types=["mlp_io"], mlp_name_patterns=[r"mlp\.0"])
+    def test_dict_mlp_with_pattern(self):
+        cfg = HookManagerConfig(hook_types={"mlp_io": [r"mlp\.0"]})
         assert cfg.mlp_name_patterns == [r"mlp\.0"]
 
-    def test_param_name_patterns_stored(self):
-        cfg = HookManagerConfig(
-            recording_type="per_batch",
-            hook_types=["param_grad"],
-            param_name_patterns=[r"mlp\.[02]"],
-        )
+    def test_dict_param_with_pattern(self):
+        cfg = HookManagerConfig(hook_types={"param_grad": [r"mlp\.[02]"]})
         assert cfg.param_name_patterns == [r"mlp\.[02]"]
 
-    def test_per_batch_default_hook_types(self):
-        cfg = HookManagerConfig(recording_type="per_batch")
-        assert cfg.hook_types == ["mlp_io"]  # defaults to mlp_io even for per_batch
+    def test_dict_unknown_key_raises(self):
+        with pytest.raises(ValueError, match="Unknown hook_types key"):
+            HookManagerConfig(hook_types={"mlp_io": None, "bogus": None})
+
+    def test_dict_empty_raises(self):
+        with pytest.raises(ValueError, match="hook_types must contain at least one entry"):
+            HookManagerConfig(hook_types={})
+
+    def test_dict_wrong_type_raises(self):
+        with pytest.raises(TypeError, match="hook_types must be a dict"):
+            HookManagerConfig(hook_types=["mlp_io"])  # type: ignore[arg-type]
+
+    # ── shorthand form ───────────────────────────────────────────────────────
+
+    def test_shorthand_mlp_only(self):
+        cfg = HookManagerConfig(mlp_name_patterns=None)
+        assert cfg.hook_types == ["mlp_io"]
+        assert "param_grad" not in cfg.hook_types
+
+    def test_shorthand_param_only(self):
+        cfg = HookManagerConfig(param_name_patterns=None)
+        assert cfg.hook_types == ["param_grad"]
+        assert "mlp_io" not in cfg.hook_types
+
+    def test_shorthand_both(self):
+        cfg = HookManagerConfig(mlp_name_patterns=[r"mlp\."], param_name_patterns=None)
+        assert set(cfg.hook_types) == {"mlp_io", "param_grad"}
+        assert cfg.mlp_name_patterns == [r"mlp\."]
+        assert cfg.param_name_patterns is None
+
+    def test_shorthand_mlp_pattern(self):
+        cfg = HookManagerConfig(mlp_name_patterns=[r"mlp\.0"])
+        assert cfg.mlp_name_patterns == [r"mlp\.0"]
+
+    def test_shorthand_param_pattern(self):
+        cfg = HookManagerConfig(param_name_patterns=[r"mlp\.[02]"])
+        assert cfg.param_name_patterns == [r"mlp\.[02]"]
+
+    # ── mixing forms raises ───────────────────────────────────────────────────
+
+    def test_mixing_forms_raises(self):
+        with pytest.raises(ValueError, match="Provide either hook_types"):
+            HookManagerConfig(
+                hook_types={"mlp_io": None},
+                mlp_name_patterns=[r"mlp\.0"],
+            )
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -775,14 +811,14 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_layer_names_populated_for_param_grad(self, tiny_model):
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
         collector = HookManager(tiny_model, config=cfg)
         assert len(collector.param_layer_names) > 0
         collector.remove()
 
     def test_param_grad_only_emits_one_record_per_step(self, tiny_model, tiny_batch):
         """param_grad-only per-batch mode emits one record per step (not per sample)."""
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
         cb = RecordingCallback()
         B = tiny_batch["input_ids"].shape[0]
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
@@ -795,7 +831,7 @@ class TestHookManagerParamGrad:
 
     def test_param_grad_entries_in_gradient(self, tiny_model, tiny_batch):
         """Records from param_grad-only per-batch mode contain materialized entries."""
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -808,7 +844,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_tensors_are_finite(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -822,9 +858,7 @@ class TestHookManagerParamGrad:
 
     def test_combined_per_batch_emits_one_record_per_step(self, tiny_model, tiny_batch):
         """Combined mlp_io + param_grad per-batch: one record per step."""
-        cfg = HookManagerConfig(
-            recording_type="per_batch", hook_types=["mlp_io", "param_grad"]
-        )
+        cfg = HookManagerConfig(hook_types={"mlp_io": None, "param_grad": None})
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -838,7 +872,7 @@ class TestHookManagerParamGrad:
 
     def test_per_batch_mlp_io_only_emits_one_record_per_step(self, tiny_model, tiny_batch):
         """per_batch with mlp_io only emits one record per step."""
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["mlp_io"])
+        cfg = HookManagerConfig(hook_types={"mlp_io": None})
         cb = RecordingCallback()
         B = tiny_batch["input_ids"].shape[0]
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
@@ -850,7 +884,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_step_increments(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
         collector = HookManager(tiny_model, config=cfg)
         with collector.collect():
             for _ in range(3):
@@ -859,7 +893,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_step_ids_in_records(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -869,11 +903,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_custom_patterns(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(
-            recording_type="per_batch",
-            hook_types=["param_grad"],
-            param_name_patterns=[r"mlp\.0"],
-        )
+        cfg = HookManagerConfig(param_name_patterns=[r"mlp\.0"])
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -885,13 +915,13 @@ class TestHookManagerParamGrad:
         assert all(k.startswith("mlp.0.") for k in param_grad_keys)
         collector.remove()
 
-    def test_param_grad_requires_per_batch(self, tiny_model):
-        """Specifying param_grad with per_sample (default) raises ValueError."""
-        with pytest.raises(ValueError, match="per_batch"):
-            HookManagerConfig(hook_types=["param_grad"])
+    def test_param_grad_hook_type_valid(self, tiny_model):
+        """param_grad is a valid hook_type in HookManagerConfig."""
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        assert "param_grad" in cfg.hook_types
 
     def test_remove_clears_param_layer_names(self, tiny_model):
-        cfg = HookManagerConfig(recording_type="per_batch", hook_types=["param_grad"])
+        cfg = HookManagerConfig(hook_types={"param_grad": None})
         collector = HookManager(tiny_model, config=cfg)
         assert len(collector.param_layer_names) > 0
         collector.remove()
@@ -1039,5 +1069,5 @@ class TestGradientFileManagerDDP:
         assert collector.layer_names == ["mlp.0"]
         with collector.collect():
             tiny_model(tiny_batch["input_ids"]).mean().backward()
-        assert len(cb.records) == tiny_batch["input_ids"].shape[0]
+        assert len(cb.records) == 1  # one record per step
         collector.remove()

@@ -22,13 +22,87 @@ class Factorized:
             pre_activation_grad=self.pre_activation_grad.to(device=device, dtype=dtype),
         )
 
-    def materialize(self) -> torch.Tensor:
-        """
-        Convert factorized layer data into materialized per-sample gradients.
+    @property
+    def is_embedding(self) -> bool:
+        """True when activation stores integer token IDs (``nn.Embedding`` hook)."""
+        return not self.activation.is_floating_point()
 
-        [B, I], [B, O]       -> [B, O * I]
-        [B, T, I], [B, T, O] -> [B, T, O * I]
+    def reduce_activation(self, reduction: str = "mean") -> torch.Tensor:
+        """Return the activation reduced to a float ``(B, F)`` tensor.
+
+        This is the counterpart of reducing ``pre_activation_grad`` — both are
+        needed when computing gram-matrix-based scores (ghost inner product).
+
+        For standard layers (``nn.Linear``, ``nn.LayerNorm``, …) the stored
+        activation is already a float tensor:
+
+        * ``(B, F)``      — returned as-is (cast to float).
+        * ``(B, T, F)``   — reduced over the token dimension via *reduction*
+          (``"mean"`` or ``"sum"``), giving ``(B, F)``.
+
+        For ``nn.Embedding`` the stored activation is an integer token-ID
+        tensor of shape ``(B, T)``.  Its MLP-equivalent activation is
+        ``one_hot(token_ids)`` of shape ``(B, T, vocab_size)``, which would be
+        prohibitively large to materialise.  Instead we compute the reduced
+        form directly via scatter-add:
+
+        * ``"mean"`` → token-frequency vectors ``(B, effective_vocab)``,
+          i.e. ``one_hot(token_ids).float().mean(dim=1)``.
+        * ``"sum"``  → token-count vectors ``(B, effective_vocab)``,
+          i.e. ``one_hot(token_ids).float().sum(dim=1)``.
+
+        ``effective_vocab = max(token_ids) + 1`` for this batch; rows beyond
+        that are zero and do not affect dot products with other batches.
+
+        Args:
+            reduction: ``"mean"`` (default) or ``"sum"``.
+
+        Returns:
+            Float tensor of shape ``(B, F)``.
         """
+        if self.is_embedding:
+            token_ids = self.activation          # (B, T) int
+            B, T = token_ids.shape
+            effective_vocab = int(token_ids.max().item()) + 1
+            freq = torch.zeros(B, effective_vocab, dtype=torch.float,
+                               device=token_ids.device)
+            freq.scatter_add_(1, token_ids,
+                              torch.ones(B, T, dtype=torch.float,
+                                         device=token_ids.device))
+            if reduction == "mean":
+                freq = freq / T
+            return freq                          # (B, effective_vocab)
+
+        a = self.activation.float()
+        if a.ndim == 2:
+            return a                             # already (B, F)
+        return a.mean(1) if reduction == "mean" else a.sum(1)  # (B, F)
+
+    def materialize(self) -> torch.Tensor:
+        """Convert factorized layer data into materialized per-sample gradients.
+
+        Standard linear layers (``nn.Linear``, ``Conv1D``, ``nn.LayerNorm``):
+
+        * ``[B, I], [B, O]       → [B, O * I]``
+        * ``[B, T, I], [B, T, O] → [B, T, O * I]``
+
+        Embedding layers (``nn.Embedding``), where activation stores integer
+        token IDs of shape ``(B, T)`` and pre_activation_grad has shape
+        ``(B, T, embed_dim)``:
+
+        * Per-sample weight gradients are computed via scatter-add over the
+          token dimension, producing ``[B, vocab_size * embed_dim]`` where
+          ``vocab_size`` is inferred as ``max(token_ids) + 1`` in this batch.
+
+        Note:
+            Embedding materialization yields a *dense* gradient over the
+            observed vocabulary — rows not present in the batch are zero.  The
+            effective ``vocab_size`` may differ across batches; do not
+            concatenate materialized Embedding gradients from different steps.
+        """
+        if self.is_embedding:
+            return self._materialize_embedding()
+
         if self.activation.ndim == 2:
             grad = torch.einsum(
                 "bo,bi->boi",
@@ -46,6 +120,35 @@ class Factorized:
             return grad.flatten(start_dim=2)
 
         raise ValueError("Expected activation and pre_activation_grad to be 2D or 3D.")
+
+    def _materialize_embedding(self) -> torch.Tensor:
+        """Scatter-add materialization for ``nn.Embedding`` weight gradients.
+
+        The embedding weight gradient for sample *i* is:
+
+        .. math::
+            \\frac{\\partial L}{\\partial W}[k, :] =
+            \\sum_{t:\\ \\text{token\\_ids}[i,t] = k}
+            \\frac{\\partial L}{\\partial \\text{output}}[i, t, :]
+
+        Args:
+            (no args — uses ``self.activation`` and ``self.pre_activation_grad``)
+
+        Returns:
+            Float tensor of shape ``(B, vocab_size * embed_dim)`` where
+            ``vocab_size = max(token_ids) + 1``.
+        """
+        token_ids = self.activation                 # (B, T) int
+        grad = self.pre_activation_grad.float()     # (B, T, embed_dim)
+        B, T = token_ids.shape
+        embed_dim = grad.shape[-1]
+        vocab_size = int(token_ids.max().item()) + 1
+
+        # idx: (B, T, embed_dim) — broadcast token IDs along the embed dim
+        idx = token_ids.unsqueeze(-1).expand(B, T, embed_dim)  # (B, T, embed_dim)
+        result = torch.zeros(B, vocab_size, embed_dim, dtype=grad.dtype)
+        result.scatter_add_(1, idx, grad)           # (B, vocab_size, embed_dim)
+        return result.reshape(B, -1)                # (B, vocab_size * embed_dim)
 
 
 GradientData = Union[torch.Tensor, Factorized]
