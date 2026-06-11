@@ -43,7 +43,7 @@ except ImportError:
     )
 
 from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import hash_sample
+from dattri_llm.gradient.utils import hash_sample
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, OffloadCallback
 from dattri_llm.trainers.olmo import OLMO_MLP_PATTERNS
 

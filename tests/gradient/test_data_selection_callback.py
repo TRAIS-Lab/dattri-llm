@@ -10,9 +10,8 @@ PyTorch's ``register_full_backward_hook`` fires *before* ``param.grad`` is
 accumulated when **none** of the module's inputs require a gradient (see the
 PyTorch warning "Full backward hook is firing when gradients are computed with
 respect to module outputs since no inputs require gradients").  This matters for
-``DataSelectionCallback._subtract_weight_contrib``: it reads ``weight.grad``
-inside the callback, which fires from within the backward hook of the last
-hooked layer.
+``DataSelectionCallback._subtract_weight``: it reads ``weight.grad`` inside the
+callback, which fires from within the backward hook of the last hooked layer.
 
 In real LLM training this edge case never arises because token embeddings
 (trainable parameters) produce intermediate activations that *do* require grad,
@@ -575,6 +574,84 @@ class TestScoreModeEquivalence:
         assert torch.all(torch.isfinite(cb.last_scores)), (
             f"Non-finite materialized scores: {cb.last_scores}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Normalization-layer consistency (regression: ghost vs materialized for norms) #
+# --------------------------------------------------------------------------- #
+
+
+class _NormMLP(nn.Module):
+    """Embedding → LayerNorm → two-layer MLP.
+
+    The LayerNorm (always hooked) has a token dimension, so its parameter
+    gradient is the *elementwise* x̂ ⊙ g, not an outer product.  Earlier the
+    ghost path scored norm layers with the Linear-style gram (g·g)(a·a), which
+    disagrees with the materialized (elementwise) path — this model exercises
+    that case.
+    """
+
+    def __init__(self, vocab_size=32, embed_dim=8, hidden=16, out_features=4):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.ln = nn.LayerNorm(embed_dim)  # bias=True by default
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden, bias=True),
+            nn.ReLU(),
+            nn.Linear(hidden, out_features, bias=True),
+        )
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        x = self.ln(self.embedding(token_ids))   # (B, T, embed_dim)
+        return self.mlp(x)
+
+
+class TestNormLayerConsistency:
+    """ghost == materialized must hold for models containing norm layers, and
+    dropping all samples must zero the norm layer's grads (exercises the
+    materialize-based gradient subtraction for norms)."""
+
+    @pytest.mark.parametrize("token_reduction", ["mean", "sum"])
+    @pytest.mark.parametrize("B,T", [(3, 5), (4, 1)])
+    def test_ghost_eq_materialized_with_layernorm(self, token_reduction, B, T):
+        torch.manual_seed(7)
+        model = _NormMLP()
+        token_ids = _make_token_ids(B, T)
+
+        ghost = _scores_for_mode(model, token_ids, "ghost", token_reduction)
+        model2 = _NormMLP()
+        model2.load_state_dict(model.state_dict())
+        mat = _scores_for_mode(model2, token_ids, "materialized", token_reduction)
+
+        assert torch.allclose(ghost, mat, atol=1e-4, rtol=1e-4), (
+            f"token_reduction={token_reduction!r}, B={B}, T={T}\n"
+            f"ghost      : {ghost.tolist()}\n"
+            f"materialized: {mat.tolist()}\n"
+            f"max abs diff: {(ghost - mat).abs().max().item():.2e}"
+        )
+
+    @pytest.mark.parametrize("score_mode", ["ghost", "materialized"])
+    def test_drop_all_zeroes_layernorm_grad(self, score_mode):
+        """Dropping every sample must zero the LayerNorm weight & bias grads,
+        validating the materialize-based subtraction for norm layers."""
+        torch.manual_seed(11)
+        B, T = 4, 6
+        model = _NormMLP()
+        token_ids = _make_token_ids(B, T)
+        cb = DataSelectionCallback(
+            model=model,
+            threshold=float("inf"),   # hard mode: every sample dropped
+            score_mode=score_mode,
+        )
+        _run_step_with_callback(model, token_ids, cb)
+
+        assert len(cb.last_dropped) == B, f"expected all {B} dropped, got {cb.last_dropped}"
+        assert torch.allclose(
+            model.ln.weight.grad, torch.zeros_like(model.ln.weight.grad), atol=1e-4
+        ), f"LayerNorm weight.grad not zeroed: max |g| = {model.ln.weight.grad.abs().max():.2e}"
+        assert torch.allclose(
+            model.ln.bias.grad, torch.zeros_like(model.ln.bias.grad), atol=1e-4
+        ), f"LayerNorm bias.grad not zeroed: max |g| = {model.ln.bias.grad.abs().max():.2e}"
 
 
 # --------------------------------------------------------------------------- #

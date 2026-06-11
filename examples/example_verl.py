@@ -33,7 +33,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import hash_sample
+from dattri_llm.gradient.utils import hash_sample
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, OffloadCallback
 from dattri_llm.trainers.verl import VERL_GPT2_MLP_PATTERNS, compute_response_nll_loss
 

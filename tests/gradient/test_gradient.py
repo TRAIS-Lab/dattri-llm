@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from dattri_llm.gradient.gradient import Factorized, Gradient
+from dattri_llm.gradient import ops
 
 
 # --------------------------------------------------------------------------- #
@@ -45,6 +46,7 @@ def make_gradient(
     layers=("l1", "l2"),
     repr_type="materialized",
     indexing="batch",
+    layer_type="nn.Linear",
 ) -> Gradient:
     if repr_type == "factorized":
         fn = factorized_bt if indexing == "batch_token" else factorized
@@ -54,10 +56,12 @@ def make_gradient(
         data = {name: fn() for name in layers}
 
     representation = {name: repr_type for name in layers}
+    idx_dict = {name: indexing for name in layers}
     return Gradient(
         representation=representation,
         data=data,
-        indexing=indexing,
+        layer_types={name: layer_type for name in layers},
+        indexing=idx_dict,
     )
 
 
@@ -72,21 +76,20 @@ class TestFactorized:
             activation=torch.ones(B, I),
             pre_activation_grad=torch.ones(B, O),
         )
-        out = f.materialize()
+        out = ops.materialize(f.activation, f.pre_activation_grad, "nn.Linear")
         assert out.shape == (B, O * I)
 
     def test_materialize_3d(self):
         f = factorized_bt()
-        out = f.materialize()
-        assert out.shape == (B, T, O * I)
+        # ops.materialize sums over the token dimension, returning (B, O*I)
+        out = ops.materialize(f.activation, f.pre_activation_grad, "nn.Linear")
+        assert out.shape == (B, O * I)
 
     def test_materialize_invalid_ndim(self):
-        f = Factorized(
-            activation=torch.randn(B, T, I, 1),
-            pre_activation_grad=torch.randn(B, T, O, 1),
-        )
-        with pytest.raises(ValueError):
-            f.materialize()
+        a = torch.randn(B, T, I, 1)
+        g = torch.randn(B, T, O, 1)
+        with pytest.raises((ValueError, RuntimeError)):
+            ops.materialize(a, g, "nn.Linear")
 
     def test_to_device_dtype(self):
         f = factorized()
@@ -115,45 +118,41 @@ class TestValidate:
 
     def test_empty_data(self):
         with pytest.raises(ValueError, match="empty"):
-            Gradient(representation={}, data={}).validate()
+            Gradient(representation={}, data={}, layer_types={}).validate()
 
     def test_missing_representation_key(self):
         data = {"l1": mat_tensor(), "l2": mat_tensor()}
         rep = {"l1": "materialized"}  # missing l2
-        g = Gradient(representation=rep, data=data)
         with pytest.raises(ValueError, match="Missing representation"):
-            g.validate()
+            Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
 
     def test_factorized_wrong_data_type(self):
         data = {"l1": mat_tensor()}
         rep = {"l1": "factorized"}
-        g = Gradient(representation=rep, data=data)
         with pytest.raises(TypeError, match="Factorized"):
-            g.validate()
+            Gradient(representation=rep, data=data, layer_types={"l1": "nn.Linear"})
 
     def test_materialized_wrong_data_type(self):
         data = {"l1": factorized()}
         rep = {"l1": "materialized"}
-        g = Gradient(representation=rep, data=data)
         with pytest.raises(TypeError, match="Tensor"):
-            g.validate()
+            Gradient(representation=rep, data=data, layer_types={"l1": "nn.Linear"})
 
     def test_batch_size_mismatch(self):
         data = {"l1": mat_tensor(b=2), "l2": mat_tensor(b=3)}
         rep = {"l1": "materialized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data)
         with pytest.raises(ValueError, match="batch size"):
-            g.validate()
+            Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
 
-    def test_token_dim_mismatch(self):
-        data = {
-            "l1": mat_tensor_bt(t=4),
-            "l2": mat_tensor_bt(t=6),
-        }
-        rep = {"l1": "materialized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data, indexing="batch_token")
-        with pytest.raises(ValueError, match="token dimension"):
-            g.validate()
+    def test_batch_token_wrong_ndim(self):
+        # A layer declared as batch_token but given a 2-D tensor must fail.
+        data = {"l1": mat_tensor()}
+        rep = {"l1": "materialized"}
+        with pytest.raises(ValueError):
+            Gradient(representation=rep, data=data, layer_types={"l1": "nn.Linear"},
+                     indexing={"l1": "batch_token"})
 
 
 # --------------------------------------------------------------------------- #
@@ -176,11 +175,20 @@ class TestProperties:
 
     def test_token_dim_batch_token(self):
         g = make_gradient(indexing="batch_token")
-        assert g.token_dim == T
+        assert g.token_dim == {"l1": T, "l2": T}
 
     def test_token_dim_batch(self):
         g = make_gradient(indexing="batch")
-        assert g.token_dim is None
+        assert g.token_dim == {"l1": None, "l2": None}
+
+    def test_token_dim_mixed(self):
+        # Mixed: l1 is batch_token, l2 is batch.
+        data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
+        rep = {"l1": "materialized", "l2": "materialized"}
+        g = Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+                     indexing={"l1": "batch_token", "l2": "batch"})
+        assert g.token_dim == {"l1": T, "l2": None}
 
     def test_device(self):
         g = make_gradient()
@@ -271,7 +279,8 @@ class TestMaterialize:
     def test_mixed_representation(self):
         data = {"l1": factorized(), "l2": mat_tensor()}
         rep = {"l1": "factorized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data)
+        g = Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
         gm = g.materialize()
         assert isinstance(gm.data["l1"], torch.Tensor)
         assert gm.representation["l1"] == "materialized"
@@ -326,7 +335,7 @@ class TestConcatenate:
         g1 = make_gradient(indexing="batch_token")
         g2 = make_gradient(indexing="batch_token")
         gc = g1.concatenate(g2, dim="token")
-        assert gc.token_dim == T * 2
+        assert gc.token_dim == {"l1": T * 2, "l2": T * 2}
 
     def test_token_concat_requires_batch_token(self):
         g1 = make_gradient()
@@ -339,9 +348,22 @@ class TestConcatenate:
         # Build a gradient with different batch size
         data = {"l1": mat_tensor_bt(b=3), "l2": mat_tensor_bt(b=3)}
         rep = {"l1": "materialized", "l2": "materialized"}
-        g2 = Gradient(representation=rep, data=data, indexing="batch_token")
+        g2 = Gradient(representation=rep, data=data,
+                      layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+                      indexing={"l1": "batch_token", "l2": "batch_token"})
         with pytest.raises(ValueError, match="batch size"):
             g1.concatenate(g2, dim="token")
+
+    def test_token_concat_requires_all_batch_token(self):
+        # Both gradients have consistent (mixed) indexing; token concat
+        # must still be rejected because l2 is not batch_token.
+        data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
+        rep = {"l1": "materialized", "l2": "materialized"}
+        g = Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+                     indexing={"l1": "batch_token", "l2": "batch"})
+        with pytest.raises(ValueError, match="batch_token"):
+            g.concatenate(g, dim="token")
 
     def test_incompatible_representation_raises(self):
         g1 = make_gradient(repr_type="materialized")
@@ -354,8 +376,8 @@ class TestConcatenate:
         data2 = {"l1": factorized()}
         rep1 = {"l1": "materialized"}
         rep2 = {"l1": "factorized"}
-        g1 = Gradient(representation=rep1, data=data1)
-        g2 = Gradient(representation=rep2, data=data2)
+        g1 = Gradient(representation=rep1, data=data1, layer_types={"l1": "nn.Linear"})
+        g2 = Gradient(representation=rep2, data=data2, layer_types={"l1": "nn.Linear"})
         with pytest.raises(ValueError):
             g1.concatenate(g2)
 
@@ -369,7 +391,7 @@ class TestAggregate:
     def test_aggregate_materialized_sum(self):
         g = make_gradient(indexing="batch_token")
         ga = g.aggregate(dim="token", mode="sum")
-        assert ga.indexing == "batch"
+        assert all(v == "batch" for v in ga.indexing.values())
         for v in ga.data.values():
             assert v.shape == (B, O * I)
 
@@ -386,10 +408,25 @@ class TestAggregate:
             assert ga.representation[name] == "materialized"
             assert isinstance(ga.data[name], torch.Tensor)
 
-    def test_aggregate_requires_batch_token(self):
+    def test_aggregate_batch_layer_passthrough(self):
+        # A "batch" layer is passed through unchanged; no error is raised.
+        data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
+        rep = {"l1": "materialized", "l2": "materialized"}
+        g = Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+                     indexing={"l1": "batch_token", "l2": "batch"})
+        ga = g.aggregate(dim="token", mode="sum")
+        assert ga.data["l1"].shape == (B, O * I)   # aggregated
+        assert ga.data["l2"].shape == (B, O * I)   # unchanged
+        assert all(v == "batch" for v in ga.indexing.values())
+
+    def test_aggregate_all_batch_still_works(self):
+        # If no layers are batch_token, aggregate is a no-op on data.
         g = make_gradient(indexing="batch")
-        with pytest.raises(ValueError, match="batch_token"):
-            g.aggregate(dim="token")
+        ga = g.aggregate(dim="token")
+        assert all(v == "batch" for v in ga.indexing.values())
+        for name in g.layer_names:
+            assert torch.equal(ga.data[name], g.data[name])
 
     def test_aggregate_unsupported_dim(self):
         g = make_gradient(indexing="batch_token")
@@ -421,10 +458,15 @@ class TestSlice:
     def test_slice_token(self):
         g = make_gradient(indexing="batch_token")
         gs = g.slice(dim="token", index=0)
-        assert gs.token_dim == 1
+        assert gs.token_dim == {"l1": 1, "l2": 1}
 
-    def test_slice_token_requires_batch_token(self):
-        g = make_gradient(indexing="batch")
+    def test_slice_token_requires_all_batch_token(self):
+        # Mixed indexing: token slice must be rejected.
+        data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
+        rep = {"l1": "materialized", "l2": "materialized"}
+        g = Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+                     indexing={"l1": "batch_token", "l2": "batch"})
         with pytest.raises(ValueError, match="batch_token"):
             g.slice(dim="token", index=0)
 
@@ -447,61 +489,140 @@ class TestSlice:
 
 
 class TestSimilarity:
-    def test_dot_reduce_all_scalar(self):
-        g = make_gradient()
-        sim = g.similarity(g, metric="dot", reduce="all")
-        assert sim.ndim == 0
+    """Gradient.similarity — the cross-gram gradient-similarity primitive."""
 
-    def test_dot_reduce_layer_dict(self):
-        g = make_gradient()
-        sim = g.similarity(g, metric="dot", reduce="layer")
-        assert set(sim.keys()) == g.layer_names
+    def test_diagonal_equals_aligned_dot(self):
+        """The diagonal of the self cross-gram equals the aligned per-sample dot."""
+        g = make_gradient(repr_type="factorized", indexing="batch_token")
+        cross = g.similarity(g, mode="factorized")
+        for name, matrix in cross.items():
+            v = g.data[name]
+            aligned = ops.dot(
+                v.activation, v.pre_activation_grad,
+                v.activation, v.pre_activation_grad,
+                g.layer_types[name],
+            )
+            assert matrix.shape == (B, B)
+            assert torch.allclose(matrix.diagonal(), aligned, atol=1e-4, rtol=1e-4)
 
-    def test_dot_reduce_none_shape(self):
-        g = make_gradient()
-        sim = g.similarity(g, metric="dot", reduce="none")
-        for v in sim.values():
-            assert v.shape == (B,)
+    def test_factorized_does_not_materialize(self):
+        """The factorized mode must not call ops.materialize on factorized layers."""
+        import dattri_llm.gradient.ops as ops_mod
 
-    def test_cosine_self_similarity_is_positive(self):
-        g = make_gradient()
-        sim = g.similarity(g, metric="cosine", reduce="all")
-        assert sim.item() > 0
+        g = make_gradient(repr_type="factorized", indexing="batch_token")
+        calls = {"n": 0}
+        orig = ops_mod.materialize
 
-    def test_similarity_incompatible_representation(self):
-        g1 = make_gradient(repr_type="materialized")
-        g2 = make_gradient(repr_type="factorized")
-        with pytest.raises(ValueError, match="representations"):
-            g1.similarity(g2)
+        def _counting(*args, **kwargs):
+            calls["n"] += 1
+            return orig(*args, **kwargs)
 
-    def test_similarity_layer_sets_differ(self):
-        g1 = make_gradient(layers=("l1", "l2"))
-        g2 = make_gradient(layers=("l1", "l3"))
-        with pytest.raises(ValueError, match="Layer sets differ"):
-            g1.similarity(g2)
+        ops_mod.materialize = _counting
+        try:
+            g.similarity(g, mode="factorized")
+        finally:
+            ops_mod.materialize = orig
+        assert calls["n"] == 0, "factorized mode should not materialize"
 
-    def test_similarity_batch_size_mismatch(self):
-        g1 = make_gradient()
-        data = {"l1": mat_tensor(b=3), "l2": mat_tensor(b=3)}
-        rep = {"l1": "materialized", "l2": "materialized"}
-        g2 = Gradient(representation=rep, data=data)
-        with pytest.raises(ValueError, match="Batch sizes differ"):
-            g1.similarity(g2)
+    def test_factorized_equals_materialized(self):
+        g = make_gradient(repr_type="factorized", indexing="batch_token")
+        fac = g.similarity(g, mode="factorized")
+        mat = g.similarity(g, mode="materialized")
+        assert set(fac.keys()) == set(mat.keys())
+        for name in fac:
+            assert torch.allclose(fac[name], mat[name], atol=1e-4, rtol=1e-4)
 
-    def test_invalid_metric(self):
-        g = make_gradient()
+    def test_cross_shape_differing_batch(self):
+        """Cross-gram against a target with a different batch size is (B_self, B_other)."""
+        g = make_gradient(repr_type="factorized")
+        other = Gradient(
+            representation={n: "factorized" for n in ("l1", "l2")},
+            data={"l1": factorized(b=5), "l2": factorized(b=5)},
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+        )
+        cross = g.similarity(other)
+        for name in ("l1", "l2"):
+            assert cross[name].shape == (B, 5)
+
+    def test_skips_layers_absent_in_other(self):
+        g = make_gradient(layers=("l1", "l2"), repr_type="factorized")
+        other = make_gradient(layers=("l1",), repr_type="factorized")
+        cross = g.similarity(other)
+        assert set(cross.keys()) == {"l1"}
+
+    def test_token_reduction_mean_divides_by_T(self):
+        g = make_gradient(repr_type="factorized", indexing="batch_token")
+        plain = g.similarity(g, token_reduction="sum")
+        mean = g.similarity(g, token_reduction="mean")
+        for name in plain:
+            assert torch.allclose(mean[name] * T, plain[name], atol=1e-4, rtol=1e-4)
+
+    # ── metric ──────────────────────────────────────────────────────────────
+
+    def test_cosine_self_diagonal_is_one(self):
+        """Cosine similarity of each sample with itself is 1."""
+        g = make_gradient(repr_type="factorized", indexing="batch_token")
+        cos = g.similarity(g, metric="cosine")
+        for matrix in cos.values():
+            assert torch.allclose(
+                matrix.diagonal(), torch.ones(B), atol=1e-4, rtol=1e-4
+            )
+
+    def test_cosine_in_unit_range(self):
+        g = make_gradient(repr_type="factorized")
+        other = make_gradient(repr_type="factorized")
+        cos = g.similarity(other, metric="cosine")
+        for matrix in cos.values():
+            assert (matrix.abs() <= 1 + 1e-4).all()
+
+    def test_cosine_factorized_equals_materialized(self):
+        g = make_gradient(repr_type="factorized", indexing="batch_token")
+        other = make_gradient(repr_type="factorized", indexing="batch_token")
+        fac = g.similarity(other, metric="cosine", mode="factorized")
+        mat = g.similarity(other, metric="cosine", mode="materialized")
+        for name in fac:
+            assert torch.allclose(fac[name], mat[name], atol=1e-4, rtol=1e-4)
+
+    # ── reduce ──────────────────────────────────────────────────────────────
+
+    def test_reduce_none_returns_per_layer_matrices(self):
+        g = make_gradient(repr_type="factorized")
+        out = g.similarity(g, reduce="none")
+        assert set(out.keys()) == g.layer_names
+        for matrix in out.values():
+            assert matrix.shape == (B, B)
+
+    def test_reduce_all_returns_single_matrix(self):
+        """`reduce="all"` returns one (B_self, B_other) matrix, not a dict."""
+        g = make_gradient(repr_type="factorized")
+        out = g.similarity(g, reduce="all")
+        assert isinstance(out, torch.Tensor)
+        assert out.shape == (B, B)
+
+    def test_reduce_all_equals_sum_over_layers(self):
+        """The overall matrix is the per-layer matrices summed over layers
+        (the full-model gradient cross-gram)."""
+        g = make_gradient(repr_type="factorized")
+        per_layer = g.similarity(g, reduce="none")
+        overall = g.similarity(g, reduce="all")
+        expected = torch.stack(list(per_layer.values())).sum(0)
+        assert torch.allclose(overall, expected, atol=1e-4, rtol=1e-4)
+
+    def test_reduce_all_no_shared_layers_raises(self):
+        g = make_gradient(layers=("l1",), repr_type="factorized")
+        other = make_gradient(layers=("l2",), repr_type="factorized")
+        with pytest.raises(ValueError, match="No shared layers"):
+            g.similarity(other, reduce="all")
+
+    # ── validation ──────────────────────────────────────────────────────────
+
+    def test_invalid_arguments_raise(self):
+        g = make_gradient(repr_type="factorized")
         with pytest.raises(ValueError, match="metric"):
             g.similarity(g, metric="l2")  # type: ignore[arg-type]
-
-    def test_invalid_reduce(self):
-        g = make_gradient()
         with pytest.raises(ValueError, match="reduce"):
-            g.similarity(g, reduce="mean")  # type: ignore[arg-type]
-
-    def test_similarity_layer_types_mismatch(self):
-        data = {"l1": mat_tensor(), "l2": mat_tensor()}
-        rep = {"l1": "materialized", "l2": "materialized"}
-        g1 = Gradient(representation=rep, data=data, layer_types={"l1": "Linear", "l2": "Linear"})
-        g2 = Gradient(representation=rep, data=data, layer_types={"l1": "Linear", "l2": "Conv"})
-        with pytest.raises(ValueError, match="Layer types differ"):
-            g1.similarity(g2)
+            g.similarity(g, reduce="layer")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="mode"):
+            g.similarity(g, mode="ghost")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="token_reduction"):
+            g.similarity(g, token_reduction="avg")  # type: ignore[arg-type]

@@ -49,30 +49,48 @@ from typing import Callable, Generator, Optional
 import torch
 import torch.nn as nn
 
-from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord, hash_sample
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.gradient.ops import canonical_class_name, extract_module_kwargs
+from dattri_llm.gradient.utils import hash_sample
 
 try:
     from transformers.pytorch_utils import Conv1D as HF_Conv1D
 except ImportError:
     HF_Conv1D = None  # type: ignore[assignment,misc]
 
-_LINEAR_TYPES: tuple[type, ...] = (nn.Linear,) + (
-    (HF_Conv1D,) if HF_Conv1D is not None else ()
+# ── Always-hooked types (do not require an MLP parent keyword) ──────────────
+# Embedding and norm layers appear at the top level of transformer blocks and
+# their per-sample gradients factorise in a form compatible with influence
+# function scoring.
+_HOOKABLE_ALWAYS: tuple[type, ...] = (
+    nn.Embedding,
+    nn.EmbeddingBag,
+    nn.LayerNorm,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
 )
+# RMSNorm was added in PyTorch 2.4 — guard for older versions.
+if hasattr(nn, "RMSNorm"):
+    _HOOKABLE_ALWAYS = _HOOKABLE_ALWAYS + (nn.RMSNorm,)  # type: ignore[assignment]
 
-# All layer types that can be registered by default.
-# Embedding and LayerNorm are included because their weight gradients factorise
-# in the same outer-product / per-sample form used by the influence-function
-# methods this library targets:
-#
-#   Embedding  :  dL/dW[token_id, :] = Σ_t  g[t, :]  × 1[input[t] == token_id]
-#                 ≡ one_hot(input)^T @ g  — same structure as Linear with
-#                 a one-hot "activation".
-#
-#   LayerNorm  :  dL/dgamma = dL/d(output) ⊙ x_norm  (elementwise product
-#                 summed over batch/tokens) — analogous to an MLP without the
-#                 cross-feature interactions.
-_HOOKABLE_TYPES: tuple[type, ...] = _LINEAR_TYPES + (nn.Embedding, nn.LayerNorm)
+# ── MLP-only types (require parent path containing an MLP-family keyword) ───
+_HOOKABLE_MLP_ONLY: tuple[type, ...] = (
+    nn.Linear,
+    nn.Bilinear,
+    nn.Conv1d,
+    nn.Conv2d,
+    nn.Conv3d,
+    nn.ConvTranspose1d,
+    nn.ConvTranspose2d,
+    nn.ConvTranspose3d,
+) + ((HF_Conv1D,) if HF_Conv1D is not None else ())
+
+# NonDynamicallyQuantizableLinear is a subclass of nn.Linear, so it's caught
+# by the nn.Linear check above; no explicit entry needed.
+
+_HOOKABLE_TYPES: tuple[type, ...] = _HOOKABLE_ALWAYS + _HOOKABLE_MLP_ONLY
 
 _MLP_PARENT_PATTERNS = re.compile(
     r"(mlp|ffn|feed_forward|feedforward|fc|dense)",
@@ -91,12 +109,11 @@ def _device_sort_key(item: tuple[int, torch.Tensor]) -> int:
 def _is_hookable_layer(name: str, module: nn.Module) -> bool:
     """Return True if *module* should be registered by the default heuristic.
 
-    * ``nn.Embedding`` and ``nn.LayerNorm`` are always included — they appear
-      at the top level of transformer blocks, not nested inside an MLP sub-module,
-      and their per-sample gradients factorise in a form compatible with the
-      influence-function scoring used here.
-    * ``nn.Linear`` and HuggingFace ``Conv1D`` are included only when the
-      parent module path contains an MLP-family keyword (``mlp``, ``ffn``,
+    * Embedding and norm layers are always included — they appear at the top
+      level of transformer blocks and their per-sample gradients factorise in a
+      form compatible with the influence-function scoring used here.
+    * Linear, Conv, ConvTranspose, and Bilinear layers are included only when
+      the parent module path contains an MLP-family keyword (``mlp``, ``ffn``,
       ``feed_forward``, ``feedforward``, ``fc``, or ``dense``).
 
     Args:
@@ -108,10 +125,9 @@ def _is_hookable_layer(name: str, module: nn.Module) -> bool:
     """
     if not isinstance(module, _HOOKABLE_TYPES):
         return False
-    # Embedding and LayerNorm: hook regardless of parent path.
-    if isinstance(module, (nn.Embedding, nn.LayerNorm)):
+    if isinstance(module, _HOOKABLE_ALWAYS):
         return True
-    # nn.Linear / Conv1D: require an MLP-family keyword in the parent path.
+    # MLP-only types: require a parent path MLP-family keyword.
     parent_path = ".".join(name.split(".")[:-1])
     return bool(_MLP_PARENT_PATTERNS.search(parent_path))
 
@@ -185,6 +201,9 @@ def register_mlp_hooks(
                 continue
 
         buffers[name] = _make_layer_buffer()
+        layer_type = canonical_class_name(module)
+        buffers[name]["_class_name"] = layer_type
+        buffers[name]["_module_kwargs"] = extract_module_kwargs(module, layer_type)
 
         def _make_forward_hook(layer_name: str):
             def _fwd(_module, inp, _out):
@@ -942,9 +961,10 @@ class HookManager:
                 )
             a = torch.cat([t for _, t in sorted(act_parts,  key=lambda x: x[0])], dim=0)
             g = torch.cat([t for _, t in sorted(grad_parts, key=lambda x: x[0])], dim=0)
-            data[layer_name] = Factorized(activation=a, pre_activation_grad=g)
+            data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
+                                          module_kwargs=buf["_module_kwargs"])
             representation[layer_name] = "factorized"
-            layer_types[layer_name] = "mlp_io"
+            layer_types[layer_name] = buf["_class_name"]
 
         for layer_name, buf in self._param_buffers.items():
             for pname, grad in buf.items():
@@ -961,13 +981,20 @@ class HookManager:
                 "Ensure backward() was called inside the collect() context."
             )
 
-        indexing = "batch"
+        indexing: dict = {}
         for name, val in data.items():
-            if layer_types.get(name) != "param_grad":
-                indexing = "batch_token" if (
-                    isinstance(val, Factorized) and val.activation.ndim == 3
-                ) else "batch"
-                break
+            if layer_types[name] == "param_grad":
+                # param_grad tensors are always (B, …) without a token dim
+                indexing[name] = "batch"
+            else:
+                indexing[name] = (
+                    "batch_token"
+                    if isinstance(val, Factorized) and (
+                        val.activation.ndim >= 3   # 3D seq, 4D Conv2d, 5D Conv3d
+                        or not val.activation.is_floating_point()  # Embedding int
+                    )
+                    else "batch"
+                )
 
         return Gradient(
             representation=representation,
@@ -1112,3 +1139,26 @@ class HookManager:
     def steps_collected(self) -> int:
         """Total number of batch steps collected since construction."""
         return self._step_count
+
+    def get_gradient(self) -> Gradient:
+        """Assemble and return the :class:`~dattri_llm.gradient.Gradient` from
+        the most recent forward+backward pass captured in the current buffers.
+
+        Call this after a backward pass inside a :meth:`collect` context to
+        retrieve the gradient without waiting for a full training step to
+        complete via callbacks::
+
+            with collector.collect():
+                loss = model(**inputs).loss
+                loss.backward()
+                grad = collector.get_gradient()
+
+        Returns:
+            A :class:`~dattri_llm.gradient.Gradient` with ``layer_types``
+            populated from the hooked module class names.
+
+        Raises:
+            RuntimeError: If no gradient data has been captured yet (i.e.
+                backward has not been called inside the collect context).
+        """
+        return self._assemble_gradient()

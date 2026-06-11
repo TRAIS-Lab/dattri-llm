@@ -7,7 +7,8 @@ from pathlib import Path
 
 import torch
 
-from dattri_llm.gradient.gradient import GradientRecord, hash_sample
+from dattri_llm.gradient.gradient import GradientRecord
+from dattri_llm.gradient.utils import hash_sample
 
 
 def _dist_rank() -> int | None:

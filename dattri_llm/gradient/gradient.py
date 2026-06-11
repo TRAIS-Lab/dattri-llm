@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 from typing import Dict, Iterable, Literal, Optional, Union
 
 import torch
+
+from dattri_llm.gradient import ops
 
 
 GradientRepresentation = Literal["materialized", "factorized"]
@@ -15,141 +16,18 @@ Indexing = Literal["batch", "batch_token"]
 class Factorized:
     activation: torch.Tensor
     pre_activation_grad: torch.Tensor
+    # Minimal serialisable hyperparameters extracted at hook-registration time
+    # via ops.extract_module_kwargs.  Excluded from equality and hashing so
+    # two Factorized tensors with identical data compare equal regardless of
+    # which layer produced them.
+    module_kwargs: Optional[dict] = field(default=None, compare=False, repr=False, hash=False)
 
     def to(self, device=None, dtype=None) -> "Factorized":
         return Factorized(
             activation=self.activation.to(device=device, dtype=dtype),
             pre_activation_grad=self.pre_activation_grad.to(device=device, dtype=dtype),
+            module_kwargs=self.module_kwargs,
         )
-
-    @property
-    def is_embedding(self) -> bool:
-        """True when activation stores integer token IDs (``nn.Embedding`` hook)."""
-        return not self.activation.is_floating_point()
-
-    def reduce_activation(self, reduction: str = "mean") -> torch.Tensor:
-        """Return the activation reduced to a float ``(B, F)`` tensor.
-
-        This is the counterpart of reducing ``pre_activation_grad`` — both are
-        needed when computing gram-matrix-based scores (ghost inner product).
-
-        For standard layers (``nn.Linear``, ``nn.LayerNorm``, …) the stored
-        activation is already a float tensor:
-
-        * ``(B, F)``      — returned as-is (cast to float).
-        * ``(B, T, F)``   — reduced over the token dimension via *reduction*
-          (``"mean"`` or ``"sum"``), giving ``(B, F)``.
-
-        For ``nn.Embedding`` the stored activation is an integer token-ID
-        tensor of shape ``(B, T)``.  Its MLP-equivalent activation is
-        ``one_hot(token_ids)`` of shape ``(B, T, vocab_size)``, which would be
-        prohibitively large to materialise.  Instead we compute the reduced
-        form directly via scatter-add:
-
-        * ``"mean"`` → token-frequency vectors ``(B, effective_vocab)``,
-          i.e. ``one_hot(token_ids).float().mean(dim=1)``.
-        * ``"sum"``  → token-count vectors ``(B, effective_vocab)``,
-          i.e. ``one_hot(token_ids).float().sum(dim=1)``.
-
-        ``effective_vocab = max(token_ids) + 1`` for this batch; rows beyond
-        that are zero and do not affect dot products with other batches.
-
-        Args:
-            reduction: ``"mean"`` (default) or ``"sum"``.
-
-        Returns:
-            Float tensor of shape ``(B, F)``.
-        """
-        if self.is_embedding:
-            token_ids = self.activation          # (B, T) int
-            B, T = token_ids.shape
-            effective_vocab = int(token_ids.max().item()) + 1
-            freq = torch.zeros(B, effective_vocab, dtype=torch.float,
-                               device=token_ids.device)
-            freq.scatter_add_(1, token_ids,
-                              torch.ones(B, T, dtype=torch.float,
-                                         device=token_ids.device))
-            if reduction == "mean":
-                freq = freq / T
-            return freq                          # (B, effective_vocab)
-
-        a = self.activation.float()
-        if a.ndim == 2:
-            return a                             # already (B, F)
-        return a.mean(1) if reduction == "mean" else a.sum(1)  # (B, F)
-
-    def materialize(self) -> torch.Tensor:
-        """Convert factorized layer data into materialized per-sample gradients.
-
-        Standard linear layers (``nn.Linear``, ``Conv1D``, ``nn.LayerNorm``):
-
-        * ``[B, I], [B, O]       → [B, O * I]``
-        * ``[B, T, I], [B, T, O] → [B, T, O * I]``
-
-        Embedding layers (``nn.Embedding``), where activation stores integer
-        token IDs of shape ``(B, T)`` and pre_activation_grad has shape
-        ``(B, T, embed_dim)``:
-
-        * Per-sample weight gradients are computed via scatter-add over the
-          token dimension, producing ``[B, vocab_size * embed_dim]`` where
-          ``vocab_size`` is inferred as ``max(token_ids) + 1`` in this batch.
-
-        Note:
-            Embedding materialization yields a *dense* gradient over the
-            observed vocabulary — rows not present in the batch are zero.  The
-            effective ``vocab_size`` may differ across batches; do not
-            concatenate materialized Embedding gradients from different steps.
-        """
-        if self.is_embedding:
-            return self._materialize_embedding()
-
-        if self.activation.ndim == 2:
-            grad = torch.einsum(
-                "bo,bi->boi",
-                self.pre_activation_grad,
-                self.activation,
-            )
-            return grad.flatten(start_dim=1)
-
-        if self.activation.ndim == 3:
-            grad = torch.einsum(
-                "bto,bti->btoi",
-                self.pre_activation_grad,
-                self.activation,
-            )
-            return grad.flatten(start_dim=2)
-
-        raise ValueError("Expected activation and pre_activation_grad to be 2D or 3D.")
-
-    def _materialize_embedding(self) -> torch.Tensor:
-        """Scatter-add materialization for ``nn.Embedding`` weight gradients.
-
-        The embedding weight gradient for sample *i* is:
-
-        .. math::
-            \\frac{\\partial L}{\\partial W}[k, :] =
-            \\sum_{t:\\ \\text{token\\_ids}[i,t] = k}
-            \\frac{\\partial L}{\\partial \\text{output}}[i, t, :]
-
-        Args:
-            (no args — uses ``self.activation`` and ``self.pre_activation_grad``)
-
-        Returns:
-            Float tensor of shape ``(B, vocab_size * embed_dim)`` where
-            ``vocab_size = max(token_ids) + 1``.
-        """
-        token_ids = self.activation                 # (B, T) int
-        grad = self.pre_activation_grad.float()     # (B, T, embed_dim)
-        B, T = token_ids.shape
-        embed_dim = grad.shape[-1]
-        vocab_size = int(token_ids.max().item()) + 1
-
-        # idx: (B, T, embed_dim) — broadcast token IDs along the embed dim
-        idx = token_ids.unsqueeze(-1).expand(B, T, embed_dim)  # (B, T, embed_dim)
-        result = torch.zeros(B, vocab_size, embed_dim, dtype=grad.dtype)
-        result.scatter_add_(1, idx, grad)           # (B, vocab_size, embed_dim)
-        return result.reshape(B, -1)                # (B, vocab_size * embed_dim)
-
 
 GradientData = Union[torch.Tensor, Factorized]
 
@@ -158,8 +36,19 @@ GradientData = Union[torch.Tensor, Factorized]
 class Gradient:
     representation: Dict[str, GradientRepresentation]
     data: Dict[str, GradientData]
-    layer_types: Optional[Dict[str, str]] = None
-    indexing: Indexing = "batch"
+    layer_types: Dict[str, str]
+    indexing: Dict[str, Indexing] = field(default_factory=dict)
+    validate_on_init: InitVar[bool] = True
+
+    def __post_init__(self, validate_on_init: bool) -> None:
+        full_indexing = {name: self.indexing.get(name, "batch") for name in self.data}
+        object.__setattr__(self, "indexing", full_indexing)
+        if validate_on_init:
+            self.validate()
+
+    def _layer_indexing(self, name: str) -> Indexing:
+        """Return the indexing mode for *name*; raises ``KeyError`` if absent."""
+        return self.indexing[name]
 
     @property
     def layer_names(self) -> set[str]:
@@ -171,11 +60,19 @@ class Gradient:
         return x.activation.shape[0] if isinstance(x, Factorized) else x.shape[0]
 
     @property
-    def token_dim(self) -> Optional[int]:
-        if self.indexing != "batch_token":
-            return None
-        x = next(iter(self.data.values()))
-        return x.activation.shape[1] if isinstance(x, Factorized) else x.shape[1]
+    def token_dim(self) -> Dict[str, "int | None"]:
+        """Per-layer token dimension; ``None`` for layers with ``"batch"`` indexing."""
+        result: Dict[str, "int | None"] = {}
+        for name, value in self.data.items():
+            if self._layer_indexing(name) == "batch_token":
+                result[name] = (
+                    value.activation.shape[1]
+                    if isinstance(value, Factorized)
+                    else value.shape[1]
+                )
+            else:
+                result[name] = None
+        return result
 
     @property
     def device(self) -> torch.device:
@@ -195,12 +92,11 @@ class Gradient:
         if missing:
             raise ValueError(f"Missing representation for layers: {sorted(missing)}")
 
-        expected_ndim = 3 if self.indexing == "batch_token" else 2
         batch_size = None
-        token_dim = None
 
         for name, value in self.data.items():
             layer_repr = self.representation[name]
+            layer_type = self.layer_types[name]
 
             if layer_repr == "factorized":
                 if not isinstance(value, Factorized):
@@ -209,34 +105,65 @@ class Gradient:
                 act = value.activation
                 gout = value.pre_activation_grad
 
-                if act.ndim != expected_ndim or gout.ndim != expected_ndim:
-                    raise ValueError(f"{name} has invalid factor dimensions")
-
-                if act.shape[:-1] != gout.shape[:-1]:
-                    raise ValueError(f"{name} factor batch/token dimensions mismatch")
+                if layer_type == "nn.EmbeddingBag":
+                    # EmbeddingBag: activation is (B, T) int token indices,
+                    # grad is the per-bag output gradient (B, embed_dim).
+                    if act.ndim != 2 or gout.ndim != 2:
+                        raise ValueError(
+                            f"{name} has invalid embedding-bag factor dimensions"
+                        )
+                    if act.shape[0] != gout.shape[0]:
+                        raise ValueError(
+                            f"{name} embedding-bag batch dimension mismatch"
+                        )
+                elif ops.is_embedding(layer_type):
+                    # Embedding: activation is (B, T) int, grad is (B, T, embed_dim).
+                    if act.ndim != 2 or gout.ndim != 3:
+                        raise ValueError(
+                            f"{name} has invalid embedding factor dimensions"
+                        )
+                    if act.shape != gout.shape[:2]:
+                        raise ValueError(
+                            f"{name} embedding batch/token dimensions mismatch"
+                        )
+                elif ops.is_conv(layer_type) or ops.is_conv_transpose(layer_type):
+                    # Raw conv data: a=(N, C_in, *spatial_in), g=(N, C_out, *spatial_out).
+                    # Spatial and channel dims differ; only batch size must match.
+                    if act.shape[0] != gout.shape[0]:
+                        raise ValueError(
+                            f"{name} conv factor batch size mismatch: "
+                            f"{act.shape[0]} != {gout.shape[0]}"
+                        )
+                else:
+                    if act.shape[:-1] != gout.shape[:-1]:
+                        raise ValueError(
+                            f"{name} factor batch/token dimensions mismatch"
+                        )
 
                 cur_batch = act.shape[0]
-                cur_token = act.shape[1] if self.indexing == "batch_token" else None
 
             else:
                 if not isinstance(value, torch.Tensor):
                     raise TypeError(f"{name} must be Tensor")
 
-                if value.ndim != expected_ndim:
-                    raise ValueError(f"{name} expected {expected_ndim}D tensor")
-
+                if value.ndim < 1:
+                    raise ValueError(f"{name} must be at least 1D")
+                if (
+                    layer_type != ops.PARAM_GRAD_MARKER
+                    and self._layer_indexing(name) == "batch_token"
+                    and value.ndim != 3
+                ):
+                    raise ValueError(
+                        f"{name} declared as batch_token but tensor is {value.ndim}D, expected 3D"
+                    )
                 cur_batch = value.shape[0]
-                cur_token = value.shape[1] if self.indexing == "batch_token" else None
 
-            if batch_size is None:
-                batch_size = cur_batch
-            elif batch_size != cur_batch:
-                raise ValueError("All layers must have the same batch size")
-
-            if token_dim is None:
-                token_dim = cur_token
-            elif token_dim != cur_token:
-                raise ValueError("All layers must have the same token dimension")
+            is_param_grad = layer_type == ops.PARAM_GRAD_MARKER
+            if not is_param_grad:
+                if batch_size is None:
+                    batch_size = cur_batch
+                elif batch_size != cur_batch:
+                    raise ValueError("All layers must have the same batch size")
 
     def clone(self) -> "Gradient":
         new_data = {}
@@ -246,6 +173,7 @@ class Gradient:
                 new_data[name] = Factorized(
                     value.activation.clone(),
                     value.pre_activation_grad.clone(),
+                    module_kwargs=value.module_kwargs,
                 )
             else:
                 new_data[name] = value.clone()
@@ -253,8 +181,8 @@ class Gradient:
         return Gradient(
             representation=dict(self.representation),
             data=new_data,
-            layer_types=dict(self.layer_types) if self.layer_types else None,
-            indexing=self.indexing,
+            layer_types=dict(self.layer_types),
+            indexing=dict(self.indexing),
         )
 
     def to(self, device=None, dtype=None) -> "Gradient":
@@ -267,7 +195,7 @@ class Gradient:
             representation=dict(self.representation),
             data=new_data,
             layer_types=self.layer_types,
-            indexing=self.indexing,
+            indexing=dict(self.indexing),
         )
 
     def materialize(self) -> "Gradient":
@@ -276,12 +204,19 @@ class Gradient:
 
         new_data = {}
         new_repr = {}
+        new_indexing = dict(self.indexing)
 
         for name, value in self.data.items():
             layer_repr = self.representation[name]
             if layer_repr == "factorized" and isinstance(value, Factorized):
-                new_data[name] = value.materialize()
+                layer_type = self.layer_types[name]
+                new_data[name] = ops.materialize(
+                    value.activation, value.pre_activation_grad, layer_type,
+                    module_kwargs=value.module_kwargs,
+                )
                 new_repr[name] = "materialized"
+                # ops.materialize always returns (B, d) — collapse to "batch".
+                new_indexing[name] = "batch"
             else:
                 new_data[name] = value
                 new_repr[name] = layer_repr
@@ -290,7 +225,7 @@ class Gradient:
             representation=new_repr,
             data=new_data,
             layer_types=self.layer_types,
-            indexing=self.indexing,
+            indexing=new_indexing,
         )
 
     def select_layers(self, layer_names: Iterable[str]) -> "Gradient":
@@ -302,12 +237,8 @@ class Gradient:
         return Gradient(
             representation={name: self.representation[name] for name in names},
             data={name: self.data[name] for name in names},
-            layer_types=(
-                {name: self.layer_types[name] for name in names}
-                if self.layer_types
-                else None
-            ),
-            indexing=self.indexing,
+            layer_types={k: v for k, v in self.layer_types.items() if k in names},
+            indexing={name: idx for name, idx in self.indexing.items() if name in names},
         )
 
     def concatenate(
@@ -318,8 +249,15 @@ class Gradient:
         self._check_compatible(other, require_same_batch=False)
 
         if dim == "token":
-            if self.indexing != "batch_token":
-                raise ValueError("Token concatenation requires indexing='batch_token'")
+            non_bt = [
+                n for n in self.layer_names
+                if self._layer_indexing(n) != "batch_token"
+            ]
+            if non_bt:
+                raise ValueError(
+                    f"Token concatenation requires all layers to have "
+                    f"indexing='batch_token'. Non-conforming: {sorted(non_bt)}"
+                )
             if self.batch_size != other.batch_size:
                 raise ValueError("Token concatenation requires the same batch size")
 
@@ -337,6 +275,7 @@ class Gradient:
                         [a.pre_activation_grad, b.pre_activation_grad],
                         dim=cat_dim,
                     ),
+                    module_kwargs=a.module_kwargs,
                 )
             elif isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
                 new_data[name] = torch.cat([a, b], dim=cat_dim)
@@ -347,7 +286,7 @@ class Gradient:
             representation=dict(self.representation),
             data=new_data,
             layer_types=self.layer_types,
-            indexing=self.indexing,
+            indexing=dict(self.indexing),
         )
         out.validate()
         return out
@@ -357,34 +296,69 @@ class Gradient:
         dim: Literal["token"] = "token",
         mode: Literal["sum", "mean"] = "sum",
     ) -> "Gradient":
+        """Reduce the token dimension of ``"batch_token"`` layers.
+
+        Layers with ``"batch"`` indexing are passed through unchanged.
+        This allows a mixed-indexing :class:`Gradient` to be unified into
+        a purely ``"batch"``-indexed one.
+
+        Args:
+            dim: Must be ``"token"`` (only token aggregation is supported).
+            mode: ``"sum"`` (default) or ``"mean"``.
+
+        Returns:
+            A new :class:`Gradient` with all layers at ``"batch"`` indexing.
+        """
         if dim != "token":
             raise NotImplementedError("Only token aggregation is supported")
-        if self.indexing != "batch_token":
-            raise ValueError("Token aggregation requires indexing='batch_token'")
         if mode not in {"sum", "mean"}:
             raise ValueError("mode must be 'sum' or 'mean'")
 
         reduce_fn = torch.sum if mode == "sum" else torch.mean
         new_data = {}
+        new_repr = {}
 
         for name, value in self.data.items():
-            if isinstance(value, Factorized):
-                # Sum of outer products is not generally representable
-                # as a single outer product, so we materialize first.
-                new_data[name] = reduce_fn(value.materialize(), dim=1)
+            layer_type = self.layer_types[name]
+            if self._layer_indexing(name) == "batch_token":
+                if isinstance(value, Factorized):
+                    mat = ops.materialize(
+                        value.activation, value.pre_activation_grad, layer_type,
+                        module_kwargs=value.module_kwargs,
+                    )  # (B, d) — already summed over T by ops.materialize
+                    if mode == "mean":
+                        # T is the token count after preprocessing: for raw Conv
+                        # this is L_out (spatial positions), not C_in.
+                        if ops.is_embedding(layer_type):
+                            T = value.activation.shape[1]
+                        elif value.module_kwargs is not None and (
+                            ops.is_conv(layer_type) or ops.is_conv_transpose(layer_type)
+                        ):
+                            # L_out is encoded in mat's flattened dim; recover from
+                            # the preprocessed activation shape via a dry run.
+                            a_p, _ = ops.preprocess_factorized(
+                                value.activation[:1], value.pre_activation_grad[:1],
+                                layer_type, value.module_kwargs,
+                            )
+                            T = a_p.shape[1]
+                        else:
+                            T = value.activation.shape[1]
+                        mat = mat / T
+                    new_data[name] = mat
+                    new_repr[name] = "materialized"
+                else:
+                    new_data[name] = reduce_fn(value, dim=1)
+                    new_repr[name] = self.representation[name]
             else:
-                new_data[name] = reduce_fn(value, dim=1)
-
-        new_repr = {
-            name: "materialized" if self.representation[name] == "factorized" else self.representation[name]
-            for name in self.data
-        }
+                # "batch" layer — pass through unchanged.
+                new_data[name] = value
+                new_repr[name] = self.representation[name]
 
         return Gradient(
             representation=new_repr,
             data=new_data,
             layer_types=self.layer_types,
-            indexing="batch",
+            indexing={},  # all layers now "batch" (default)
         )
 
     def slice(
@@ -392,8 +366,16 @@ class Gradient:
         dim: Literal["batch", "token"],
         index,
     ) -> "Gradient":
-        if dim == "token" and self.indexing != "batch_token":
-            raise ValueError("Token slicing requires indexing='batch_token'")
+        if dim == "token":
+            non_bt = [
+                n for n in self.layer_names
+                if self._layer_indexing(n) != "batch_token"
+            ]
+            if non_bt:
+                raise ValueError(
+                    f"Token slicing requires all layers to have "
+                    f"indexing='batch_token'. Non-conforming: {sorted(non_bt)}"
+                )
 
         slice_dim = 0 if dim == "batch" else 1
         new_data = {}
@@ -413,6 +395,7 @@ class Gradient:
                 new_data[name] = Factorized(
                     activation=slice_tensor(value.activation),
                     pre_activation_grad=slice_tensor(value.pre_activation_grad),
+                    module_kwargs=value.module_kwargs,
                 )
             else:
                 new_data[name] = slice_tensor(value)
@@ -421,49 +404,185 @@ class Gradient:
             representation=dict(self.representation),
             data=new_data,
             layer_types=self.layer_types,
-            indexing=self.indexing,
+            indexing=dict(self.indexing),
         )
 
     def similarity(
         self,
         other: "Gradient",
         metric: Literal["dot", "cosine"] = "dot",
-        reduce: Literal["none", "layer", "all"] = "all",
+        reduce: Literal["none", "all"] = "none",
+        mode: Literal["factorized", "materialized"] = "factorized",
+        token_reduction: Optional[Literal["sum", "mean"]] = None,
         eps: float = 1e-8,
-    ):
-        self._check_compatible(other, require_same_batch=True)
+    ) -> Dict[str, torch.Tensor] | torch.Tensor:
+        """Per-sample gradient similarity between this gradient and ``other``.
 
-        per_layer = {}
+        For each shared layer this forms the full ``(B_self, B_other)`` cross-gram
+        ``K[i, j] = ⟨∇W_i (self), ∇W_j (other)⟩`` — the fundamental object for
+        gradient-based data attribution.  The aligned ``i == j`` case is its
+        diagonal; per-sample influence scoring against a target gradient is the
+        row-sum over ``other``'s batch (``⟨∇W_i, Σ_j ∇W_target_j⟩``).
 
+        Layers absent from *other*, or stored with a different representation,
+        are skipped (so a target gradient need only overlap on some layers).
+
+        Args:
+            other: Gradient to compare against (e.g. a target/reference batch).
+            metric: ``"dot"`` for the raw inner product, or ``"cosine"`` for the
+                cosine similarity (each entry divided by the two gradients'
+                norms).
+            reduce: ``"none"`` (default) keeps the result broken down per layer,
+                returning ``{layer: (B_self, B_other)}``.  ``"all"`` returns a
+                single ``(B_self, B_other)`` matrix — the full-model gradient
+                cross-gram, i.e. the per-layer matrices summed over layers
+                (``⟨g_i, g_j⟩ = Σ_layer ⟨g_i^layer, g_j^layer⟩``).  Either way
+                the per-sample pair structure is preserved.
+            mode: ``"factorized"`` (ghost, no materialisation, via
+                :func:`ops.cross_dot`) or ``"materialized"`` (materialize each
+                side then matrix-multiply).  Numerically equivalent.
+            token_reduction: When ``"mean"``, divide each layer's matrix by the
+                source token/position count so rows are comparable across
+                sequence lengths.  Applies to ``metric="dot"`` only (cosine is
+                already scale-invariant).  ``"sum"`` / ``None`` apply none.
+            eps: Numerical floor added to the cosine denominator.
+
+        Returns:
+            ``{layer: (B_self, B_other) tensor}`` for ``reduce="none"``, else a
+            single ``(B_self, B_other)`` tensor.
+
+        Note:
+            ``reduce="all"`` requires every shared layer to have the same
+            ``B_self`` (and ``B_other``); summing is undefined when a layer's
+            gradient was collapsed over the batch during a forward broadcast.
+        """
+        if metric not in {"dot", "cosine"}:
+            raise ValueError("metric must be 'dot' or 'cosine'")
+        if reduce not in {"none", "all"}:
+            raise ValueError("reduce must be 'none' or 'all'")
+        if mode not in {"factorized", "materialized"}:
+            raise ValueError("mode must be 'factorized' or 'materialized'")
+        if token_reduction not in (None, "sum", "mean"):
+            raise ValueError("token_reduction must be None, 'sum', or 'mean'")
+
+        per_layer: Dict[str, torch.Tensor] = {}
         for name in self.layer_names:
-            x = self._layer_tensor(name)
-            y = other._layer_tensor(name)
-
-            dot = (x * y).sum(dim=-1)
-
-            if metric == "dot":
-                sim = dot
-            elif metric == "cosine":
-                sim = dot / (x.norm(dim=-1) * y.norm(dim=-1) + eps)
-            else:
-                raise ValueError("metric must be 'dot' or 'cosine'")
-
-            per_layer[name] = sim
+            if name not in other.data:
+                continue
+            terms = self._layer_cross_matrix(other, name, mode)
+            if terms is None:
+                continue
+            matrix, n_pos = terms
+            if metric == "cosine":
+                n_s = self._layer_norm_sq(name).clamp_min(0).sqrt()      # (B_self,)
+                n_o = other._layer_norm_sq(name).clamp_min(0).sqrt()     # (B_other,)
+                matrix = matrix / (n_s[:, None] * n_o[None, :] + eps)
+            elif token_reduction == "mean" and n_pos:
+                matrix = matrix / n_pos
+            per_layer[name] = matrix
 
         if reduce == "none":
             return per_layer
+        # reduce == "all": full-model gradient cross-gram (sum the per-layer
+        # matrices, since the whole-model gradient is the concatenation of layers).
+        if not per_layer:
+            raise ValueError("No shared layers to compute an overall similarity")
+        return torch.stack(list(per_layer.values())).sum(0)
 
-        if reduce == "layer":
-            return {name: value.sum() for name, value in per_layer.items()}
+    def _layer_cross_matrix(self, other: "Gradient", name: str, mode: str):
+        """Return ``((B_self, B_other) cross-gram, source position count)`` for
+        one layer, or ``None`` when the representations are incompatible.
 
-        if reduce == "all":
-            return torch.stack([value.sum() for value in per_layer.values()]).sum()
+        ``mode="factorized"`` contracts the factors via :func:`ops.cross_dot`;
+        ``mode="materialized"`` materializes both sides and matrix-multiplies.
+        """
+        sv = self.data[name]
+        ov = other.data[name]
+        layer_type = self.layer_types[name]
 
-        raise ValueError("reduce must be 'none', 'layer', or 'all'")
+        if isinstance(sv, Factorized) and isinstance(ov, Factorized):
+            a_s, g_s = ops.preprocess_factorized(
+                sv.activation, sv.pre_activation_grad, layer_type, sv.module_kwargs
+            )
+            a_t, g_t = ops.preprocess_factorized(
+                ov.activation, ov.pre_activation_grad,
+                other.layer_types[name], ov.module_kwargs,
+            )
+            n_pos = self._position_count(a_s, layer_type)
+            if mode == "factorized":
+                # Factors already preprocessed → pass module_kwargs=None.
+                matrix = ops.cross_dot(a_s, g_s, a_t, g_t, layer_type, None, None)
+            else:
+                mat_s = ops.materialize(a_s, g_s, layer_type).float()
+                mat_t = ops.materialize(a_t, g_t, layer_type).float()
+                if ops.is_embedding(layer_type) or not a_s.is_floating_point():
+                    mat_s, mat_t = self._align_embedding_width(
+                        mat_s, mat_t, g_s.shape[-1]
+                    )
+                matrix = mat_s @ mat_t.T
+            return matrix, n_pos
 
-    def _layer_tensor(self, name: str) -> torch.Tensor:
+        if isinstance(sv, Factorized) or isinstance(ov, Factorized):
+            # One side factorized, the other materialized — incompatible.
+            return None
+
+        # Both plain materialized tensors: flatten non-batch dims and dot.
+        xf = sv.reshape(sv.shape[0], -1).float()
+        yf = ov.reshape(ov.shape[0], -1).float()
+        n_pos = sv.shape[1] if sv.ndim >= 3 else None
+        return xf @ yf.T, n_pos
+
+    def _layer_norm_sq(self, name: str) -> torch.Tensor:
+        """Per-sample squared gradient norms ``(B,)`` for one layer.
+
+        Used by :meth:`similarity` for the cosine denominator.  Independent of
+        ``mode`` (the norm is the same whether computed from factors or the
+        materialized gradient).
+        """
         value = self.data[name]
-        return value.materialize() if isinstance(value, Factorized) else value
+        if isinstance(value, Factorized):
+            return ops.grad_norm_sq(
+                value.activation, value.pre_activation_grad,
+                self.layer_types[name], module_kwargs=value.module_kwargs,
+            )
+        flat = value.reshape(value.shape[0], -1).float()
+        return (flat * flat).sum(-1)
+
+    @staticmethod
+    def _position_count(a_proc: torch.Tensor, layer_type: str) -> "int | None":
+        """Token/spatial position count of a *preprocessed* activation.
+
+        ``(B, T)`` int for embeddings, ``(B, L, P)`` after im2col for convs,
+        ``(B, T, d)`` for sequence layers — all return dim-1; ``(B, d)`` (no
+        position axis) returns ``None``.
+        """
+        if ops.is_embedding(layer_type) or not a_proc.is_floating_point():
+            return a_proc.shape[1]
+        if a_proc.ndim >= 3:
+            return a_proc.shape[1]
+        return None
+
+    @staticmethod
+    def _align_embedding_width(
+        mat_s: torch.Tensor, mat_t: torch.Tensor, embed_dim: int
+    ):
+        """Zero-pad two flattened embedding gradients to a common vocab width.
+
+        Embedding ``materialize`` uses ``vocab = max(token) + 1`` per batch, so
+        the two sides may differ; padding makes the dot product well-defined.
+        """
+        v_s = mat_s.shape[1] // embed_dim
+        v_t = mat_t.shape[1] // embed_dim
+        v = max(v_s, v_t)
+        if v_s < v:
+            mat_s = torch.cat(
+                [mat_s, mat_s.new_zeros(mat_s.shape[0], (v - v_s) * embed_dim)], dim=1
+            )
+        if v_t < v:
+            mat_t = torch.cat(
+                [mat_t, mat_t.new_zeros(mat_t.shape[0], (v - v_t) * embed_dim)], dim=1
+            )
+        return mat_s, mat_t
 
     def _check_compatible(
         self,
@@ -483,8 +602,15 @@ class Gradient:
                 f"Layers have differing representations: {sorted(mismatched)}"
             )
 
-        if self.indexing != other.indexing:
-            raise ValueError(f"Different indexing: {self.indexing} vs {other.indexing}")
+        indexing_mismatch = {
+            name
+            for name in self.layer_names
+            if self._layer_indexing(name) != other._layer_indexing(name)
+        }
+        if indexing_mismatch:
+            raise ValueError(
+                f"Layers have differing indexing: {sorted(indexing_mismatch)}"
+            )
 
         if self.layer_types != other.layer_types:
             raise ValueError(
@@ -494,43 +620,18 @@ class Gradient:
         if require_same_batch and self.batch_size != other.batch_size:
             raise ValueError("Batch sizes differ")
 
-        if (
-            require_same_batch
-            and self.indexing == "batch_token"
-            and self.token_dim != other.token_dim
-        ):
-            raise ValueError("Token dimensions differ")
-
-
-# --------------------------------------------------------------------------- #
-# Sample hashing                                                               #
-# --------------------------------------------------------------------------- #
-
-
-def hash_sample(inputs: dict[str, torch.Tensor], sample_idx: int) -> str:
-    """Compute a SHA-256 hash that uniquely identifies one sample in a batch.
-
-    All tensor fields in *inputs* are included, sorted by key for
-    determinism.  Non-tensor values are skipped.  The hash is content-based
-    and stable: the same sample always produces the same hash regardless of
-    batch position, epoch, or whether the trainer has stripped metadata fields
-    like dataset indices.
-
-    Args:
-        inputs: The full input dict passed to the model (e.g.
-            ``{"input_ids": ..., "attention_mask": ..., "labels": ...}``).
-        sample_idx: Index of the sample within the batch dimension.
-
-    Returns:
-        A 64-character hex string (SHA-256 digest).
-    """
-    h = hashlib.sha256()
-    for key in sorted(inputs):
-        val = inputs[key]
-        if isinstance(val, torch.Tensor) and val.ndim > 0:
-            h.update(key.encode())
-            h.update(val[sample_idx].cpu().contiguous().numpy().tobytes())
-    return h.hexdigest()
+        if require_same_batch:
+            self_td = self.token_dim
+            other_td = other.token_dim
+            mismatched_td = {
+                name
+                for name in self.layer_names
+                if self_td[name] != other_td[name]
+            }
+            if mismatched_td:
+                raise ValueError(
+                    f"Token dimensions differ for layers: {sorted(mismatched_td)}"
+                )
 
 
 # --------------------------------------------------------------------------- #

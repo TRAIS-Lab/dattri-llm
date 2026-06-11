@@ -17,7 +17,8 @@ from dattri_llm.gradient.hooks import (
     OffloadCallback,
 )
 from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import Gradient, GradientRecord, hash_sample
+from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.utils import hash_sample
 
 
 # --------------------------------------------------------------------------- #
@@ -866,7 +867,12 @@ class TestHookManagerParamGrad:
         assert len(cb.records) == 1
         g = cb.records[0].gradient
         types = set((g.layer_types or {}).values())
-        assert "mlp_io" in types
+        # After the ops refactor, mlp_io layers store their canonical class names
+        # (e.g. "nn.Linear", "nn.Embedding") rather than the generic "mlp_io" marker.
+        non_param_types = types - {"param_grad"}
+        assert len(non_param_types) > 0, (
+            "Expected at least one canonical layer type (mlp_io layers) in types"
+        )
         assert "param_grad" in types
         collector.remove()
 

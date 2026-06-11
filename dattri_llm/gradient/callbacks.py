@@ -36,11 +36,7 @@ import torch.nn as nn
 
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
-
-try:
-    from transformers.pytorch_utils import Conv1D as HF_Conv1D
-except ImportError:
-    HF_Conv1D = None  # type: ignore[assignment,misc]
+from dattri_llm.gradient import ops
 
 
 # --------------------------------------------------------------------------- #
@@ -275,9 +271,10 @@ class DataSelectionCallback(HookManagerCallback):
 
         W_l.grad  -=  sum_t  g_{i,t}^T  x  a_{i,t}
 
-    Supports ``nn.Linear`` (weight ``(out, in)``), HuggingFace ``Conv1D``
-    (weight ``(in, out)``), and ``nn.Embedding`` (weight ``(vocab, embed)``
-    via scatter-sub).
+    The per-sample weight gradient comes from :func:`ops.materialize`, so every
+    layer type supported by the library (linear, convolution, transposed
+    convolution, normalization, and embedding families) is handled by the same
+    code path; bias gradients are subtracted as the summed output gradient.
 
     Args:
         model: The model being trained.  ``DataParallel`` / ``DDP`` wrappers
@@ -502,10 +499,7 @@ class DataSelectionCallback(HookManagerCallback):
 
         target_grad = self._resolve_target()
 
-        if self._score_mode == "ghost":
-            scores = self._ghost_scores(record, target_grad)
-        else:
-            scores = self._materialized_scores(record, target_grad)
+        scores = self._compute_scores(record, target_grad)
         self.last_scores = scores.detach().cpu()
         dropped = self._select_dropped(self.last_scores)
         self.last_dropped = dropped
@@ -597,6 +591,10 @@ class DataSelectionCallback(HookManagerCallback):
     def _assemble_val_gradient(self) -> Optional[Gradient]:
         """Build a :class:`Gradient` from the captured val-pass buffers.
 
+        Raw hook data is stored with the module reference so that
+        :func:`~dattri_llm.gradient.ops.preprocess_factorized` is called
+        lazily inside ops functions rather than at assembly time.
+
         Returns:
             A :class:`Gradient` with ``"factorized"`` representation for each
             layer that has both activation and grad_output data, or ``None``
@@ -604,16 +602,36 @@ class DataSelectionCallback(HookManagerCallback):
         """
         data: Dict[str, Any] = {}
         representation: Dict[str, str] = {}
+        indexing: Dict[str, str] = {}
+        layer_types: Dict[str, str] = {}
         for layer_name, act in self._val_act_bufs.items():
             grad = self._val_grad_bufs.get(layer_name)
             if grad is None:
                 continue
-            data[layer_name] = Factorized(activation=act, pre_activation_grad=grad)
+            try:
+                module = self._root.get_submodule(layer_name)
+                layer_type = ops.canonical_class_name(module)
+                module_kwargs = ops.extract_module_kwargs(module, layer_type)
+            except AttributeError:
+                layer_type = "nn.Embedding" if not act.is_floating_point() else "nn.Linear"
+                module_kwargs = None
+            layer_types[layer_name] = layer_type
+            data[layer_name] = Factorized(activation=act, pre_activation_grad=grad,
+                                          module_kwargs=module_kwargs)
             representation[layer_name] = "factorized"
+            indexing[layer_name] = (
+                "batch_token"
+                if (act.ndim >= 3 or not act.is_floating_point())
+                else "batch"
+            )
         if not data:
             return None
-        from dattri_llm.gradient.gradient import Gradient as _Gradient
-        return _Gradient(representation=representation, data=data)
+        return Gradient(
+            representation=representation,
+            data=data,
+            layer_types=layer_types,
+            indexing=indexing,
+        )
 
     # ---------------------------------------------------------------------- #
     # Drop-set selection                                                       #
@@ -649,71 +667,25 @@ class DataSelectionCallback(HookManagerCallback):
         return [i for i in bottom_idx if scores[i] < 0]
 
     # ---------------------------------------------------------------------- #
-    # Scoring helpers                                                          #
+    # Per-sample influence scoring                                             #
     # ---------------------------------------------------------------------- #
 
-    def _per_sample_grad(self, val: Factorized, mat: torch.Tensor) -> torch.Tensor:
-        """Apply token reduction to a materialised layer gradient.
-
-        Args:
-            val: The source :class:`Factorized` (used only to detect Embedding
-                and recover T for mean normalisation).
-            mat: Materialised gradient of shape ``(B, F)`` or ``(B, T, F)``.
-
-        Returns:
-            ``(B, F)`` tensor — per-sample gradient with token reduction applied.
-        """
-        if mat.ndim == 3:
-            T = mat.shape[1]
-            ps = mat.sum(1)  # (B, F)
-            return ps / T if self._token_reduction == "mean" else ps
-        # 2-D: no token dim, or Embedding (already summed over T internally).
-        if val.is_embedding and self._token_reduction == "mean":
-            T = val.activation.shape[1]
-            return mat / T
-        return mat
-
-    def _batch_grad(self, mat: torch.Tensor) -> torch.Tensor:
-        """Sum a materialised gradient over all samples (and tokens if present).
-
-        The batch gradient is always a plain sum — token reduction is applied
-        to the *per-sample* side, not here, so the scale is consistent.
-
-        Args:
-            mat: Materialised gradient of shape ``(B, F)`` or ``(B, T, F)``.
-
-        Returns:
-            ``(F,)`` tensor.
-        """
-        return mat.flatten(0, 1).sum(0) if mat.ndim == 3 else mat.sum(0)
-
-    # ---------------------------------------------------------------------- #
-    # Ghost inner product scoring                                              #
-    # ---------------------------------------------------------------------- #
-
-    def _ghost_scores(
+    def _compute_scores(
         self,
         record: GradientRecord,
         target: Optional[Gradient] = None,
     ) -> torch.Tensor:
-        """Compute per-sample influence scores via ghost inner product.
+        """Compute per-sample influence scores ``score[i] = ⟨∇W_i, ∇W_target⟩``.
 
-        Computes ``score[i] = <dL_i/dW, dL_target/dW>`` via gram (or cross-gram)
-        matrices on the factorised (g, a) factors, avoiding the full weight
-        gradient materialisation::
+        ``∇W_target`` is the sum of the target samples' gradients (the training
+        batch itself when ``target`` is ``None``).  The per-layer inner products
+        are delegated to :meth:`Gradient.similarity` — the single shared
+        implementation of factorized gradient similarity — and this method only
+        sums each layer's cross-gram over the target batch and accumulates
+        across layers.
 
-            score[i] = sum_{t, j, s}  (g_{i,t} . g_tgt_{j,s}) * (a_{i,t} . a_tgt_{j,s})
-
-        When ``target`` is ``None`` the training batch acts as its own target
-        (self-gram); otherwise a cross-gram against ``target`` is computed.
-
-        Each (sample, token) pair is treated as an independent row on the
-        flattened (B*T) axis.  Reducing tokens before gram formation gives
-        wrong scores because the sum-of-products factorisation does not
-        commute with token averaging.
-
-        For ``nn.Embedding`` the activation cross-gram is computed in
-        O(B*T * d_embed) via scatter-add instead of the O((B*T)^2) form.
+        ``score_mode`` selects the :meth:`~Gradient.similarity` ``mode``
+        (``"ghost"`` → ``"factorized"``); both modes are numerically identical.
 
         Args:
             record: Full-batch GradientRecord for this step.
@@ -722,181 +694,51 @@ class DataSelectionCallback(HookManagerCallback):
         Returns:
             Float tensor of shape (B,).
         """
-        B = record.gradient.batch_size
+        gradient = record.gradient
+        other = gradient if target is None else target
+        mode = "materialized" if self._score_mode == "materialized" else "factorized"
+
+        # {layer: (B_layer, B_target)} cross-gram, token-normalised per `mode`.
+        per_layer = gradient.similarity(
+            other, mode=mode, token_reduction=self._token_reduction
+        )
+
+        B = gradient.batch_size
         scores = torch.zeros(B)
-
-        for layer_name, val in record.gradient.data.items():
-            if not isinstance(val, Factorized):
-                continue
-
-            # Resolve target factors for this layer.
-            if target is None:
-                tgt_val = val  # self-gram
-            else:
-                tgt_val = target.data.get(layer_name)
-                if not isinstance(tgt_val, Factorized):
-                    continue
-
-            g = val.pre_activation_grad.float()          # (Bl,  T,  out) or (Bl,  out)
-            g_tgt = tgt_val.pre_activation_grad.float()  # (Bt, Tt, out) or (Bt, out)
-
-            # Bl may differ from B when a layer's gradient was summed over the
-            # batch dim during the forward broadcast (e.g. GPT-2 wpe, where
-            # position_ids has shape (1, T) shared across all samples).  In
-            # that case all B samples receive an equal contribution.
-            layer_B = g.shape[0]
-
-            if g.ndim == 2:
-                # No token dimension — cross-gram at sample level.
-                a = val.reduce_activation(self._token_reduction)          # (Bl, in)
-                a_tgt = tgt_val.reduce_activation(self._token_reduction)  # (Bt, in)
-                G = g @ g_tgt.T     # (Bl, Bt)
-                A = a @ a_tgt.T     # (Bl, Bt)
-                layer_scores = (G * A).sum(-1)  # (Bl,)
-                if layer_B < B:
-                    layer_scores = layer_scores.expand(B)
-                scores += layer_scores
-
-            else:
-                T = g.shape[1]
-                g_flat = g.reshape(-1, g.shape[-1])               # (Bl*T,  out)
-                g_tgt_flat = g_tgt.reshape(-1, g_tgt.shape[-1])   # (Bt*Tt, out)
-
-                if val.is_embedding:
-                    # A_cross[p, q] = 1[tok_train[p] == tok_tgt[q]].
-                    # Efficient form: bt_scores[p] = g_flat[p] · G_tgt_sum[tok[p]]
-                    # where G_tgt_sum[k] = sum_{q: tok_tgt[q]==k} g_tgt_flat[q].
-                    tok_flat = val.activation.reshape(-1)          # (Bl*T,)  int
-                    tok_tgt_flat = tgt_val.activation.reshape(-1)  # (Bt*Tt,) int
-                    vocab = int(max(tok_flat.max().item(),
-                                    tok_tgt_flat.max().item())) + 1
-                    G_tgt_sum = torch.zeros(vocab, g_tgt_flat.shape[-1],
-                                            dtype=g_tgt_flat.dtype)
-                    G_tgt_sum.scatter_add_(
-                        0,
-                        tok_tgt_flat.unsqueeze(-1).expand_as(g_tgt_flat),
-                        g_tgt_flat,
-                    )
-                    bt_scores = (g_flat * G_tgt_sum[tok_flat]).sum(-1)  # (Bl*T,)
-                else:
-                    a_flat = val.activation.float().reshape(-1, val.activation.shape[-1])
-                    a_tgt_flat = tgt_val.activation.float().reshape(
-                        -1, tgt_val.activation.shape[-1]
-                    )
-                    G_cross = g_flat @ g_tgt_flat.T    # (Bl*T, Bt*Tt)
-                    A_cross = a_flat @ a_tgt_flat.T    # (Bl*T, Bt*Tt)
-                    bt_scores = (G_cross * A_cross).sum(-1)  # (Bl*T,)
-
-                layer_scores = bt_scores.reshape(layer_B, T).sum(1)  # (Bl,)
-                if self._token_reduction == "mean":
-                    layer_scores = layer_scores / T
-                if layer_B < B:
-                    layer_scores = layer_scores.expand(B)
-                scores += layer_scores
-
-        return scores
-
-    # ---------------------------------------------------------------------- #
-    # Materialized inner product scoring                                       #
-    # ---------------------------------------------------------------------- #
-
-    def _materialized_scores(
-        self,
-        record: GradientRecord,
-        target: Optional[Gradient] = None,
-    ) -> torch.Tensor:
-        """Compute per-sample influence scores by materialising weight gradients.
-
-        For each layer, builds the per-sample weight gradient explicitly::
-
-            dW_i = sum_t  g_{i,t}^T  (x)  a_{i,t}
-
-        and dots it against the target gradient::
-
-            score[i] = < dW_i,  dW_target >
-            dW_target = sum_{j,s}  g_tgt_{j,s}^T  (x)  a_tgt_{j,s}
-
-        When ``target`` is ``None`` the training batch is the target
-        (``dW_target = sum_j dW_j``).  This is identical to ``_ghost_scores``
-        because ``< g_i x a_i, g_j x a_j > = (g_i . g_j)(a_i . a_j)``.
-
-        Token reduction is applied to the per-sample gradient; the target
-        gradient is always a plain sum for consistent scale.
-
-        Args:
-            record: Full-batch GradientRecord for this step.
-            target: Optional external target Gradient.  ``None`` → batch mode.
-
-        Returns:
-            Float tensor of shape (B,).
-        """
-        B = record.gradient.batch_size
-        scores = torch.zeros(B)
-
-        for layer_name, val in record.gradient.data.items():
-            if not isinstance(val, Factorized):
-                continue
-
-            mat = val.materialize().float()  # (B, F) or (B, T, F)
-            per_sample = self._per_sample_grad(val, mat)  # (B, F) with reduction
-
-            if target is None:
-                batch_grad = self._batch_grad(mat)  # (F,)
-            else:
-                tgt_val = target.data.get(layer_name)
-                if not isinstance(tgt_val, Factorized):
-                    continue
-                tgt_mat = tgt_val.materialize().float()
-
-                # Embedding layers use vocab_size = max(token_ids) + 1, which
-                # varies per batch.  Pad both sides to the same vocabulary
-                # size so the dot product is well-defined.
-                if val.is_embedding:
-                    embed_dim = val.pre_activation_grad.shape[-1]
-                    V_tr = per_sample.shape[1] // embed_dim
-                    V_tgt = tgt_mat.shape[1] // embed_dim
-                    V = max(V_tr, V_tgt)
-                    if V_tr < V:
-                        per_sample = torch.cat(
-                            [
-                                per_sample,
-                                torch.zeros(
-                                    per_sample.shape[0],
-                                    (V - V_tr) * embed_dim,
-                                    dtype=per_sample.dtype,
-                                ),
-                            ],
-                            dim=1,
-                        )
-                    if V_tgt < V:
-                        tgt_mat = torch.cat(
-                            [
-                                tgt_mat,
-                                torch.zeros(
-                                    tgt_mat.shape[0],
-                                    (V - V_tgt) * embed_dim,
-                                    dtype=tgt_mat.dtype,
-                                ),
-                            ],
-                            dim=1,
-                        )
-
-                batch_grad = self._batch_grad(tgt_mat)  # (F,)
-
-            scores += (per_sample * batch_grad).sum(-1)
-
+        for matrix in per_layer.values():
+            # Sum over target samples → ⟨∇W_i, Σ_j ∇W_target_j⟩.
+            layer_scores = matrix.sum(1)
+            # A layer whose gradient was summed over the batch during the forward
+            # broadcast (e.g. GPT-2 wpe) yields fewer rows; every sample then
+            # receives an equal contribution.
+            if layer_scores.shape[0] < B:
+                layer_scores = layer_scores.expand(B)
+            scores += layer_scores
         return scores
 
     # ---------------------------------------------------------------------- #
     # Gradient correction                                                      #
     # ---------------------------------------------------------------------- #
 
+    # Layers whose parameters are indexed channels-first (dim 1) rather than
+    # channels-last (last dim).  Determines the reduction axis for bias grads.
+    _CHANNELS_FIRST_NORMS = frozenset(
+        {"nn.GroupNorm", "nn.InstanceNorm1d", "nn.InstanceNorm2d", "nn.InstanceNorm3d"}
+    )
+
     def _remove_contributions(
         self,
         record: GradientRecord,
         dropped: List[int],
     ) -> None:
-        """Subtract dropped samples' weight gradient contributions from param.grad.
+        """Subtract dropped samples' parameter-gradient contributions.
+
+        The per-sample weight gradients are obtained from
+        :func:`ops.materialize` (so every supported layer type is handled
+        consistently with the rest of the library), and bias gradients are the
+        summed output gradient.  The result is subtracted from each hooked
+        layer's ``param.grad`` so the optimizer steps as if the dropped samples
+        were never in the batch.
 
         Args:
             record: Full-batch :class:`GradientRecord` for this step.
@@ -916,71 +758,79 @@ class DataSelectionCallback(HookManagerCallback):
             except AttributeError:
                 continue
 
-            self._subtract_weight_contrib(module, val, dropped)
-            self._subtract_bias_contrib(module, val, dropped)
+            layer_type = ops.canonical_class_name(module)
+            a_d = val.activation[dropped]            # (n, ...)
+            g_d = val.pre_activation_grad[dropped]   # (n, ...)
+            self._subtract_weight(module, layer_type, val.module_kwargs, a_d, g_d)
+            self._subtract_bias(module, layer_type, g_d)
 
-    def _subtract_weight_contrib(
+    def _subtract_weight(
         self,
         module: nn.Module,
-        val: Factorized,
-        dropped: List[int],
+        layer_type: str,
+        module_kwargs: Optional[dict],
+        a_d: torch.Tensor,
+        g_d: torch.Tensor,
     ) -> None:
-        """Remove dropped samples' contributions from ``module.weight.grad``.
+        """Subtract the dropped samples' weight-gradient contribution.
 
-        Handles ``nn.Linear`` (weight ``(out, in)``), HuggingFace ``Conv1D``
-        (weight ``(in, out)``), and ``nn.Embedding`` (weight ``(vocab, embed)``
-        via scatter-add).
-
-        ``nn.LayerNorm`` weight subtraction is skipped: the exact per-sample
-        contribution requires the internally-normalised activation ``x_hat``
-        which the forward hook does not capture (it sees the raw input ``x``).
-        LayerNorm *bias* subtraction remains exact (see
-        :meth:`_subtract_bias_contrib`).
+        Uses :func:`ops.materialize` (``include_bias=False``) for the per-sample
+        weight gradient, then maps it onto ``weight.grad``'s natural shape — a
+        vocab-row slice for embeddings, a position-sum for norms, a transpose
+        for HuggingFace ``Conv1D``, and a plain ``reshape_as`` otherwise.
         """
         weight = getattr(module, "weight", None)
         if weight is None or weight.grad is None:
             return
 
-        # LayerNorm: weight grad = sum_{b,t} grad_out[b,t,k] * x_hat[b,t,k].
-        # We only have the raw (un-normalised) activation, so we cannot form
-        # the exact outer product.  Skip to avoid writing incorrect values.
-        if isinstance(module, nn.LayerNorm):
+        # (n, d_weight); sum over the dropped samples → (d_weight,).
+        contrib = ops.materialize(
+            a_d, g_d, layer_type, module_kwargs, include_bias=False
+        ).sum(0)
+
+        if ops.is_embedding(layer_type):
+            # materialize scatters into rows 0..max_token; subtract that slice.
+            embed_dim = weight.shape[1]
+            vocab_local = contrib.numel() // embed_dim
+            weight.grad[:vocab_local] -= contrib.reshape(vocab_local, embed_dim).to(
+                weight.grad.dtype
+            )
             return
 
-        is_conv1d = HF_Conv1D is not None and isinstance(module, HF_Conv1D)
-        is_embedding = val.is_embedding
+        if ops.is_norm(layer_type):
+            # Per-position gradient flattened over positions; sum them.
+            wnum = weight.numel()
+            contrib = contrib.reshape(-1, wnum).sum(0)
+        elif layer_type == "transformers.pytorch_utils.Conv1D":
+            # materialize yields (out, in) order; HF Conv1D weight is (in, out).
+            out_f, in_f = weight.shape[1], weight.shape[0]
+            contrib = contrib.reshape(out_f, in_f).T
 
-        for i in dropped:
-            g_i = val.pre_activation_grad[i]  # (T, out) or (T, embed_dim)
-            a_i = val.activation[i]            # (T, in) or (T,) integer for Embedding
+        weight.grad -= contrib.reshape_as(weight.grad).to(weight.grad.dtype)
 
-            if is_embedding:
-                # Embedding weight is (vocab_size, embed_dim).
-                # Contribution: for each token t, weight[token_ids[t], :] += g_i[t, :].
-                embed_dim = g_i.shape[-1]
-                T = a_i.shape[0]
-                idx = a_i.unsqueeze(-1).expand(T, embed_dim)       # (T, embed_dim)
-                contrib = torch.zeros_like(weight.grad)
-                contrib.scatter_add_(0, idx, g_i.to(contrib.dtype))
-            elif is_conv1d:
-                # Conv1D: weight is (in, out), grad_W = a^T @ g
-                contrib = torch.einsum("ti,to->io", a_i, g_i)
-            else:
-                # nn.Linear: weight is (out, in), grad_W = g^T @ a
-                contrib = torch.einsum("to,ti->oi", g_i, a_i)
-            weight.grad -= contrib.to(weight.grad.dtype)
-
-    def _subtract_bias_contrib(
+    def _subtract_bias(
         self,
         module: nn.Module,
-        val: Factorized,
-        dropped: List[int],
+        layer_type: str,
+        g_d: torch.Tensor,
     ) -> None:
-        """Remove dropped samples' contributions from ``module.bias.grad``."""
+        """Subtract the dropped samples' bias-gradient contribution.
+
+        The bias gradient is the output gradient summed over every dimension
+        except the channel dimension (last dim for linear/LayerNorm/RMSNorm,
+        dim 1 for conv/transposed-conv/Group/Instance norm).
+        """
         bias = getattr(module, "bias", None)
         if bias is None or bias.grad is None:
             return
-        for i in dropped:
-            # bias grad = sum of grad_output over batch and tokens
-            contrib = val.pre_activation_grad[i].sum(0)  # (out,)
-            bias.grad -= contrib.to(bias.grad.dtype)
+        channels = bias.shape[0]
+        g = g_d.float()
+        if (
+            ops.is_conv(layer_type)
+            or ops.is_conv_transpose(layer_type)
+            or layer_type in self._CHANNELS_FIRST_NORMS
+        ):
+            contrib = g.movedim(1, -1).reshape(-1, channels).sum(0)
+        else:
+            contrib = g.reshape(-1, channels).sum(0)
+        bias.grad -= contrib.to(bias.grad.dtype)

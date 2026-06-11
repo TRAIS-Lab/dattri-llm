@@ -30,7 +30,8 @@ from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import BaseAttributor
 from dattri_llm.algorithm.task import AttributionTask
 from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import Gradient, hash_sample
+from dattri_llm.gradient.gradient import Gradient
+from dattri_llm.gradient.utils import hash_sample
 
 
 # --------------------------------------------------------------------------- #
