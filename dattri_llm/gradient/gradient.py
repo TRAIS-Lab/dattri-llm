@@ -473,7 +473,8 @@ class Gradient:
             if terms is None:
                 continue
             matrix, n_pos = terms
-            if metric == "cosine":
+            if metric == "cosine" and reduce == "none":
+                # Per-layer cosine: normalise each layer independently.
                 n_s = self._layer_norm_sq(name).clamp_min(0).sqrt()      # (B_self,)
                 n_o = other._layer_norm_sq(name).clamp_min(0).sqrt()     # (B_other,)
                 matrix = matrix / (n_s[:, None] * n_o[None, :] + eps)
@@ -487,7 +488,18 @@ class Gradient:
         # matrices, since the whole-model gradient is the concatenation of layers).
         if not per_layer:
             raise ValueError("No shared layers to compute an overall similarity")
-        return torch.stack(list(per_layer.values())).sum(0)
+        total = torch.stack(list(per_layer.values())).sum(0)
+        if metric == "cosine":
+            # Full-model cosine: normalise by the concatenated-gradient norms,
+            # i.e. sqrt(sum of per-layer squared norms).
+            norm_sq_s = torch.stack(
+                [self._layer_norm_sq(n) for n in per_layer]
+            ).sum(0).clamp_min(0)                                         # (B_self,)
+            norm_sq_o = torch.stack(
+                [other._layer_norm_sq(n) for n in per_layer]
+            ).sum(0).clamp_min(0)                                         # (B_other,)
+            total = total / (norm_sq_s.sqrt()[:, None] * norm_sq_o.sqrt()[None, :] + eps)
+        return total
 
     def _layer_cross_matrix(self, other: "Gradient", name: str, mode: str):
         """Return ``((B_self, B_other) cross-gram, source position count)`` for
