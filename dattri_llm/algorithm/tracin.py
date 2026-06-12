@@ -23,7 +23,6 @@ import json
 from typing import List, Optional, Sequence, Union
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from dattri_llm.algorithm.arguments import AttributionArguments
@@ -112,6 +111,7 @@ class TracInAttributor(BaseAttributor):
         test_dataset: Dataset,
         train_gradients_dir: Optional[str] = None,
         test_gradients_dir: Optional[str] = None,
+        loop_over_test: bool = False,
     ) -> torch.Tensor:
         """Compute the (num_train, num_test) attribution score matrix.
 
@@ -130,6 +130,18 @@ class TracInAttributor(BaseAttributor):
             test_gradients_dir: Directory written by
                 :class:`GradientFileManager` during the test forward+backward
                 pass.
+            loop_over_test: Controls the streaming strategy for the inner loop.
+
+                * ``False`` (default) — test-batch gradients are loaded once
+                  per step and cached on device; train batches are streamed one
+                  at a time.  Peak memory: one train batch + all test batches.
+                  Disk reads per step: ``N_train_batches + N_test_batches``.
+
+                * ``True`` — both train and test batches are streamed; no
+                  caching.  Peak memory: one train batch + one test batch.
+                  Disk reads per step:
+                  ``N_train_batches x N_test_batches + N_train_batches``.
+                  Use when the test set is too large to hold on device at once.
 
         Returns:
             Float tensor of shape ``(len(train_dataset), len(test_dataset))``.
@@ -181,39 +193,47 @@ class TracInAttributor(BaseAttributor):
 
         scores = torch.zeros(n_train, n_test, dtype=torch.float)
 
+        metric = "cosine" if self.normalized_grad else "dot"
+        tok_reduction = "mean" if self.token_reduction == "mean" else None
+
         for step, weight in zip(steps, weights):
-            train_flat = self._stack_flat_batches(
-                train_fm, step, train_batch_hashes, device,
-            )
-            test_flat = self._stack_flat_batches(
-                test_fm, step, test_batch_hashes, device,
-            )
+            if not loop_over_test:
+                test_batch_grads = [
+                    _load_batch_gradients(test_fm, step, hashes, self.layer_name).to(device)
+                    for hashes in test_batch_hashes
+                ]
 
-            if self.normalized_grad:
-                train_flat = F.normalize(train_flat, dim=-1)
-                test_flat = F.normalize(test_flat, dim=-1)
+            train_row = 0
+            for train_hashes in train_batch_hashes:
+                train_g = _load_batch_gradients(
+                    train_fm, step, train_hashes, self.layer_name,
+                ).to(device)
+                n_tr = train_g.batch_size
 
-            scores += (weight * (train_flat @ test_flat.T)).detach().to("cpu")
+                if loop_over_test:
+                    test_batch_grads = [
+                        _load_batch_gradients(test_fm, step, hashes, self.layer_name).to(device)
+                        for hashes in test_batch_hashes
+                    ]
+
+                test_col = 0
+                for test_g in test_batch_grads:
+                    n_te = test_g.batch_size
+                    block = train_g.similarity(
+                        test_g,
+                        metric=metric,
+                        reduce="all",
+                        token_reduction=tok_reduction,
+                    )
+                    scores[train_row:train_row + n_tr, test_col:test_col + n_te] += (
+                        weight * block
+                    ).detach().cpu()
+                    test_col += n_te
+
+                train_row += n_tr
 
         self._save_scores(scores, steps, weights)
         return scores
-    
-    ### Helper funcs ####
-
-    def _stack_flat_batches(
-        self,
-        fm: GradientFileManager,
-        step: int,
-        batch_hashes: List[List[str]],
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Load every batch's gradients at ``step``, flatten, and stack to (N, D)."""
-        flats = []
-        for hashes in batch_hashes:
-            g = _load_batch_gradients(fm, step, hashes, self.layer_name)
-            flat = _flatten(g, self.token_reduction).to(device)
-            flats.append(flat)
-        return torch.cat(flats, dim=0)
 
     def _resolve_steps(
         self,
@@ -293,34 +313,6 @@ class TracInAttributor(BaseAttributor):
             json.dump(meta, f, indent=2)
 
 
-class GradCosAttributor(TracInAttributor):
-    """GradCos: TracIn with cosine similarity and uniform weights.
-
-    Equivalent to ``TracInAttributor(args, normalized_grad=True,
-    weight_list=None, ...)`` — provided as a separate class so the algorithm
-    name appears explicitly at call sites and in the saved metadata.
-    """
-
-    def __init__(
-        self,
-        args: AttributionArguments,
-        *,
-        layer_name: Optional[Union[str, List[str]]] = None,
-        steps: Optional[Sequence[int]] = None,
-        token_reduction: str = "sum",
-        task: Optional[AttributionTask] = None,
-    ) -> None:
-        super().__init__(
-            args=args,
-            weight_list=None,
-            normalized_grad=True,
-            layer_name=layer_name,
-            steps=steps,
-            token_reduction=token_reduction,
-            task=task,
-        )
-
-
 # --------------------------------------------------------------------------- #
 # Module-level helpers                                                         #
 # --------------------------------------------------------------------------- #
@@ -362,20 +354,3 @@ def _load_batch_gradients(
     for g in per_sample[1:]:
         out = out.concatenate(g, dim="batch")
     return out
-
-
-def _flatten(g: Gradient, token_reduction: str) -> torch.Tensor:
-    """Materialize and flatten a batched :class:`Gradient` to ``(B, D)``.
-
-    Layers are concatenated in sorted name order so that train and test
-    flattenings line up.  For ``batch_token`` indexing the token dim is
-    reduced by sum or mean before flattening.
-    """
-    g = g.materialize()
-    parts = []
-    for name in sorted(g.layer_names):
-        t = g.data[name]
-        if g.indexing == "batch_token":
-            t = t.sum(1) if token_reduction == "sum" else t.mean(1)
-        parts.append(t.flatten(1).float())
-    return torch.cat(parts, dim=1)
