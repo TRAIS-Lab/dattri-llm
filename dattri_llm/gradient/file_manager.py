@@ -271,6 +271,52 @@ class GradientFileManager:
         entries = sorted(self._index[input_hash], key=lambda e: e["step"])
         return [self._load_entry(e) for e in entries]
 
+    def available_steps(self) -> list[int]:
+        """Return every step present in the (merged) index, ascending.
+
+        Returns:
+            Sorted list of distinct step indices across all saved records.
+        """
+        steps = {e["step"] for entries in self._index.values() for e in entries}
+        return sorted(steps)
+
+    def iter_step(self, step: int) -> list[tuple[str, list[int]]]:
+        """Enumerate the on-disk record slots for one step, in disk order.
+
+        Walks the merged index and groups, for the requested ``step``, the
+        record positions by file.  This is the ordering used to assign
+        attribution-matrix rows/columns: it depends only on what is on disk,
+        not on any reconstructed dataset or DataLoader.
+
+        Args:
+            step: The step to enumerate.
+
+        Returns:
+            List of ``(file_relpath, sorted_record_idxs)`` tuples, ordered by
+            file name.  ``file_relpath`` is relative to the root *save_dir* and
+            can be passed to :meth:`load_records`.
+        """
+        by_file: dict[str, set[int]] = {}
+        for entries in self._index.values():
+            for e in entries:
+                if e["step"] == step:
+                    by_file.setdefault(e["file"], set()).add(e["idx"])
+        return [(f, sorted(by_file[f])) for f in sorted(by_file)]
+
+    def load_records(self, file_relpath: str) -> list[GradientRecord]:
+        """Load every :class:`GradientRecord` stored in one file.
+
+        Args:
+            file_relpath: Path relative to the root *save_dir*, as returned by
+                :meth:`iter_step`.
+
+        Returns:
+            The file's records as a list (a single-record file is wrapped in a
+            one-element list).
+        """
+        obj = torch.load(self._root_dir / file_relpath, weights_only=False)
+        return obj if isinstance(obj, list) else [obj]
+
     def _load_entry(self, entry: dict) -> GradientRecord:
         # "file" is always relative to _root_dir, not _save_dir.
         path = self._root_dir / entry["file"]

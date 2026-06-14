@@ -1,74 +1,68 @@
-"""TracIn and GradCos attributors over on-disk gradients (workflow 2).
+"""TracIn / GradCos attribution over on-disk gradients (workflow 2).
 
-These attributors consume :class:`~dattri_llm.gradient.gradient.Gradient`
-records produced earlier by the gradient-collection pipeline and persisted
-to disk via :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.
-No forward/backward pass is performed at attribution time — only inner
-products between pre-stored per-sample gradients.
+This attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
+records produced earlier by the gradient-collection pipeline and persisted to
+disk via :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  No
+forward/backward pass is performed at attribution time — only inner products
+between pre-stored per-sample gradients.
 
-Score::
+Per saved step ``k`` (a TracIn ensemble term)::
 
-    score[i, j] = sum_k weight_k * <g_train_i^(k), g_test_j^(k)>
+    score[(train_i, k), test_j] = weight_k * <g_train_i^(k), g_test_j^(k)>
 
-where ``k`` indexes the saved gradient *steps* used as TracIn ensemble
-terms.  ``g_*^(k)`` is the per-sample weight gradient flattened into a
-single vector across all hooked layers.  With ``normalized_grad=True`` the
-inner product is replaced by a cosine similarity per ``(i, j)`` — this is
-the GradCos variant.
+where ``g_*^(k)`` is the per-sample weight gradient across all hooked layers.
+With ``normalized_grad=True`` the inner product becomes a cosine similarity
+(the GradCos / CosIn variant); ``GradCos = TracInAttributor(normalized_grad=True)``
+— there is no separate subclass.
+
+The result is a :class:`~dattri_llm.algorithm.result.AttributionScore`.  It is
+*trajectory-aware* on the train side: one row per ``(train_hash, step)`` pair,
+rather than a single step-summed row.  Summing a sample's rows over steps
+recovers the classic dattri ``(num_train, num_test)`` matrix.  Rows and columns
+are identified by content hash, read directly from the on-disk records, so no
+reconstruction of the original training DataLoader is required — the ordering
+is defined entirely by what is on disk.
 """
 
 from __future__ import annotations
 
-import json
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import BaseAttributor
+from dattri_llm.algorithm.result import AttributionScore
 from dattri_llm.algorithm.task import AttributionTask
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
-from dattri_llm.gradient.utils import hash_sample
-
-
-# --------------------------------------------------------------------------- #
-# TracIn / GradCos                                                             #
-# --------------------------------------------------------------------------- #
 
 
 class TracInAttributor(BaseAttributor):
-    """TracIn attributor that consumes pre-collected on-disk gradients.
+    """TracIn / GradCos attributor that consumes pre-collected on-disk gradients.
 
     Args:
         args: :class:`AttributionArguments` controlling DataLoader behaviour,
-            device placement, and the output directory where the score tensor
-            is persisted.  Only ``per_device_train_batch_size``,
-            ``per_device_eval_batch_size``, the dataloader_* fields,
-            ``device``, and ``output_dir`` are consulted in this workflow.
-        weight_list: Per-step weights, one per included step.  Typically the
-            learning rate at each saved step.  If ``None`` (and ``steps`` is
-            also ``None``), every common step is included with uniform weight
-            ``1.0`` — i.e. the GradDot variant.  Must have the same length as
-            ``steps`` (or as the auto-discovered step list).
-        normalized_grad: If ``True``, L2-normalise each per-sample flattened
-            gradient before the dot product.  ``True`` corresponds to
-            CosIn / GradCos; ``False`` to TracIn / GradDot.
-        layer_name: Restrict the inner product to these layer names (matching
-            keys of the saved :class:`Gradient`).  ``None`` uses every layer
-            present in both the train and test gradients.
-        steps: Saved step indices to include as TracIn ensemble terms.
-            ``None`` auto-discovers the intersection of steps present in both
-            ``train_gradients_dir`` and ``test_gradients_dir``.
-        token_reduction: How to reduce the token dim of ``indexing="batch_token"``
-            gradients before flattening.  ``"sum"`` (default) matches a
-            sum-over-tokens loss reduction; ``"mean"`` matches a mean-over-tokens
-            loss reduction.  This must match the loss reduction used during
-            gradient collection if you want scores comparable across sequences
-            of different lengths.
-        task: Accepted for parity with the workflow-1 API but unused in this
-            workflow.
+            device placement, and the output directory where the score is
+            persisted.  Only the ``dataloader_*`` fields, ``device``, and
+            ``output_dir`` are consulted in this workflow.
+        weight_list: Per-step weights, one per included step (typically the
+            learning rate at each saved step).  ``None`` uses uniform weight
+            ``1.0`` for every step (GradDot).  Length must match the resolved
+            step list.
+        normalized_grad: If ``True``, use cosine similarity per ``(i, j)`` pair
+            (GradCos / CosIn); if ``False``, the raw inner product (TracIn /
+            GradDot).
+        layer_name: Restrict the inner product to these layer names.  ``None``
+            uses every layer shared between the train and test gradients.
+        steps: Saved step indices to include as ensemble terms.  ``None``
+            auto-discovers the intersection of steps present in both gradient
+            directories.
+        token_reduction: How to reduce the token dim of
+            ``indexing="batch_token"`` gradients.  ``"sum"`` (default) matches a
+            sum-over-tokens loss; ``"mean"`` matches a mean-over-tokens loss.
+        task: Accepted for parity with the workflow-1 API but unused here.
 
     Raises:
         ValueError: If ``token_reduction`` is not ``"sum"`` or ``"mean"``.
@@ -103,55 +97,46 @@ class TracInAttributor(BaseAttributor):
         self.token_reduction = token_reduction
 
     def cache(self, train_dataset: Dataset) -> None:
-        pass
+        """No-op: gradients are already cached on disk in this workflow."""
 
     def attribute(
         self,
-        train_dataset: Dataset,
-        test_dataset: Dataset,
+        train_dataset: Optional[Dataset] = None,
+        test_dataset: Optional[Dataset] = None,
         train_gradients_dir: Optional[str] = None,
         test_gradients_dir: Optional[str] = None,
         loop_over_test: bool = False,
-    ) -> torch.Tensor:
-        """Compute the (num_train, num_test) attribution score matrix.
+    ) -> AttributionScore:
+        """Compute the trajectory-aware attribution score from on-disk gradients.
 
-        Iterates the train and test datasets in their natural order with
-        ``shuffle=False``; row ``i`` corresponds to ``train_dataset[i]`` and
-        column ``j`` to ``test_dataset[j]``.  Each sample's gradient is
-        retrieved from disk by content hash (:func:`hash_sample`), so the
-        collation that produced the saved gradients must yield identical
-        per-sample tensors here (same padding policy, same field ordering).
+        Rows and columns are derived from the saved records themselves: the
+        column order is the test-sample hash order at the first included step,
+        and rows are appended per step in on-disk order.  ``train_dataset`` /
+        ``test_dataset`` are accepted for API parity but are *not* required and
+        are not used to define ordering.
 
         Args:
-            train_dataset: The training dataset whose influence is measured.
-            test_dataset: The test (query) dataset.
+            train_dataset: Unused; kept for API parity.
+            test_dataset: Unused; kept for API parity.
             train_gradients_dir: Directory written by
                 :class:`GradientFileManager` during the training pass.
             test_gradients_dir: Directory written by
-                :class:`GradientFileManager` during the test forward+backward
-                pass.
-            loop_over_test: Controls the streaming strategy for the inner loop.
-
-                * ``False`` (default) — test-batch gradients are loaded once
-                  per step and cached on device; train batches are streamed one
-                  at a time.  Peak memory: one train batch + all test batches.
-                  Disk reads per step: ``N_train_batches + N_test_batches``.
-
-                * ``True`` — both train and test batches are streamed; no
-                  caching.  Peak memory: one train batch + one test batch.
-                  Disk reads per step:
-                  ``N_train_batches x N_test_batches + N_train_batches``.
-                  Use when the test set is too large to hold on device at once.
+                :class:`GradientFileManager` during the test pass.
+            loop_over_test: If ``False`` (default), the step's test blocks are
+                loaded once and reused across train blocks (peak memory: all
+                test blocks of one step + one train block).  If ``True``, test
+                blocks are re-streamed for every train block (peak memory: one
+                train + one test block), at the cost of more disk reads.
 
         Returns:
-            Float tensor of shape ``(len(train_dataset), len(test_dataset))``.
-            Also persisted to ``args.output_dir/scores.pt`` alongside a
-            ``metadata.json`` describing the run.
+            An :class:`AttributionScore`.  Also persisted to
+            ``args.output_dir`` as ``scores.pt`` + ``metadata.json``.
 
         Raises:
-            ValueError: If either gradients dir is missing, or no common
-                steps are found between the two dirs, or ``weight_list``
-                length disagrees with the resolved step list.
+            ValueError: If either gradients dir is missing, no common steps are
+                found, or ``weight_list`` length disagrees with the step list.
+            KeyError: If a test sample present at a later step was absent at the
+                first step (test set changed across the trajectory).
         """
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
@@ -165,75 +150,77 @@ class TracInAttributor(BaseAttributor):
 
         steps = self._resolve_steps(train_fm, test_fm)
         weights = self._resolve_weights(steps)
-
-        train_loader = self._make_dataloader(train_dataset, train=True)
-        test_loader = self._make_dataloader(test_dataset, train=False)
-
-        n_train = len(train_dataset)
-        n_test = len(test_dataset)
         device = self.args.device
-
-        # Precompute per-batch sample hashes so we do not re-hash each step.
-        train_batch_hashes = [
-            [hash_sample(b, i) for i in range(_batch_size(b))] for b in train_loader
-        ]
-        test_batch_hashes = [
-            [hash_sample(b, i) for i in range(_batch_size(b))] for b in test_loader
-        ]
-        if sum(len(h) for h in train_batch_hashes) != n_train:
-            raise RuntimeError(
-                "Train DataLoader produced a different total sample count than "
-                "len(train_dataset)."
-            )
-        if sum(len(h) for h in test_batch_hashes) != n_test:
-            raise RuntimeError(
-                "Test DataLoader produced a different total sample count than "
-                "len(test_dataset)."
-            )
-
-        scores = torch.zeros(n_train, n_test, dtype=torch.float)
 
         metric = "cosine" if self.normalized_grad else "dot"
         tok_reduction = "mean" if self.token_reduction == "mean" else None
 
+        # Column order: the test-hash order observed at the first included step.
+        test_ids = self._test_column_order(test_fm, steps[0])
+        test_index = {h: c for c, h in enumerate(test_ids)}
+        num_test = len(test_ids)
+
+        # Trajectory-aware rows accumulate (one chunk per train block) on CPU;
+        # the user opted into building the full (train_hash, step) matrix.
+        row_chunks: List[torch.Tensor] = []
+        row_train_ids: List[str] = []
+        row_steps: List[int] = []
+
         for step, weight in zip(steps, weights):
             if not loop_over_test:
-                test_batch_grads = [
-                    _load_batch_gradients(test_fm, step, hashes, self.layer_name).to(device)
-                    for hashes in test_batch_hashes
+                test_blocks = [
+                    (g.to(device), h)
+                    for g, h in self._grad_loader(test_fm, step)
                 ]
 
-            train_row = 0
-            for train_hashes in train_batch_hashes:
-                train_g = _load_batch_gradients(
-                    train_fm, step, train_hashes, self.layer_name,
-                ).to(device)
+            for train_g, train_hashes in self._grad_loader(train_fm, step):
+                train_g = train_g.to(device)
                 n_tr = train_g.batch_size
+                row_buf = torch.zeros(n_tr, num_test, dtype=torch.float)
 
-                if loop_over_test:
-                    test_batch_grads = [
-                        _load_batch_gradients(test_fm, step, hashes, self.layer_name).to(device)
-                        for hashes in test_batch_hashes
-                    ]
-
-                test_col = 0
-                for test_g in test_batch_grads:
-                    n_te = test_g.batch_size
+                blocks = (
+                    ((g.to(device), h) for g, h in self._grad_loader(test_fm, step))
+                    if loop_over_test
+                    else test_blocks
+                )
+                for test_g, test_hashes in blocks:
+                    cols = [self._require_col(test_index, h, step) for h in test_hashes]
                     block = train_g.similarity(
                         test_g,
                         metric=metric,
                         reduce="all",
                         token_reduction=tok_reduction,
                     )
-                    scores[train_row:train_row + n_tr, test_col:test_col + n_te] += (
-                        weight * block
-                    ).detach().cpu()
-                    test_col += n_te
+                    row_buf[:, cols] = (weight * block).detach().to("cpu", torch.float)
 
-                train_row += n_tr
+                row_chunks.append(row_buf)
+                row_train_ids.extend(train_hashes)
+                row_steps.extend([step] * n_tr)
 
-        self._save_scores(scores, steps, weights)
-        return scores
+        scores = (
+            torch.cat(row_chunks, dim=0)
+            if row_chunks
+            else torch.zeros(0, num_test, dtype=torch.float)
+        )
+
+        result = AttributionScore(
+            scores=scores,
+            row_train_ids=row_train_ids,
+            row_steps=row_steps,
+            test_ids=test_ids,
+            steps=steps,
+            weights=weights,
+            algorithm="GradCos" if self.normalized_grad else "TracIn",
+            normalized_grad=self.normalized_grad,
+            layer_name=self.layer_name,
+            token_reduction=self.token_reduction,
+        )
+        result.save(self.args.output_path)
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                             #
+    # ------------------------------------------------------------------ #
 
     def _resolve_steps(
         self,
@@ -242,13 +229,7 @@ class TracInAttributor(BaseAttributor):
     ) -> List[int]:
         if self.steps is not None:
             return list(self.steps)
-        train_steps = {
-            e["step"] for entries in train_fm.index.values() for e in entries
-        }
-        test_steps = {
-            e["step"] for entries in test_fm.index.values() for e in entries
-        }
-        common = sorted(train_steps & test_steps)
+        common = sorted(set(train_fm.available_steps()) & set(test_fm.available_steps()))
         if not common:
             raise ValueError(
                 "No common steps between train and test gradient directories."
@@ -265,22 +246,35 @@ class TracInAttributor(BaseAttributor):
             )
         return [float(w) for w in self.weight_list]
 
-    def _make_dataloader(self, dataset: Dataset, *, train: bool) -> DataLoader:
-        """Build a deterministic DataLoader (shuffle=False) from ``args``.
+    def _test_column_order(self, test_fm: GradientFileManager, step: int) -> List[str]:
+        """Establish the column (test-hash) order from one step's disk layout."""
+        ids: List[str] = []
+        for _, hashes in self._grad_loader(test_fm, step):
+            ids.extend(hashes)
+        return ids
 
-        Workflow 2 looks up gradients by content hash; the order in which
-        the loader produces samples defines the row/column index of the
-        output matrix, so shuffling is always disabled.
+    @staticmethod
+    def _require_col(test_index: dict, h: str, step: int) -> int:
+        if h not in test_index:
+            raise KeyError(
+                f"Test sample {h[:16]}… appears at step {step} but was absent at "
+                "the first step used to define columns; the test set must be "
+                "consistent across the trajectory."
+            )
+        return test_index[h]
+
+    def _grad_loader(self, fm: GradientFileManager, step: int) -> DataLoader:
+        """A DataLoader yielding ``(Gradient_block, hashes)`` per file at *step*.
+
+        Uses ``batch_size=1`` with an identity collate (each item is already a
+        batched block) so that ``num_workers`` prefetches files in parallel.
         """
-        batch_size = (
-            self.args.per_device_train_batch_size
-            if train
-            else self.args.per_device_eval_batch_size
-        )
+        dataset = _GradientFileDataset(fm, step, layer_name=self.layer_name)
         kwargs: dict = {
             "dataset": dataset,
-            "batch_size": batch_size,
+            "batch_size": 1,
             "shuffle": False,
+            "collate_fn": _identity_collate,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
         }
@@ -290,67 +284,77 @@ class TracInAttributor(BaseAttributor):
                 kwargs["prefetch_factor"] = self.args.dataloader_prefetch_factor
         return DataLoader(**kwargs)
 
-    def _save_scores(
+
+# --------------------------------------------------------------------------- #
+# Internal: on-disk gradient loading                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _identity_collate(batch: list) -> object:
+    """Collate for a ``batch_size=1`` loader: return the single item as-is.
+
+    :class:`_GradientFileDataset` already yields a batched :class:`Gradient`
+    block per item, so the DataLoader must not stack anything; it just unwraps
+    the singleton list.
+    """
+    (item,) = batch
+    return item
+
+
+class _GradientFileDataset(Dataset):
+    """Yields ``(Gradient_block, hashes)`` for each on-disk file at one step.
+
+    Reading on-disk gradients one *sample* at a time would re-read each batch
+    file once per sample and rebuild batches via repeated
+    :meth:`Gradient.concatenate`.  This dataset instead exposes one *file* per
+    item — a single :func:`torch.load` yields a whole batch block — so a
+    standard :class:`~torch.utils.data.DataLoader` with ``num_workers > 0`` can
+    prefetch files in parallel and the attributor can stream blocks without
+    stacking a full train/test side into one tensor.
+
+    Args:
+        file_manager: Manager opened on the gradient directory.
+        step: The step whose record files this dataset iterates.
+        layer_name: If given, restrict each block's gradient to these layers.
+    """
+
+    def __init__(
         self,
-        scores: torch.Tensor,
-        steps: List[int],
-        weights: List[float],
+        file_manager: GradientFileManager,
+        step: int,
+        layer_name: Optional[List[str]] = None,
     ) -> None:
-        out_dir = self.args.output_path
-        out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(scores, out_dir / "scores.pt")
-        meta = {
-            "algorithm": "GradCos" if self.normalized_grad else "TracIn",
-            "normalized_grad": self.normalized_grad,
-            "steps": steps,
-            "weights": weights,
-            "layer_name": self.layer_name,
-            "token_reduction": self.token_reduction,
-            "num_train": int(scores.shape[0]),
-            "num_test": int(scores.shape[1]),
-        }
-        with open(out_dir / "metadata.json", "w") as f:
-            json.dump(meta, f, indent=2)
+        self._fm = file_manager
+        self._step = step
+        self._layer_name = list(layer_name) if layer_name is not None else None
+        self._slots = file_manager.iter_step(step)
 
+    def __len__(self) -> int:
+        return len(self._slots)
 
-# --------------------------------------------------------------------------- #
-# Module-level helpers                                                         #
-# --------------------------------------------------------------------------- #
+    def __getitem__(self, i: int) -> Tuple[Gradient, List[str]]:
+        file_rel, idxs = self._slots[i]
+        records = self._fm.load_records(file_rel)
 
+        grads: List[Gradient] = []
+        hashes: List[str] = []
+        for idx in idxs:
+            rec = records[idx]
+            g = rec.gradient
+            if self._layer_name is not None:
+                g = g.select_layers(self._layer_name)
+            grads.append(g)
+            h = rec.input_hash
+            hashes.extend(h if isinstance(h, list) else [h])
 
-def _batch_size(batch: dict) -> int:
-    for v in batch.values():
-        if isinstance(v, torch.Tensor) and v.ndim > 0:
-            return int(v.shape[0])
-    raise ValueError("Cannot infer batch size: no batched tensor field in batch dict.")
+        block = grads[0]
+        for g in grads[1:]:
+            block = block.concatenate(g, dim="batch")
 
-
-def _load_sample_gradient(
-    fm: GradientFileManager,
-    step: int,
-    h: str,
-    layer_name: Optional[List[str]],
-) -> Gradient:
-    """Return a batch-size-1 :class:`Gradient` for one sample at one step."""
-    rec = fm.load_by_hash(step, h)
-    g = rec.gradient
-    if isinstance(rec.input_hash, list):
-        i = rec.input_hash.index(h)
-        g = g.slice(dim="batch", index=i)
-    if layer_name is not None:
-        g = g.select_layers(layer_name)
-    return g
-
-
-def _load_batch_gradients(
-    fm: GradientFileManager,
-    step: int,
-    hashes: List[str],
-    layer_name: Optional[List[str]],
-) -> Gradient:
-    """Concatenate per-sample :class:`Gradient` lookups along the batch dim."""
-    per_sample = [_load_sample_gradient(fm, step, h, layer_name) for h in hashes]
-    out = per_sample[0]
-    for g in per_sample[1:]:
-        out = out.concatenate(g, dim="batch")
-    return out
+        if block.batch_size != len(hashes):
+            raise RuntimeError(
+                f"Block batch size ({block.batch_size}) disagrees with hash "
+                f"count ({len(hashes)}) for file {file_rel!r} at step "
+                f"{self._step}."
+            )
+        return block, hashes
