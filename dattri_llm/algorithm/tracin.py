@@ -134,7 +134,9 @@ class TracInAttributor(BaseAttributor):
 
         Raises:
             ValueError: If either gradients dir is missing, no common steps are
-                found, or ``weight_list`` length disagrees with the step list.
+                found, an explicitly requested step is absent from either
+                directory, or ``weight_list`` length disagrees with the step
+                list.
             KeyError: If a test sample present at a later step was absent at the
                 first step (test set changed across the trajectory).
         """
@@ -225,14 +227,24 @@ class TracInAttributor(BaseAttributor):
         train_fm: GradientFileManager,
         test_fm: GradientFileManager,
     ) -> List[int]:
+        common = set(train_fm.available_steps()) & set(test_fm.available_steps())
         if self.steps is not None:
+            # Honour the caller's order (steps[0] defines the column layout) but
+            # reject any step missing from either directory — otherwise a typo'd
+            # step silently contributes nothing (or yields an empty result).
+            missing = [s for s in self.steps if s not in common]
+            if missing:
+                raise ValueError(
+                    f"Requested steps {missing} are not present in both the "
+                    f"train and test gradient directories. Available common "
+                    f"steps: {sorted(common)}."
+                )
             return list(self.steps)
-        common = sorted(set(train_fm.available_steps()) & set(test_fm.available_steps()))
         if not common:
             raise ValueError(
                 "No common steps between train and test gradient directories."
             )
-        return common
+        return sorted(common)
 
     def _resolve_weights(self, steps: List[int]) -> List[float]:
         if self.weight_list is None:

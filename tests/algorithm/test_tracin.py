@@ -197,3 +197,43 @@ class TestTracInOnDisk:
 
         # Columns discovered on-the-fly must match the on-disk step-0 order.
         assert res_false.test_ids == _disk_test_column_order(collected["test_dir"], 0)
+
+    def _attr_with_steps(self, out_dir, steps, weight_list):
+        args = AttributionArguments(
+            output_dir=str(out_dir),
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
+        return TracInAttributor(
+            args, layer_name=LAYER_NAMES, normalized_grad=False,
+            weight_list=weight_list, steps=steps,
+        )
+
+    def test_requested_step_absent_raises(self, collected, tmp_path):
+        """A requested step missing from disk must error, not silently no-op."""
+        attr = self._attr_with_steps(tmp_path / "o", steps=[0, 1, 99],
+                                     weight_list=[1.0, 0.5, 0.3])
+        with pytest.raises(ValueError, match=r"99"):
+            attr.attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+            )
+
+    def test_all_requested_steps_absent_raises(self, collected, tmp_path):
+        """A fully bogus step list must error instead of returning an empty score."""
+        attr = self._attr_with_steps(tmp_path / "o", steps=[99], weight_list=[1.0])
+        with pytest.raises(ValueError, match=r"not present in both"):
+            attr.attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+            )
+
+    def test_valid_explicit_steps_still_work(self, collected, tmp_path):
+        """Sanity: validation does not reject genuinely present steps."""
+        attr = self._attr_with_steps(tmp_path / "o", steps=[1, 0],
+                                     weight_list=[0.5, 1.0])
+        res = attr.attribute(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+        )
+        assert sorted(set(res.row_steps)) == [0, 1]
