@@ -58,6 +58,25 @@ try:
 except ImportError:
     HF_Conv1D = None  # type: ignore[assignment,misc]
 
+
+def _queue_backward_end_callback(fn: Callable[[], None]) -> bool:
+    """Schedule ``fn`` to run once the in-flight backward pass fully completes.
+
+    Must be called from *within* a backward pass (e.g. a module full-backward
+    hook).  The callback fires after the autograd engine has finished — the
+    point at which FSDP has written every (sharded) ``param.grad`` back to its
+    original parameter, so reading ``param.grad`` inside ``fn`` is safe.
+
+    Returns ``True`` if the callback was successfully queued, ``False`` if the
+    autograd engine does not expose ``queue_callback`` on this build (in which
+    case the caller should fall back to its existing behaviour).
+    """
+    try:
+        torch.autograd.Variable._execution_engine.queue_callback(fn)
+        return True
+    except Exception:  # pragma: no cover - unexpected autograd internals
+        return False
+
 # ── Always-hooked types (do not require an MLP parent keyword) ──────────────
 # Embedding and norm layers appear at the top level of transformer blocks and
 # their per-sample gradients factorise in a form compatible with influence
@@ -765,6 +784,21 @@ class HookManager:
         self._n_mlp_params: int = 0            # target for sub-cond (b)
         self._grad_done: bool = True
 
+        # End-of-backward barrier for sub-cond (b).  Under FSDP the
+        # per-parameter post-accumulate-grad hooks never fire (grads flow
+        # through the flattened FlatParameter) and FSDP writes the (sharded)
+        # ``param.grad`` back to each original parameter only *after* the whole
+        # backward pass completes.  To cover this, every step queues a callback
+        # on the autograd engine that fires once backward is fully done — the
+        # point at which all ``param.grad`` are guaranteed ready.  For non-FSDP
+        # models the per-parameter hooks complete the step earlier (during
+        # backward), so this callback is a harmless no-op.  ``_mlp_params_ready``
+        # is the callback's signal; ``_backward_end_scheduled`` is the live
+        # token for the in-flight step (guards against double-queuing and
+        # against a stale callback leaking into the next step).
+        self._mlp_params_ready: bool = False
+        self._backward_end_scheduled: bool = False
+
         root = getattr(model, "module", model)
         self._n_replicas: int = (
             len(model.device_ids)
@@ -852,6 +886,12 @@ class HookManager:
             return
 
         with self._step_lock:
+            # We are inside the backward pass here — the only valid place to
+            # queue an end-of-backward callback.  Queue it once per step as the
+            # FSDP-safe satisfier of sub-cond (b) (see ``__init__``).
+            if self._n_mlp_params > 0 and not self._backward_end_scheduled:
+                if _queue_backward_end_callback(self._on_backward_end):
+                    self._backward_end_scheduled = True
             self._bwd_replica_counts[layer_name] = (
                 self._bwd_replica_counts.get(layer_name, 0) + 1
             )
@@ -859,6 +899,25 @@ class HookManager:
                 self._seen_bwd.add(layer_name)
             if len(self._seen_bwd) == self._n_layers:
                 self._check_mlp_done()
+
+    def _on_backward_end(self) -> None:
+        """Fired once the backward pass fully completes (FSDP-safe barrier).
+
+        By this point every ``param.grad`` is written — including FSDP's
+        (sharded) write-back to the original parameters — so sub-cond (b) is
+        satisfied and any callback that reads ``param.grad`` in ``on_step_end``
+        sees ready gradients.  The ``_backward_end_scheduled`` guard ensures a
+        callback that fires *after* its step already completed (the common
+        non-FSDP case, where per-parameter hooks finished the step earlier) is
+        ignored rather than leaking ``_mlp_params_ready`` into the next step.
+        """
+        if not self._collecting:
+            return
+        with self._step_lock:
+            if not self._backward_end_scheduled:
+                return
+            self._mlp_params_ready = True
+            self._check_mlp_done()
 
     def _check_step_mlp_param_complete(
         self,
@@ -883,8 +942,12 @@ class HookManager:
         Must be called with ``_step_lock`` held.
         """
         bwd_hooks_done = len(self._seen_bwd) == self._n_layers
-        # Sub-condition (b): all MLP param hooks fired, or no MLP params exist.
+        # Sub-condition (b): all MLP param grads are ready.  Satisfied when no
+        # MLP params exist, when every per-parameter post-accumulate hook has
+        # fired (non-FSDP), or when the FSDP end-of-backward callback has fired
+        # (``_mlp_params_ready``).
         mlp_params_done = (self._n_mlp_params == 0
+                           or self._mlp_params_ready
                            or self._mlp_param_hook_count >= self._n_mlp_params)
         if bwd_hooks_done and mlp_params_done:
             self._bwd_done = True
@@ -935,6 +998,8 @@ class HookManager:
         self._mlp_param_hook_count = 0
         self._param_hook_count = 0
         # Reset completion flags for the next step.
+        self._mlp_params_ready = False
+        self._backward_end_scheduled = False
         self._bwd_done = "mlp_io" not in self._config.hook_types
         self._grad_done = "param_grad" not in self._config.hook_types
         self._reset_layer_buffers()
@@ -1037,6 +1102,8 @@ class HookManager:
         self._reset_layer_buffers()
         self._reset_param_buffers()
         self._param_hook_count = 0
+        self._mlp_params_ready = False
+        self._backward_end_scheduled = False
         self._seen_bwd.clear()
         self._bwd_replica_counts.clear()
         self._last_inputs = {}
@@ -1124,6 +1191,19 @@ class HookManager:
         remove_hooks(self._mlp_weight_handles)
         remove_hooks(self._param_handles)
         self._param_buffers.clear()
+
+    def add_callback(self, callback: HookManagerCallback) -> None:
+        """Attach a callback after construction and run its ``on_register``.
+
+        Useful when a callback can only be built *after* the manager — most
+        notably :class:`~dattri_llm.gradient.callbacks.DataSelectionCallback`
+        under FSDP, where the manager is created on the unwrapped model (so its
+        hooks survive wrapping) but the callback needs the FSDP-wrapped module
+        to discover the parameter shard layout.
+        """
+        self._callbacks.append(callback)
+        if hasattr(callback, "on_register"):
+            callback.on_register(self)
 
     @property
     def layer_names(self) -> list[str]:

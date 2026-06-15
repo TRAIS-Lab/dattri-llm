@@ -29,7 +29,9 @@ Three built-in callbacks are provided:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+import math
+from collections import namedtuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,6 +39,13 @@ import torch.nn as nn
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient import ops
+
+
+# Per-parameter slice of an FSDP ``FlatParameter`` shard.  ``start``/``end`` are
+# the inclusive indices into the *flattened, unsharded* parameter that this rank
+# owns (i.e. ``param.grad`` equals ``full.reshape(-1)[start : end + 1]``);
+# ``in_shard`` is False when this rank holds none of the parameter.
+_ShardSpec = namedtuple("_ShardSpec", "orig_shape in_shard start end")
 
 
 # --------------------------------------------------------------------------- #
@@ -276,9 +285,31 @@ class DataSelectionCallback(HookManagerCallback):
     convolution, normalization, and embedding families) is handled by the same
     code path; bias gradients are subtracted as the summed output gradient.
 
+    **Distributed (FSDP):**
+
+    ``FullyShardedDataParallel`` (``use_orig_params=True``) is supported.  Each
+    original ``param.grad`` is then a 1-D *shard* holding FSDP's averaged
+    gradient, and a dropped sample's weight elements may be owned by a different
+    rank's shard, so removal is done collectively: every rank computes its
+    dropped samples' full contribution, a single ``all_reduce`` sums them, the
+    result is rescaled by ``1/world_size`` to match FSDP's averaging, and each
+    rank subtracts the slice it owns.  This runs on every step (with zero
+    contributions when a rank drops nothing) to keep ranks in lock-step, and
+    assumes FSDP's default averaged-gradient reduction.
+
+    Construction order under FSDP: build the :class:`HookManager` on the
+    *unwrapped* model (so its hooks survive wrapping), wrap with FSDP, then pass
+    the **wrapped** module here (needed to discover the shard layout) and attach
+    via :meth:`HookManager.add_callback`::
+
+        collector = HookManager(model, config=...)
+        model = FSDP(model, use_orig_params=True)
+        collector.add_callback(DataSelectionCallback(model, ...))
+
     Args:
         model: The model being trained.  ``DataParallel`` / ``DDP`` wrappers
-            are unwrapped automatically via ``.module``.
+            are unwrapped automatically via ``.module``; for FSDP, pass the
+            FSDP-wrapped module (see "Distributed (FSDP)" above).
         threshold: Interpretation depends on ``threshold_mode``:
 
             * ``"hard"`` — score cutoff (any float, default ``0.0``).
@@ -361,6 +392,18 @@ class DataSelectionCallback(HookManagerCallback):
                 raise ValueError("target='val_loader' requires val_loss_fn.")
 
         self._root: nn.Module = getattr(model, "module", model)
+        # Top-level model as passed in.  When the model is FSDP-wrapped this is
+        # the FSDP module (``_root`` is its unwrapped ``.module``); it is the
+        # entry point used to discover the FSDP ``FlatParameter`` shard layout.
+        self._model: nn.Module = model
+        # Lazily-built map ``id(param) -> _ShardSpec`` for FSDP gradient
+        # correction; ``None`` until the first ``on_step_end`` (the model may be
+        # wrapped in FSDP *after* this callback is constructed).  Empty dict ==
+        # "not FSDP".  ``_fsdp_world_size`` is the process-group size used to
+        # rescale all-reduced contributions to FSDP's averaged-gradient
+        # convention.
+        self._fsdp_shard_map: Optional[Dict[int, _ShardSpec]] = None
+        self._fsdp_world_size: int = 1
         self._threshold = threshold
         self._threshold_mode = threshold_mode
         self._token_reduction = token_reduction
@@ -503,7 +546,13 @@ class DataSelectionCallback(HookManagerCallback):
         self.last_scores = scores.detach().cpu()
         dropped = self._select_dropped(self.last_scores)
         self.last_dropped = dropped
-        if dropped:
+
+        self._ensure_fsdp_map()
+        if self._fsdp_shard_map:
+            # FSDP path runs every step (collectives must stay in lock-step
+            # across ranks), even when this rank drops nothing.
+            self._remove_contributions_fsdp(record, dropped)
+        elif dropped:
             self._remove_contributions(record, dropped)
 
     # ---------------------------------------------------------------------- #
@@ -834,3 +883,217 @@ class DataSelectionCallback(HookManagerCallback):
         else:
             contrib = g.reshape(-1, channels).sum(0)
         bias.grad -= contrib.to(bias.grad.dtype)
+
+    # ---------------------------------------------------------------------- #
+    # FSDP gradient correction                                                 #
+    # ---------------------------------------------------------------------- #
+    #
+    # Under ``FullyShardedDataParallel`` (``use_orig_params=True``) each
+    # original ``param.grad`` is a 1-D *shard* — a contiguous slice of the
+    # flattened, unsharded parameter — holding FSDP's *averaged* gradient
+    # ``(1/world_size) · Σ_r G_r`` for that slice.  A dropped sample lives on a
+    # single rank, but the weight elements its gradient touches may be owned by
+    # a *different* rank's shard, so removal cannot be done rank-locally.
+    #
+    # Each rank instead computes the full-shaped gradient contribution of *its*
+    # dropped samples, the contributions are summed across ranks with a single
+    # ``all_reduce`` and rescaled by ``1/world_size`` to match FSDP's averaging,
+    # and every rank then subtracts the slice covering the elements it owns.
+    # The result equals ``(1/world_size) · Σ_r G_r^kept`` shard-for-shard.
+    #
+    # The collectives run on *every* step the callback is active (with zero
+    # contributions when no rank dropped anything) so all ranks stay in
+    # lock-step.  This assumes FSDP's default averaged-gradient reduction.
+
+    def _ensure_fsdp_map(self) -> None:
+        """Build the ``id(param) -> _ShardSpec`` map on first use (idempotent).
+
+        The model may be FSDP-wrapped *after* this callback is constructed, so
+        discovery is deferred to the first ``on_step_end``.  Leaves an empty
+        map (and ``_fsdp_world_size == 1``) for non-FSDP models, which routes
+        ``on_step_end`` through the rank-local :meth:`_remove_contributions`.
+        """
+        if self._fsdp_shard_map is not None:
+            return
+        shard_map: Dict[int, _ShardSpec] = {}
+        for module in self._model.modules():
+            flat_param = getattr(module, "_flat_param", None)
+            if flat_param is None:
+                continue
+            infos = getattr(flat_param, "_shard_param_infos", None)
+            params = getattr(flat_param, "_params", None)
+            shapes = getattr(flat_param, "_shapes", None)
+            if infos is None or params is None or shapes is None:
+                continue
+            for param, info, shape in zip(params, infos, shapes):
+                shard_map[id(param)] = _ShardSpec(
+                    orig_shape=tuple(shape),
+                    in_shard=bool(info.in_shard),
+                    start=info.intra_param_start_idx,
+                    end=info.intra_param_end_idx,
+                )
+        self._fsdp_shard_map = shard_map
+        if shard_map:
+            import torch.distributed as dist
+
+            self._fsdp_world_size = (
+                dist.get_world_size()
+                if dist.is_available() and dist.is_initialized()
+                else 1
+            )
+
+    def _remove_contributions_fsdp(
+        self,
+        record: GradientRecord,
+        dropped: List[int],
+    ) -> None:
+        """Shard-aware, collective version of :meth:`_remove_contributions`.
+
+        Runs on every rank in lock-step.  See the section comment above for the
+        correctness argument.
+        """
+        import torch.distributed as dist
+
+        world = self._fsdp_world_size
+        use_dist = world > 1 and dist.is_available() and dist.is_initialized()
+
+        # Skip the (expensive) contribution all-reduce when *no* rank dropped
+        # anything this step.  The drop count itself is reduced first so the
+        # decision is identical on every rank.
+        if use_dist:
+            count = torch.tensor([len(dropped)], dtype=torch.long)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+            any_dropped = bool(count.item())
+        else:
+            any_dropped = bool(dropped)
+        if not any_dropped:
+            return
+
+        entries = self._build_fsdp_contributions(record, dropped)
+        if not entries:
+            return
+
+        if use_dist:
+            buf = torch.cat([flat for _, flat in entries])
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            buf /= world
+            offset = 0
+            for param, flat in entries:
+                self._subtract_shard(param, buf[offset : offset + flat.numel()])
+                offset += flat.numel()
+        else:
+            # Single-rank FSDP (no sharding across ranks): grads are not
+            # averaged, so subtract the local contribution directly.
+            for param, flat in entries:
+                self._subtract_shard(param, flat)
+
+    def _build_fsdp_contributions(
+        self,
+        record: GradientRecord,
+        dropped: List[int],
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return ``[(param, full_flat_contribution)]`` for every sharded param.
+
+        Each contribution is the *full*, unsharded parameter-gradient of this
+        rank's dropped samples, flattened in the parameter's natural C-order
+        (zeros when this rank dropped nothing).  The entry list — params and
+        their full sizes — depends only on model structure and is therefore
+        identical across ranks, which keeps the packed ``all_reduce`` aligned.
+        """
+        B = record.gradient.batch_size
+        shard_map = self._fsdp_shard_map
+        assert shard_map is not None
+        entries: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_name, val in sorted(record.gradient.data.items()):
+            if not isinstance(val, Factorized):
+                continue
+            if val.pre_activation_grad.shape[0] < B:
+                continue
+            try:
+                module = self._root.get_submodule(layer_name)
+            except AttributeError:
+                continue
+            layer_type = ops.canonical_class_name(module)
+            a_d = val.activation[dropped] if dropped else None
+            g_d = val.pre_activation_grad[dropped] if dropped else None
+
+            weight = getattr(module, "weight", None)
+            if weight is not None and id(weight) in shard_map:
+                full_numel = math.prod(shard_map[id(weight)].orig_shape)
+                flat = torch.zeros(full_numel, dtype=torch.float32)
+                if dropped:
+                    contrib, off = self._weight_contrib_natural(
+                        layer_type, val.module_kwargs, a_d, g_d,
+                        shard_map[id(weight)].orig_shape,
+                    )
+                    flat[off : off + contrib.numel()] = contrib.float()
+                entries.append((weight, flat))
+
+            bias = getattr(module, "bias", None)
+            if bias is not None and id(bias) in shard_map:
+                channels = math.prod(shard_map[id(bias)].orig_shape)
+                flat = torch.zeros(channels, dtype=torch.float32)
+                if dropped:
+                    flat = self._bias_contrib_natural(layer_type, g_d, channels).float()
+                entries.append((bias, flat))
+        return entries
+
+    def _weight_contrib_natural(
+        self,
+        layer_type: str,
+        module_kwargs: Optional[dict],
+        a_d: torch.Tensor,
+        g_d: torch.Tensor,
+        full_shape: Tuple[int, ...],
+    ) -> Tuple[torch.Tensor, int]:
+        """Full weight-gradient contribution as a 1-D tensor in the parameter's
+        natural C-order, plus the flat offset at which it begins.
+
+        Mirrors the per-layer-type reshaping in :meth:`_subtract_weight` but
+        uses the *unsharded* ``full_shape`` (FSDP shards expose only a 1-D
+        slice, so ``weight.shape`` is unusable).  The offset is non-zero only
+        for embeddings, whose contribution covers just rows ``0..max_token``.
+        """
+        contrib = ops.materialize(
+            a_d, g_d, layer_type, module_kwargs, include_bias=False
+        ).sum(0)
+        if ops.is_embedding(layer_type):
+            # materialize scatters into rows 0..max_token, flattened row-major
+            # — already aligned with the start of the flattened weight.
+            return contrib, 0
+        if ops.is_norm(layer_type):
+            wnum = math.prod(full_shape)
+            return contrib.reshape(-1, wnum).sum(0), 0
+        if layer_type == "transformers.pytorch_utils.Conv1D":
+            # materialize yields (out, in); HF Conv1D weight is (in, out).
+            out_f, in_f = full_shape[1], full_shape[0]
+            return contrib.reshape(out_f, in_f).T.reshape(-1), 0
+        return contrib.reshape(-1), 0
+
+    def _bias_contrib_natural(
+        self,
+        layer_type: str,
+        g_d: torch.Tensor,
+        channels: int,
+    ) -> torch.Tensor:
+        """Full bias-gradient contribution as a 1-D ``(channels,)`` tensor."""
+        g = g_d.float()
+        if (
+            ops.is_conv(layer_type)
+            or ops.is_conv_transpose(layer_type)
+            or layer_type in self._CHANNELS_FIRST_NORMS
+        ):
+            return g.movedim(1, -1).reshape(-1, channels).sum(0)
+        return g.reshape(-1, channels).sum(0)
+
+    def _subtract_shard(self, param: torch.Tensor, full_flat: torch.Tensor) -> None:
+        """Subtract the slice of ``full_flat`` this rank owns from ``param.grad``.
+
+        ``full_flat`` is the (already averaged) full-parameter contribution in
+        natural C-order; the rank's shard is ``full.reshape(-1)[start:end+1]``.
+        """
+        spec = self._fsdp_shard_map[id(param)]  # type: ignore[index]
+        if not spec.in_shard or param.grad is None:
+            return
+        seg = full_flat.reshape(-1)[spec.start : spec.end + 1]
+        param.grad -= seg.to(param.grad.dtype)
