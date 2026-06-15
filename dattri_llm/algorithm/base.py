@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
 
 if TYPE_CHECKING:
@@ -252,3 +253,118 @@ class BaseInnerProductAttributor(BaseAttributor):
         Returns:
             DataLoader: A configured DataLoader.
         """
+
+
+# --------------------------------------------------------------------------- #
+# On-disk gradient loading                                                     #
+# --------------------------------------------------------------------------- #
+#
+# Shared building blocks for attributors that consume pre-collected on-disk
+# gradients (e.g. :class:`~dattri_llm.algorithm.tracin.TracInAttributor`).
+# Reading on-disk gradients one *sample* at a time would re-read each batch
+# file once per sample; these helpers instead expose one *file* per item so a
+# standard DataLoader with ``num_workers > 0`` can prefetch whole batch blocks
+# in parallel.
+
+
+def identity_collate(batch: list) -> object:
+    """Collate for a ``batch_size=1`` loader: return the single item as-is.
+
+    :class:`GradientFileDataset` already yields a batched :class:`Gradient`
+    block per item, so the DataLoader must not stack anything; it just unwraps
+    the singleton list.
+    """
+    (item,) = batch
+    return item
+
+
+class GradientFileDataset(Dataset):
+    """Yields ``(Gradient_block, hashes)`` for each on-disk file at one step.
+
+    Exposes one *file* per item — a single :func:`torch.load` yields a whole
+    batch block — so a standard :class:`~torch.utils.data.DataLoader` with
+    ``num_workers > 0`` can prefetch files in parallel and an attributor can
+    stream blocks without stacking a full train/test side into one tensor.
+
+    Args:
+        file_manager: Manager opened on the gradient directory.
+        step: The step whose record files this dataset iterates.
+        layer_name: If given, restrict each block's gradient to these layers.
+    """
+
+    def __init__(
+        self,
+        file_manager: GradientFileManager,
+        step: int,
+        layer_name: Optional[List[str]] = None,
+    ) -> None:
+        self._fm = file_manager
+        self._step = step
+        self._layer_name = list(layer_name) if layer_name is not None else None
+        self._slots = file_manager.iter_step(step)
+
+    def __len__(self) -> int:
+        return len(self._slots)
+
+    def __getitem__(self, i: int) -> Tuple[Gradient, List[str]]:
+        file_rel, idxs = self._slots[i]
+        records = self._fm.load_records(file_rel)
+
+        grads: List[Gradient] = []
+        hashes: List[str] = []
+        for idx in idxs:
+            rec = records[idx]
+            g = rec.gradient
+            if self._layer_name is not None:
+                g = g.select_layers(self._layer_name)
+            grads.append(g)
+            h = rec.input_hash
+            hashes.extend(h if isinstance(h, list) else [h])
+
+        block = grads[0]
+        for g in grads[1:]:
+            block = block.concatenate(g, dim="batch")
+
+        if block.batch_size != len(hashes):
+            raise RuntimeError(
+                f"Block batch size ({block.batch_size}) disagrees with hash "
+                f"count ({len(hashes)}) for file {file_rel!r} at step "
+                f"{self._step}."
+            )
+        return block, hashes
+
+
+def make_gradient_dataloader(
+    file_manager: GradientFileManager,
+    step: int,
+    args: AttributionArguments,
+    layer_name: Optional[List[str]] = None,
+) -> DataLoader:
+    """Build a DataLoader yielding ``(Gradient_block, hashes)`` per file at *step*.
+
+    Uses ``batch_size=1`` with :func:`identity_collate` (each item is already a
+    batched block) so that ``num_workers`` prefetches files in parallel.
+
+    Args:
+        file_manager: Manager opened on the gradient directory.
+        step: The step whose record files to stream.
+        args: Supplies the ``dataloader_*`` settings.
+        layer_name: If given, restrict each block's gradient to these layers.
+
+    Returns:
+        A configured :class:`~torch.utils.data.DataLoader`.
+    """
+    dataset = GradientFileDataset(file_manager, step, layer_name=layer_name)
+    kwargs: dict = {
+        "dataset": dataset,
+        "batch_size": 1,
+        "shuffle": False,
+        "collate_fn": identity_collate,
+        "num_workers": args.dataloader_num_workers,
+        "pin_memory": args.dataloader_pin_memory,
+    }
+    if args.dataloader_num_workers > 0:
+        kwargs["persistent_workers"] = args.dataloader_persistent_workers
+        if args.dataloader_prefetch_factor is not None:
+            kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
+    return DataLoader(**kwargs)

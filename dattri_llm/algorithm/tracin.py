@@ -15,7 +15,7 @@ With ``normalized_grad=True`` the inner product becomes a cosine similarity
 (the GradCos / CosIn variant); ``GradCos = TracInAttributor(normalized_grad=True)``
 — there is no separate subclass.
 
-The result is a :class:`~dattri_llm.algorithm.result.AttributionScore`.  It is
+The result is a :class:`~dattri_llm.algorithm.score.AttributionScore`.  It is
 *trajectory-aware* on the train side: one row per ``(train_hash, step)`` pair,
 rather than a single step-summed row.  Summing a sample's rows over steps
 recovers the classic dattri ``(num_train, num_test)`` matrix.  Rows and columns
@@ -29,11 +29,11 @@ from __future__ import annotations
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import BaseAttributor
-from dattri_llm.algorithm.result import AttributionScore
+from dattri_llm.algorithm.base import BaseAttributor, make_gradient_dataloader
+from dattri_llm.algorithm.score import AttributionScore
 from dattri_llm.algorithm.task import AttributionTask
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
@@ -155,10 +155,12 @@ class TracInAttributor(BaseAttributor):
         metric = "cosine" if self.normalized_grad else "dot"
         tok_reduction = "mean" if self.token_reduction == "mean" else None
 
-        # Column order: the test-hash order observed at the first included step.
-        test_ids = self._test_column_order(test_fm, steps[0])
-        test_index = {h: c for c, h in enumerate(test_ids)}
-        num_test = len(test_ids)
+        # Column order (the test-hash order on disk at the first included step)
+        # is discovered lazily while the first train block is scored, so the
+        # test side is never loaded twice — there is no separate pre-pass that
+        # reads every test file just to read its hashes.
+        test_ids: List[str] = []
+        test_index: dict = {}
 
         # Trajectory-aware rows accumulate (one chunk per train block) on CPU;
         # the user opted into building the full (train_hash, step) matrix.
@@ -166,37 +168,33 @@ class TracInAttributor(BaseAttributor):
         row_train_ids: List[str] = []
         row_steps: List[int] = []
 
-        for step, weight in zip(steps, weights):
-            if not loop_over_test:
-                test_blocks = [
-                    (g.to(device), h)
-                    for g, h in self._grad_loader(test_fm, step)
-                ]
+        for si, (step, weight) in enumerate(zip(steps, weights)):
+            test_blocks = (
+                None
+                if loop_over_test
+                else [(g.to(device), h) for g, h in self._grad_loader(test_fm, step)]
+            )
 
-            for train_g, train_hashes in self._grad_loader(train_fm, step):
+            for bi, (train_g, train_hashes) in enumerate(
+                self._grad_loader(train_fm, step)
+            ):
                 train_g = train_g.to(device)
-                n_tr = train_g.batch_size
-                row_buf = torch.zeros(n_tr, num_test, dtype=torch.float)
-
-                blocks = (
+                test_iter = (
                     ((g.to(device), h) for g, h in self._grad_loader(test_fm, step))
                     if loop_over_test
-                    else test_blocks
+                    else iter(test_blocks)
                 )
-                for test_g, test_hashes in blocks:
-                    cols = [self._require_col(test_index, h, step) for h in test_hashes]
-                    block = train_g.similarity(
-                        test_g,
-                        metric=metric,
-                        reduce="all",
-                        token_reduction=tok_reduction,
-                    )
-                    row_buf[:, cols] = (weight * block).detach().to("cpu", torch.float)
-
+                # The first train block of the first step defines the columns;
+                # every later block must match them (_require_col guards this).
+                row_buf = self._row_for_train_block(
+                    train_g, weight, test_iter, step, metric, tok_reduction,
+                    test_ids, test_index, discover=(si == 0 and bi == 0),
+                )
                 row_chunks.append(row_buf)
                 row_train_ids.extend(train_hashes)
-                row_steps.extend([step] * n_tr)
+                row_steps.extend([step] * train_g.batch_size)
 
+        num_test = len(test_ids)
         scores = (
             torch.cat(row_chunks, dim=0)
             if row_chunks
@@ -246,12 +244,59 @@ class TracInAttributor(BaseAttributor):
             )
         return [float(w) for w in self.weight_list]
 
-    def _test_column_order(self, test_fm: GradientFileManager, step: int) -> List[str]:
-        """Establish the column (test-hash) order from one step's disk layout."""
-        ids: List[str] = []
-        for _, hashes in self._grad_loader(test_fm, step):
-            ids.extend(hashes)
-        return ids
+    def _row_for_train_block(
+        self,
+        train_g: Gradient,
+        weight: float,
+        test_iter,
+        step: int,
+        metric: str,
+        tok_reduction: Optional[str],
+        test_ids: List[str],
+        test_index: dict,
+        *,
+        discover: bool,
+    ) -> torch.Tensor:
+        """Compute one train block's CPU score row ``(n_tr, num_test)``.
+
+        When ``discover`` is True (only the first train block of the first
+        step) the column layout is built *as the test stream is consumed* —
+        each unseen test hash becomes the next column — so the test side is
+        scored exactly once and never pre-loaded just to read its hashes.
+        Later blocks pass ``discover=False`` and resolve columns via
+        :meth:`_require_col`, which rejects a test hash absent from the layout.
+        """
+        n_tr = train_g.batch_size
+
+        def _sim(test_g: Gradient) -> torch.Tensor:
+            block = train_g.similarity(
+                test_g, metric=metric, reduce="all", token_reduction=tok_reduction
+            )
+            return (weight * block).detach().to("cpu", torch.float)
+
+        if not discover:
+            row_buf = torch.zeros(n_tr, len(test_ids), dtype=torch.float)
+            for test_g, test_hashes in test_iter:
+                cols = [self._require_col(test_index, h, step) for h in test_hashes]
+                row_buf[:, cols] = _sim(test_g)
+            return row_buf
+
+        # Discovery: columns are unknown until the whole test stream is seen,
+        # so buffer each block's (cols, values) and assemble once num_test is
+        # fixed.  Peak extra memory is one full row — the same as row_buf.
+        pieces: List[Tuple[List[int], torch.Tensor]] = []
+        for test_g, test_hashes in test_iter:
+            cols = []
+            for h in test_hashes:
+                if h not in test_index:
+                    test_index[h] = len(test_ids)
+                    test_ids.append(h)
+                cols.append(test_index[h])
+            pieces.append((cols, _sim(test_g)))
+        row_buf = torch.zeros(n_tr, len(test_ids), dtype=torch.float)
+        for cols, vals in pieces:
+            row_buf[:, cols] = vals
+        return row_buf
 
     @staticmethod
     def _require_col(test_index: dict, h: str, step: int) -> int:
@@ -263,98 +308,10 @@ class TracInAttributor(BaseAttributor):
             )
         return test_index[h]
 
-    def _grad_loader(self, fm: GradientFileManager, step: int) -> DataLoader:
-        """A DataLoader yielding ``(Gradient_block, hashes)`` per file at *step*.
+    def _grad_loader(self, fm: GradientFileManager, step: int):
+        """DataLoader over this attributor's gradient files at *step*.
 
-        Uses ``batch_size=1`` with an identity collate (each item is already a
-        batched block) so that ``num_workers`` prefetches files in parallel.
+        Thin wrapper around :func:`~dattri_llm.algorithm.base.make_gradient_dataloader`
+        that binds the attributor's ``args`` and ``layer_name``.
         """
-        dataset = _GradientFileDataset(fm, step, layer_name=self.layer_name)
-        kwargs: dict = {
-            "dataset": dataset,
-            "batch_size": 1,
-            "shuffle": False,
-            "collate_fn": _identity_collate,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-        }
-        if self.args.dataloader_num_workers > 0:
-            kwargs["persistent_workers"] = self.args.dataloader_persistent_workers
-            if self.args.dataloader_prefetch_factor is not None:
-                kwargs["prefetch_factor"] = self.args.dataloader_prefetch_factor
-        return DataLoader(**kwargs)
-
-
-# --------------------------------------------------------------------------- #
-# Internal: on-disk gradient loading                                          #
-# --------------------------------------------------------------------------- #
-
-
-def _identity_collate(batch: list) -> object:
-    """Collate for a ``batch_size=1`` loader: return the single item as-is.
-
-    :class:`_GradientFileDataset` already yields a batched :class:`Gradient`
-    block per item, so the DataLoader must not stack anything; it just unwraps
-    the singleton list.
-    """
-    (item,) = batch
-    return item
-
-
-class _GradientFileDataset(Dataset):
-    """Yields ``(Gradient_block, hashes)`` for each on-disk file at one step.
-
-    Reading on-disk gradients one *sample* at a time would re-read each batch
-    file once per sample and rebuild batches via repeated
-    :meth:`Gradient.concatenate`.  This dataset instead exposes one *file* per
-    item — a single :func:`torch.load` yields a whole batch block — so a
-    standard :class:`~torch.utils.data.DataLoader` with ``num_workers > 0`` can
-    prefetch files in parallel and the attributor can stream blocks without
-    stacking a full train/test side into one tensor.
-
-    Args:
-        file_manager: Manager opened on the gradient directory.
-        step: The step whose record files this dataset iterates.
-        layer_name: If given, restrict each block's gradient to these layers.
-    """
-
-    def __init__(
-        self,
-        file_manager: GradientFileManager,
-        step: int,
-        layer_name: Optional[List[str]] = None,
-    ) -> None:
-        self._fm = file_manager
-        self._step = step
-        self._layer_name = list(layer_name) if layer_name is not None else None
-        self._slots = file_manager.iter_step(step)
-
-    def __len__(self) -> int:
-        return len(self._slots)
-
-    def __getitem__(self, i: int) -> Tuple[Gradient, List[str]]:
-        file_rel, idxs = self._slots[i]
-        records = self._fm.load_records(file_rel)
-
-        grads: List[Gradient] = []
-        hashes: List[str] = []
-        for idx in idxs:
-            rec = records[idx]
-            g = rec.gradient
-            if self._layer_name is not None:
-                g = g.select_layers(self._layer_name)
-            grads.append(g)
-            h = rec.input_hash
-            hashes.extend(h if isinstance(h, list) else [h])
-
-        block = grads[0]
-        for g in grads[1:]:
-            block = block.concatenate(g, dim="batch")
-
-        if block.batch_size != len(hashes):
-            raise RuntimeError(
-                f"Block batch size ({block.batch_size}) disagrees with hash "
-                f"count ({len(hashes)}) for file {file_rel!r} at step "
-                f"{self._step}."
-            )
-        return block, hashes
+        return make_gradient_dataloader(fm, step, self.args, self.layer_name)
