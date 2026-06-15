@@ -113,7 +113,11 @@ class TracInAttributor(BaseAttributor):
         column order is the test-sample hash order at the first included step,
         and rows are appended per step in on-disk order.  ``train_dataset`` /
         ``test_dataset`` are accepted for API parity but are *not* required and
-        are not used to define ordering.
+        are not used to define ordering.  The test set must be consistent across
+        the included steps — a sample present at one step but missing at another
+        raises ``KeyError`` rather than producing a silent zero.  Test samples
+        with identical content share a single column (they hash equally), so
+        ``num_test`` counts distinct test samples.
 
         Args:
             train_dataset: Unused; kept for API parity.
@@ -137,8 +141,9 @@ class TracInAttributor(BaseAttributor):
                 found, an explicitly requested step is absent from either
                 directory, or ``weight_list`` length disagrees with the step
                 list.
-            KeyError: If a test sample present at a later step was absent at the
-                first step (test set changed across the trajectory).
+            KeyError: If the test set changed across the trajectory — a sample
+                present at a later step that was absent at the first step, or a
+                column defined at the first step that is missing at a later one.
         """
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
@@ -276,7 +281,9 @@ class TracInAttributor(BaseAttributor):
         each unseen test hash becomes the next column — so the test side is
         scored exactly once and never pre-loaded just to read its hashes.
         Later blocks pass ``discover=False`` and resolve columns via
-        :meth:`_require_col`, which rejects a test hash absent from the layout.
+        :meth:`_require_col`, which rejects a test hash absent from the layout;
+        the mirror case — a column present at the first step but *missing* at a
+        later step — is caught here so the gap is never left as silent zeros.
         """
         n_tr = train_g.batch_size
 
@@ -288,9 +295,22 @@ class TracInAttributor(BaseAttributor):
 
         if not discover:
             row_buf = torch.zeros(n_tr, len(test_ids), dtype=torch.float)
+            seen_cols: set = set()
             for test_g, test_hashes in test_iter:
                 cols = [self._require_col(test_index, h, step) for h in test_hashes]
                 row_buf[:, cols] = _sim(test_g)
+                seen_cols.update(cols)
+            if len(seen_cols) != len(test_ids):
+                missing = [
+                    f"{test_ids[c][:16]}…"
+                    for c in range(len(test_ids))
+                    if c not in seen_cols
+                ]
+                raise KeyError(
+                    f"Test sample(s) {missing} defined the columns at the first "
+                    f"step but are absent at step {step}; the test set must be "
+                    "consistent across the trajectory."
+                )
             return row_buf
 
         # Discovery: columns are unknown until the whole test stream is seen,

@@ -119,6 +119,15 @@ def _disk_test_column_order(test_dir: Path, step: int):
     return ids
 
 
+def _load_step_records(test_dir: Path, step: int):
+    fm = GradientFileManager(str(test_dir))
+    recs = []
+    for file_rel, idxs in fm.iter_step(step):
+        all_recs = fm.load_records(file_rel)
+        recs.extend(all_recs[i] for i in idxs)
+    return recs
+
+
 @pytest.fixture()
 def collected(tmp_path):
     torch.manual_seed(SEED)
@@ -237,3 +246,41 @@ class TestTracInOnDisk:
             test_gradients_dir=str(collected["test_dir"]),
         )
         assert sorted(set(res.row_steps)) == [0, 1]
+
+    @pytest.mark.parametrize("loop_over_test", [False, True])
+    def test_vanishing_test_column_raises(self, collected, tmp_path, loop_over_test):
+        """A column defined at step 0 but absent at step 1 must error, not zero."""
+        # Curate a test dir: step 0 keeps all samples, step 1 drops the last.
+        curated = tmp_path / "te_curated"
+        fm_out = GradientFileManager(str(curated))
+        fm_out.save_batch(_load_step_records(collected["test_dir"], 0))
+        fm_out.save_batch(_load_step_records(collected["test_dir"], 1)[:-1])
+
+        attr = self._attr_with_steps(tmp_path / "o", steps=[0, 1],
+                                     weight_list=[1.0, 0.5])
+        with pytest.raises(KeyError, match=r"consistent across the trajectory"):
+            attr.attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(curated),
+                loop_over_test=loop_over_test,
+            )
+
+    def test_duplicate_content_test_samples_share_a_column(self, tmp_path):
+        """Identical-content test samples collapse to one column (no zero column)."""
+        torch.manual_seed(SEED)
+        model = MLP().eval()
+        checkpoints = _make_checkpoints(model)
+        x_tr, y_tr, x_te, y_te = _make_data()
+        x_te[1], y_te[1] = x_te[0].clone(), y_te[0].clone()  # duplicate sample 0
+
+        train_dir, test_dir = tmp_path / "tr", tmp_path / "te"
+        _collect_to_disk(model, checkpoints, x_tr, y_tr, train_dir)
+        _collect_to_disk(model, checkpoints, x_te, y_te, test_dir)
+
+        res = _make_attr(tmp_path / "o", normalized=False).attribute(
+            train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+        )
+        distinct = len({hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)})
+        assert distinct == N_TEST - 1
+        assert len(res.test_ids) == distinct          # collapsed, not N_TEST
+        assert int((res.scores.abs().sum(0) == 0).sum()) == 0  # no spurious zero column
