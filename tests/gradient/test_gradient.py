@@ -550,13 +550,6 @@ class TestSimilarity:
         cross = g.similarity(other)
         assert set(cross.keys()) == {"l1"}
 
-    def test_token_reduction_mean_divides_by_T(self):
-        g = make_gradient(repr_type="factorized", indexing="batch_token")
-        plain = g.similarity(g, token_reduction="sum")
-        mean = g.similarity(g, token_reduction="mean")
-        for name in plain:
-            assert torch.allclose(mean[name] * T, plain[name], atol=1e-4, rtol=1e-4)
-
     # ── metric ──────────────────────────────────────────────────────────────
 
     def test_cosine_self_diagonal_is_one(self):
@@ -624,5 +617,3 @@ class TestSimilarity:
             g.similarity(g, reduce="layer")  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="mode"):
             g.similarity(g, mode="ghost")  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="token_reduction"):
-            g.similarity(g, token_reduction="avg")  # type: ignore[arg-type]

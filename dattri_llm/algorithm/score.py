@@ -54,7 +54,6 @@ class AttributionScore:
         normalized_grad: Whether per-sample gradients were L2-normalised
             (cosine / GradCos) before the inner product.
         layer_name: Layers the inner product was restricted to, or ``None``.
-        token_reduction: ``"sum"`` or ``"mean"`` token reduction used.
     """
 
     scores: torch.Tensor
@@ -66,7 +65,6 @@ class AttributionScore:
     algorithm_meta: Dict[str, Any]
     normalized_grad: bool
     layer_name: Optional[List[str]]
-    token_reduction: str
 
     # Rebuilt from the lists above; never persisted directly.
     train_index: Dict[str, List[Tuple[int, int]]] = field(init=False, repr=False)
@@ -337,7 +335,6 @@ class AttributionScore:
             "algorithm_meta": self.algorithm_meta,
             "normalized_grad": self.normalized_grad,
             "layer_name": self.layer_name,
-            "token_reduction": self.token_reduction,
             "num_train": self.num_train,
             "num_test": self.num_test,
             "num_rows": self.num_rows,
@@ -360,7 +357,7 @@ class AttributionScore:
         scores = torch.load(out / cls._SCORES_FILE, weights_only=True)
         with open(out / cls._META_FILE) as f:
             meta = json.load(f)
-        algorithm_meta = meta.get("algorithm_meta")
+        algorithm_meta = meta.get("algorithm_meta", {})
         return cls(
             scores=scores,
             row_train_ids=meta["row_train_ids"],
@@ -370,5 +367,4 @@ class AttributionScore:
             algorithm_meta=algorithm_meta,
             normalized_grad=meta["normalized_grad"],
             layer_name=meta["layer_name"],
-            token_reduction=meta["token_reduction"],
         )

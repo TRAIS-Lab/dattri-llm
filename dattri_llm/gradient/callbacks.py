@@ -318,12 +318,6 @@ class DataSelectionCallback(HookManagerCallback):
 
         threshold_mode: One of ``"hard"`` (default), ``"bottom_fraction"``,
             or ``"negative_bottom_fraction"``.  See class docstring for details.
-        token_reduction: How to reduce the token dimension when computing
-            scores.  ``"mean"`` (default) or ``"sum"``.  ``"mean"`` matches the
-            per-token loss scale used by HuggingFace Transformers, verl, and
-            OLMo-core, so scores are comparable across sequences of different
-            lengths.  ``"sum"`` gives longer sequences proportionally higher
-            scores.
         score_mode: Scoring algorithm. ``"ghost"`` (default) uses the ghost
             inner product (no weight-gradient materialisation); ``"materialized"``
             builds the full per-sample weight gradient and dots it against the
@@ -349,17 +343,12 @@ class DataSelectionCallback(HookManagerCallback):
         model: nn.Module,
         threshold: float = 0.0,
         threshold_mode: str = "hard",
-        token_reduction: str = "mean",
         score_mode: str = "ghost",
         target: str = "batch",
         target_gradient: Optional[Gradient] = None,
         val_loader: Optional[Any] = None,
         val_loss_fn: Optional[Callable[[nn.Module, Any], torch.Tensor]] = None,
     ) -> None:
-        if token_reduction not in ("sum", "mean"):
-            raise ValueError(
-                f"token_reduction must be 'sum' or 'mean', got {token_reduction!r}."
-            )
         if threshold_mode not in _THRESHOLD_MODES:
             raise ValueError(
                 f"threshold_mode must be one of {sorted(_THRESHOLD_MODES)}, "
@@ -406,7 +395,6 @@ class DataSelectionCallback(HookManagerCallback):
         self._fsdp_world_size: int = 1
         self._threshold = threshold
         self._threshold_mode = threshold_mode
-        self._token_reduction = token_reduction
         self._score_mode = score_mode
         self._target = target
         self._target_gradient = target_gradient
@@ -747,10 +735,8 @@ class DataSelectionCallback(HookManagerCallback):
         other = gradient if target is None else target
         mode = "materialized" if self._score_mode == "materialized" else "factorized"
 
-        # {layer: (B_layer, B_target)} cross-gram, token-normalised per `mode`.
-        per_layer = gradient.similarity(
-            other, mode=mode, token_reduction=self._token_reduction
-        )
+        # {layer: (B_layer, B_target)} cross-gram per selected scoring mode.
+        per_layer = gradient.similarity(other, mode=mode)
 
         B = gradient.batch_size
         scores = torch.zeros(B)

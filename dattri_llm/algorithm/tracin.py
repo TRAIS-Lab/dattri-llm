@@ -59,13 +59,7 @@ class TracInAttributor(BaseAttributor):
         steps: Saved step indices to include as ensemble terms.  ``None``
             auto-discovers the intersection of steps present in both gradient
             directories.
-        token_reduction: How to reduce the token dim of
-            ``indexing="batch_token"`` gradients.  ``"sum"`` (default) matches a
-            sum-over-tokens loss; ``"mean"`` matches a mean-over-tokens loss.
         task: Accepted for parity with the workflow-1 API but unused here.
-
-    Raises:
-        ValueError: If ``token_reduction`` is not ``"sum"`` or ``"mean"``.
     """
 
     def __init__(
@@ -76,13 +70,8 @@ class TracInAttributor(BaseAttributor):
         normalized_grad: bool = False,
         layer_name: Optional[Union[str, List[str]]] = None,
         steps: Optional[Sequence[int]] = None,
-        token_reduction: str = "sum",
         task: Optional[AttributionTask] = None,
     ) -> None:
-        if token_reduction not in ("sum", "mean"):
-            raise ValueError(
-                f"token_reduction must be 'sum' or 'mean', got {token_reduction!r}."
-            )
         self.args = args
         self.task = task
         self.weight_list = list(weight_list) if weight_list is not None else None
@@ -94,7 +83,6 @@ class TracInAttributor(BaseAttributor):
         else:
             self.layer_name = list(layer_name)
         self.steps = list(steps) if steps is not None else None
-        self.token_reduction = token_reduction
 
     def cache(self, train_dataset: Dataset) -> None:
         """No-op: gradients are already cached on disk in this workflow."""
@@ -160,7 +148,6 @@ class TracInAttributor(BaseAttributor):
         device = self.args.device
 
         metric = "cosine" if self.normalized_grad else "dot"
-        tok_reduction = "mean" if self.token_reduction == "mean" else None
 
         # Column order (the test-hash order on disk at the first included step)
         # is discovered lazily while the first train block is scored, so the
@@ -194,7 +181,7 @@ class TracInAttributor(BaseAttributor):
                 # The first train block of the first step defines the columns;
                 # every later block must match them (_require_col guards this).
                 row_buf = self._row_for_train_block(
-                    train_g, weight, test_iter, step, metric, tok_reduction,
+                    train_g, weight, test_iter, step, metric,
                     test_ids, test_index, discover=(si == 0 and bi == 0),
                 )
                 row_chunks.append(row_buf)
@@ -217,7 +204,6 @@ class TracInAttributor(BaseAttributor):
             algorithm="GradCos" if self.normalized_grad else "TracIn",
             normalized_grad=self.normalized_grad,
             layer_name=self.layer_name,
-            token_reduction=self.token_reduction,
         )
         result.save(self.args.output_path)
         return result
@@ -267,7 +253,6 @@ class TracInAttributor(BaseAttributor):
         test_iter,
         step: int,
         metric: str,
-        tok_reduction: Optional[str],
         test_ids: List[str],
         test_index: dict,
         *,
@@ -288,7 +273,7 @@ class TracInAttributor(BaseAttributor):
 
         def _sim(test_g: Gradient) -> torch.Tensor:
             block = train_g.similarity(
-                test_g, metric=metric, reduce="all", token_reduction=tok_reduction
+                test_g, metric=metric, reduce="all"
             )
             return (weight * block).detach().to("cpu", torch.float)
 

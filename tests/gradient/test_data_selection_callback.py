@@ -108,9 +108,8 @@ class TestDataSelectionCallbackHardThreshold:
     """hard threshold_mode (default) — scores below a cutoff are dropped."""
 
     @pytest.mark.parametrize("loss_reduction", ["mean", "sum"])
-    @pytest.mark.parametrize("token_reduction", ["mean", "sum"])
     @pytest.mark.parametrize("B,T", [(2, 5), (4, 1), (1, 10)])
-    def test_drop_all_zeroes_grad(self, loss_reduction, token_reduction, B, T):
+    def test_drop_all_zeroes_grad(self, loss_reduction, B, T):
         """Dropping every sample must zero out all MLP weight and bias grads.
 
         Uses ``MinimalEmbeddingMLP`` so that MLP inputs always require grad,
@@ -124,7 +123,6 @@ class TestDataSelectionCallbackHardThreshold:
         cb = DataSelectionCallback(
             model=model,
             threshold=float("inf"),   # drop everything
-            token_reduction=token_reduction,
         )
 
         _run_step_with_callback(model, token_ids, cb, loss_reduction=loss_reduction)
@@ -427,13 +425,11 @@ def _scores_for_mode(
     model: nn.Module,
     token_ids: torch.Tensor,
     score_mode: str,
-    token_reduction: str = "mean",
 ) -> torch.Tensor:
     """Return last_scores produced by one forward+backward step."""
     cb = DataSelectionCallback(
         model=model,
         threshold=-float("inf"),   # keep everything — only compute scores
-        token_reduction=token_reduction,
         score_mode=score_mode,
     )
     _run_step_with_callback(model, token_ids, cb)
@@ -455,12 +451,10 @@ class TestScoreModeEquivalence:
     * for layers *without* a token dimension (e.g. a plain 2-D linear)
     * for layers *with* a token dimension (the typical LLM case, B×T×F)
     * for ``nn.Embedding`` layers specifically (activation = integer token IDs)
-    * across both token-reduction modes (``"mean"`` and ``"sum"``)
     """
 
-    @pytest.mark.parametrize("token_reduction", ["mean", "sum"])
     @pytest.mark.parametrize("B,T", [(2, 5), (4, 1), (1, 10), (3, 8)])
-    def test_ghost_eq_materialized_with_token_dim(self, token_reduction, B, T):
+    def test_ghost_eq_materialized_with_token_dim(self, B, T):
         """Both score modes agree for all (B, T) configurations.
 
         ``MinimalEmbeddingMLP`` has a token dimension in every layer (the
@@ -472,18 +466,14 @@ class TestScoreModeEquivalence:
         token_ids = _make_token_ids(B, T)
 
         # Ghost scores
-        ghost_scores = _scores_for_mode(
-            model, token_ids, "ghost", token_reduction=token_reduction
-        )
+        ghost_scores = _scores_for_mode(model, token_ids, "ghost")
 
         # Re-use the exact same model weights and inputs for materialized.
         # Recreate a fresh model with the same state so gradients don't
         # accumulate from the first run.
         model2 = MinimalEmbeddingMLP()
         model2.load_state_dict(model.state_dict())
-        mat_scores = _scores_for_mode(
-            model2, token_ids, "materialized", token_reduction=token_reduction
-        )
+        mat_scores = _scores_for_mode(model2, token_ids, "materialized")
 
         assert ghost_scores.shape == (B,), (
             f"ghost scores shape {ghost_scores.shape} != ({B},)"
@@ -492,14 +482,13 @@ class TestScoreModeEquivalence:
             f"materialized scores shape {mat_scores.shape} != ({B},)"
         )
         assert torch.allclose(ghost_scores, mat_scores, atol=1e-4, rtol=1e-4), (
-            f"token_reduction={token_reduction!r}, B={B}, T={T}\n"
+            f"B={B}, T={T}\n"
             f"ghost      : {ghost_scores.tolist()}\n"
             f"materialized: {mat_scores.tolist()}\n"
             f"max abs diff: {(ghost_scores - mat_scores).abs().max().item():.2e}"
         )
 
-    @pytest.mark.parametrize("token_reduction", ["mean", "sum"])
-    def test_ghost_eq_materialized_no_token_dim(self, token_reduction):
+    def test_ghost_eq_materialized_no_token_dim(self):
         """Both score modes agree for a plain 2-D linear layer (no token dim).
 
         Uses a minimal model where the forward pass collapses the token
@@ -537,17 +526,13 @@ class TestScoreModeEquivalence:
         token_ids = _make_token_ids(B, T)
         model = MeanPoolMLP()
 
-        ghost_scores = _scores_for_mode(
-            model, token_ids, "ghost", token_reduction=token_reduction
-        )
+        ghost_scores = _scores_for_mode(model, token_ids, "ghost")
         model2 = MeanPoolMLP()
         model2.load_state_dict(model.state_dict())
-        mat_scores = _scores_for_mode(
-            model2, token_ids, "materialized", token_reduction=token_reduction
-        )
+        mat_scores = _scores_for_mode(model2, token_ids, "materialized")
 
         assert torch.allclose(ghost_scores, mat_scores, atol=1e-4, rtol=1e-4), (
-            f"token_reduction={token_reduction!r} (no-token-dim model)\n"
+            "no-token-dim model\n"
             f"ghost      : {ghost_scores.tolist()}\n"
             f"materialized: {mat_scores.tolist()}\n"
             f"max abs diff: {(ghost_scores - mat_scores).abs().max().item():.2e}"
@@ -611,20 +596,19 @@ class TestNormLayerConsistency:
     dropping all samples must zero the norm layer's grads (exercises the
     materialize-based gradient subtraction for norms)."""
 
-    @pytest.mark.parametrize("token_reduction", ["mean", "sum"])
     @pytest.mark.parametrize("B,T", [(3, 5), (4, 1)])
-    def test_ghost_eq_materialized_with_layernorm(self, token_reduction, B, T):
+    def test_ghost_eq_materialized_with_layernorm(self, B, T):
         torch.manual_seed(7)
         model = _NormMLP()
         token_ids = _make_token_ids(B, T)
 
-        ghost = _scores_for_mode(model, token_ids, "ghost", token_reduction)
+        ghost = _scores_for_mode(model, token_ids, "ghost")
         model2 = _NormMLP()
         model2.load_state_dict(model.state_dict())
-        mat = _scores_for_mode(model2, token_ids, "materialized", token_reduction)
+        mat = _scores_for_mode(model2, token_ids, "materialized")
 
         assert torch.allclose(ghost, mat, atol=1e-4, rtol=1e-4), (
-            f"token_reduction={token_reduction!r}, B={B}, T={T}\n"
+            f"B={B}, T={T}\n"
             f"ghost      : {ghost.tolist()}\n"
             f"materialized: {mat.tolist()}\n"
             f"max abs diff: {(ghost - mat).abs().max().item():.2e}"

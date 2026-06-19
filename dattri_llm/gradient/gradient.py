@@ -413,7 +413,6 @@ class Gradient:
         metric: Literal["dot", "cosine"] = "dot",
         reduce: Literal["none", "all"] = "none",
         mode: Literal["factorized", "materialized"] = "factorized",
-        token_reduction: Optional[Literal["sum", "mean"]] = None,
         eps: float = 1e-8,
     ) -> Dict[str, torch.Tensor] | torch.Tensor:
         """Per-sample gradient similarity between this gradient and ``other``.
@@ -441,10 +440,6 @@ class Gradient:
             mode: ``"factorized"`` (ghost, no materialisation, via
                 :func:`ops.cross_dot`) or ``"materialized"`` (materialize each
                 side then matrix-multiply).  Numerically equivalent.
-            token_reduction: When ``"mean"``, divide each layer's matrix by the
-                source token/position count so rows are comparable across
-                sequence lengths.  Applies to ``metric="dot"`` only (cosine is
-                already scale-invariant).  ``"sum"`` / ``None`` apply none.
             eps: Numerical floor added to the cosine denominator.
 
         Returns:
@@ -462,8 +457,6 @@ class Gradient:
             raise ValueError("reduce must be 'none' or 'all'")
         if mode not in {"factorized", "materialized"}:
             raise ValueError("mode must be 'factorized' or 'materialized'")
-        if token_reduction not in (None, "sum", "mean"):
-            raise ValueError("token_reduction must be None, 'sum', or 'mean'")
 
         per_layer: Dict[str, torch.Tensor] = {}
         for name in self.layer_names:
@@ -472,14 +465,13 @@ class Gradient:
             terms = self._layer_cross_matrix(other, name, mode)
             if terms is None:
                 continue
-            matrix, n_pos = terms
+            matrix, _ = terms
             if metric == "cosine" and reduce == "none":
                 # Per-layer cosine: normalise each layer independently.
-                n_s = self._layer_norm_sq(name).clamp_min(0).sqrt()      # (B_self,)
-                n_o = other._layer_norm_sq(name).clamp_min(0).sqrt()     # (B_other,)
+                n_s = self.layer_norm_sq(name).clamp_min(0).sqrt()      # (B_self,)
+                n_o = other.layer_norm_sq(name).clamp_min(0).sqrt()     # (B_other,)
                 matrix = matrix / (n_s[:, None] * n_o[None, :] + eps)
-            elif token_reduction == "mean" and n_pos:
-                matrix = matrix / n_pos
+
             per_layer[name] = matrix
 
         if reduce == "none":
@@ -493,10 +485,10 @@ class Gradient:
             # Full-model cosine: normalise by the concatenated-gradient norms,
             # i.e. sqrt(sum of per-layer squared norms).
             norm_sq_s = torch.stack(
-                [self._layer_norm_sq(n) for n in per_layer]
+                [self.layer_norm_sq(n) for n in per_layer]
             ).sum(0).clamp_min(0)                                         # (B_self,)
             norm_sq_o = torch.stack(
-                [other._layer_norm_sq(n) for n in per_layer]
+                [other.layer_norm_sq(n) for n in per_layer]
             ).sum(0).clamp_min(0)                                         # (B_other,)
             total = total / (norm_sq_s.sqrt()[:, None] * norm_sq_o.sqrt()[None, :] + eps)
         return total
@@ -544,7 +536,7 @@ class Gradient:
         n_pos = sv.shape[1] if sv.ndim >= 3 else None
         return xf @ yf.T, n_pos
 
-    def _layer_norm_sq(self, name: str) -> torch.Tensor:
+    def layer_norm_sq(self, name: str) -> torch.Tensor:
         """Per-sample squared gradient norms ``(B,)`` for one layer.
 
         Used by :meth:`similarity` for the cosine denominator.  Independent of

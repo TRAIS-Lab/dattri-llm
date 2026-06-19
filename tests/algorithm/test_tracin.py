@@ -13,6 +13,7 @@ on-disk layout.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.algorithm.score import AttributionScore
 from dattri_llm.algorithm.tracin import TracInAttributor
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
@@ -206,6 +208,28 @@ class TestTracInOnDisk:
 
         # Columns discovered on-the-fly must match the on-disk step-0 order.
         assert res_false.test_ids == _disk_test_column_order(collected["test_dir"], 0)
+
+    def test_score_metadata_uses_algorithm_meta(self, collected, tmp_path):
+        """Method-specific metadata stays under algorithm_meta only."""
+        out_dir = tmp_path / "o"
+        res = _make_attr(out_dir, normalized=False).attribute(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+        )
+
+        meta = json.loads((out_dir / "metadata.json").read_text())
+        assert meta["algorithm_meta"] == {"steps": [0, 1], "weights": STEP_WEIGHTS}
+        assert "steps" not in meta
+        assert "weights" not in meta
+        assert "token_reduction" not in meta
+
+        loaded = AttributionScore.load(out_dir)
+        assert loaded.algorithm_meta == res.algorithm_meta
+        assert not hasattr(loaded, "token_reduction")
+
+        meta.pop("algorithm_meta")
+        (out_dir / "metadata.json").write_text(json.dumps(meta))
+        assert AttributionScore.load(out_dir).algorithm_meta == {}
 
     def _attr_with_steps(self, out_dir, steps, weight_list):
         args = AttributionArguments(
