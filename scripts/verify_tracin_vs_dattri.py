@@ -392,11 +392,12 @@ def run_per_step_experiment(name: str, *, normalized: bool, tmp: Path) -> bool:
     )
 
     print(f"\n=== {name}: per-step retrieval ===")
+    steps = result.algorithm_meta["steps"]
     print(f"  steps present: {sorted(result.step_matrices())}")
 
     ok = True
     summed = torch.zeros_like(oracle_steps[0])
-    for k in result.steps:
+    for k in steps:
         repo_step = align_step(result, k, train_hashes, test_hashes)
         summed += repo_step
         diff = (repo_step - oracle_steps[k]).abs().max().item()
@@ -406,12 +407,12 @@ def run_per_step_experiment(name: str, *, normalized: bool, tmp: Path) -> bool:
               f"max|repo - oracle| = {diff:.3e}  {'PASS' if step_ok else 'FAIL'}")
 
     # The single-scalar accessor agrees with the per-step matrix.
-    scalar = result.score_at(train_hashes[0], result.steps[0], test_hashes[0])
-    scalar_ok = torch.allclose(scalar, align_step(result, result.steps[0],
+    scalar = result.score_at(train_hashes[0], steps[0], test_hashes[0])
+    scalar_ok = torch.allclose(scalar, align_step(result, steps[0],
                                                   train_hashes, test_hashes)[0, 0],
                                atol=1e-6)
     ok &= scalar_ok
-    print(f"  score_at(train0, step{result.steps[0]}, test0) = {scalar.item():.4f}  "
+    print(f"  score_at(train0, step{steps[0]}, test0) = {scalar.item():.4f}  "
           f"{'PASS' if scalar_ok else 'FAIL'}")
 
     # Per-step matrices must sum to the aggregate (trajectory-agnostic) score.

@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -47,9 +47,10 @@ class AttributionScore:
             row.  ``(row_train_ids[r], row_steps[r])`` is unique across rows.
         test_ids: Length-``num_test`` list giving the test-sample hash for each
             column.
-        steps: The full ordered list of steps included in this run.
-        weights: Per-step weights applied (parallel to ``steps``).
-        algorithm: ``"TracIn"`` or ``"GradCos"``.
+        algorithm: The specific attribution algorithm used.
+        algorithm_meta: Algorithm-specific metadata.  For TracIn/GradCos this
+            includes ``"steps"`` (the ordered steps included in the run) and
+            ``"weights"`` (the per-step weights applied, parallel to steps).
         normalized_grad: Whether per-sample gradients were L2-normalised
             (cosine / GradCos) before the inner product.
         layer_name: Layers the inner product was restricted to, or ``None``.
@@ -61,9 +62,8 @@ class AttributionScore:
     row_steps: List[int]
     test_ids: List[str]
 
-    steps: List[int]
-    weights: List[float]
     algorithm: str
+    algorithm_meta: Dict[str, Any]
     normalized_grad: bool
     layer_name: Optional[List[str]]
     token_reduction: str
@@ -196,8 +196,8 @@ class AttributionScore:
 
         This is the per-step view of the attribution: the ensemble term
         ``weight_step · ⟨g_train^step, g_test^step⟩`` for every train/test pair
-        present at ``step``.  Summing :meth:`step_matrix` over all of
-        :attr:`steps` reproduces :meth:`agnostic_matrix`.
+        present at ``step``.  Summing :meth:`step_matrix` over all recorded
+        steps reproduces :meth:`agnostic_matrix`.
 
         Args:
             step: The step to extract.
@@ -225,7 +225,7 @@ class AttributionScore:
 
         Returns:
             Ordered mapping ``step -> (train_ids, matrix)`` for each step in
-            :attr:`steps` (ascending), where ``matrix`` has shape
+            recorded steps (ascending), where ``matrix`` has shape
             ``(num_train_at_step, num_test)``.
         """
         present = sorted(set(self.row_steps))
@@ -333,9 +333,8 @@ class AttributionScore:
             "row_train_ids": self.row_train_ids,
             "row_steps": self.row_steps,
             "test_ids": self.test_ids,
-            "steps": self.steps,
-            "weights": self.weights,
             "algorithm": self.algorithm,
+            "algorithm_meta": self.algorithm_meta,
             "normalized_grad": self.normalized_grad,
             "layer_name": self.layer_name,
             "token_reduction": self.token_reduction,
@@ -361,14 +360,14 @@ class AttributionScore:
         scores = torch.load(out / cls._SCORES_FILE, weights_only=True)
         with open(out / cls._META_FILE) as f:
             meta = json.load(f)
+        algorithm_meta = meta.get("algorithm_meta")
         return cls(
             scores=scores,
             row_train_ids=meta["row_train_ids"],
             row_steps=meta["row_steps"],
             test_ids=meta["test_ids"],
-            steps=meta["steps"],
-            weights=meta["weights"],
             algorithm=meta["algorithm"],
+            algorithm_meta=algorithm_meta,
             normalized_grad=meta["normalized_grad"],
             layer_name=meta["layer_name"],
             token_reduction=meta["token_reduction"],
