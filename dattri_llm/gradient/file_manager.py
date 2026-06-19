@@ -303,6 +303,39 @@ class GradientFileManager:
                     by_file.setdefault(e["file"], set()).add(e["idx"])
         return [(f, sorted(by_file[f])) for f in sorted(by_file)]
 
+    def iter_steps(self, steps: list[int]) -> list[tuple[str, dict[int, list[int]]]]:
+        """Enumerate record slots for multiple steps, grouped by file.
+
+        This is the multi-step companion to :meth:`iter_step`.  A file that
+        contains records for several requested steps appears once, with its
+        matching record indices grouped by step, so callers can load the file a
+        single time and consume every relevant record from it.
+
+        Args:
+            steps: Step IDs to enumerate.
+
+        Returns:
+            List of ``(file_relpath, {step: sorted_record_idxs})`` tuples,
+            ordered by file name.
+        """
+        wanted = set(steps)
+        by_file: dict[str, dict[int, set[int]]] = {}
+        for entries in self._index.values():
+            for e in entries:
+                step = e["step"]
+                if step in wanted:
+                    by_file.setdefault(e["file"], {}).setdefault(
+                        step, set()
+                    ).add(e["idx"])
+        out: list[tuple[str, dict[int, list[int]]]] = []
+        for file_rel in sorted(by_file):
+            by_step = {
+                step: sorted(idxs)
+                for step, idxs in sorted(by_file[file_rel].items())
+            }
+            out.append((file_rel, by_step))
+        return out
+
     def load_records(self, file_relpath: str) -> list[GradientRecord]:
         """Load every :class:`GradientRecord` stored in one file.
 

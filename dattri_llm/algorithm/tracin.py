@@ -6,9 +6,9 @@ disk via :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  No
 forward/backward pass is performed at attribution time — only inner products
 between pre-stored per-sample gradients.
 
-Per saved step ``k`` (a TracIn ensemble term)::
+Per mapped step pair ``(k_train, k_test)`` (a TracIn ensemble term)::
 
-    score[(train_i, k), test_j] = weight_k * <g_train_i^(k), g_test_j^(k)>
+    score[(train_i, k_train), test_j] = weight_k * <g_train_i^(k_train), g_test_j^(k_test)>
 
 where ``g_*^(k)`` is the per-sample weight gradient across all hooked layers.
 With ``normalized_grad=True`` the inner product becomes a cosine similarity
@@ -26,13 +26,13 @@ is defined entirely by what is on disk.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import Dataset
 
 from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import BaseAttributor, make_gradient_dataloader
+from dattri_llm.algorithm.base import BaseAttributor, make_gradient_multistep_dataloader
 from dattri_llm.algorithm.score import AttributionScore
 from dattri_llm.algorithm.task import AttributionTask
 from dattri_llm.gradient.file_manager import GradientFileManager
@@ -56,9 +56,8 @@ class TracInAttributor(BaseAttributor):
             GradDot).
         layer_name: Restrict the inner product to these layer names.  ``None``
             uses every layer shared between the train and test gradients.
-        steps: Saved step indices to include as ensemble terms.  ``None``
-            auto-discovers the intersection of steps present in both gradient
-            directories.
+        step_map: Optional mapping from train-gradient step to test-gradient
+            step.  ``None`` uses identity mapping over the common on-disk steps.
         task: Accepted for parity with the workflow-1 API but unused here.
     """
 
@@ -69,20 +68,20 @@ class TracInAttributor(BaseAttributor):
         weight_list: Optional[Sequence[float]] = None,
         normalized_grad: bool = False,
         layer_name: Optional[Union[str, List[str]]] = None,
-        steps: Optional[Sequence[int]] = None,
+        step_map: Optional[Mapping[int, int]] = None,
         task: Optional[AttributionTask] = None,
     ) -> None:
         self.args = args
         self.task = task
         self.weight_list = list(weight_list) if weight_list is not None else None
         self.normalized_grad = normalized_grad
+        self.step_map = dict(step_map) if step_map is not None else None
         if isinstance(layer_name, str):
             self.layer_name: Optional[List[str]] = [layer_name]
         elif layer_name is None:
             self.layer_name = None
         else:
             self.layer_name = list(layer_name)
-        self.steps = list(steps) if steps is not None else None
 
     def cache(self, train_dataset: Dataset) -> None:
         """No-op: gradients are already cached on disk in this workflow."""
@@ -126,9 +125,8 @@ class TracInAttributor(BaseAttributor):
 
         Raises:
             ValueError: If either gradients dir is missing, no common steps are
-                found, an explicitly requested step is absent from either
-                directory, or ``weight_list`` length disagrees with the step
-                list.
+                found, or ``weight_list`` length disagrees with the
+                auto-discovered common step list.
             KeyError: If the test set changed across the trajectory — a sample
                 present at a later step that was absent at the first step, or a
                 column defined at the first step that is missing at a later one.
@@ -143,50 +141,88 @@ class TracInAttributor(BaseAttributor):
         train_fm = GradientFileManager(train_gradients_dir)
         test_fm = GradientFileManager(test_gradients_dir)
 
-        steps = self._resolve_steps(train_fm, test_fm)
-        weights = self._resolve_weights(steps)
+        step_pairs = self._resolve_step_pairs(train_fm, test_fm)
+        train_steps = [train_step for train_step, _ in step_pairs]
+        test_steps = [test_step for _, test_step in step_pairs]
+        weights = self._resolve_weights(train_steps)
         device = self.args.device
 
         metric = "cosine" if self.normalized_grad else "dot"
 
-        # Column order (the test-hash order on disk at the first included step)
-        # is discovered lazily while the first train block is scored, so the
-        # test side is never loaded twice — there is no separate pre-pass that
-        # reads every test file just to read its hashes.
+        # Test files are streamed once at file granularity.  If an on-disk file
+        # contains multiple requested steps, all matching records are consumed
+        # from that single load.  Column order is then defined from the first
+        # mapped test step after its complete hash list is known, so validation
+        # does not depend on file ordering.
         test_ids: List[str] = []
         test_index: dict = {}
+        test_hashes_by_step: dict[int, List[str]] = {}
+        test_blocks_by_step: dict[int, List[Tuple[Gradient, List[str]]]] = {}
+        for by_step in self._grad_file_loader(test_fm, sorted(set(test_steps))):
+            for test_step, (test_g, test_hashes) in by_step.items():
+                test_hashes_by_step.setdefault(test_step, []).extend(test_hashes)
+                if not loop_over_test:
+                    test_blocks_by_step.setdefault(test_step, []).append(
+                        (test_g.to(device), test_hashes)
+                    )
+
+        column_step = test_steps[0]
+        for h in test_hashes_by_step[column_step]:
+            if h not in test_index:
+                test_index[h] = len(test_ids)
+                test_ids.append(h)
+
+        for test_step in sorted(set(test_steps)):
+            seen = {
+                self._require_col(test_index, h, test_step)
+                for h in test_hashes_by_step[test_step]
+            }
+            if len(seen) != len(test_ids):
+                missing = [
+                    f"{test_ids[c][:16]}…"
+                    for c in range(len(test_ids))
+                    if c not in seen
+                ]
+                raise KeyError(
+                    f"Test sample(s) {missing} defined the columns at test step "
+                    f"{column_step} but are absent at test step {test_step}; "
+                    "the test set must be consistent across the trajectory."
+                )
 
         # Trajectory-aware rows accumulate (one chunk per train block) on CPU;
         # the user opted into building the full (train_hash, step) matrix.
         row_chunks: List[torch.Tensor] = []
         row_train_ids: List[str] = []
         row_steps: List[int] = []
+        pair_by_train_step = dict(step_pairs)
+        weight_by_train_step = dict(zip(train_steps, weights))
 
-        for si, (step, weight) in enumerate(zip(steps, weights)):
-            test_blocks = (
-                None
-                if loop_over_test
-                else [(g.to(device), h) for g, h in self._grad_loader(test_fm, step)]
-            )
-
-            for bi, (train_g, train_hashes) in enumerate(
-                self._grad_loader(train_fm, step)
-            ):
+        for by_step in self._grad_file_loader(train_fm, train_steps):
+            for train_step, (train_g, train_hashes) in by_step.items():
                 train_g = train_g.to(device)
+                test_step = pair_by_train_step[train_step]
+                weight = weight_by_train_step[train_step]
                 test_iter = (
-                    ((g.to(device), h) for g, h in self._grad_loader(test_fm, step))
+                    (
+                        (test_g.to(device), test_hashes)
+                        for by_test_step in self._grad_file_loader(test_fm, [test_step])
+                        for _, (test_g, test_hashes) in by_test_step.items()
+                    )
                     if loop_over_test
-                    else iter(test_blocks)
+                    else iter(test_blocks_by_step[test_step])
                 )
-                # The first train block of the first step defines the columns;
-                # every later block must match them (_require_col guards this).
                 row_buf = self._row_for_train_block(
-                    train_g, weight, test_iter, step, metric,
-                    test_ids, test_index, discover=(si == 0 and bi == 0),
+                    train_g,
+                    weight,
+                    test_iter,
+                    train_step,
+                    metric,
+                    test_ids,
+                    test_index,
                 )
                 row_chunks.append(row_buf)
                 row_train_ids.extend(train_hashes)
-                row_steps.extend([step] * train_g.batch_size)
+                row_steps.extend([train_step] * train_g.batch_size)
 
         num_test = len(test_ids)
         scores = (
@@ -200,7 +236,13 @@ class TracInAttributor(BaseAttributor):
             row_train_ids=row_train_ids,
             row_steps=row_steps,
             test_ids=test_ids,
-            algorithm_meta={"steps": steps, "weights": weights},
+            algorithm_meta={
+                "steps": train_steps,
+                "train_steps": train_steps,
+                "test_steps": test_steps,
+                "step_map": [[tr, te] for tr, te in step_pairs],
+                "weights": weights,
+            },
             algorithm="GradCos" if self.normalized_grad else "TracIn",
             normalized_grad=self.normalized_grad,
             layer_name=self.layer_name,
@@ -212,29 +254,42 @@ class TracInAttributor(BaseAttributor):
     # Helpers                                                             #
     # ------------------------------------------------------------------ #
 
-    def _resolve_steps(
+    def _resolve_step_pairs(
         self,
         train_fm: GradientFileManager,
         test_fm: GradientFileManager,
-    ) -> List[int]:
-        common = set(train_fm.available_steps()) & set(test_fm.available_steps())
-        if self.steps is not None:
-            # Honour the caller's order (steps[0] defines the column layout) but
-            # reject any step missing from either directory — otherwise a typo'd
-            # step silently contributes nothing (or yields an empty result).
-            missing = [s for s in self.steps if s not in common]
-            if missing:
+    ) -> List[Tuple[int, int]]:
+        train_steps = set(train_fm.available_steps())
+        test_steps = set(test_fm.available_steps())
+
+        if self.step_map is None:
+            common = train_steps & test_steps
+            if not common:
                 raise ValueError(
-                    f"Requested steps {missing} are not present in both the "
-                    f"train and test gradient directories. Available common "
-                    f"steps: {sorted(common)}."
+                    "No common steps between train and test gradient directories. "
+                    "Pass step_map={train_step: test_step} when the recorded "
+                    "train and test step IDs differ."
                 )
-            return list(self.steps)
-        if not common:
-            raise ValueError(
-                "No common steps between train and test gradient directories."
-            )
-        return sorted(common)
+            return [(step, step) for step in sorted(common)]
+
+        missing_train = sorted(s for s in self.step_map if s not in train_steps)
+        missing_test = sorted({s for s in self.step_map.values() if s not in test_steps})
+        if missing_train or missing_test:
+            problems = []
+            if missing_train:
+                problems.append(
+                    f"train step(s) {missing_train} not present; "
+                    f"available train steps: {sorted(train_steps)}"
+                )
+            if missing_test:
+                problems.append(
+                    f"test step(s) {missing_test} not present; "
+                    f"available test steps: {sorted(test_steps)}"
+                )
+            raise ValueError("Invalid step_map: " + "; ".join(problems))
+        if not self.step_map:
+            raise ValueError("step_map must not be empty.")
+        return [(tr, self.step_map[tr]) for tr in sorted(self.step_map)]
 
     def _resolve_weights(self, steps: List[int]) -> List[float]:
         if self.weight_list is None:
@@ -255,20 +310,8 @@ class TracInAttributor(BaseAttributor):
         metric: str,
         test_ids: List[str],
         test_index: dict,
-        *,
-        discover: bool,
     ) -> torch.Tensor:
-        """Compute one train block's CPU score row ``(n_tr, num_test)``.
-
-        When ``discover`` is True (only the first train block of the first
-        step) the column layout is built *as the test stream is consumed* —
-        each unseen test hash becomes the next column — so the test side is
-        scored exactly once and never pre-loaded just to read its hashes.
-        Later blocks pass ``discover=False`` and resolve columns via
-        :meth:`_require_col`, which rejects a test hash absent from the layout;
-        the mirror case — a column present at the first step but *missing* at a
-        later step — is caught here so the gap is never left as silent zeros.
-        """
+        """Compute one train block's CPU score row ``(n_tr, num_test)``."""
         n_tr = train_g.batch_size
 
         def _sim(test_g: Gradient) -> torch.Tensor:
@@ -277,41 +320,23 @@ class TracInAttributor(BaseAttributor):
             )
             return (weight * block).detach().to("cpu", torch.float)
 
-        if not discover:
-            row_buf = torch.zeros(n_tr, len(test_ids), dtype=torch.float)
-            seen_cols: set = set()
-            for test_g, test_hashes in test_iter:
-                cols = [self._require_col(test_index, h, step) for h in test_hashes]
-                row_buf[:, cols] = _sim(test_g)
-                seen_cols.update(cols)
-            if len(seen_cols) != len(test_ids):
-                missing = [
-                    f"{test_ids[c][:16]}…"
-                    for c in range(len(test_ids))
-                    if c not in seen_cols
-                ]
-                raise KeyError(
-                    f"Test sample(s) {missing} defined the columns at the first "
-                    f"step but are absent at step {step}; the test set must be "
-                    "consistent across the trajectory."
-                )
-            return row_buf
-
-        # Discovery: columns are unknown until the whole test stream is seen,
-        # so buffer each block's (cols, values) and assemble once num_test is
-        # fixed.  Peak extra memory is one full row — the same as row_buf.
-        pieces: List[Tuple[List[int], torch.Tensor]] = []
-        for test_g, test_hashes in test_iter:
-            cols = []
-            for h in test_hashes:
-                if h not in test_index:
-                    test_index[h] = len(test_ids)
-                    test_ids.append(h)
-                cols.append(test_index[h])
-            pieces.append((cols, _sim(test_g)))
         row_buf = torch.zeros(n_tr, len(test_ids), dtype=torch.float)
-        for cols, vals in pieces:
-            row_buf[:, cols] = vals
+        seen_cols: set = set()
+        for test_g, test_hashes in test_iter:
+            cols = [self._require_col(test_index, h, step) for h in test_hashes]
+            row_buf[:, cols] = _sim(test_g)
+            seen_cols.update(cols)
+        if len(seen_cols) != len(test_ids):
+            missing = [
+                f"{test_ids[c][:16]}…"
+                for c in range(len(test_ids))
+                if c not in seen_cols
+            ]
+            raise KeyError(
+                f"Test sample(s) {missing} defined the columns at the first "
+                f"mapped test step but are absent for train step {step}; the "
+                "test set must be consistent across the trajectory."
+            )
         return row_buf
 
     @staticmethod
@@ -324,10 +349,6 @@ class TracInAttributor(BaseAttributor):
             )
         return test_index[h]
 
-    def _grad_loader(self, fm: GradientFileManager, step: int):
-        """DataLoader over this attributor's gradient files at *step*.
-
-        Thin wrapper around :func:`~dattri_llm.algorithm.base.make_gradient_dataloader`
-        that binds the attributor's ``args`` and ``layer_name``.
-        """
-        return make_gradient_dataloader(fm, step, self.args, self.layer_name)
+    def _grad_file_loader(self, fm: GradientFileManager, steps: List[int]):
+        """DataLoader over this attributor's gradient files for *steps*."""
+        return make_gradient_multistep_dataloader(fm, steps, self.args, self.layer_name)

@@ -266,7 +266,6 @@ def repo_attribution(model, checkpoints, x_tr, y_tr, x_te, y_te, tmp: Path, *,
         layer_name=["mlp.fc1", "mlp.fc2"],
         normalized_grad=normalized,
         weight_list=None if normalized else STEP_WEIGHTS,
-        steps=steps,
     )
     result = attr.attribute(
         train_gradients_dir=str(train_dir),

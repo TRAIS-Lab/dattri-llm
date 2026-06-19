@@ -49,8 +49,10 @@ class AttributionScore:
             column.
         algorithm: The specific attribution algorithm used.
         algorithm_meta: Algorithm-specific metadata.  For TracIn/GradCos this
-            includes ``"steps"`` (the ordered steps included in the run) and
-            ``"weights"`` (the per-step weights applied, parallel to steps).
+            includes ``"steps"``/``"train_steps"`` (the ordered train steps),
+            ``"test_steps"`` (the mapped test steps), ``"step_map"``
+            (``[train_step, test_step]`` pairs), and ``"weights"`` (parallel
+            to train steps).
         normalized_grad: Whether per-sample gradients were L2-normalised
             (cosine / GradCos) before the inner product.
         layer_name: Layers the inner product was restricted to, or ``None``.

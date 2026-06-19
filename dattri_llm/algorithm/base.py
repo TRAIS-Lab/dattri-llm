@@ -309,29 +309,100 @@ class GradientFileDataset(Dataset):
     def __getitem__(self, i: int) -> Tuple[Gradient, List[str]]:
         file_rel, idxs = self._slots[i]
         records = self._fm.load_records(file_rel)
+        return _records_to_block(
+            records, idxs, self._layer_name, file_rel=file_rel, step=self._step
+        )
 
-        grads: List[Gradient] = []
-        hashes: List[str] = []
-        for idx in idxs:
-            rec = records[idx]
-            g = rec.gradient
-            if self._layer_name is not None:
-                g = g.select_layers(self._layer_name)
-            grads.append(g)
-            h = rec.input_hash
-            hashes.extend(h if isinstance(h, list) else [h])
 
-        block = grads[0]
-        for g in grads[1:]:
-            block = block.concatenate(g, dim="batch")
+def _records_to_block(
+    records: list,
+    idxs: list[int],
+    layer_name: Optional[List[str]],
+    *,
+    file_rel: str,
+    step: int,
+) -> Tuple[Gradient, List[str]]:
+    grads: List[Gradient] = []
+    hashes: List[str] = []
+    for idx in idxs:
+        rec = records[idx]
+        g = rec.gradient
+        if layer_name is not None:
+            g = g.select_layers(layer_name)
+        grads.append(g)
+        h = rec.input_hash
+        hashes.extend(h if isinstance(h, list) else [h])
 
-        if block.batch_size != len(hashes):
-            raise RuntimeError(
-                f"Block batch size ({block.batch_size}) disagrees with hash "
-                f"count ({len(hashes)}) for file {file_rel!r} at step "
-                f"{self._step}."
+    if not grads:
+        raise RuntimeError(f"No records selected for file {file_rel!r} at step {step}.")
+
+    block = grads[0]
+    for g in grads[1:]:
+        block = block.concatenate(g, dim="batch")
+
+    if block.batch_size != len(hashes):
+        raise RuntimeError(
+            f"Block batch size ({block.batch_size}) disagrees with hash "
+            f"count ({len(hashes)}) for file {file_rel!r} at step {step}."
+        )
+    return block, hashes
+
+
+class GradientFileMultiStepDataset(Dataset):
+    """Yields all requested step blocks from each on-disk file.
+
+    Each item performs one :func:`torch.load` and returns
+    ``{step: (Gradient_block, hashes)}`` for every requested step represented in
+    that file.  This preserves file-level pipelining even when a batch file
+    contains multiple collected steps.
+    """
+
+    def __init__(
+        self,
+        file_manager: GradientFileManager,
+        steps: List[int],
+        layer_name: Optional[List[str]] = None,
+    ) -> None:
+        self._fm = file_manager
+        self._steps = list(steps)
+        self._layer_name = list(layer_name) if layer_name is not None else None
+        self._files = file_manager.iter_steps(self._steps)
+
+    def __len__(self) -> int:
+        return len(self._files)
+
+    def __getitem__(self, i: int) -> dict[int, Tuple[Gradient, List[str]]]:
+        file_rel, by_step = self._files[i]
+        records = self._fm.load_records(file_rel)
+        return {
+            step: _records_to_block(
+                records, idxs, self._layer_name, file_rel=file_rel, step=step
             )
-        return block, hashes
+            for step, idxs in by_step.items()
+        }
+
+
+def make_gradient_multistep_dataloader(
+    file_manager: GradientFileManager,
+    steps: List[int],
+    args: AttributionArguments,
+    layer_name: Optional[List[str]] = None,
+) -> DataLoader:
+    """Build a DataLoader yielding per-file blocks for multiple steps."""
+    dataset = GradientFileMultiStepDataset(file_manager, steps, layer_name=layer_name)
+    kwargs: dict = {
+        "dataset": dataset,
+        "batch_size": 1,
+        "shuffle": False,
+        "collate_fn": identity_collate,
+        "num_workers": args.dataloader_num_workers,
+        "pin_memory": args.dataloader_pin_memory,
+    }
+    if args.dataloader_num_workers > 0:
+        kwargs["persistent_workers"] = args.dataloader_persistent_workers
+        if args.dataloader_prefetch_factor is not None:
+            kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
+    return DataLoader(**kwargs)
 
 
 def make_gradient_dataloader(

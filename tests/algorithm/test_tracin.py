@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.algorithm.base import make_gradient_multistep_dataloader
 from dattri_llm.algorithm.score import AttributionScore
 from dattri_llm.algorithm.tracin import TracInAttributor
 from dattri_llm.gradient.callbacks import OffloadCallback
@@ -89,6 +90,17 @@ def _oracle(model, checkpoints, x_tr, y_tr, x_te, y_te, *, normalized):
     return total
 
 
+def _mapped_oracle(model, checkpoints, x_tr, y_tr, x_te, y_te, step_map, weights):
+    total = torch.zeros(N_TRAIN, N_TEST)
+    for train_step, test_step in sorted(step_map.items()):
+        model.load_state_dict(checkpoints[train_step])
+        g_tr = _per_sample_grads(model, x_tr, y_tr)
+        model.load_state_dict(checkpoints[test_step])
+        g_te = _per_sample_grads(model, x_te, y_te)
+        total = total + weights[train_step] * (g_tr @ g_te.T)
+    return total
+
+
 def _collect_to_disk(model, checkpoints, x, y, out_dir: Path):
     fm = GradientFileManager(str(out_dir))
     offload = OffloadCallback(
@@ -149,22 +161,115 @@ def collected(tmp_path):
     )
 
 
-def _make_attr(out_dir: Path, *, normalized):
-    args = AttributionArguments(
+def _args(out_dir: Path) -> AttributionArguments:
+    return AttributionArguments(
         output_dir=str(out_dir),
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
     )
+
+
+def _make_attr(out_dir: Path, *, normalized):
+    args = _args(out_dir)
     return TracInAttributor(
         args,
         layer_name=LAYER_NAMES,
         normalized_grad=normalized,
         weight_list=None if normalized else STEP_WEIGHTS,
-        steps=[0, 1],
     )
 
 
 class TestTracInOnDisk:
+    def test_steps_are_auto_discovered_from_gradient_files(self, collected, tmp_path):
+        """Attribution uses the common on-disk steps, with no constructor steps."""
+        curated = tmp_path / "te_step0_only"
+        fm_out = GradientFileManager(str(curated))
+        fm_out.save_batch(_load_step_records(collected["test_dir"], 0))
+
+        attr = self._make_weighted_attr(tmp_path / "o", weight_list=[1.0])
+        res = attr.attribute(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(curated),
+        )
+
+        assert res.algorithm_meta["steps"] == [0]
+        assert res.algorithm_meta["weights"] == [1.0]
+        assert sorted(set(res.row_steps)) == [0]
+
+    def test_multistep_loader_loads_mixed_step_file_once(
+        self, collected, tmp_path, monkeypatch
+    ):
+        mixed = tmp_path / "mixed"
+        fm_out = GradientFileManager(str(mixed))
+        fm_out.save_batch(
+            _load_step_records(collected["train_dir"], 0)
+            + _load_step_records(collected["train_dir"], 1)
+        )
+        reader = GradientFileManager(str(mixed))
+
+        calls = []
+        original = GradientFileManager.load_records
+
+        def counted(self, file_relpath):
+            calls.append(file_relpath)
+            return original(self, file_relpath)
+
+        monkeypatch.setattr(GradientFileManager, "load_records", counted)
+        blocks = list(
+            make_gradient_multistep_dataloader(reader, [0, 1], _args(tmp_path / "o"))
+        )
+
+        assert len(blocks) == 1
+        assert set(blocks[0]) == {0, 1}
+        assert len(calls) == 1
+
+    def test_explicit_step_map_allows_different_test_steps(self, collected, tmp_path):
+        curated = tmp_path / "te_step0_only"
+        fm_out = GradientFileManager(str(curated))
+        fm_out.save_batch(_load_step_records(collected["test_dir"], 0))
+
+        step_map = {0: 0, 1: 0}
+        attr = self._make_weighted_attr(
+            tmp_path / "o", weight_list=STEP_WEIGHTS, step_map=step_map
+        )
+        res = attr.attribute(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(curated),
+        )
+
+        matrix = res.query(
+            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic"
+        )
+        oracle = _mapped_oracle(
+            collected["model"], collected["checkpoints"],
+            collected["x_tr"], collected["y_tr"],
+            collected["x_te"], collected["y_te"],
+            step_map, STEP_WEIGHTS,
+        )
+        assert torch.allclose(matrix, oracle, atol=1e-5, rtol=1e-4)
+        assert res.algorithm_meta["steps"] == [0, 1]
+        assert res.algorithm_meta["train_steps"] == [0, 1]
+        assert res.algorithm_meta["test_steps"] == [0, 0]
+        assert res.algorithm_meta["step_map"] == [[0, 0], [1, 0]]
+
+    def test_invalid_step_map_raises(self, collected, tmp_path):
+        attr = self._make_weighted_attr(
+            tmp_path / "o", weight_list=[1.0], step_map={99: 0}
+        )
+        with pytest.raises(ValueError, match="Invalid step_map"):
+            attr.attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+            )
+
+    def test_weight_list_matches_auto_discovered_steps(self, collected, tmp_path):
+        attr = self._make_weighted_attr(tmp_path / "o", weight_list=[1.0])
+        with pytest.raises(ValueError, match="weight_list length"):
+            attr.attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+            )
+
     @pytest.mark.parametrize("normalized", [False, True])
     @pytest.mark.parametrize("loop_over_test", [False, True])
     def test_matches_autograd_oracle(self, collected, tmp_path, normalized, loop_over_test):
@@ -218,7 +323,13 @@ class TestTracInOnDisk:
         )
 
         meta = json.loads((out_dir / "metadata.json").read_text())
-        assert meta["algorithm_meta"] == {"steps": [0, 1], "weights": STEP_WEIGHTS}
+        assert meta["algorithm_meta"] == {
+            "steps": [0, 1],
+            "train_steps": [0, 1],
+            "test_steps": [0, 1],
+            "step_map": [[0, 0], [1, 1]],
+            "weights": STEP_WEIGHTS,
+        }
         assert "steps" not in meta
         assert "weights" not in meta
         assert "token_reduction" not in meta
@@ -231,7 +342,7 @@ class TestTracInOnDisk:
         (out_dir / "metadata.json").write_text(json.dumps(meta))
         assert AttributionScore.load(out_dir).algorithm_meta == {}
 
-    def _attr_with_steps(self, out_dir, steps, weight_list):
+    def _make_weighted_attr(self, out_dir, weight_list, step_map=None):
         args = AttributionArguments(
             output_dir=str(out_dir),
             dataloader_num_workers=0,
@@ -239,37 +350,8 @@ class TestTracInOnDisk:
         )
         return TracInAttributor(
             args, layer_name=LAYER_NAMES, normalized_grad=False,
-            weight_list=weight_list, steps=steps,
+            weight_list=weight_list, step_map=step_map,
         )
-
-    def test_requested_step_absent_raises(self, collected, tmp_path):
-        """A requested step missing from disk must error, not silently no-op."""
-        attr = self._attr_with_steps(tmp_path / "o", steps=[0, 1, 99],
-                                     weight_list=[1.0, 0.5, 0.3])
-        with pytest.raises(ValueError, match=r"99"):
-            attr.attribute(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
-            )
-
-    def test_all_requested_steps_absent_raises(self, collected, tmp_path):
-        """A fully bogus step list must error instead of returning an empty score."""
-        attr = self._attr_with_steps(tmp_path / "o", steps=[99], weight_list=[1.0])
-        with pytest.raises(ValueError, match=r"not present in both"):
-            attr.attribute(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
-            )
-
-    def test_valid_explicit_steps_still_work(self, collected, tmp_path):
-        """Sanity: validation does not reject genuinely present steps."""
-        attr = self._attr_with_steps(tmp_path / "o", steps=[1, 0],
-                                     weight_list=[0.5, 1.0])
-        res = attr.attribute(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
-        )
-        assert sorted(set(res.row_steps)) == [0, 1]
 
     @pytest.mark.parametrize("loop_over_test", [False, True])
     def test_vanishing_test_column_raises(self, collected, tmp_path, loop_over_test):
@@ -280,8 +362,7 @@ class TestTracInOnDisk:
         fm_out.save_batch(_load_step_records(collected["test_dir"], 0))
         fm_out.save_batch(_load_step_records(collected["test_dir"], 1)[:-1])
 
-        attr = self._attr_with_steps(tmp_path / "o", steps=[0, 1],
-                                     weight_list=[1.0, 0.5])
+        attr = self._make_weighted_attr(tmp_path / "o", weight_list=[1.0, 0.5])
         with pytest.raises(KeyError, match=r"consistent across the trajectory"):
             attr.attribute(
                 train_gradients_dir=str(collected["train_dir"]),
