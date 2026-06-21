@@ -763,6 +763,75 @@ def fim(
 
 
 # ---------------------------------------------------------------------------
+# K-FAC / EK-FAC attribution kernels
+# ---------------------------------------------------------------------------
+
+def sym_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
+    """Damped symmetric inverse ``(matrix + damping·I)^{-1}``.
+
+    Computed via eigendecomposition so the result stays symmetric and a small
+    *damping* keeps a rank-deficient K-FAC covariance factor invertible.
+    """
+    evals, evecs = torch.linalg.eigh(matrix.float())
+    return (evecs / (evals + damping)) @ evecs.T
+
+
+def kfac_cross(
+    a1: torch.Tensor, g1: torch.Tensor,
+    a2: torch.Tensor, g2: torch.Tensor,
+    layer_type: str,
+    A_inv: torch.Tensor,
+    G_inv: torch.Tensor,
+    module_kwargs1: Optional[dict] = None,
+    module_kwargs2: Optional[dict] = None,
+    include_bias: bool = True,
+) -> torch.Tensor:
+    """K-FAC preconditioned cross-gram between two factorized gradient sets.
+
+    Returns ``K[i, j] = vec(∇W1_i)ᵀ (A⁻¹ ⊗ G⁻¹) vec(∇W2_j)`` — i.e.
+    :func:`cross_dot` with the side-1 factors whitened by the inverse K-FAC
+    covariances (``A_inv`` over the input dim, ``G_inv`` over the output dim).
+    Both inverses are symmetric, so whitening either side gives the same value.
+    Defined for linear and convolution layers.
+    """
+    a1, g1 = preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
+    a2, g2 = preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
+    a1 = a1.float() @ A_inv.float()
+    g1 = g1.float() @ G_inv.float()
+    return _cross_dot(a1, g1, a2, g2, layer_type)
+
+
+def kfac_eigh(
+    A: torch.Tensor, G: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Eigendecompose both K-FAC factors: returns ``(s_A, U_A, s_G, U_G)``."""
+    s_A, U_A = torch.linalg.eigh(A.float())
+    s_G, U_G = torch.linalg.eigh(G.float())
+    return s_A, U_A, s_G, U_G
+
+
+def ekfac_materialize(
+    a: torch.Tensor,
+    g: torch.Tensor,
+    layer_type: str,
+    U_A: torch.Tensor,
+    U_G: torch.Tensor,
+    module_kwargs: Optional[dict] = None,
+    include_bias: bool = True,
+) -> torch.Tensor:
+    """Per-sample weight gradient rotated into the K-FAC eigenbasis.
+
+    Returns ``(B, d_out·d_in)`` flattened ``U_Gᵀ ∇W U_A`` — the eigenbasis
+    coordinates whose empirical second moments are the EK-FAC corrected
+    eigenvalues, and against which test/train gradients are scored.
+    """
+    a, g = preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a = a.float() @ U_A.float()
+    g = g.float() @ U_G.float()
+    return materialize(a, g, layer_type)
+
+
+# ---------------------------------------------------------------------------
 # Streaming accumulators
 # ---------------------------------------------------------------------------
 
