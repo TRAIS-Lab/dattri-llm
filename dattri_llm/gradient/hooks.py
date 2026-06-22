@@ -49,6 +49,7 @@ from typing import Callable, Generator, Optional
 import torch
 import torch.nn as nn
 
+from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.ops import canonical_class_name, extract_module_kwargs
 from dattri_llm.gradient.utils import hash_sample
@@ -568,138 +569,6 @@ class HookManagerConfig:
         Only meaningful when ``"param_grad"`` is in :attr:`hook_types`.
         """
         return self._hook_types.get("param_grad")
-
-
-# --------------------------------------------------------------------------- #
-# Callback base class                                                          #
-# --------------------------------------------------------------------------- #
-
-
-class HookManagerCallback:
-    """Base class for gradient collection event hooks.
-
-    All methods are no-ops by default; subclasses override only what they need.
-    ``on_layer_forward`` and ``on_layer_backward`` are wired into PyTorch's
-    hook system and fire regardless of trainer callback support.
-    """
-
-    def on_layer_forward(self, layer_name: str, activation: torch.Tensor) -> None:
-        """Called after each layer's forward hook captures the activation.
-
-        Fires once per layer per forward pass.  ``activation`` is on CPU.
-
-        Args:
-            layer_name: Fully-qualified name of the hooked layer.
-            activation: Captured input activation, shape ``(B, *, in_features)``.
-        """
-
-    def on_layer_backward(self, layer_name: str, grad_output: torch.Tensor) -> None:
-        """Called after each layer's backward hook captures the gradient.
-
-        ``grad_output`` is on CPU.  Fires once per layer per backward pass
-        (once per replica under DataParallel).
-
-        Args:
-            layer_name: Fully-qualified name of the hooked layer.
-            grad_output: Captured output gradient, shape ``(B, *, out_features)``.
-        """
-
-    def on_step_end(self, record: GradientRecord) -> None:
-        """Called exactly once per batch step after the :class:`GradientRecord` is assembled.
-
-        The record always contains the full-batch gradient (``input_hash`` is a
-        list of B hashes).  Per-sample slicing is the callback's responsibility
-        — see :class:`OffloadCallback` for an example.
-
-        Args:
-            record: The assembled :class:`GradientRecord` for this step.
-        """
-
-    def on_context_end(self) -> None:
-        """Called when the :meth:`~HookManager.collect` context closes.
-
-        Use this to flush any remaining staged records to disk.
-        """
-
-
-# --------------------------------------------------------------------------- #
-# Built-in offload callback                                                    #
-# --------------------------------------------------------------------------- #
-
-
-class OffloadCallback(HookManagerCallback):
-    """Built-in callback that periodically saves :class:`GradientRecord` objects.
-
-    Accumulates records in memory and writes them to a single batch file every
-    ``offload_interval`` *batch steps*.  Any remaining staged records are written
-    when the :meth:`~HookManager.collect` context closes.
-
-    Args:
-        offload_interval: Number of **batch steps** to accumulate before writing
-            a batch file.  Set to ``1`` for one file per step.
-        file_manager: The :class:`GradientFileManager` to delegate saves to.
-        recording_type: ``"per_batch"`` (default) stores one
-            :class:`GradientRecord` per step.  ``"per_sample"`` slices the
-            full-batch record into B individual records (one per sample) before
-            staging — useful when downstream code looks up gradients by a
-            single-sample hash.
-    """
-
-    def __init__(
-        self,
-        offload_interval: int,
-        file_manager: GradientFileManager,
-        recording_type: str = "per_batch",
-    ) -> None:
-        if recording_type not in ("per_sample", "per_batch"):
-            raise ValueError(
-                f"recording_type must be 'per_sample' or 'per_batch', got {recording_type!r}."
-            )
-        self._offload_interval = offload_interval
-        self.file_manager = file_manager
-        self._recording_type = recording_type
-        self._staged: list[GradientRecord] = []
-        self._staged_steps: set[int] = set()
-
-    def on_step_end(self, record: GradientRecord) -> None:
-        records = self._expand(record)
-        # Flush *before* staging when we detect the start of a new step and
-        # have already accumulated enough complete steps.
-        if record.step not in self._staged_steps:
-            if len(self._staged_steps) >= self._offload_interval:
-                self._flush()
-        self._staged.extend(records)
-        self._staged_steps.add(record.step)
-
-    def _expand(self, record: GradientRecord) -> list[GradientRecord]:
-        """Return per-sample slices when recording_type='per_sample', else [record]."""
-        if self._recording_type != "per_sample":
-            return [record]
-        hashes = record.input_hash if isinstance(record.input_hash, list) else [record.input_hash]
-        batch_size = record.gradient.batch_size
-        return [
-            GradientRecord(
-                step=record.step,
-                input_hash=hashes[i],
-                gradient=record.gradient.slice(dim="batch", index=i),
-            )
-            for i in range(batch_size)
-        ]
-
-    def on_context_end(self) -> None:
-        self._flush()
-
-    def _flush(self) -> None:
-        if not self._staged:
-            return
-        self.file_manager.save_batch(self._staged)
-        self._staged.clear()
-        self._staged_steps.clear()
-
-    @property
-    def staged(self) -> list[GradientRecord]:
-        """Records staged but not yet written to disk."""
-        return list(self._staged)
 
 
 # --------------------------------------------------------------------------- #
