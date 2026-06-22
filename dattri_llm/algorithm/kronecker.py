@@ -335,31 +335,28 @@ class EKFACAttributor(_KroneckerBaseAttributor):
     ``Λ`` of the projected gradients (a second pass over the training
     gradients), giving ``F_l⁻¹ ≈ (U_A ⊗ U_G)(Λ + λ)⁻¹(U_A ⊗ U_G)ᵀ``.
 
-    **Two modes** (``mode``) are supported; they differ only in how the
-    per-sample gradient ``∇W`` is projected into the eigenbasis, and they give
-    *different* scores except in the heavy-damping limit:
+    The per-sample gradient is projected as ``M = U_Gᵀ ∇W U_A`` — the faithful
+    expansion of ``(U_A ⊗ U_G)ᵀ vec(∇W)``.  This is the unique projection that
+    **reduces to K-FAC** when ``Λ`` equals the Kronecker eigenvalues, and it is
+    invariant to the (arbitrary) sign of each eigenvector.
 
-    * ``"exact"`` *(default)* — the faithful Kronecker-eigenbasis projection
-      ``M = U_Gᵀ ∇W U_A``.  This is what ``(U_A ⊗ U_G)ᵀ vec(∇W)`` actually
-      expands to, and it is the unique form that **reduces to K-FAC** when
-      ``Λ`` equals the Kronecker eigenvalues.
-    * ``"approx"`` — the transposed form ``M = U_G ∇W U_Aᵀ`` used by the
-      ``dattri`` library (``q_s ∇W q_aᵀ``).  Kept for compatibility with that
-      widely-used implementation.  Caveat: this form does not reduce to K-FAC
-      **and is not invariant to eigenvector sign/orientation** — so with
-      rank-deficient covariances its scores depend on ``eigh``'s arbitrary
-      basis choice (see ``tests/algorithm/test_kronecker.py``).  Prefer the default.
+    ``mode`` selects the implementation and is kept mainly for backward
+    compatibility / cross-checking:
 
-    Both materialise the per-layer rotated gradient identically, so the choice
-    is about which definition you want, not about cost.
+    * ``"exact"`` *(default)* — the faithful projection above.
+    * ``"approx"`` — the code path mirroring the ``dattri`` library.  Its
+      original transposed projection ``U_G ∇W U_Aᵀ`` was wrong (does not reduce
+      to K-FAC and is sign-sensitive; see
+      ``test_transposed_projection_is_sign_sensitive``); fixed, it now uses the
+      same faithful projection, so the two modes produce identical scores.
 
     Args:
         args: :class:`AttributionArguments`.
         damping: Added to the corrected eigenvalues before inversion.
         layer_name: Restrict to these layers; ``None`` uses every eligible layer.
         task: Accepted for API parity; unused.
-        mode: ``"exact"`` (default, faithful / reduces to K-FAC) or ``"approx"``
-            (the dattri library's transposed projection).
+        mode: ``"exact"`` (default) or ``"approx"``; see above.  Currently
+            equivalent.
     """
 
     algorithm = "EKFAC"
@@ -399,15 +396,17 @@ class EKFACAttributor(_KroneckerBaseAttributor):
                 "No K-FAC-eligible (linear/conv) layers found in the training "
                 "gradients; check `layer_name` and the collected layers."
             )
-        # Store the rotation matrices fed to ``ekfac_materialize`` (which does
-        # ``a @ R``).  ``R = U`` gives the faithful (exact) ``M = U_Gᵀ ∇W U_A``;
-        # the transposed ``R = Uᵀ`` gives the dattri (approx) ``M = U_G ∇W U_Aᵀ``.
+        # Eigenvectors are fed to ``ekfac_materialize`` (which does ``a @ U``),
+        # giving the faithful projection ``M = U_Gᵀ ∇W U_A``.
         eig: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         for layer, acc in accums.items():
             A, G = acc.result()
             _, U_A, _, U_G = ops.kfac_eigh(A, G)
             if self.mode == "approx":
-                U_A, U_G = U_A.T.contiguous(), U_G.T.contiguous()
+                # 'approx' mirrors the dattri code path.  Its transpose here
+                # (U_A.T, U_G.T) was the bug; fixed, it uses the faithful
+                # eigenvectors, matching 'exact'.
+                U_A, U_G = U_A, U_G
             eig[layer] = (U_A, U_G)
 
         # Pass 2 — empirical second moments of the projected gradients (Λ).

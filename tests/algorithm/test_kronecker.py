@@ -102,31 +102,6 @@ def _ekfac_oracle(tr_f, te_f, train_hashes, test_hashes, damping):
     return oracle
 
 
-def _ekfac_oracle_dattri(tr_f, te_f, train_hashes, test_hashes, damping):
-    """EK-FAC oracle for the dattri (transposed) projection ``U_G ∇W U_Aᵀ``.
-
-    NOTE: this projection is *not* sign-invariant, so this oracle only matches
-    the implementation when both happen to pick the same eigenvector signs —
-    which is exactly why the dattri convention is unreliable (see the skipped
-    test that uses it).
-    """
-    N = len(train_hashes)
-    oracle = torch.zeros(len(train_hashes), len(test_hashes))
-    for l in LAYERS:
-        a_tr, g_tr = _stack(tr_f, train_hashes, l, 0), _stack(tr_f, train_hashes, l, 1)
-        a_te, g_te = _stack(te_f, test_hashes, l, 0), _stack(te_f, test_hashes, l, 1)
-        A = a_tr.T @ a_tr / N
-        G = g_tr.T @ g_tr / N
-        _, U_A, _, U_G = ops.kfac_eigh(A, G)
-        dW_tr = torch.einsum("no,ni->noi", g_tr, a_tr)
-        dW_te = torch.einsum("mo,mi->moi", g_te, a_te)
-        M_tr = torch.einsum("po,noi,qi->npq", U_G, dW_tr, U_A)  # U_G ∇W U_Aᵀ
-        M_te = torch.einsum("po,moi,qi->mpq", U_G, dW_te, U_A)
-        lam = (M_tr * M_tr).mean(0)
-        oracle += torch.einsum("npq,mpq->nm", M_tr / (lam + damping), M_te)
-    return oracle
-
-
 def _grad_dot_oracle(tr_f, te_f, train_hashes, test_hashes):
     """Plain per-sample gradient dot ``⟨∇W_tr, ∇W_te⟩`` summed over layers.
 
@@ -225,19 +200,15 @@ class TestEKFAC:
         )
         assert res.algorithm == "EKFAC"
 
-    @pytest.mark.parametrize("mode", ["exact", "approx"])
-    def test_heavy_damping_limit_is_gradient_dot(self, collected, tmp_path, mode):
-        """At large damping both modes → (1/λ)·⟨∇W_tr, ∇W_te⟩.
-
-        This validates the scoring machinery (rotate → divide → contract) for
-        each mode without depending on the (ill-defined for 'approx')
-        eigenvector orientation.
-        """
+    def test_heavy_damping_limit_is_gradient_dot(self, collected, tmp_path):
+        """At large damping EK-FAC → (1/λ)·⟨∇W_tr, ∇W_te⟩ (the eigenvalue
+        correction washes out), validating the rotate→divide→contract machinery."""
         damping = 1e6
-        args = AttributionArguments(output_dir=str(tmp_path / "o"),
-                                    dataloader_num_workers=0, dataloader_pin_memory=False)
-        res = EKFACAttributor(args, damping=damping, layer_name=LAYERS,
-                              mode=mode).attribute(
+        res = EKFACAttributor(
+            AttributionArguments(output_dir=str(tmp_path / "o"),
+                                 dataloader_num_workers=0, dataloader_pin_memory=False),
+            damping=damping, layer_name=LAYERS,
+        ).attribute(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -251,44 +222,20 @@ class TestEKFAC:
             f"max diff {(matrix - oracle).abs().max().item():.2e}"
         )
 
-    @pytest.mark.skip(
-        reason="Documents the 'approx' (dattri) mode's unreliability: its "
-        "projection U_G ∇W U_Aᵀ is NOT sign-invariant, and the MLP's "
-        "rank-deficient covariances have arbitrary null-space eigenvectors, so "
-        "its scores depend on eigh's arbitrary basis choice and cannot match an "
-        "independent decomposition. See test_approx_mode_is_sign_sensitive for "
-        "the root cause; the faithful 'exact' mode has no such issue."
-    )
-    def test_approx_mode_matches_its_oracle(self, collected, tmp_path):
-        """The 'approx' mode *should* match its transposed-projection oracle, but
-        does not, because that projection is eigenbasis-orientation-dependent."""
-        args = AttributionArguments(output_dir=str(tmp_path / "o"),
-                                    dataloader_num_workers=0, dataloader_pin_memory=False)
-        res = EKFACAttributor(args, damping=DAMPING, layer_name=LAYERS,
-                              mode="approx").attribute(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
-        )
-        matrix = res.query(collected["train_hashes"], collected["test_hashes"],
-                           trajectory="agnostic")
-        tr_f = _load_factors(collected["train_dir"], 0, LAYERS)
-        te_f = _load_factors(collected["test_dir"], 0, LAYERS)
-        oracle = _ekfac_oracle_dattri(tr_f, te_f, collected["train_hashes"],
-                                      collected["test_hashes"], DAMPING)
-        assert torch.allclose(matrix, oracle, atol=1e-4, rtol=1e-3)
-
-    def test_approx_mode_is_sign_sensitive(self):
-        """Root cause of the 'approx' mode's unreliability: the score changes
-        under a valid eigenvector sign flip, while the 'exact' score does not."""
+    def test_transposed_projection_is_sign_sensitive(self):
+        """Design rationale for the faithful projection ``U_Gᵀ ∇W U_A``: its
+        score is invariant to an (arbitrary) eigenvector sign flip, whereas the
+        transposed ``U_G ∇W U_Aᵀ`` (dattri's original) is not — which is why the
+        'approx' mode was fixed to use the faithful projection too."""
         torch.manual_seed(0)
         B, out, inn = 30, 4, 5
         a, g = torch.randn(B, inn), torch.randn(B, out)
         A, G = a.T @ a / B, g.T @ g / B
         _, U_A, _, U_G = ops.kfac_eigh(A, G)
 
-        def score(U_A, U_G, approx):
+        def score(U_A, U_G, transposed):
             rot_a, rot_g = (
-                (U_A.T.contiguous(), U_G.T.contiguous()) if approx else (U_A, U_G)
+                (U_A.T.contiguous(), U_G.T.contiguous()) if transposed else (U_A, U_G)
             )
             M = ops.ekfac_materialize(a, g, "nn.Linear", rot_a, rot_g, include_bias=False)
             lam = (M * M).mean(0)
@@ -296,20 +243,22 @@ class TestEKFAC:
 
         U_G_flip = U_G.clone()
         U_G_flip[:, 0] *= -1  # a different but equally valid eigenbasis
+        # Faithful projection: invariant.  Transposed (dattri): not.
         assert torch.allclose(score(U_A, U_G, False), score(U_A, U_G_flip, False), atol=1e-4)
         assert not torch.allclose(score(U_A, U_G, True), score(U_A, U_G_flip, True), atol=1e-4)
 
-    def test_modes_differ_at_small_damping(self, collected, tmp_path):
-        """The two modes are genuinely different (not interchangeable)."""
+    def test_modes_agree(self, collected, tmp_path):
+        """The fixed 'approx' mode now produces the same scores as 'exact'."""
         def run(mode):
-            args = AttributionArguments(output_dir=str(tmp_path / mode),
-                                        dataloader_num_workers=0, dataloader_pin_memory=False)
-            return EKFACAttributor(args, damping=1e-2, layer_name=LAYERS,
-                                   mode=mode).attribute(
+            return EKFACAttributor(
+                AttributionArguments(output_dir=str(tmp_path / mode),
+                                     dataloader_num_workers=0, dataloader_pin_memory=False),
+                damping=1e-2, layer_name=LAYERS, mode=mode,
+            ).attribute(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
             ).query(collected["train_hashes"], collected["test_hashes"], trajectory="agnostic")
-        assert not torch.allclose(run("exact"), run("approx"), atol=1e-3)
+        assert torch.allclose(run("exact"), run("approx"), atol=1e-6)
 
     def test_invalid_mode_raises(self, tmp_path):
         args = AttributionArguments(output_dir=str(tmp_path / "o"))
