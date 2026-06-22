@@ -38,9 +38,9 @@ class AttributionScore:
 
     Args:
         scores: Float tensor of shape ``(num_rows, num_test)``.  Row ``r``
-            holds ``weight_{row_steps[r]} · ⟨g_train^step, g_test^step⟩`` for
-            training sample ``row_train_ids[r]`` at step ``row_steps[r]``,
-            against every test sample.
+            holds ``⟨g_train^step, g_test⟩`` for training sample
+            ``row_train_ids[r]`` at step ``row_steps[r]``, against every test
+            sample.
         row_train_ids: Length-``num_rows`` list giving the training-sample
             hash for each row.
         row_steps: Length-``num_rows`` list giving the training step for each
@@ -48,11 +48,8 @@ class AttributionScore:
         test_ids: Length-``num_test`` list giving the test-sample hash for each
             column.
         algorithm: The specific attribution algorithm used.
-        algorithm_meta: Algorithm-specific metadata.  For TracIn/GradCos this
-            includes ``"steps"``/``"train_steps"`` (the ordered train steps),
-            ``"test_steps"`` (the mapped test steps), ``"step_map"``
-            (``[train_step, test_step]`` pairs), and ``"weights"`` (parallel
-            to train steps).
+        algorithm_meta: Algorithm-specific metadata (e.g. ``"damping"`` for the
+            K-FAC family); empty for TracIn/GradCos.
         normalized_grad: Whether per-sample gradients were L2-normalised
             (cosine / GradCos) before the inner product.
         layer_name: Layers the inner product was restricted to, or ``None``.

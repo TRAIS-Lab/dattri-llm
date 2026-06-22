@@ -19,12 +19,12 @@ Equivalence relies on the loss being a **sum over samples** so that each
 sample's captured ``grad_output`` equals its own gradient, making the
 factorised per-sample gradient exactly ``dL_i/dW``.
 
-The ensemble uses **two checkpoints**, so the repo's ``HookManager`` completes
-two collection steps inside a single ``collect()`` context (``step 0`` for
-checkpoint 0, ``step 1`` for checkpoint 1, each holding all samples).  This
-exercises the multi-step path: ``_on_step_complete`` firing twice (buffer
-reset + step-counter increment) and the per-step weighted ensemble sum
-``score = Σ_k w_k · ⟨g_train^(k), g_test^(k)⟩``.
+The ensemble uses **two checkpoints**.  The simplified repo attributor computes
+an unweighted, single-checkpoint gradient cross-gram (no internal step ensemble
+or step alignment), so the two-checkpoint TracIn ensemble
+``score = Σ_k w_k · ⟨g_train^(k), g_test^(k)⟩`` is reconstructed by running
+attribution **once per checkpoint** and combining the per-checkpoint matrices
+with the step weights externally.
 
 Run::
 
@@ -194,11 +194,11 @@ def oracle_scores(model, checkpoints, x_tr, y_tr, x_te, y_te, *, normalized: boo
 
 def collect_to_disk(model: nn.Module, checkpoints, x: torch.Tensor, y: torch.Tensor,
                     out_dir: Path):
-    """Collect the whole dataset once per checkpoint, all inside one context.
+    """Collect the whole dataset for each given checkpoint inside one context.
 
-    Each checkpoint's full-set forward+backward completes one HookManager step,
-    so two checkpoints produce ``step 0`` and ``step 1`` — the HookManager's
-    step-completion logic fires twice within a single ``collect()`` block.
+    Each checkpoint's full-set forward+backward completes one HookManager step.
+    Callers now pass a single checkpoint per dir (one collected step, ``step 0``)
+    so that each attribution run is a single, unweighted cross-gram.
     """
     fm = GradientFileManager(str(out_dir))
     offload = OffloadCallback(
@@ -232,56 +232,60 @@ def sample_hashes(x_tr, y_tr, x_te, y_te):
     return train_hashes, test_hashes
 
 
-def repo_attribution(model, checkpoints, x_tr, y_tr, x_te, y_te, tmp: Path, *,
-                     normalized: bool):
-    """Collect gradients to disk, run TracIn, and return the AttributionScore.
+def repo_step_matrices(model, checkpoints, x_tr, y_tr, x_te, y_te, tmp: Path, *,
+                       normalized: bool):
+    """Run the (single-checkpoint) repo attributor once per checkpoint.
 
-    Returns ``(result, train_hashes, test_hashes)`` so callers can both compare
-    the aggregate matrix and inspect per-step scores via ``result``.
+    The simplified ``TracInAttributor`` no longer ensembles or weights steps
+    internally — it just computes one gradient cross-gram.  The two-checkpoint
+    TracIn ensemble is therefore reconstructed here by attributing each
+    checkpoint independently (its own single-step train/test dirs).  Returns the
+    list of *unweighted* per-checkpoint matrices, each realigned to oracle
+    (sample) order.
     """
-    train_dir, test_dir, out_dir = tmp / "train_g", tmp / "test_g", tmp / "out"
-    collect_to_disk(model, checkpoints, x_tr, y_tr, train_dir)
-    collect_to_disk(model, checkpoints, x_te, y_te, test_dir)
-
-    args = AttributionArguments(
-        output_dir=str(out_dir),
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=3,
-        dataloader_num_workers=0,
-        dataloader_pin_memory=False,
-    )
-    # Sanity-check that the collector really wrote one record per step.
-    train_steps = sorted(
-        {e["step"] for es in GradientFileManager(str(train_dir)).index.values() for e in es}
-    )
-    assert train_steps == list(range(len(checkpoints))), (
-        f"expected steps {list(range(len(checkpoints)))}, collected {train_steps}"
-    )
-
-    steps = list(range(len(checkpoints)))
-    # GradCos == TracIn with normalized_grad=True (the subclass was removed);
-    # uniform weights for the normalized variant, per-step weights otherwise.
-    attr = TracInAttributor(
-        args,
-        layer_name=["mlp.fc1", "mlp.fc2"],
-        normalized_grad=normalized,
-        weight_list=None if normalized else STEP_WEIGHTS,
-    )
-    result = attr.attribute(
-        train_gradients_dir=str(train_dir),
-        test_gradients_dir=str(test_dir),
-    )
     train_hashes, test_hashes = sample_hashes(x_tr, y_tr, x_te, y_te)
-    return result, train_hashes, test_hashes
+    mats = []
+    for k, sd in enumerate(checkpoints):
+        run = tmp / f"ckpt_{k}"
+        train_dir, test_dir, out_dir = run / "train_g", run / "test_g", run / "out"
+        collect_to_disk(model, [sd], x_tr, y_tr, train_dir)
+        collect_to_disk(model, [sd], x_te, y_te, test_dir)
+
+        # Each checkpoint is one collection step → one record per sample.
+        train_steps = sorted(
+            {e["step"] for es in GradientFileManager(str(train_dir)).index.values()
+             for e in es}
+        )
+        assert train_steps == [0], f"expected a single step, collected {train_steps}"
+
+        args = AttributionArguments(
+            output_dir=str(out_dir),
+            per_device_train_batch_size=4,
+            per_device_eval_batch_size=3,
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
+        # GradCos == TracIn with normalized_grad=True (the subclass was removed).
+        attr = TracInAttributor(
+            args, layer_name=["mlp.fc1", "mlp.fc2"], normalized_grad=normalized,
+        )
+        result = attr.attribute(
+            train_gradients_dir=str(train_dir),
+            test_gradients_dir=str(test_dir),
+        )
+        mats.append(result.query(train_hashes, test_hashes, trajectory="agnostic"))
+    return mats
 
 
 def repo_scores(model, checkpoints, x_tr, y_tr, x_te, y_te, tmp: Path, *,
                 normalized: bool):
-    """Aggregate (trajectory-agnostic) repo matrix, realigned to sample order."""
-    result, train_hashes, test_hashes = repo_attribution(
+    """Weighted ensemble of the per-checkpoint repo matrices (weights applied
+    externally now that the attributor itself is unweighted)."""
+    weights = step_weights(normalized=normalized)
+    mats = repo_step_matrices(
         model, checkpoints, x_tr, y_tr, x_te, y_te, tmp, normalized=normalized
     )
-    return result.query(train_hashes, test_hashes, trajectory="agnostic")
+    return sum(w * m for w, m in zip(weights, mats))
 
 
 # --------------------------------------------------------------------------- #
@@ -357,47 +361,35 @@ def run_variant(name: str, *, normalized: bool, tmp: Path) -> bool:
     return ok
 
 
-def align_step(result, step: int, train_hashes, test_hashes):
-    """Reorder one step's hash-keyed matrix to oracle (sample) order."""
-    train_ids_disk, mat = result.step_matrix(step)
-    pos = {h: i for i, h in enumerate(train_ids_disk)}
-    row_perm = [pos[h] for h in train_hashes]
-    cols = [result.test_index[h] for h in test_hashes]
-    return mat[row_perm][:, cols]
-
-
 def run_per_step_experiment(name: str, *, normalized: bool, tmp: Path) -> bool:
-    """Retrieve the attribution score *for each step* and check it per step.
+    """Attribute each checkpoint independently and check it per step.
 
-    Demonstrates the user-facing per-step API on :class:`AttributionScore`:
-
-      * ``result.step_matrices()``  — every step's matrix at once
-      * ``result.step_matrix(k)``   — a single step's matrix
-      * ``result.score_at(tr, k, te)`` — one (train, step, test) scalar
-
-    Each step's matrix is compared against the per-step autograd oracle, and we
-    confirm the per-step matrices sum back to the aggregate score.
+    The simplified attributor has no internal step ensemble, so the per-step
+    terms come from independent single-checkpoint runs (see
+    :func:`repo_step_matrices`).  Each weighted per-checkpoint matrix is compared
+    against the per-step autograd oracle, and we confirm they sum back to the
+    aggregate (full-ensemble) score.
     """
     torch.manual_seed(SEED)
     model = MLP().eval()
     checkpoints = make_checkpoints(model)
     x_tr, y_tr, x_te, y_te = make_data()
 
+    weights = step_weights(normalized=normalized)
     oracle_steps = oracle_step_scores(
         model, checkpoints, x_tr, y_tr, x_te, y_te, normalized=normalized
     )
-    result, train_hashes, test_hashes = repo_attribution(
+    repo_mats = repo_step_matrices(
         model, checkpoints, x_tr, y_tr, x_te, y_te, tmp, normalized=normalized
     )
 
     print(f"\n=== {name}: per-step retrieval ===")
-    steps = result.algorithm_meta["steps"]
-    print(f"  steps present: {sorted(result.step_matrices())}")
+    print(f"  checkpoints attributed: {len(repo_mats)}")
 
     ok = True
     summed = torch.zeros_like(oracle_steps[0])
-    for k in steps:
-        repo_step = align_step(result, k, train_hashes, test_hashes)
+    for k, (w, mat) in enumerate(zip(weights, repo_mats)):
+        repo_step = w * mat
         summed += repo_step
         diff = (repo_step - oracle_steps[k]).abs().max().item()
         step_ok = torch.allclose(repo_step, oracle_steps[k], atol=1e-4)
@@ -405,17 +397,10 @@ def run_per_step_experiment(name: str, *, normalized: bool, tmp: Path) -> bool:
         print(f"  step {k}: shape {tuple(repo_step.shape)}  "
               f"max|repo - oracle| = {diff:.3e}  {'PASS' if step_ok else 'FAIL'}")
 
-    # The single-scalar accessor agrees with the per-step matrix.
-    scalar = result.score_at(train_hashes[0], steps[0], test_hashes[0])
-    scalar_ok = torch.allclose(scalar, align_step(result, steps[0],
-                                                  train_hashes, test_hashes)[0, 0],
-                               atol=1e-6)
-    ok &= scalar_ok
-    print(f"  score_at(train0, step{steps[0]}, test0) = {scalar.item():.4f}  "
-          f"{'PASS' if scalar_ok else 'FAIL'}")
-
-    # Per-step matrices must sum to the aggregate (trajectory-agnostic) score.
-    aggregate = result.query(train_hashes, test_hashes, trajectory="agnostic")
+    # The weighted per-checkpoint matrices must sum to the full oracle ensemble.
+    aggregate = oracle_scores(
+        model, checkpoints, x_tr, y_tr, x_te, y_te, normalized=normalized
+    )
     sum_ok = torch.allclose(summed, aggregate, atol=1e-5)
     ok &= sum_ok
     print(f"  Σ step matrices == aggregate score: {'PASS' if sum_ok else 'FAIL'}")
