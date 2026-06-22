@@ -190,7 +190,7 @@ class TestTracInOnDisk:
         )
         assert res.algorithm == "TracIn"
         assert res.scores.shape == (N_TRAIN, N_TEST)
-        assert res.algorithm_meta == {}
+        assert res.algorithm_meta == {"selected_training_steps": [0]}
 
         gradcos = _make_attr(tmp_path / "b", normalized=True).attribute(
             train_gradients_dir=str(collected["train_dir"]),
@@ -287,6 +287,47 @@ class TestTracInOnDisk:
         assert torch.allclose(matrix, oracle, atol=1e-5, rtol=1e-4), (
             f"max diff {(matrix - oracle).abs().max().item():.2e}"
         )
+
+    def test_selected_training_steps_selects_checkpoints(self, tmp_path):
+        """``selected_training_steps=[1]`` attributes only from checkpoint 1:
+        rows are all stamped step 1 and the score equals that single
+        checkpoint's cross-gram (no ensemble over the dropped step 0)."""
+        torch.manual_seed(SEED)
+        model = MLP().eval()
+        sd0, sd1 = _make_checkpoints(model)
+        x_tr, y_tr, x_te, y_te = _make_data()
+
+        train_dir, test_dir = tmp_path / "tr", tmp_path / "te"
+        _collect_to_disk(model, [sd0, sd1], x_tr, y_tr, train_dir)
+        _collect_to_disk(model, [sd0], x_te, y_te, test_dir)
+
+        train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
+        test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
+
+        res = _make_attr(tmp_path / "o", normalized=False).attribute(
+            train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+            selected_training_steps=[1],
+        )
+
+        assert res.scores.shape[0] == N_TRAIN            # only one step's rows
+        assert sorted(set(res.row_steps)) == [1]
+        assert res.algorithm_meta["selected_training_steps"] == [1]
+
+        oracle = (
+            _grads_at(model, sd1, x_tr, y_tr, normalized=False)
+            @ _grads_at(model, sd0, x_te, y_te, normalized=False).T
+        )
+        matrix = res.query(train_hashes, test_hashes, trajectory="agnostic")
+        assert torch.allclose(matrix, oracle, atol=1e-5, rtol=1e-4)
+
+    def test_unknown_steps_raise(self, collected, tmp_path):
+        attr = _make_attr(tmp_path / "o", normalized=False)
+        with pytest.raises(ValueError, match=r"requested steps"):
+            attr.attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                selected_training_steps=[99],
+            )
 
     def test_duplicate_content_test_samples_share_a_column(self, tmp_path):
         """Identical-content test samples collapse to one column (no zero column)."""

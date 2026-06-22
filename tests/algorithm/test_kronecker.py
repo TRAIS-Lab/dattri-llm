@@ -378,6 +378,59 @@ class TestRowStepsTracked:
         }
 
 
+class TestStepSelection:
+    """`steps=` restricts which training checkpoints the Fisher + rows use."""
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_selected_steps_equal_curated_single_step_dir(self, tmp_path, cls):
+        """Attributing a two-step train dir with ``selected_training_steps=[1]``
+        is identical to attributing a dir curated to hold only the step-1
+        records."""
+        torch.manual_seed(TT.SEED)
+        model = TT.MLP().eval()
+        checkpoints = TT._make_checkpoints(model)  # steps 0 and 1
+        x_tr, y_tr, x_te, y_te = TT._make_data()
+
+        raw_train, test_dir = tmp_path / "raw_tr", tmp_path / "te"
+        TT._collect_to_disk(model, checkpoints, x_tr, y_tr, raw_train)
+        TT._collect_to_disk(model, checkpoints[:1], x_te, y_te, test_dir)
+
+        curated = tmp_path / "tr_s1"
+        GradientFileManager(str(curated)).save_batch(TT._load_step_records(raw_train, 1))
+
+        train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(TT.N_TRAIN)]
+        test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(TT.N_TEST)]
+
+        def run(train_dir, steps):
+            attr = cls(
+                AttributionArguments(output_dir=str(tmp_path / f"o_{steps}"),
+                                     dataloader_num_workers=0, dataloader_pin_memory=False),
+                damping=DAMPING, layer_name=LAYERS,
+            )
+            return attr.attribute(
+                train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+                selected_training_steps=steps,
+            )
+
+        selected = run(raw_train, [1])
+        curated_res = run(curated, None)
+
+        assert sorted(set(selected.row_steps)) == [1]
+        assert selected.algorithm_meta["selected_training_steps"] == [1]
+        a = selected.query(train_hashes, test_hashes, trajectory="agnostic")
+        b = curated_res.query(train_hashes, test_hashes, trajectory="agnostic")
+        assert torch.allclose(a, b, atol=1e-5), f"max diff {(a - b).abs().max():.2e}"
+
+    def test_unknown_steps_raise(self, collected, tmp_path):
+        attr = _make(KFACAttributor, tmp_path / "o")
+        with pytest.raises(ValueError, match=r"requested steps"):
+            attr.attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                selected_training_steps=[99],
+            )
+
+
 class TestKroneckerShared:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")

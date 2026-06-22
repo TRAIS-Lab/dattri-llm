@@ -36,14 +36,15 @@ the on-disk content hash, in disk order.
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import (
     BaseAttributor,
-    make_gradient_multistep_dataloader,
+    iter_gradient_blocks,
+    resolve_steps,
 )
 from dattri_llm.algorithm.score import AttributionScore
 from dattri_llm.algorithm.task import AttributionTask
@@ -95,9 +96,13 @@ class _KroneckerBaseAttributor(BaseAttributor):
 
     @abstractmethod
     def _fit(
-        self, train_fm: GradientFileManager, device: torch.device
+        self,
+        train_fm: GradientFileManager,
+        train_steps: List[int],
+        device: torch.device,
     ) -> object:
-        """Estimate the per-layer preconditioner from *all* training gradients.
+        """Estimate the per-layer preconditioner from the selected training
+        gradients (the records at *train_steps*).
 
         Returns an opaque context object passed back to :meth:`_prepare_test`
         and :meth:`_score`.
@@ -130,6 +135,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_gradients_dir: Optional[str] = None,
         test_gradients_dir: Optional[str] = None,
         loop_over_test: bool = False,
+        selected_training_steps: Optional[Iterable[int]] = None,
     ) -> AttributionScore:
         """Compute the ``(num_train, num_test)`` attribution score from on-disk
         gradients — every train record against every test record.
@@ -147,14 +153,20 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 re-streamed and rebuilt for every train block (peak memory: one
                 train + one test block) at the cost of more disk reads — use this
                 when the test set does not fit in memory.
+            selected_training_steps: Restrict the training checkpoints used (the
+                Fisher fit and the output rows) to these steps; ``None`` (default)
+                uses every step on disk.  Over-specified ranges are intersected
+                with what is available.  The test set always supplies every
+                column.
 
         Returns:
             An :class:`AttributionScore` whose rows/columns are the train/test
             content hashes (disk order); also persisted to ``args.output_dir``.
 
         Raises:
-            ValueError: If a gradients dir is missing or no K-FAC-eligible layers
-                are present in the training gradients.
+            ValueError: If a gradients dir is missing, ``selected_training_steps``
+                matches no step in the training gradients, or no K-FAC-eligible
+                layers are present in the training gradients.
         """
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
@@ -166,15 +178,23 @@ class _KroneckerBaseAttributor(BaseAttributor):
         test_fm = GradientFileManager(test_gradients_dir)
         device = self.args.device
 
-        # Fit the preconditioner once over the whole training set.
-        ctx = self._fit(train_fm, device)
+        # ``selected_training_steps`` picks which training checkpoints to
+        # attribute from (the Fisher fit and the output rows).  The test set
+        # defines the query columns and is always used in full.
+        train_steps = resolve_steps(train_fm, selected_training_steps)
+        test_steps = test_fm.available_steps()
+
+        # Fit the preconditioner once over the selected training gradients.
+        ctx = self._fit(train_fm, train_steps, device)
 
         # One pass over the test files: fix the column order (disk order) and,
         # unless looping, build + cache each block's test representation.
         test_ids: List[str] = []
         test_index: dict = {}
         cached_test: List[Tuple[object, List[str]]] = []
-        for _step, test_g, test_hashes in self._iter_all_blocks(test_fm):
+        for _step, test_g, test_hashes in iter_gradient_blocks(
+            test_fm, test_steps, self.args, self.layer_name
+        ):
             for h in test_hashes:
                 if h not in test_index:
                     test_index[h] = len(test_ids)
@@ -183,17 +203,21 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 cached_test.append((self._prepare_test(test_g.to(device), ctx), test_hashes))
         num_test = len(test_ids)
 
-        # Score every train block against every test representation.
+        # Score every selected train block against every test representation.
         row_chunks: List[torch.Tensor] = []
         row_train_ids: List[str] = []
         row_steps: List[int] = []
-        for train_step, train_g, train_hashes in self._iter_all_blocks(train_fm):
+        for train_step, train_g, train_hashes in iter_gradient_blocks(
+            train_fm, train_steps, self.args, self.layer_name
+        ):
             train_g = train_g.to(device)
             row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
             test_reps = (
                 (
                     (self._prepare_test(g.to(device), ctx), h)
-                    for _s, g, h in self._iter_all_blocks(test_fm)
+                    for _s, g, h in iter_gradient_blocks(
+                        test_fm, test_steps, self.args, self.layer_name
+                    )
                 )
                 if loop_over_test
                 else cached_test
@@ -220,7 +244,10 @@ class _KroneckerBaseAttributor(BaseAttributor):
             # one step; the real step is preserved rather than forced to 0.
             row_steps=row_steps,
             test_ids=test_ids,
-            algorithm_meta={"damping": self.damping},
+            algorithm_meta={
+                "damping": self.damping,
+                "selected_training_steps": train_steps,
+            },
             algorithm=self.algorithm,
             normalized_grad=False,
             layer_name=self.layer_name,
@@ -244,25 +271,6 @@ class _KroneckerBaseAttributor(BaseAttributor):
             out.append(name)
         return out
 
-    def _iter_all_blocks(self, fm: GradientFileManager):
-        """Yield ``(step, Gradient_block, hashes)`` for every record on disk.
-
-        Uses the multi-step file loader so each file is ``torch.load``-ed exactly
-        once even if it holds records from several steps.  The records are pooled
-        across whatever steps exist in *fm* — the Fisher fit treats every record
-        as one sample regardless of step — but the recorded step is yielded so
-        the train side can stamp each output row with the checkpoint it came
-        from rather than a placeholder.
-        """
-        steps = fm.available_steps()
-        if not steps:
-            return
-        for by_step in make_gradient_multistep_dataloader(
-            fm, steps, self.args, self.layer_name
-        ):
-            for step, (block, hashes) in by_step.items():
-                yield step, block, hashes
-
 
 class KFACAttributor(_KroneckerBaseAttributor):
     """K-FAC influence attributor.
@@ -276,15 +284,23 @@ class KFACAttributor(_KroneckerBaseAttributor):
         damping: Tikhonov term added to each covariance factor before inversion.
         layer_name: Restrict to these layers; ``None`` uses every eligible layer.
         task: Accepted for API parity; unused.
+
+    The training checkpoints used are chosen per call via
+    :meth:`attribute`'s ``selected_training_steps`` argument.
     """
 
     algorithm = "KFAC"
 
     def _fit(
-        self, train_fm: GradientFileManager, device: torch.device
+        self,
+        train_fm: GradientFileManager,
+        train_steps: List[int],
+        device: torch.device,
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         accums: Dict[str, ops.KFACAccumulator] = {}
-        for _step, train_g, _ in self._iter_all_blocks(train_fm):
+        for _step, train_g, _ in iter_gradient_blocks(
+            train_fm, train_steps, self.args, self.layer_name
+        ):
             train_g = train_g.to(device)
             for layer in self._kfac_layers(train_g):
                 f = train_g.data[layer]
@@ -363,6 +379,9 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         task: Accepted for API parity; unused.
         mode: ``"exact"`` (default) or ``"approx"``; see above.  Currently
             equivalent.
+
+    The training checkpoints used are chosen per call via
+    :meth:`attribute`'s ``selected_training_steps`` argument.
     """
 
     algorithm = "EKFAC"
@@ -381,15 +400,22 @@ class EKFACAttributor(_KroneckerBaseAttributor):
             raise ValueError(
                 f"mode must be one of {self.EKFAC_MODES}, got {mode!r}."
             )
-        super().__init__(args, damping=damping, layer_name=layer_name, task=task)
+        super().__init__(
+            args, damping=damping, layer_name=layer_name, task=task
+        )
         self.mode = mode
 
     def _fit(
-        self, train_fm: GradientFileManager, device: torch.device
+        self,
+        train_fm: GradientFileManager,
+        train_steps: List[int],
+        device: torch.device,
     ) -> dict:
         # Pass 1 — Kronecker covariance factors and their eigenbases.
         accums: Dict[str, ops.KFACAccumulator] = {}
-        for _step, train_g, _ in self._iter_all_blocks(train_fm):
+        for _step, train_g, _ in iter_gradient_blocks(
+            train_fm, train_steps, self.args, self.layer_name
+        ):
             train_g = train_g.to(device)
             for layer in self._kfac_layers(train_g):
                 f = train_g.data[layer]
@@ -418,7 +444,9 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         # Pass 2 — empirical second moments of the projected gradients (Λ).
         lam_sum: Dict[str, torch.Tensor] = {}
         counts: Dict[str, int] = {}
-        for _step, train_g, _ in self._iter_all_blocks(train_fm):
+        for _step, train_g, _ in iter_gradient_blocks(
+            train_fm, train_steps, self.args, self.layer_name
+        ):
             train_g = train_g.to(device)
             for layer, (U_A, U_G) in eig.items():
                 if layer not in train_g.data:

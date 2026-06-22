@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -403,6 +403,63 @@ def make_gradient_multistep_dataloader(
         if args.dataloader_prefetch_factor is not None:
             kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
     return DataLoader(**kwargs)
+
+
+def resolve_steps(
+    file_manager: GradientFileManager,
+    requested: Optional[Iterable[int]],
+) -> List[int]:
+    """Resolve which on-disk steps an attributor should consume.
+
+    ``requested=None`` selects every step present on disk.  Otherwise the
+    requested steps are intersected with what is available, so an over-specified
+    range (e.g. ``range(0, 1000)`` against checkpoints saved every 50 steps) is
+    accepted and simply keeps the steps that exist.  An empty intersection is an
+    error — it almost always means a typo'd or wrong step set.
+
+    Args:
+        file_manager: Manager opened on the gradient directory.
+        requested: Steps to keep, any iterable of ints, or ``None`` for all.
+
+    Returns:
+        The ascending list of steps to use.
+
+    Raises:
+        ValueError: If ``requested`` is given but matches no available step.
+    """
+    available = file_manager.available_steps()
+    if requested is None:
+        return available
+    wanted = set(requested)
+    selected = [s for s in available if s in wanted]
+    if not selected:
+        raise ValueError(
+            f"None of the requested steps {sorted(wanted)} are present in the "
+            f"gradients; available steps: {available}."
+        )
+    return selected
+
+
+def iter_gradient_blocks(
+    file_manager: GradientFileManager,
+    steps: List[int],
+    args: AttributionArguments,
+    layer_name: Optional[List[str]] = None,
+):
+    """Yield ``(step, Gradient_block, hashes)`` for *steps*, one load per file.
+
+    Uses the multi-step file loader so each file is ``torch.load``-ed exactly
+    once even if it holds records from several requested steps; the recorded
+    step is yielded alongside each block so callers can stamp output rows with
+    the checkpoint they came from.
+    """
+    if not steps:
+        return
+    for by_step in make_gradient_multistep_dataloader(
+        file_manager, list(steps), args, layer_name
+    ):
+        for step, (block, hashes) in by_step.items():
+            yield step, block, hashes
 
 
 def make_gradient_dataloader(

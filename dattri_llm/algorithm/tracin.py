@@ -28,13 +28,17 @@ required.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import Dataset
 
 from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import BaseAttributor, make_gradient_multistep_dataloader
+from dattri_llm.algorithm.base import (
+    BaseAttributor,
+    iter_gradient_blocks,
+    resolve_steps,
+)
 from dattri_llm.algorithm.score import AttributionScore
 from dattri_llm.algorithm.task import AttributionTask
 from dattri_llm.gradient.file_manager import GradientFileManager
@@ -60,6 +64,8 @@ class TracInAttributor(BaseAttributor):
         layer_name: Restrict the inner product to these layer names.  ``None``
             uses every layer shared between the train and test gradients.
         task: Accepted for parity with the workflow-1 API but unused here.
+
+
     """
 
     def __init__(
@@ -90,6 +96,7 @@ class TracInAttributor(BaseAttributor):
         train_gradients_dir: Optional[str] = None,
         test_gradients_dir: Optional[str] = None,
         loop_over_test: bool = False,
+        selected_training_steps: Optional[Iterable[int]] = None,
     ) -> AttributionScore:
         """Compute the ``(num_train, num_test)`` attribution score from on-disk
         gradients — every train record against every test record.
@@ -112,13 +119,19 @@ class TracInAttributor(BaseAttributor):
                 blocks + one train block).  If ``True``, they are re-streamed for
                 every train block (peak memory: one train + one test block) at
                 the cost of more disk reads.
+            selected_training_steps: Restrict the training checkpoints used (the
+                output rows) to these steps; ``None`` (default) uses every step
+                on disk.  Over-specified ranges are intersected with what is
+                available.  The test set always supplies every column.
 
         Returns:
             An :class:`AttributionScore`.  Also persisted to
             ``args.output_dir`` as ``scores.pt`` + ``metadata.json``.
 
         Raises:
-            ValueError: If either gradients dir is missing.
+            ValueError: If either gradients dir is missing, or
+                ``selected_training_steps`` matches no step in the training
+                gradients.
         """
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
@@ -132,12 +145,19 @@ class TracInAttributor(BaseAttributor):
         device = self.args.device
         metric = "cosine" if self.normalized_grad else "dot"
 
+        # ``selected_training_steps`` picks which training checkpoints become
+        # output rows; the test set always contributes every column.
+        train_steps = resolve_steps(train_fm, selected_training_steps)
+        test_steps = test_fm.available_steps()
+
         # One pass over the test files: fix the column order (disk order) and,
         # unless looping, cache each (device-resident) block for reuse.
         test_ids: List[str] = []
         test_index: dict = {}
         cached_test: List[Tuple[Gradient, List[str]]] = []
-        for _step, test_g, test_hashes in self._iter_all_blocks(test_fm):
+        for _step, test_g, test_hashes in iter_gradient_blocks(
+            test_fm, test_steps, self.args, self.layer_name
+        ):
             for h in test_hashes:
                 if h not in test_index:
                     test_index[h] = len(test_ids)
@@ -146,17 +166,21 @@ class TracInAttributor(BaseAttributor):
                 cached_test.append((test_g.to(device), test_hashes))
         num_test = len(test_ids)
 
-        # Score every train block against every test block.
+        # Score every selected train block against every test block.
         row_chunks: List[torch.Tensor] = []
         row_train_ids: List[str] = []
         row_steps: List[int] = []
-        for train_step, train_g, train_hashes in self._iter_all_blocks(train_fm):
+        for train_step, train_g, train_hashes in iter_gradient_blocks(
+            train_fm, train_steps, self.args, self.layer_name
+        ):
             train_g = train_g.to(device)
             row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
             test_blocks = (
                 (
                     (g.to(device), h)
-                    for _s, g, h in self._iter_all_blocks(test_fm)
+                    for _s, g, h in iter_gradient_blocks(
+                        test_fm, test_steps, self.args, self.layer_name
+                    )
                 )
                 if loop_over_test
                 else cached_test
@@ -180,30 +204,10 @@ class TracInAttributor(BaseAttributor):
             row_train_ids=row_train_ids,
             row_steps=row_steps,
             test_ids=test_ids,
-            algorithm_meta={},
+            algorithm_meta={"selected_training_steps": train_steps},
             algorithm="GradCos" if self.normalized_grad else "TracIn",
             normalized_grad=self.normalized_grad,
             layer_name=self.layer_name,
         )
         result.save(self.args.output_path)
         return result
-
-    # ------------------------------------------------------------------ #
-    # Helpers                                                             #
-    # ------------------------------------------------------------------ #
-
-    def _iter_all_blocks(self, fm: GradientFileManager):
-        """Yield ``(step, Gradient_block, hashes)`` for every record on disk.
-
-        Uses the multi-step file loader so each file is ``torch.load``-ed exactly
-        once even if it holds records from several steps; the recorded step is
-        yielded so train rows can be stamped with the checkpoint they came from.
-        """
-        steps = fm.available_steps()
-        if not steps:
-            return
-        for by_step in make_gradient_multistep_dataloader(
-            fm, steps, self.args, self.layer_name
-        ):
-            for step, (block, hashes) in by_step.items():
-                yield step, block, hashes
