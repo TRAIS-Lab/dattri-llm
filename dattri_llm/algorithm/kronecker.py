@@ -174,7 +174,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         test_ids: List[str] = []
         test_index: dict = {}
         cached_test: List[Tuple[object, List[str]]] = []
-        for test_g, test_hashes in self._iter_all_blocks(test_fm):
+        for _step, test_g, test_hashes in self._iter_all_blocks(test_fm):
             for h in test_hashes:
                 if h not in test_index:
                     test_index[h] = len(test_ids)
@@ -186,13 +186,14 @@ class _KroneckerBaseAttributor(BaseAttributor):
         # Score every train block against every test representation.
         row_chunks: List[torch.Tensor] = []
         row_train_ids: List[str] = []
-        for train_g, train_hashes in self._iter_all_blocks(train_fm):
+        row_steps: List[int] = []
+        for train_step, train_g, train_hashes in self._iter_all_blocks(train_fm):
             train_g = train_g.to(device)
             row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
             test_reps = (
                 (
                     (self._prepare_test(g.to(device), ctx), h)
-                    for g, h in self._iter_all_blocks(test_fm)
+                    for _s, g, h in self._iter_all_blocks(test_fm)
                 )
                 if loop_over_test
                 else cached_test
@@ -203,6 +204,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 row[:, cols] = block.detach().to("cpu", torch.float)
             row_chunks.append(row)
             row_train_ids.extend(train_hashes)
+            row_steps.extend([train_step] * train_g.batch_size)
 
         scores = (
             torch.cat(row_chunks, dim=0)
@@ -213,8 +215,10 @@ class _KroneckerBaseAttributor(BaseAttributor):
         result = AttributionScore(
             scores=scores,
             row_train_ids=row_train_ids,
-            # Single checkpoint: one row per train sample, no step dimension.
-            row_steps=[0] * len(row_train_ids),
+            # One row per train sample, stamped with the step it was recorded at.
+            # These are single-checkpoint methods, so a given dir typically holds
+            # one step; the real step is preserved rather than forced to 0.
+            row_steps=row_steps,
             test_ids=test_ids,
             algorithm_meta={"damping": self.damping},
             algorithm=self.algorithm,
@@ -241,12 +245,14 @@ class _KroneckerBaseAttributor(BaseAttributor):
         return out
 
     def _iter_all_blocks(self, fm: GradientFileManager):
-        """Yield ``(Gradient_block, hashes)`` for every record on disk.
+        """Yield ``(step, Gradient_block, hashes)`` for every record on disk.
 
         Uses the multi-step file loader so each file is ``torch.load``-ed exactly
-        once even if it holds records from several steps; the records are pooled
-        across whatever steps exist in *fm* (these are single-checkpoint
-        attributors, so step is not a meaningful axis).
+        once even if it holds records from several steps.  The records are pooled
+        across whatever steps exist in *fm* — the Fisher fit treats every record
+        as one sample regardless of step — but the recorded step is yielded so
+        the train side can stamp each output row with the checkpoint it came
+        from rather than a placeholder.
         """
         steps = fm.available_steps()
         if not steps:
@@ -254,8 +260,8 @@ class _KroneckerBaseAttributor(BaseAttributor):
         for by_step in make_gradient_multistep_dataloader(
             fm, steps, self.args, self.layer_name
         ):
-            for _, block_and_hashes in by_step.items():
-                yield block_and_hashes
+            for step, (block, hashes) in by_step.items():
+                yield step, block, hashes
 
 
 class KFACAttributor(_KroneckerBaseAttributor):
@@ -278,7 +284,7 @@ class KFACAttributor(_KroneckerBaseAttributor):
         self, train_fm: GradientFileManager, device: torch.device
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         accums: Dict[str, ops.KFACAccumulator] = {}
-        for train_g, _ in self._iter_all_blocks(train_fm):
+        for _step, train_g, _ in self._iter_all_blocks(train_fm):
             train_g = train_g.to(device)
             for layer in self._kfac_layers(train_g):
                 f = train_g.data[layer]
@@ -383,7 +389,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
     ) -> dict:
         # Pass 1 — Kronecker covariance factors and their eigenbases.
         accums: Dict[str, ops.KFACAccumulator] = {}
-        for train_g, _ in self._iter_all_blocks(train_fm):
+        for _step, train_g, _ in self._iter_all_blocks(train_fm):
             train_g = train_g.to(device)
             for layer in self._kfac_layers(train_g):
                 f = train_g.data[layer]
@@ -412,7 +418,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         # Pass 2 — empirical second moments of the projected gradients (Λ).
         lam_sum: Dict[str, torch.Tensor] = {}
         counts: Dict[str, int] = {}
-        for train_g, _ in self._iter_all_blocks(train_fm):
+        for _step, train_g, _ in self._iter_all_blocks(train_fm):
             train_g = train_g.to(device)
             for layer, (U_A, U_G) in eig.items():
                 if layer not in train_g.data:

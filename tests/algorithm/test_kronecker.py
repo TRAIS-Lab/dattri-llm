@@ -335,6 +335,49 @@ class TestKFACMultiToken:
         )
 
 
+@pytest.fixture()
+def collected_step1(tmp_path):
+    """Single-checkpoint dirs whose records were recorded at a *non-zero* step.
+
+    Collects both checkpoints (steps 0 and 1), then curates train/test dirs
+    holding only the step-1 records — which keep their recorded ``step`` of 1 —
+    so the attributor sees a one-checkpoint dataset stamped at step 1 rather
+    than 0.
+    """
+    torch.manual_seed(TT.SEED)
+    model = TT.MLP().eval()
+    checkpoints = TT._make_checkpoints(model)  # steps 0 and 1
+    x_tr, y_tr, x_te, y_te = TT._make_data()
+    raw_train, raw_test = tmp_path / "raw_tr", tmp_path / "raw_te"
+    TT._collect_to_disk(model, checkpoints, x_tr, y_tr, raw_train)
+    TT._collect_to_disk(model, checkpoints, x_te, y_te, raw_test)
+
+    train_dir, test_dir = tmp_path / "tr_s1", tmp_path / "te_s1"
+    GradientFileManager(str(train_dir)).save_batch(TT._load_step_records(raw_train, 1))
+    GradientFileManager(str(test_dir)).save_batch(TT._load_step_records(raw_test, 1))
+
+    train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(TT.N_TRAIN)]
+    test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(TT.N_TEST)]
+    return dict(train_dir=train_dir, test_dir=test_dir,
+                train_hashes=train_hashes, test_hashes=test_hashes)
+
+
+class TestRowStepsTracked:
+    """Regression: rows are stamped with the gradient's recorded step, not 0."""
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_row_steps_reflect_recorded_step(self, collected_step1, tmp_path, cls):
+        res = _make(cls, tmp_path / "o").attribute(
+            train_gradients_dir=str(collected_step1["train_dir"]),
+            test_gradients_dir=str(collected_step1["test_dir"]),
+        )
+        assert res.row_steps == [1] * TT.N_TRAIN
+        # The hash→step pairing must be correct sample-by-sample, not just in bulk.
+        assert dict(zip(res.row_train_ids, res.row_steps)) == {
+            h: 1 for h in collected_step1["train_hashes"]
+        }
+
+
 class TestKroneckerShared:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")
