@@ -42,10 +42,13 @@ def _full_grads(model, sd, x, y):
     return TT._grads_at(model, sd, x, y, normalized=False)
 
 
-def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_step):
+def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_step,
+                  fisher_scale=1.0):
     """Explicit DVEmb influence: (num_train_rows grouped by step, num_test).
 
     Returns ``{step: (B, num_test) tensor}`` of η · g_valᵀ M g(z*).
+    ``fisher_scale`` multiplies each step's Hessian (e.g. the batch size under
+    ``loss_reduction="mean"``).
     """
     steps = list(range(len(train_sds)))
     prop_steps = [s for s in steps if s < final_step]
@@ -53,7 +56,7 @@ def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_s
     g_tr = {s: _full_grads(model, train_sds[s], x_tr, y_tr) for s in prop_steps}
     g_te = _full_grads(model, test_sd, x_te, y_te)              # (num_test, P)
     dim = g_te.shape[1]
-    H = {s: g_tr[s].T @ g_tr[s] for s in prop_steps}            # Σ_z g gᵀ
+    H = {s: fisher_scale * (g_tr[s].T @ g_tr[s]) for s in prop_steps}   # (fs)·Σ_z g gᵀ
     eye = torch.eye(dim)
 
     out = {}
@@ -106,6 +109,7 @@ class TestDVEmbOnDisk:
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=loop_over_test,
             final_step=2,
+            loss_reduction="sum",  # fixture collects with a sum loss
         )
         oracle = _dvemb_oracle(
             collected["model"], collected["train_sds"],
@@ -126,17 +130,65 @@ class TestDVEmbOnDisk:
         a = _make_attr(tmp_path / "a", 0.3).attribute(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            loop_over_test=False, final_step=2,
+            loop_over_test=False, final_step=2, loss_reduction="sum",
         )
         b = _make_attr(tmp_path / "b", 0.3).attribute(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            loop_over_test=True, final_step=2,
+            loop_over_test=True, final_step=2, loss_reduction="sum",
         )
         assert a.test_ids == b.test_ids
         assert a.row_train_ids == b.row_train_ids
         assert a.row_steps == b.row_steps
         assert torch.equal(a.scores, b.scores)
+
+    def test_loop_over_test_multiblock_scatter(self, collected, tmp_path):
+        """With the test set split across two on-disk blocks, the column-blocked
+        ``loop_over_test=True`` path must scatter each block's columns into the
+        right places and match both the all-resident path and the oracle."""
+        model, sd = collected["model"], collected["test_sd"]
+        x_te, y_te = collected["x_te"], collected["y_te"]
+
+        # Re-collect the θ_T test gradients as two separate blocks (two halves),
+        # so iter_gradient_blocks yields two files / column groups.
+        test_dir2 = tmp_path / "te2"
+        fm = TT.GradientFileManager(str(test_dir2))
+        offload = TT.OffloadCallback(
+            offload_interval=1, file_manager=fm, recording_type="per_sample"
+        )
+        hm = TT.HookManager(
+            model, config=TT.HookManagerConfig(linear_io=[r"mlp\."]),
+            callbacks=[offload],
+        )
+        model.load_state_dict(sd)
+        half = x_te.shape[0] // 2
+        with hm.collect():
+            for xs, ys in [(x_te[:half], y_te[:half]), (x_te[half:], y_te[half:])]:
+                model.zero_grad(set_to_none=True)
+                ((model(x=xs, y=ys) - ys) ** 2).sum().backward()
+        hm.remove()
+
+        lr = 0.5
+        common = dict(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(test_dir2), final_step=2, loss_reduction="sum",
+        )
+        res_f = _make_attr(tmp_path / "f", lr).attribute(loop_over_test=False, **common)
+        res_t = _make_attr(tmp_path / "t", lr).attribute(loop_over_test=True, **common)
+
+        assert res_f.test_ids == res_t.test_ids
+        assert len(res_t.test_ids) == TT.N_TEST          # both blocks' columns present
+        assert res_f.row_train_ids == res_t.row_train_ids
+        assert torch.equal(res_f.scores, res_t.scores)
+
+        oracle = _dvemb_oracle(
+            model, collected["train_sds"], collected["x_tr"], collected["y_tr"],
+            sd, x_te, y_te, lr=lr, final_step=2,
+        )
+        for step, (train_ids, matrix) in res_t.step_matrices().items():
+            want = oracle[step][[collected["train_hashes"].index(h) for h in train_ids]]
+            cols = [collected["test_hashes"].index(h) for h in res_t.test_ids]
+            assert torch.allclose(matrix, want[:, cols], atol=1e-5, rtol=1e-4)
 
     def test_reduces_to_tracin_at_final_step(self, collected, tmp_path):
         """The last step (t_s = T−1) has an empty propagation product, so its
@@ -145,7 +197,7 @@ class TestDVEmbOnDisk:
         res = _make_attr(tmp_path / "o", lr).attribute(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            final_step=2,
+            final_step=2, loss_reduction="sum",
         )
         # Oracle: η · g(θ_1) gᵀ_val (no Fisher factor for the final train step).
         g_tr1 = _full_grads(
@@ -169,7 +221,7 @@ class TestDVEmbOnDisk:
         res = _make_attr(tmp_path / "o", lr).attribute(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            selected_training_steps=[0], final_step=2,
+            selected_training_steps=[0], final_step=2, loss_reduction="sum",
         )
         assert sorted(set(res.row_steps)) == [0]
         oracle = _dvemb_oracle(
@@ -185,6 +237,46 @@ class TestDVEmbOnDisk:
             matrix, oracle[0][rows][:, cols], atol=1e-5, rtol=1e-4
         )
 
+    def test_loss_reduction_mean_scales_fisher_by_batch_size(self, collected, tmp_path):
+        """``loss_reduction='mean'`` multiplies each step's Fisher by its batch
+        size: the empirical Fisher needs the true per-sample gradients, so a
+        mean-loss-recorded ``ĝ = g/B`` must be rescaled by ``B``.
+
+        The fixture records the full ``N_TRAIN`` batch at each step, so the
+        step-0 rows (propagated through step 1) must match an oracle whose
+        step-1 Hessian is scaled by ``N_TRAIN``.  The final-step rows have no
+        propagation and so are identical to the ``"sum"`` reduction.
+        """
+        lr = 0.3
+        res = _make_attr(tmp_path / "o", lr).attribute(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            final_step=2, loss_reduction="mean",
+        )
+        assert res.algorithm_meta["loss_reduction"] == "mean"
+
+        oracle = _dvemb_oracle(
+            collected["model"], collected["train_sds"],
+            collected["x_tr"], collected["y_tr"],
+            collected["test_sd"], collected["x_te"], collected["y_te"],
+            lr=lr, final_step=2, fisher_scale=TT.N_TRAIN,
+        )
+        for step, (train_ids, matrix) in res.step_matrices().items():
+            want = oracle[step][[collected["train_hashes"].index(h) for h in train_ids]]
+            cols = [collected["test_hashes"].index(h) for h in res.test_ids]
+            assert torch.allclose(matrix, want[:, cols], atol=1e-5, rtol=1e-4), (
+                f"step {step}: max diff "
+                f"{(matrix - want[:, cols]).abs().max().item():.2e}"
+            )
+
+    def test_invalid_loss_reduction_raises(self, collected, tmp_path):
+        with pytest.raises(ValueError, match=r"loss_reduction"):
+            _make_attr(tmp_path / "o", 0.1).attribute(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                final_step=2, loss_reduction="average",
+            )
+
     def test_per_step_learning_rate_mapping(self, collected, tmp_path):
         """A {step: η} mapping uses each step's own rate in score and Fisher."""
         lrs = {0: 0.3, 1: 0.6}
@@ -193,7 +285,7 @@ class TestDVEmbOnDisk:
         ).attribute(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            final_step=2,
+            final_step=2, loss_reduction="sum",
         )
         # Oracle with per-step rates: η_{t_s} scale and η_k factors.
         model, train_sds = collected["model"], collected["train_sds"]

@@ -23,7 +23,14 @@ the test gradient taken at the **final** model ``θ_T`` (capital ``T`` =
 ``final_step``).  The per-step Hessian is the Gauss-Newton / empirical-Fisher
 approximation built from that step's recorded per-sample gradients,
 
-    H_k ≈ Σ_{z ∈ B_k} ∇ℓ(θ_k, z) ∇ℓ(θ_k, z)ᵀ.                              (2)
+    H_k ≈ (1/c) Σ_{z ∈ B_k} ĝ(θ_k, z) ĝ(θ_k, z)ᵀ                            (2)
+
+where ``ĝ`` is the *recorded* per-sample gradient and ``c`` its per-sample loss
+weight: the empirical Fisher must use the **true** per-sample gradients, so when
+the gradients were recorded under a **mean** loss (``ĝ = ∇ℓ / B``, ``c = 1/B``)
+the sum of recorded outer products is rescaled by the step's batch size ``B``,
+while under a **sum** loss (``ĝ = ∇ℓ``, ``c = 1``) it is used as-is — see the
+``loss_reduction`` argument of :meth:`attribute`.
 
 Setting every ``H_k = 0`` recovers TracIn (η · ⟨g_test, g_train⟩); the Fisher
 factors are exactly the "training dynamics" correction DVEmb adds.
@@ -148,6 +155,73 @@ class DVEmbAttributor(BaseAttributor):
         mat = block.to(device).materialize()
         return {name: value.float() for name, value in mat.data.items()}
 
+    def _propagate_and_score(
+        self,
+        w: Dict[str, torch.Tensor],
+        n_cols: int,
+        layers: List[str],
+        train_fm: GradientFileManager,
+        prop_steps: List[int],
+        output_steps: set,
+        device: torch.device,
+        loss_reduction: str,
+    ) -> Tuple[torch.Tensor, List[str], List[int]]:
+        """One latest→earliest sweep for the ``n_cols`` columns held in ``w``.
+
+        The step is the outer loop, so each train block is loaded/materialised
+        once **per call**; ``w[name]`` (shape ``(n_cols, d)``) is scored against
+        the step's train gradients and then advanced in place by that step's
+        Fisher factor.  Because every test column propagates independently,
+        scoring a subset of columns gives identical values to scoring them all —
+        this is what makes the ``loop_over_test`` column-blocking exact.
+
+        Returns ``(scores (num_rows, n_cols), row_train_ids, row_steps)``.
+        """
+        row_chunks: List[torch.Tensor] = []
+        row_train_ids: List[str] = []
+        row_steps: List[int] = []
+        for ts in sorted(prop_steps, reverse=True):
+            lr = self._lr(ts)
+            emit = ts in output_steps
+            # Accumulate this step's Fisher contribution across all its blocks
+            # before advancing w, so the whole batch B_ts forms one (I − η H_ts)
+            # factor.  ``n_t`` counts the step's recorded samples for B_ts.
+            delta: Dict[str, torch.Tensor] = {
+                name: torch.zeros_like(w[name]) for name in layers
+            }
+            n_t = 0
+            for _s, train_g, train_hashes in iter_gradient_blocks(
+                train_fm, [ts], self.args, self.layer_name
+            ):
+                mat = self._materialize(train_g, device)
+                shared = [n for n in layers if n in mat]
+                if not shared:
+                    continue
+                batch = mat[shared[0]].shape[0]
+                n_t += batch
+                # D[i, j] = ⟨g(z*_i), w_j⟩ summed over layers → (B, n_cols).
+                D = torch.zeros(batch, n_cols, device=device)
+                for name in shared:
+                    D += mat[name] @ w[name].T
+                if emit:
+                    row_chunks.append((lr * D).detach().to("cpu", torch.float))
+                    row_train_ids.extend(train_hashes)
+                    row_steps.extend([ts] * batch)
+                # Fisher update term: Σ_i D[i, j] g(z*_i) → (n_cols, d).
+                for name in shared:
+                    delta[name] += D.T @ mat[name]
+            # H_t = (1/c) Σ ĝ ĝᵀ: ×B_t for mean-loss-recorded grads, ×1 for sum.
+            fisher_scale = float(n_t) if loss_reduction == "mean" else 1.0
+            for name in layers:
+                w[name] -= lr * fisher_scale * delta[name]
+
+        scores = (
+            torch.cat(row_chunks, dim=0)
+            if row_chunks
+            else torch.zeros(0, n_cols, dtype=torch.float)
+        )
+        return scores, row_train_ids, row_steps
+
     # ------------------------------------------------------------------ #
     # Main entry point                                                   #
     # ------------------------------------------------------------------ #
@@ -161,6 +235,7 @@ class DVEmbAttributor(BaseAttributor):
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
         final_step: Optional[int] = None,
+        loss_reduction: str = "mean",
     ) -> AttributionScore:
         """Compute the ``(num_train_rows, num_test)`` DVEmb attribution score.
 
@@ -175,10 +250,19 @@ class DVEmbAttributor(BaseAttributor):
                 gradients must have been collected at the **final** model
                 ``θ_T`` (capital ``T`` = ``final_step``), since the score dots
                 against ``∇ℓ(θ_T, z_val)``.
-            loop_over_test: Accepted for API parity with TracIn / K-FAC.  DVEmb
-                carries the full per-column test embedding through the whole step
-                sweep, so the test state is always resident; both values produce
-                identical results.
+            loop_over_test: Memory/disk trade-off for the per-test-column
+                embedding ``w`` (shape ``(num_test, d)``), which is
+                back-propagated through the steps.  Because every test column
+                propagates independently, ``False`` (default) uses the test
+                columns as the **inner** loop and the steps as the outer loop:
+                one dense embedding is held and the training gradients are
+                streamed exactly **once** (peak memory: full ``w`` + one train
+                block; fastest).  ``True`` uses the test blocks as the **outer**
+                loop to save space: each test block gets its own sweep, holding
+                only that block's embedding while **re-streaming the training
+                gradients once per block** (peak memory: one test block's ``w`` +
+                one train block).  Both produce identical scores; use ``True``
+                when the full test embedding does not fit in memory.
             selected_training_steps: Restrict which training checkpoints become
                 output **rows** to these steps; ``None`` (default) emits a row
                 for every step ``< final_step``.  The propagation product always
@@ -191,15 +275,37 @@ class DVEmbAttributor(BaseAttributor):
                 ``< final_step`` participate (both as rows and in the Fisher
                 product).  ``None`` (default) uses ``max(available step) + 1``,
                 i.e. every recorded training step participates.
+            loss_reduction: How the *training* loss whose backward produced the
+                recorded gradients was reduced over each minibatch — ``"mean"``
+                (default) or ``"sum"``.  This fixes the scale of the empirical
+                Fisher ``H_t`` in the propagation factor ``(I − η H_t)``.  The
+                exact SGD Jacobian is ``I − η ∇²L_t``; its empirical-Fisher form
+                needs the **true** per-sample gradients, ``H_t ≈ (1/c)Σ_z ĝ_zĝ_zᵀ``
+                where ``ĝ_z`` is the recorded gradient and ``c`` its per-sample
+                loss weight.  Under ``"mean"`` the backward scaled each ``ĝ_z`` by
+                ``1/B_t`` (``c = 1/B_t``), so the Fisher is multiplied by the
+                step's batch size ``B_t`` — inferred from the number of records
+                at that step.  Under ``"sum"`` the recorded gradients are already
+                the true per-sample gradients (``c = 1``) and no correction is
+                applied.  The score's *front* factor and update direction use
+                ``ĝ_z`` directly and are unaffected either way; only the Fisher
+                scale changes.  (``B_t`` is taken to be the number of recorded
+                samples at step ``t``, which assumes the full minibatch was
+                collected.)
 
         Returns:
             An :class:`AttributionScore`; also persisted to ``args.output_dir``.
 
         Raises:
-            ValueError: If a gradients dir is missing,
-                ``selected_training_steps`` matches no available step, or no
-                training step satisfies ``step < final_step``.
+            ValueError: If a gradients dir is missing, ``loss_reduction`` is not
+                ``"mean"``/``"sum"``, ``selected_training_steps`` matches no
+                available step, or no training step satisfies
+                ``step < final_step``.
         """
+        if loss_reduction not in ("mean", "sum"):
+            raise ValueError(
+                f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}."
+            )
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
                 f"{type(self).__name__} requires both train_gradients_dir and "
@@ -231,79 +337,83 @@ class DVEmbAttributor(BaseAttributor):
 
         test_steps = test_fm.available_steps()
 
-        # ---- Initialise w = test gradient at the final model θ_T -------- #
-        # One pass over the test files fixes the column order (disk order) and
-        # materialises each test gradient into the running embedding ``w``,
-        # keyed per layer with shape (num_test, d_layer).
-        test_ids: List[str] = []
-        test_index: Dict[str, int] = {}
-        pending: List[Tuple[Dict[str, torch.Tensor], List[int]]] = []
-        for _step, test_g, test_hashes in iter_gradient_blocks(
-            test_fm, test_steps, self.args, self.layer_name
-        ):
-            mat = self._materialize(test_g, device)
-            cols: List[int] = []
-            for h in test_hashes:
-                if h not in test_index:
-                    test_index[h] = len(test_ids)
-                    test_ids.append(h)
-                cols.append(test_index[h])
-            pending.append((mat, cols))
-        num_test = len(test_ids)
-
-        layers = list(pending[0][0].keys()) if pending else []
-        w: Dict[str, torch.Tensor] = {
-            name: torch.zeros(num_test, pending[0][0][name].shape[1], device=device)
-            for name in layers
-        }
-        for mat, cols in pending:
-            idx = torch.as_tensor(cols, device=device)
-            for name in layers:
-                # Duplicate-hash columns collapse to the same index; index_copy_
-                # keeps the last writer, mirroring on-disk dedup behaviour.
-                w[name].index_copy_(0, idx, mat[name])
-        del pending
-
-        # ---- Sweep steps latest → earliest, scoring then folding in H --- #
-        row_chunks: List[torch.Tensor] = []
-        row_train_ids: List[str] = []
-        row_steps: List[int] = []
-        for ts in sorted(prop_steps, reverse=True):
-            lr = self._lr(ts)
-            emit = ts in output_steps
-            # Accumulate this step's Fisher contribution across all its blocks
-            # before advancing w, so the whole batch B_ts forms one (I − η H_ts)
-            # factor (applying blocks one at a time would not compose).
-            delta: Dict[str, torch.Tensor] = {
-                name: torch.zeros_like(w[name]) for name in layers
-            }
-            for _s, train_g, train_hashes in iter_gradient_blocks(
-                train_fm, [ts], self.args, self.layer_name
+        # The test embedding w starts at the final-model test gradients and is
+        # back-propagated through the steps.  Each test column evolves
+        # independently, so loop_over_test trades memory for disk reads.
+        if not loop_over_test:
+            # ---- step outer / test inner: one dense embedding, train read once.
+            # Materialise every test gradient into one (num_test, d) embedding and
+            # sweep the train gradients a single time (peak: full w + one train
+            # block).  Fastest; the default.
+            test_ids: List[str] = []
+            test_index: Dict[str, int] = {}
+            pending: List[Tuple[Dict[str, torch.Tensor], List[int]]] = []
+            for _step, test_g, test_hashes in iter_gradient_blocks(
+                test_fm, test_steps, self.args, self.layer_name
             ):
-                mat = self._materialize(train_g, device)
-                shared = [n for n in layers if n in mat]
-                if not shared:
-                    continue
-                batch = mat[shared[0]].shape[0]
-                # D[i, j] = ⟨g(z*_i), w_j⟩ summed over layers  → (B, num_test).
-                D = torch.zeros(batch, num_test, device=device)
-                for name in shared:
-                    D += mat[name] @ w[name].T
-                if emit:
-                    row_chunks.append((lr * D).detach().to("cpu", torch.float))
-                    row_train_ids.extend(train_hashes)
-                    row_steps.extend([ts] * batch)
-                # Fisher update term: Σ_i D[i, j] g(z*_i)  → (num_test, d).
-                for name in shared:
-                    delta[name] += D.T @ mat[name]
-            for name in layers:
-                w[name] -= lr * delta[name]
-
-        scores = (
-            torch.cat(row_chunks, dim=0)
-            if row_chunks
-            else torch.zeros(0, num_test, dtype=torch.float)
-        )
+                mat = self._materialize(test_g, device)
+                cols: List[int] = []
+                for h in test_hashes:
+                    if h not in test_index:
+                        test_index[h] = len(test_ids)
+                        test_ids.append(h)
+                    cols.append(test_index[h])
+                pending.append((mat, cols))
+            num_test = len(test_ids)
+            layers = list(pending[0][0].keys()) if pending else []
+            w: Dict[str, torch.Tensor] = {
+                name: torch.zeros(num_test, pending[0][0][name].shape[1], device=device)
+                for name in layers
+            }
+            for mat, cols in pending:
+                idx = torch.as_tensor(cols, device=device)
+                for name in layers:
+                    # Duplicate-hash columns collapse via index_copy_ (last wins).
+                    w[name].index_copy_(0, idx, mat[name])
+            del pending
+            scores, row_train_ids, row_steps = self._propagate_and_score(
+                w, num_test, layers, train_fm, prop_steps, output_steps,
+                device, loss_reduction,
+            )
+        else:
+            # ---- test outer: one block's embedding resident, train re-streamed.
+            # Bounds peak memory to a single test block's embedding by giving each
+            # test block its own full sweep (re-reading the train gradients once
+            # per block).  Use when the full test embedding does not fit.
+            # Pass 1 fixes the column order from hashes alone (no materialise).
+            test_ids = []
+            test_index = {}
+            for _step, _tg, test_hashes in iter_gradient_blocks(
+                test_fm, test_steps, self.args, self.layer_name
+            ):
+                for h in test_hashes:
+                    if h not in test_index:
+                        test_index[h] = len(test_ids)
+                        test_ids.append(h)
+            num_test = len(test_ids)
+            # Pass 2: one test block at a time — seed w, sweep, scatter columns.
+            scores = None
+            row_train_ids = []
+            row_steps = []
+            for _step, test_g, test_hashes in iter_gradient_blocks(
+                test_fm, test_steps, self.args, self.layer_name
+            ):
+                w_block = self._materialize(test_g, device)  # (B_block, d) per layer
+                layers = list(w_block.keys())
+                block_cols = [test_index[h] for h in test_hashes]
+                block_scores, rtids, rsteps = self._propagate_and_score(
+                    w_block, len(block_cols), layers, train_fm, prop_steps,
+                    output_steps, device, loss_reduction,
+                )
+                if scores is None:
+                    scores = torch.zeros(
+                        block_scores.shape[0], num_test, dtype=torch.float
+                    )
+                    row_train_ids, row_steps = rtids, rsteps
+                # Scatter this block's columns into the shared (rows × num_test).
+                scores[:, block_cols] = block_scores
+            if scores is None:
+                scores = torch.zeros(0, num_test, dtype=torch.float)
 
         result = AttributionScore(
             scores=scores,
@@ -315,6 +425,7 @@ class DVEmbAttributor(BaseAttributor):
                 "selected_training_steps": sorted(output_steps),
                 "propagated_steps": sorted(prop_steps),
                 "learning_rate": self.learning_rate,
+                "loss_reduction": loss_reduction,
             },
             algorithm=self.algorithm,
             normalized_grad=False,
