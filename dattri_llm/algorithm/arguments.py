@@ -171,6 +171,18 @@ class AttributionArguments:
         },
     )
 
+    # ── Hardware ─────────────────────────────────────────────────────────────
+
+    use_cpu: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to use cpu. If set to False, we will use the "
+                "available torch device/backend."
+            )
+        },
+    )
+
     # ── Precision ────────────────────────────────────────────────────────────
 
     bf16: bool = field(
@@ -426,7 +438,10 @@ class AttributionArguments:
     @cached_property
     def _device_and_n_gpu(self) -> tuple[torch.device, int]:
         """Resolve the local device and GPU count (computed once)."""
-        if torch.cuda.is_available():
+        if self.use_cpu:
+            device = torch.device("cpu")
+            n_gpu = 0
+        elif torch.cuda.is_available():
             local_rank = int(os.environ.get("LOCAL_RANK", -1))
             if local_rank != -1:
                 # Distributed: each rank uses its assigned GPU.
