@@ -7,11 +7,13 @@ import warnings
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
     HookManagerConfig,
     _is_linear_io_capable,
+    default_hook_assignment,
     register_linear_io_hooks,
     register_param_grad_hooks,
     remove_hooks,
@@ -336,3 +338,78 @@ class TestRegisterParamGradHooks:
         buffers, handles = register_param_grad_hooks(dp_model)
         assert len(buffers) > 0
         remove_hooks(handles)
+
+
+# --------------------------------------------------------------------------- #
+# maximal_hook_assignment                                                       #
+# --------------------------------------------------------------------------- #
+
+
+class _GhostLinearModel(nn.Module):
+    """A model whose ``ghost`` Linear is applied functionally, not as a module.
+
+    ``ghost``'s forward/backward hooks therefore never fire — the situation that
+    stalls HookManager step completion (cf. ``MultiheadAttention.out_proj``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.used = nn.Linear(4, 4)
+        self.ghost = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.used(x)
+        # Apply ghost's weight functionally — its module hooks do not fire.
+        return F.linear(x, self.ghost.weight, self.ghost.bias)
+
+
+class TestMaximalHookAssignment:
+    def test_skips_functionally_invoked_layer(self):
+        model = _GhostLinearModel()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assignment = default_hook_assignment(model, torch.randn(2, 4))
+        # 'used' is a real module call → kept; 'ghost' never fires → skipped.
+        assert assignment == {"used": "linear_io"}
+        assert any("ghost" in str(w.message) for w in caught)
+
+    def test_default_model_keeps_all_layers(self, tiny_model, tiny_batch):
+        assignment = default_hook_assignment(
+            tiny_model, tiny_batch["input_ids"]
+        )
+        assert set(assignment) == {
+            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+        }
+        assert all(t == "linear_io" for t in assignment.values())
+
+    def test_result_is_usable_as_hook_types(self):
+        model = _GhostLinearModel()
+        assignment = default_hook_assignment(model, torch.randn(2, 4))
+        # The discovered assignment resolves cleanly (ghost excluded).
+        resolved = resolve_hook_assignments(
+            model, HookManagerConfig(hook_types=assignment)
+        )
+        assert resolved == {"used": "linear_io"}
+
+    def test_dict_input_unpacked(self, tiny_model, tiny_batch):
+        assignment = default_hook_assignment(
+            tiny_model, {"input_ids": tiny_batch["input_ids"]}
+        )
+        assert "mlp.0" in assignment
+
+    def test_param_grad_layer_discovered_via_backward(self):
+        class _CustomParam(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scale = nn.Parameter(torch.ones(4))
+                self.lin = nn.Linear(4, 4)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.lin(x) * self.scale
+
+        model = _CustomParam()
+        assignment = default_hook_assignment(model, torch.randn(2, 4))
+        # The container owns 'scale' directly (not linear-IO-capable) → param_grad;
+        # the Linear is a real module call → linear_io.
+        assert assignment[""] == "param_grad"
+        assert assignment["lin"] == "linear_io"

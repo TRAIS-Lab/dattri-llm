@@ -659,6 +659,176 @@ def _warn_zero_layers() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Active-layer discovery                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def _invoke_model(model: nn.Module, sample_input: object) -> object:
+    """Call *model* on *sample_input*, unpacking dicts / sequences."""
+    if isinstance(sample_input, dict):
+        return model(**sample_input)
+    if isinstance(sample_input, (list, tuple)):
+        return model(*sample_input)
+    return model(sample_input)
+
+
+def _derive_scalar_loss(output: object) -> Optional[torch.Tensor]:
+    """Best-effort reduction of a model output to a scalar for ``backward()``.
+
+    Prefers ``output.loss``; otherwise sums a floating-point output tensor
+    (``output`` itself, ``output.logits``, or the first float tensor in a
+    dict/sequence).  Returns ``None`` when no differentiable scalar is found.
+    """
+    loss = getattr(output, "loss", None)
+    if isinstance(loss, torch.Tensor):
+        return loss
+
+    if isinstance(output, torch.Tensor):
+        candidate: Optional[torch.Tensor] = output
+    else:
+        candidate = getattr(output, "logits", None)
+        if candidate is None:
+            values: object = ()
+            if isinstance(output, dict):
+                values = output.values()
+            elif isinstance(output, (list, tuple)):
+                values = output
+            candidate = next(
+                (
+                    v
+                    for v in values
+                    if isinstance(v, torch.Tensor) and v.is_floating_point()
+                ),
+                None,
+            )
+
+    if isinstance(candidate, torch.Tensor) and candidate.is_floating_point():
+        return candidate.sum()
+    return None
+
+
+def default_hook_assignment(
+    model: nn.Module,
+    sample_input: object,
+    loss_fn: Optional[Callable[[object], torch.Tensor]] = None,
+) -> dict[str, str]:
+    """Discover the default-style assignment for layers that actually fire.
+
+    Some modules are registered as sub-modules but invoked *functionally*
+    rather than called as modules — e.g. :class:`nn.MultiheadAttention` applies
+    its ``out_proj`` weight through ``F.linear`` instead of ``out_proj(...)``.
+    Such a module's forward/backward hooks never fire, so a :class:`HookManager`
+    that waits on them can never complete a step.
+
+    This helper runs one forward (and, when a scalar loss is available,
+    backward) pass on *sample_input* with lightweight monitor hooks to find
+    which layers are actually exercised, then returns the default assignment
+    (:attr:`HookManagerConfig.is_default` behaviour) restricted to those
+    layers.  Pass the result as ``hook_types``::
+
+        assignment = maximal_hook_assignment(model, sample_input)
+        hm = HookManager(model, config=HookManagerConfig(hook_types=assignment))
+
+    A ``linear_io`` candidate is kept when its forward hook fires (the module is
+    invoked as a module); a ``param_grad`` candidate is kept when one of its
+    parameters receives a gradient.  Layers that never fire are skipped (with a
+    warning) rather than left to stall step completion.
+
+    Args:
+        model: The model to inspect (plain, ``DataParallel``, or DDP wrapped).
+        sample_input: A representative input.  A ``dict`` is passed as
+            ``model(**sample_input)``, a ``list`` / ``tuple`` as
+            ``model(*sample_input)``, anything else as ``model(sample_input)``.
+        loss_fn: Optional callable mapping the model output to a scalar loss for
+            the backward pass.  When omitted, a scalar is derived from the
+            output; if none can be derived, only ``linear_io`` (forward-fired)
+            layers are discovered.
+
+    Returns:
+        ``{layer_name: "linear_io" | "param_grad"}`` for the layers that fired.
+
+    Note:
+        This executes a real forward+backward pass, which may update stateful
+        layers (e.g. BatchNorm running stats).  Run it on a throwaway batch.
+    """
+    root: nn.Module = getattr(model, "module", model)
+    modules = dict(root.named_modules())
+
+    # Default-style candidate assignment (same rule as the resolver's default).
+    candidate: dict[str, str] = {}
+    for name, module in modules.items():
+        if _is_linear_io_capable(module):
+            candidate[name] = LINEAR_IO
+        elif _has_trainable_params(module):
+            candidate[name] = PARAM_GRAD
+
+    fired: set[str] = set()
+    handles: list[torch.utils.hooks.RemovableHook] = []
+
+    def _make_forward_monitor(layer_name: str) -> Callable:
+        def _hook(_module, _inp, _out) -> None:
+            fired.add(layer_name)
+        return _hook
+
+    def _make_grad_monitor(layer_name: str) -> Callable:
+        def _hook(_grad: torch.Tensor) -> None:
+            fired.add(layer_name)
+        return _hook
+
+    for name, module in modules.items():
+        kind = candidate.get(name)
+        if kind == LINEAR_IO:
+            handles.append(module.register_forward_hook(_make_forward_monitor(name)))
+        elif kind == PARAM_GRAD:
+            for _, param in module.named_parameters(recurse=False):
+                if param.requires_grad:
+                    handles.append(param.register_hook(_make_grad_monitor(name)))
+
+    try:
+        with torch.enable_grad():
+            output = _invoke_model(model, sample_input)
+            try:
+                loss = (
+                    loss_fn(output)
+                    if loss_fn is not None
+                    else _derive_scalar_loss(output)
+                )
+            except Exception as exc:  # noqa: BLE001 - user loss_fn may fail
+                loss = None
+                warnings.warn(
+                    f"maximal_hook_assignment could not compute a loss "
+                    f"({exc!r}); param_grad layers may be missed. Pass loss_fn.",
+                    stacklevel=2,
+                )
+            if isinstance(loss, torch.Tensor) and loss.requires_grad:
+                model.zero_grad(set_to_none=True)
+                loss.backward()
+            elif any(t == PARAM_GRAD for t in candidate.values()):
+                warnings.warn(
+                    "maximal_hook_assignment could not derive a differentiable "
+                    "scalar loss; param_grad layers may be missed. Pass loss_fn.",
+                    stacklevel=2,
+                )
+    finally:
+        remove_hooks(handles)
+        model.zero_grad(set_to_none=True)
+
+    assignment = {n: t for n, t in candidate.items() if n in fired}
+
+    skipped = sorted(set(candidate) - set(assignment))
+    if skipped:
+        warnings.warn(
+            "maximal_hook_assignment skipped layers that did not fire during "
+            f"the sample pass (e.g. invoked functionally): {skipped}.",
+            stacklevel=2,
+        )
+    if not assignment:
+        _warn_zero_layers()
+
+    return assignment
+
+
+# --------------------------------------------------------------------------- #
 # Hook manager                                                                 #
 # --------------------------------------------------------------------------- #
 
