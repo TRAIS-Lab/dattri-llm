@@ -90,7 +90,7 @@ def _collect_to_disk(model, checkpoints, x, y, out_dir: Path):
     )
     hm = HookManager(
         model,
-        config=HookManagerConfig(mlp_name_patterns=[r"mlp\."]),
+        config=HookManagerConfig(linear_io=[r"mlp\."]),
         callbacks=[offload],
     )
     with hm.collect():

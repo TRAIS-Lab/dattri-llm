@@ -2,10 +2,11 @@
 
 Two low-level hook families are provided:
 
-MLP factorized hooks — ``register_mlp_hooks``
-----------------------------------------------
-Registers forward and backward hooks on MLP linear layers to capture the
-input activations and output gradients needed for the outer-product identity:
+Linear-IO factorized hooks — ``register_linear_io_hooks``
+---------------------------------------------------------
+Registers forward and backward hooks on linear-family layers (``nn.Linear``,
+``nn.Conv*``, ``nn.Embedding``, norm layers, …) to capture the input
+activations and output gradients needed for the outer-product identity:
 
     dL/dW ≈ g^T ⊗ a    (per sample)
 
@@ -28,7 +29,7 @@ which receive the gradient sum from all replicas before the hook fires.
 Under DDP the hook fires after the allreduce.
 
 These are **batch-level** gradients (one tensor per parameter per step),
-not per-sample.  Use ``register_mlp_hooks`` when per-sample factorized
+not per-sample.  Use ``register_linear_io_hooks`` when per-sample factorized
 gradients are needed.
 
 Per-layer callbacks
@@ -78,11 +79,16 @@ def _queue_backward_end_callback(fn: Callable[[], None]) -> bool:
     except Exception:  # pragma: no cover - unexpected autograd internals
         return False
 
-# ── Always-hooked types (do not require an MLP parent keyword) ──────────────
-# Embedding and norm layers appear at the top level of transformer blocks and
-# their per-sample gradients factorise in a form compatible with influence
-# function scoring.
-_HOOKABLE_ALWAYS: tuple[type, ...] = (
+# ── Linear-IO-capable types ─────────────────────────────────────────────────
+# Layers whose per-sample gradient factorises as an outer product of the input
+# activation and the output gradient (``dL/dW ≈ g^T ⊗ a``).  These are the
+# layers that can be hooked with the ``linear_io`` family.  Any layer (whether
+# or not it appears here) can instead be hooked with the ``param_grad`` family,
+# which materialises the batch-level parameter gradient directly.
+#
+# Membership is decided purely by type — never by the module's name in the
+# graph, which is arbitrary.
+_LINEAR_IO_TYPES: tuple[type, ...] = (
     nn.Embedding,
     nn.EmbeddingBag,
     nn.LayerNorm,
@@ -90,13 +96,6 @@ _HOOKABLE_ALWAYS: tuple[type, ...] = (
     nn.InstanceNorm1d,
     nn.InstanceNorm2d,
     nn.InstanceNorm3d,
-)
-# RMSNorm was added in PyTorch 2.4 — guard for older versions.
-if hasattr(nn, "RMSNorm"):
-    _HOOKABLE_ALWAYS = _HOOKABLE_ALWAYS + (nn.RMSNorm,)  # type: ignore[assignment]
-
-# ── MLP-only types (require parent path containing an MLP-family keyword) ───
-_HOOKABLE_MLP_ONLY: tuple[type, ...] = (
     nn.Linear,
     nn.Bilinear,
     nn.Conv1d,
@@ -106,16 +105,9 @@ _HOOKABLE_MLP_ONLY: tuple[type, ...] = (
     nn.ConvTranspose2d,
     nn.ConvTranspose3d,
 ) + ((HF_Conv1D,) if HF_Conv1D is not None else ())
-
-# NonDynamicallyQuantizableLinear is a subclass of nn.Linear, so it's caught
-# by the nn.Linear check above; no explicit entry needed.
-
-_HOOKABLE_TYPES: tuple[type, ...] = _HOOKABLE_ALWAYS + _HOOKABLE_MLP_ONLY
-
-_MLP_PARENT_PATTERNS = re.compile(
-    r"(mlp|ffn|feed_forward|feedforward|fc|dense)",
-    re.IGNORECASE,
-)
+# RMSNorm was added in PyTorch 2.4 — guard for older versions.
+if hasattr(nn, "RMSNorm"):
+    _LINEAR_IO_TYPES = _LINEAR_IO_TYPES + (nn.RMSNorm,)  # type: ignore[assignment]
 
 # Buffer type alias.
 # Keys: "activation", "grad_output", "_act_parts", "_grad_parts", "_lock"
@@ -126,30 +118,22 @@ def _device_sort_key(item: tuple[int, torch.Tensor]) -> int:
     return item[0]
 
 
-def _is_hookable_layer(name: str, module: nn.Module) -> bool:
-    """Return True if *module* should be registered by the default heuristic.
+def _is_linear_io_capable(module: nn.Module) -> bool:
+    """Return ``True`` if *module*'s gradient factorises for ``linear_io`` hooks.
 
-    * Embedding and norm layers are always included — they appear at the top
-      level of transformer blocks and their per-sample gradients factorise in a
-      form compatible with the influence-function scoring used here.
-    * Linear, Conv, ConvTranspose, and Bilinear layers are included only when
-      the parent module path contains an MLP-family keyword (``mlp``, ``ffn``,
-      ``feed_forward``, ``feedforward``, ``fc``, or ``dense``).
-
-    Args:
-        name: Fully-qualified module name (dot-separated path from root).
-        module: The module to test.
-
-    Returns:
-        ``True`` when the module should be hooked by default.
+    Membership is decided purely by type (see :data:`_LINEAR_IO_TYPES`), never
+    by the module's name in the graph.
     """
-    if not isinstance(module, _HOOKABLE_TYPES):
-        return False
-    if isinstance(module, _HOOKABLE_ALWAYS):
-        return True
-    # MLP-only types: require a parent path MLP-family keyword.
-    parent_path = ".".join(name.split(".")[:-1])
-    return bool(_MLP_PARENT_PATTERNS.search(parent_path))
+    return isinstance(module, _LINEAR_IO_TYPES)
+
+
+def _has_trainable_params(module: nn.Module) -> bool:
+    """Return ``True`` if *module* directly owns a trainable parameter.
+
+    Only the module's own parameters are considered (``recurse=False``), so a
+    parent is not credited with parameters that belong to its children.
+    """
+    return any(p.requires_grad for _, p in module.named_parameters(recurse=False))
 
 
 def _make_layer_buffer() -> LayerBuffer:
@@ -162,13 +146,13 @@ def _make_layer_buffer() -> LayerBuffer:
     }
 
 
-def register_mlp_hooks(
+def register_linear_io_hooks(
     model: nn.Module,
-    name_patterns: Optional[list[str]] = None,
+    layer_names: Optional[set[str]] = None,
     on_layer_forward: Optional[Callable[[str, torch.Tensor], None]] = None,
     on_layer_backward: Optional[Callable[[str, torch.Tensor], None]] = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
-    """Register forward and backward hooks on MLP linear layers.
+    """Register forward and backward hooks on linear-family layers.
 
     For each qualifying layer the function registers:
 
@@ -186,9 +170,10 @@ def register_mlp_hooks(
     Args:
         model: The PyTorch model (plain, ``DataParallel``, or
             ``DistributedDataParallel`` wrapped).
-        name_patterns: Optional list of regex strings.  When provided, only
-            layers whose fully-qualified name matches at least one pattern
-            are hooked.  When ``None``, the MLP-keyword heuristic is used.
+        layer_names: Optional set of fully-qualified module names to hook.
+            When provided, only modules whose name is in the set *and* which
+            are linear-IO-capable are hooked.  When ``None``, every
+            linear-IO-capable layer is hooked (see :data:`_LINEAR_IO_TYPES`).
         on_layer_forward: Optional callable fired after each forward hook
             capture.  Signature: ``(layer_name: str, activation: Tensor)``.
             The tensor is on CPU.
@@ -203,22 +188,14 @@ def register_mlp_hooks(
     """
     root: nn.Module = getattr(model, "module", model)
 
-    compiled: list[re.Pattern[str]] | None = None
-    if name_patterns is not None:
-        compiled = [re.compile(p) for p in name_patterns]
-
     buffers: dict[str, LayerBuffer] = {}
     handles: list[torch.utils.hooks.RemovableHook] = []
 
     for name, module in root.named_modules():
-        if compiled is not None:
-            if not isinstance(module, _HOOKABLE_TYPES):
-                continue
-            if not any(p.search(name) for p in compiled):
-                continue
-        else:
-            if not _is_hookable_layer(name, module):
-                continue
+        if not _is_linear_io_capable(module):
+            continue
+        if layer_names is not None and name not in layer_names:
+            continue
 
         buffers[name] = _make_layer_buffer()
         layer_type = canonical_class_name(module)
@@ -259,8 +236,9 @@ def remove_hooks(handles: list[torch.utils.hooks.RemovableHook]) -> None:
     """Remove all registered hooks and clear the handle list.
 
     Args:
-        handles: List of hook handles returned by :func:`register_mlp_hooks`,
-            :func:`register_mlp_param_hooks`, or
+        handles: List of hook handles returned by
+            :func:`register_linear_io_hooks`,
+            :func:`register_linear_param_hooks`, or
             :func:`register_param_grad_hooks`.
     """
     for h in handles:
@@ -277,7 +255,7 @@ ParamGradBuffer = dict  # {param_name: Tensor | None}
 
 def register_param_grad_hooks(
     model: nn.Module,
-    name_patterns: Optional[list[str]] = None,
+    layer_names: Optional[set[str]] = None,
     on_param_grad: Optional[Callable[[str, str, torch.Tensor], None]] = None,
 ) -> tuple[dict[str, ParamGradBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register parameter-gradient hooks on general module layers.
@@ -301,15 +279,15 @@ def register_param_grad_hooks(
 
     These are **batch-level** gradients (one ``(out, in)`` tensor per
     parameter per step).  For per-sample factorized gradients use
-    :func:`register_mlp_hooks` instead.
+    :func:`register_linear_io_hooks` instead.
 
     Args:
         model: The model to hook (plain ``nn.Module``, ``DataParallel``, or
             ``DistributedDataParallel``).
-        name_patterns: Optional list of regex strings.  When provided, only
-            modules whose fully-qualified name matches at least one pattern
-            are hooked.  When ``None``, all leaf modules that have at least
-            one trainable parameter are hooked.
+        layer_names: Optional set of fully-qualified module names to hook.
+            When provided, only modules whose name is in the set are hooked.
+            When ``None``, every module that directly owns at least one
+            trainable parameter is hooked.
         on_param_grad: Optional callback fired immediately when a parameter's
             gradient is computed.  Signature:
             ``(layer_name: str, param_name: str, grad: Tensor)``.
@@ -322,21 +300,12 @@ def register_param_grad_hooks(
     """
     root: nn.Module = getattr(model, "module", model)
 
-    compiled: list[re.Pattern[str]] | None = None
-    if name_patterns is not None:
-        compiled = [re.compile(p) for p in name_patterns]
-
     buffers: dict[str, ParamGradBuffer] = {}
     handles: list[torch.utils.hooks.RemovableHook] = []
 
     for layer_name, module in root.named_modules():
-        if compiled is not None:
-            if not any(p.search(layer_name) for p in compiled):
-                continue
-        else:
-            # Default: hook leaf modules (no child modules) with trainable params.
-            if list(module.children()):
-                continue
+        if layer_names is not None and layer_name not in layer_names:
+            continue
 
         trainable = [
             (pname, param)
@@ -365,12 +334,12 @@ def register_param_grad_hooks(
     return buffers, handles
 
 
-def register_mlp_param_hooks(
+def register_linear_param_hooks(
     model: nn.Module,
-    name_patterns: Optional[list[str]] = None,
-    on_mlp_param_grad: Optional[Callable[[str, str, torch.Tensor], None]] = None,
+    layer_names: Optional[set[str]] = None,
+    on_linear_param_grad: Optional[Callable[[str, str, torch.Tensor], None]] = None,
 ) -> tuple[int, list[torch.utils.hooks.RemovableHook]]:
-    """Register post-accumulate-grad hooks on hooked MLP layers' trainable params.
+    """Register post-accumulate-grad hooks on linear layers' trainable params.
 
     Unlike :func:`register_param_grad_hooks`, which uses
     ``Tensor.register_hook`` (fires *before* ``param.grad`` is accumulated),
@@ -381,17 +350,17 @@ def register_mlp_param_hooks(
     a precondition for any callback that needs to read or modify weight
     gradients in-place (e.g. :class:`~dattri_llm.gradient.callbacks.DataSelectionCallback`).
 
-    The same MLP-layer heuristic (or ``name_patterns`` list) as
-    :func:`register_mlp_hooks` is used to identify qualifying layers.
+    The same layer-selection rule as :func:`register_linear_io_hooks` is used
+    to identify qualifying layers.
 
     Args:
         model: The model to hook (plain ``nn.Module``, ``DataParallel``, or
             ``DistributedDataParallel``).
-        name_patterns: Optional list of regex strings.  When provided, only
-            ``nn.Linear`` / ``Conv1D`` layers whose fully-qualified name
-            matches at least one pattern are hooked.  When ``None``, the
-            MLP-keyword heuristic is used.
-        on_mlp_param_grad: Optional callback fired after each MLP parameter's
+        layer_names: Optional set of fully-qualified module names to hook.
+            When provided, only linear-IO-capable modules whose name is in the
+            set are hooked.  When ``None``, every linear-IO-capable layer is
+            hooked.
+        on_linear_param_grad: Optional callback fired after each parameter's
             gradient is accumulated.  Signature:
             ``(layer_name: str, param_name: str, grad: Tensor)`` where
             ``grad`` is ``param.grad.detach().cpu()``.
@@ -403,22 +372,14 @@ def register_mlp_param_hooks(
     """
     root: nn.Module = getattr(model, "module", model)
 
-    compiled: list[re.Pattern[str]] | None = None
-    if name_patterns is not None:
-        compiled = [re.compile(p) for p in name_patterns]
-
     n_params: int = 0
     handles: list[torch.utils.hooks.RemovableHook] = []
 
     for name, module in root.named_modules():
-        if compiled is not None:
-            if not isinstance(module, _HOOKABLE_TYPES):
-                continue
-            if not any(p.search(name) for p in compiled):
-                continue
-        else:
-            if not _is_hookable_layer(name, module):
-                continue
+        if not _is_linear_io_capable(module):
+            continue
+        if layer_names is not None and name not in layer_names:
+            continue
 
         for pname, param in module.named_parameters(recurse=False):
             if not param.requires_grad:
@@ -427,9 +388,9 @@ def register_mlp_param_hooks(
 
             def _make_hook(ln: str, pn: str):
                 def _hook(p: torch.nn.Parameter) -> None:
-                    if on_mlp_param_grad is not None:
+                    if on_linear_param_grad is not None:
                         g = p.grad.detach().cpu()
-                        on_mlp_param_grad(ln, pn, g)
+                        on_linear_param_grad(ln, pn, g)
                 return _hook
 
             handles.append(
@@ -443,132 +404,258 @@ def register_mlp_param_hooks(
 # Hook manager configuration                                                   #
 # --------------------------------------------------------------------------- #
 
-# Sentinel that distinguishes "caller did not pass this keyword" from
-# "caller explicitly passed None (= use default heuristic)".
-_UNSET: object = object()
+class _RegisterAll:
+    """Sentinel type for :data:`REGISTER_ALL`.
 
-_VALID_HOOK_TYPES = frozenset({"mlp_io", "param_grad"})
+    A selector value of :data:`REGISTER_ALL` requests that *every* layer
+    applicable to a given hook family be registered, regardless of name.
+    """
+
+    _instance: Optional["_RegisterAll"] = None
+
+    def __new__(cls) -> "_RegisterAll":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "REGISTER_ALL"
+
+
+REGISTER_ALL = _RegisterAll()
+"""Importable selector meaning "register every applicable layer".
+
+Pass it to :class:`HookManagerConfig` to register a hook family on all of its
+applicable layers (linear-IO-capable layers for ``linear_io``; all layers with
+trainable parameters for ``param_grad``)::
+
+    from dattri_llm.gradient.hooks import HookManagerConfig, REGISTER_ALL
+
+    # linear_io on every linear-family layer, nothing else
+    HookManagerConfig(linear_io=REGISTER_ALL)
+
+    # param_grad on every trainable layer
+    HookManagerConfig(param_grad=REGISTER_ALL)
+"""
+
+# A hook-family selector is one of:
+#   * ``None``        — not provided (the family is not requested explicitly).
+#   * ``REGISTER_ALL``— register every applicable layer.
+#   * ``list[str]``   — register applicable layers whose name matches a regex.
+Selector = Optional[object]  # None | _RegisterAll | list[str]
+
+# Hook-family names and the layer_types marker used for materialized grads.
+LINEAR_IO = "linear_io"
+PARAM_GRAD = "param_grad"
+
+
+_VALID_HOOK_TYPES = frozenset({LINEAR_IO, PARAM_GRAD})
 
 
 class HookManagerConfig:
     """Configuration for :class:`HookManager`.
 
-    Can be constructed in **two equivalent forms**:
+    The core control is :attr:`hook_types`, an explicit **assignment** mapping
+    each fully-qualified layer name to the hook family it should use:
 
-    **Dict form** — pass ``hook_types`` as a mapping whose *keys* name the
-    active hook types and whose *values* give the optional regex name-pattern
-    list (``None`` → use the default layer-identification heuristic):
-
-    .. code-block:: python
-
-        # mlp_io only, default heuristic
-        HookManagerConfig(hook_types={"mlp_io": None})
-
-        # mlp_io with custom pattern, param_grad with default heuristic
-        HookManagerConfig(hook_types={"mlp_io": [r"mlp\\."], "param_grad": None})
-
-        # param_grad only, custom pattern
-        HookManagerConfig(hook_types={"param_grad": [r"lm_head"]})
-
-    **Shorthand form** — pass ``mlp_name_patterns`` and/or
-    ``param_name_patterns`` as keyword arguments.  *Passing* a keyword
-    (even as ``None``) activates that hook type; *omitting* it deactivates
-    it:
+    * ``linear_io`` — per-sample factorized hooks on linear-family layers
+      (see :func:`register_linear_io_hooks`).
+    * ``param_grad`` — batch-level materialized parameter-gradient hooks,
+      available for *any* layer with trainable parameters
+      (see :func:`register_param_grad_hooks`).
 
     .. code-block:: python
 
-        # mlp_io only, default heuristic  (same as HookManagerConfig())
-        HookManagerConfig(mlp_name_patterns=None)
+        # explicit per-layer assignment
+        HookManagerConfig(hook_types={"mlp.0": "linear_io", "lm_head": "param_grad"})
 
-        # param_grad only, default heuristic
-        HookManagerConfig(param_name_patterns=None)
+    The regex **selectors** ``linear_io`` and ``param_grad`` are an add-on that
+    *extends* the assignment without having to spell out every layer.  Each
+    selector is one of:
 
-        # both, each with its own pattern
-        HookManagerConfig(mlp_name_patterns=[r"mlp\\."], param_name_patterns=None)
+    * ``None`` — add nothing.
+    * :data:`REGISTER_ALL` — add every layer applicable to that family.
+    * ``list[str]`` — add applicable layers whose fully-qualified name matches
+      at least one of the given regex patterns.
 
-    **Default** (no arguments) — equivalent to
-    ``hook_types={"mlp_io": None}``: register mlp_io hooks on all
-    default-heuristic layers.
+    .. code-block:: python
 
-    Mixing the dict form and the shorthand form in the same call raises
-    :exc:`ValueError`.
+        # linear_io on every linear-family layer
+        HookManagerConfig(linear_io=REGISTER_ALL)
+
+        # explicit assignment, extended by a regex add-on
+        HookManagerConfig(
+            hook_types={"lm_head": "param_grad"},
+            linear_io=[r"mlp\\."],
+        )
+
+    The explicit assignment and the selector add-ons are merged into one final
+    ``{layer_name: hook_type}`` map.  **If a layer is assigned two different
+    hook families** (e.g. listed in ``hook_types`` as ``param_grad`` but also
+    matched by the ``linear_io`` selector), a :exc:`ValueError` is raised — one
+    layer may only be registered with one hook family.
+
+    **Default** (no arguments) — register ``linear_io`` on every
+    linear-IO-capable layer, and fall back to ``param_grad`` for any remaining
+    layer that has trainable parameters but is not linear-IO-capable.
     """
 
     def __init__(
         self,
-        hook_types: Optional[dict[str, Optional[list[str]]]] = None,
-        mlp_name_patterns: object = _UNSET,
-        param_name_patterns: object = _UNSET,
+        hook_types: Optional[dict[str, str]] = None,
+        linear_io: Selector = None,
+        param_grad: Selector = None,
     ) -> None:
-        _has_shorthand = (
-            mlp_name_patterns is not _UNSET or param_name_patterns is not _UNSET
+        self.hook_types = self._validate_assignment(hook_types)
+        self.linear_io = self._validate_selector("linear_io", linear_io)
+        self.param_grad = self._validate_selector("param_grad", param_grad)
+
+    @staticmethod
+    def _validate_assignment(
+        hook_types: Optional[dict[str, str]],
+    ) -> dict[str, str]:
+        if hook_types is None:
+            return {}
+        if not isinstance(hook_types, dict):
+            raise TypeError(
+                "hook_types must be a dict mapping layer name to hook type "
+                f"({sorted(_VALID_HOOK_TYPES)}), got "
+                f"{type(hook_types).__name__}."
+            )
+        for layer_name, hook_type in hook_types.items():
+            if hook_type not in _VALID_HOOK_TYPES:
+                raise ValueError(
+                    f"hook_types['{layer_name}'] = '{hook_type}' is not a valid "
+                    f"hook type. Valid types: {sorted(_VALID_HOOK_TYPES)}."
+                )
+        return dict(hook_types)
+
+    @staticmethod
+    def _validate_selector(name: str, selector: Selector) -> Selector:
+        if selector is None or selector is REGISTER_ALL:
+            return selector
+        if isinstance(selector, (list, tuple)):
+            if not all(isinstance(p, str) for p in selector):
+                raise TypeError(
+                    f"{name} pattern list must contain only regex strings."
+                )
+            return list(selector)
+        raise TypeError(
+            f"{name} must be None, REGISTER_ALL, or a list of regex strings, "
+            f"got {type(selector).__name__}."
         )
 
-        if hook_types is not None and _has_shorthand:
+    @property
+    def is_default(self) -> bool:
+        """True when nothing was requested (the auto fallback applies)."""
+        return (
+            not self.hook_types
+            and self.linear_io is None
+            and self.param_grad is None
+        )
+
+
+def _selector_matches(selector: Selector, name: str) -> bool:
+    """Return ``True`` if *name* is selected by *selector*.
+
+    ``None`` selects nothing, :data:`REGISTER_ALL` selects everything, and a
+    list of regex strings selects names matching at least one pattern.
+    """
+    if selector is None:
+        return False
+    if selector is REGISTER_ALL:
+        return True
+    return any(re.search(p, name) for p in selector)  # type: ignore[union-attr]
+
+
+def resolve_hook_assignments(
+    root: nn.Module,
+    config: HookManagerConfig,
+) -> dict[str, str]:
+    """Resolve the final ``{layer_name: hook_type}`` assignment.
+
+    Resolution rules:
+
+    * **Default** (``config.is_default``) — every linear-IO-capable layer is
+      assigned ``linear_io``; every other layer that directly owns a trainable
+      parameter falls back to ``param_grad``.
+    * **Explicit assignment** (``config.hook_types``) — taken verbatim, after
+      validating that each named layer exists and supports the requested family.
+    * **Selector add-ons** (``config.linear_io`` / ``config.param_grad``) —
+      extend the assignment with the applicable layers they match.
+
+    A layer assigned two *different* hook families raises :exc:`ValueError`.  A
+    warning is emitted if the resolution registers zero layers.
+    """
+    modules = dict(root.named_modules())
+    assignment: dict[str, str] = {}
+
+    def assign(layer_name: str, hook_type: str) -> None:
+        existing = assignment.get(layer_name)
+        if existing is not None and existing != hook_type:
             raise ValueError(
-                "Provide either hook_types (dict form) or mlp_name_patterns / "
-                "param_name_patterns (shorthand form), not both."
+                f"Layer '{layer_name}' is assigned conflicting hook types: "
+                f"'{existing}' and '{hook_type}'. A layer may only be "
+                "registered with one hook family."
             )
+        assignment[layer_name] = hook_type
 
-        if hook_types is not None:
-            # ── dict form ────────────────────────────────────────────────────
-            if not isinstance(hook_types, dict):
-                raise TypeError(
-                    f"hook_types must be a dict mapping hook-type name to name "
-                    f"patterns (or None), got {type(hook_types).__name__}. "
-                    "Example: hook_types={'mlp_io': None, 'param_grad': None}"
-                )
-            if not hook_types:
-                raise ValueError(
-                    "hook_types must contain at least one entry. "
-                    "Valid keys: 'mlp_io', 'param_grad'."
-                )
-            unknown = set(hook_types) - _VALID_HOOK_TYPES
-            if unknown:
-                raise ValueError(
-                    f"Unknown hook_types key(s): {sorted(unknown)}. "
-                    f"Valid keys: {sorted(_VALID_HOOK_TYPES)}."
-                )
-            self._hook_types: dict[str, Optional[list[str]]] = dict(hook_types)
+    if config.is_default:
+        for name, module in modules.items():
+            if _is_linear_io_capable(module):
+                assignment[name] = LINEAR_IO
+            elif _has_trainable_params(module):
+                assignment[name] = PARAM_GRAD
+        # The default never produces conflicts, so skip the zero-layer warning
+        # path below only if something was registered.
+        if not assignment:
+            _warn_zero_layers()
+        return assignment
 
-        elif _has_shorthand:
-            # ── shorthand form ───────────────────────────────────────────────
-            self._hook_types = {}
-            if mlp_name_patterns is not _UNSET:
-                self._hook_types["mlp_io"] = mlp_name_patterns  # type: ignore[assignment]
-            if param_name_patterns is not _UNSET:
-                self._hook_types["param_grad"] = param_name_patterns  # type: ignore[assignment]
+    # 1. Explicit per-layer assignment (validated against the model).
+    for layer_name, hook_type in config.hook_types.items():
+        module = modules.get(layer_name)
+        if module is None:
+            raise ValueError(
+                f"hook_types names layer '{layer_name}', which does not exist "
+                "in the model."
+            )
+        if hook_type == LINEAR_IO and not _is_linear_io_capable(module):
+            raise ValueError(
+                f"Layer '{layer_name}' was assigned 'linear_io' but its type "
+                f"({canonical_class_name(module)}) does not support factorized "
+                "linear-IO hooks."
+            )
+        if hook_type == PARAM_GRAD and not _has_trainable_params(module):
+            raise ValueError(
+                f"Layer '{layer_name}' was assigned 'param_grad' but has no "
+                "trainable parameters."
+            )
+        assign(layer_name, hook_type)
 
-        else:
-            # ── default: mlp_io with the default heuristic ───────────────────
-            self._hook_types = {"mlp_io": None}
+    # 2. Selector add-ons extend the assignment with applicable layers only.
+    for name, module in modules.items():
+        if _is_linear_io_capable(module) and _selector_matches(
+            config.linear_io, name
+        ):
+            assign(name, LINEAR_IO)
+        if _has_trainable_params(module) and _selector_matches(
+            config.param_grad, name
+        ):
+            assign(name, PARAM_GRAD)
 
-    # ---------------------------------------------------------------------- #
-    # Read-only properties                                                     #
-    # ---------------------------------------------------------------------- #
+    if not assignment:
+        _warn_zero_layers()
 
-    @property
-    def hook_types(self) -> list[str]:
-        """Active hook-type names in insertion order."""
-        return list(self._hook_types.keys())
+    return assignment
 
-    @property
-    def mlp_name_patterns(self) -> Optional[list[str]]:
-        """Regex patterns for :func:`register_mlp_hooks`, or ``None`` for the
-        default layer-identification heuristic.
 
-        Only meaningful when ``"mlp_io"`` is in :attr:`hook_types`.
-        """
-        return self._hook_types.get("mlp_io")
-
-    @property
-    def param_name_patterns(self) -> Optional[list[str]]:
-        """Regex patterns for :func:`register_param_grad_hooks`, or ``None``
-        to hook all leaf modules with trainable parameters.
-
-        Only meaningful when ``"param_grad"`` is in :attr:`hook_types`.
-        """
-        return self._hook_types.get("param_grad")
+def _warn_zero_layers() -> None:
+    warnings.warn(
+        "HookManager registered zero layers: no module matched the requested "
+        "hook configuration. No gradients will be collected.",
+        stacklevel=3,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -585,13 +672,13 @@ class HookManager:
     Args:
         model: The model to hook (plain ``nn.Module``, ``DataParallel``, or
             ``DistributedDataParallel``).
-        config: :class:`HookManagerConfig` controlling ``hook_types`` and
-            layer patterns.  Defaults to ``HookManagerConfig()`` (mlp_io only).
+        config: :class:`HookManagerConfig` giving the per-layer ``hook_types``
+            assignment (optionally extended by the ``linear_io`` / ``param_grad``
+            regex selectors).  Defaults to ``HookManagerConfig()`` (linear_io on
+            every capable layer, with a param_grad fallback for the rest).
         callbacks: List of :class:`HookManagerCallback` objects.
         sample_id_key: Key in the model's forward kwargs used as a hint for
             batch size detection.  Defaults to ``"input_ids"``.
-        name_patterns: Kept for backward compatibility.  Forwarded as
-            ``mlp_name_patterns`` when ``config`` is ``None``.
     """
 
     def __init__(
@@ -600,20 +687,12 @@ class HookManager:
         config: Optional[HookManagerConfig] = None,
         callbacks: Optional[list[HookManagerCallback]] = None,
         sample_id_key: str = "input_ids",
-        # Kept for backward compatibility; ignored when config is provided.
-        name_patterns: Optional[list[str]] = None,
     ) -> None:
         self._model = model
         self._callbacks: list[HookManagerCallback] = callbacks or []
         self._sample_id_key = sample_id_key
 
-        if config is None:
-            # Legacy path: name_patterns is forwarded as mlp_name_patterns.
-            # HookManagerConfig(mlp_name_patterns=None) is the default (mlp_io,
-            # default heuristic), same behaviour as before the refactor.
-            self._config = HookManagerConfig(mlp_name_patterns=name_patterns)
-        else:
-            self._config = config
+        self._config = config if config is not None else HookManagerConfig()
 
         self._step_count: int = 0
         self._collecting: bool = False
@@ -646,8 +725,8 @@ class HookManager:
         #     → (a) done before (b); step triggered by (b)
         #
         # ``_grad_done`` — True once all user-specified ``param_grad`` hooks
-        #   have fired (only relevant for ``hook_types`` containing
-        #   ``"param_grad"``; starts True otherwise).
+        #   have fired (only relevant when ``param_grad`` layers are
+        #   registered; starts True otherwise).
         self._bwd_done: bool = True
         self._mlp_param_hook_count: int = 0   # fires toward sub-cond (b)
         self._n_mlp_params: int = 0            # target for sub-cond (b)
@@ -680,34 +759,42 @@ class HookManager:
             self._capture_model_input, with_kwargs=True
         )
 
+        # Resolve which hook family each layer is assigned to (one family per
+        # layer), then register concrete layer-name sets.
+        assignment = resolve_hook_assignments(root, self._config)
+        linear_io_layers = {n for n, t in assignment.items() if t == LINEAR_IO}
+        param_grad_layers = {n for n, t in assignment.items() if t == PARAM_GRAD}
+        self._has_linear_io = bool(linear_io_layers)
+        self._has_param_grad = bool(param_grad_layers)
+
         self._buffers: dict = {}
         self._handles: list = []
         self._mlp_weight_handles: list = []   # post-accumulate hooks for sub-cond (b)
         self._n_layers: int = 0
-        if "mlp_io" in self._config.hook_types:
+        if self._has_linear_io:
             self._bwd_done = False
-            self._buffers, self._handles = register_mlp_hooks(
+            self._buffers, self._handles = register_linear_io_hooks(
                 model,
-                name_patterns=self._config.mlp_name_patterns,
+                layer_names=linear_io_layers,
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
             )
             self._n_layers = len(self._buffers)
-            self._n_mlp_params, self._mlp_weight_handles = register_mlp_param_hooks(
+            self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
                 model,
-                name_patterns=self._config.mlp_name_patterns,
-                on_mlp_param_grad=self._check_step_mlp_param_complete,
+                layer_names=linear_io_layers,
+                on_linear_param_grad=self._check_step_mlp_param_complete,
             )
 
         self._param_buffers: dict = {}
         self._param_handles: list = []
         self._n_params_hooked: int = 0
         self._param_hook_count: int = 0
-        if "param_grad" in self._config.hook_types:
+        if self._has_param_grad:
             self._grad_done = False
             self._param_buffers, self._param_handles = register_param_grad_hooks(
                 model,
-                name_patterns=self._config.param_name_patterns,
+                layer_names=param_grad_layers,
                 on_param_grad=self._check_step_grad_complete,
             )
             self._n_params_hooked = len(self._param_handles)
@@ -794,7 +881,7 @@ class HookManager:
         _param_name: str,
         _grad: torch.Tensor,
     ) -> None:
-        """Fired by :func:`register_mlp_param_hooks` after each MLP param's
+        """Fired by :func:`register_linear_param_hooks` after each linear param's
         grad is accumulated.  Once all MLP param hooks have reported, checks
         whether the composite ``_bwd_done`` condition is met."""
         if not self._collecting:
@@ -869,8 +956,8 @@ class HookManager:
         # Reset completion flags for the next step.
         self._mlp_params_ready = False
         self._backward_end_scheduled = False
-        self._bwd_done = "mlp_io" not in self._config.hook_types
-        self._grad_done = "param_grad" not in self._config.hook_types
+        self._bwd_done = not self._has_linear_io
+        self._grad_done = not self._has_param_grad
         self._reset_layer_buffers()
         self._reset_param_buffers()
 
@@ -1076,7 +1163,7 @@ class HookManager:
 
     @property
     def layer_names(self) -> list[str]:
-        """Fully-qualified names of all hooked MLP layers (mlp_io)."""
+        """Fully-qualified names of all hooked linear-IO layers."""
         return list(self._buffers.keys())
 
     @property

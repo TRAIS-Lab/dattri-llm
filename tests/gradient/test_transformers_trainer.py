@@ -91,7 +91,7 @@ class TestGradientCollectingTrainerMlpIo:
             model=tiny_gpt2,
             args=training_args,
             train_dataset=tiny_dataset,
-            gradient_collection_mode="mlp_io",
+            gradient_collection_mode="linear_io",
         )
         trainer.train()
 
@@ -105,7 +105,7 @@ class TestGradientCollectingTrainerMlpIo:
             model=tiny_gpt2,
             args=training_args,
             train_dataset=tiny_dataset,
-            gradient_collection_mode="mlp_io",
+            gradient_collection_mode="linear_io",
         )
         trainer.train()
 
@@ -125,7 +125,7 @@ class TestGradientCollectingTrainerMlpIo:
             model=tiny_gpt2,
             args=training_args,
             train_dataset=tiny_dataset,
-            gradient_collection_mode="mlp_io",
+            gradient_collection_mode="linear_io",
         )
         trainer.train()
 
@@ -145,7 +145,7 @@ class TestGradientCollectingTrainerMlpIo:
             model=tiny_gpt2,
             args=training_args,
             train_dataset=tiny_dataset,
-            gradient_collection_mode="mlp_io",
+            gradient_collection_mode="linear_io",
             gradient_save_dir=custom_dir,
         )
         trainer.train()

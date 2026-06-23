@@ -458,7 +458,7 @@ class DataSelectionCallback(HookManagerCallback):
         both training and val passes (PyTorch does not allow selective hook
         suppression), but the flag ensures only val data is stored.
         """
-        from dattri_llm.gradient.hooks import register_mlp_hooks
+        from dattri_llm.gradient.hooks import register_linear_io_hooks
 
         cb_self = self  # capture for closures
 
@@ -470,7 +470,7 @@ class DataSelectionCallback(HookManagerCallback):
             if cb_self._in_val_pass:
                 cb_self._val_grad_bufs[layer_name] = grad
 
-        _, self._val_hook_handles = register_mlp_hooks(
+        _, self._val_hook_handles = register_linear_io_hooks(
             model=self._root,
             on_layer_forward=_val_fwd,
             on_layer_backward=_val_bwd,

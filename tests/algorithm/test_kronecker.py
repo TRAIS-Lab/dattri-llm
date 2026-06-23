@@ -307,7 +307,7 @@ class TestKFACMultiToken:
 
         def collect(x, out_dir):
             fm = GradientFileManager(str(out_dir))
-            hm = HookManager(model, config=HookManagerConfig(mlp_name_patterns=[r"fc"]),
+            hm = HookManager(model, config=HookManagerConfig(linear_io=[r"fc"]),
                              callbacks=[OffloadCallback(offload_interval=1, file_manager=fm,
                                                         recording_type="per_sample")])
             with hm.collect():

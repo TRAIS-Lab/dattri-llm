@@ -31,7 +31,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 
 from dattri_llm.gradient.callbacks import DataSelectionCallback
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 
 SEED = 0
 VOCAB = 32
@@ -115,7 +115,7 @@ def _fsdp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
 
         # HookManager on the unwrapped model (hooks survive FSDP wrapping).
         collector = HookManager(
-            model, config=HookManagerConfig(hook_types={"mlp_io": None})
+            model, config=HookManagerConfig(linear_io=REGISTER_ALL)
         )
         fsdp_model = FSDP(
             model,

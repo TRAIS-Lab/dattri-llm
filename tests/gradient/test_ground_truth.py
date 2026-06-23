@@ -49,7 +49,11 @@ import torch.nn.functional as F
 from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
 
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.hooks import HookManager, HookManagerCallback
+from dattri_llm.gradient.hooks import (
+    HookManager,
+    HookManagerCallback,
+    HookManagerConfig,
+)
 
 try:
     from transformers.pytorch_utils import Conv1D as _HF_Conv1D
@@ -230,12 +234,17 @@ def _run_batch(
 ):
     """One HookManager-collected batch pass; returns the assembled Gradient.
 
-    ``name_patterns`` is forwarded to HookManager to override the default MLP
-    heuristic.  Pass a pattern like ``["mlp"]`` for wrapper models where the
-    target layer is at the top level and doesn't have an MLP-parent in its path.
+    ``name_patterns`` is forwarded as the ``linear_io`` selector to restrict
+    collection to specific layers.  Pass a pattern like ``["mlp"]`` to target a
+    single layer instead of hooking every linear-family layer (the default).
     """
     cb = _CaptureCB()
-    mgr = HookManager(model, callbacks=[cb], name_patterns=name_patterns)
+    config = (
+        HookManagerConfig(linear_io=name_patterns)
+        if name_patterns is not None
+        else None
+    )
+    mgr = HookManager(model, config=config, callbacks=[cb])
     with mgr.collect():
         model.zero_grad()
         model(x).sum().backward()

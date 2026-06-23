@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from dattri_llm.gradient.hooks import (
+    REGISTER_ALL,
     HookManager,
     HookManagerCallback,
     HookManagerConfig,
@@ -134,17 +135,17 @@ class TestGradientRecord:
 class TestHookManagerInit:
     def test_layer_names_populated(self, tiny_model):
         collector = HookManager(tiny_model)
-        # TinyMLP has: embedding (Embedding — always hooked),
-        # mlp.0 and mlp.2 (Linear inside an MLP block).
-        # attn_proj and lm_head (Linear without an MLP-family parent) are skipped.
-        assert len(collector.layer_names) == 3
-        assert "embedding" in collector.layer_names
-        assert "mlp.0" in collector.layer_names
-        assert "mlp.2" in collector.layer_names
+        # Default config hooks every linear-family layer regardless of name:
+        # embedding, attn_proj, mlp.0, mlp.2, lm_head (mlp.1 is ReLU).
+        assert set(collector.layer_names) == {
+            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+        }
         collector.remove()
 
     def test_custom_patterns(self, tiny_model):
-        collector = HookManager(tiny_model, name_patterns=[r"mlp\.0"])
+        collector = HookManager(
+            tiny_model, config=HookManagerConfig(linear_io=[r"mlp\.0"])
+        )
         assert collector.layer_names == ["mlp.0"]
         collector.remove()
 
@@ -257,8 +258,9 @@ class TestRecordContent:
         cb = RecordingCallback()
         _run_one_step(tiny_model, tiny_batch["input_ids"], callbacks=[cb])
         for rec in cb.records:
-            # embedding (Embedding), mlp.0, mlp.2 (Linear inside mlp block)
-            assert len(rec.gradient.layer_names) == 3
+            # Default config hooks every linear-family layer:
+            # embedding, attn_proj, mlp.0, mlp.2, lm_head.
+            assert len(rec.gradient.layer_names) == 5
             assert "embedding" in rec.gradient.layer_names
 
     def test_gradient_finite(self, tiny_model, tiny_batch):
@@ -546,7 +548,7 @@ class TestBatchSaving:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
             offload = OffloadCallback(offload_interval=100, file_manager=manager)
-            cfg = HookManagerConfig(hook_types={"mlp_io": None})
+            cfg = HookManagerConfig(linear_io=REGISTER_ALL)
             collector = HookManager(tiny_model, config=cfg, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
@@ -720,84 +722,71 @@ class TestHookManagerRemove:
 class TestHookManagerConfig:
     # ── default ─────────────────────────────────────────────────────────────
 
-    def test_default_hook_types(self):
+    def test_default_selectors(self):
         cfg = HookManagerConfig()
-        assert cfg.hook_types == ["mlp_io"]
-        assert cfg.mlp_name_patterns is None   # default heuristic
-        assert cfg.param_name_patterns is None  # param_grad not active
+        assert cfg.hook_types == {}
+        assert cfg.linear_io is None
+        assert cfg.param_grad is None
+        assert cfg.is_default
 
-    # ── dict form ────────────────────────────────────────────────────────────
+    # ── hook_types assignment (the basic control) ─────────────────────────────
 
-    def test_dict_mlp_io_only(self):
-        cfg = HookManagerConfig(hook_types={"mlp_io": None})
-        assert cfg.hook_types == ["mlp_io"]
-        assert cfg.mlp_name_patterns is None
+    def test_hook_types_assignment(self):
+        cfg = HookManagerConfig(
+            hook_types={"mlp.0": "linear_io", "lm_head": "param_grad"}
+        )
+        assert cfg.hook_types == {"mlp.0": "linear_io", "lm_head": "param_grad"}
+        assert not cfg.is_default
 
-    def test_dict_param_grad_only(self):
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
-        assert cfg.hook_types == ["param_grad"]
-        assert cfg.param_name_patterns is None
+    def test_hook_types_invalid_value_raises(self):
+        with pytest.raises(ValueError, match="not a valid hook type"):
+            HookManagerConfig(hook_types={"mlp.0": "bogus"})
 
-    def test_dict_both_hook_types(self):
-        cfg = HookManagerConfig(hook_types={"mlp_io": None, "param_grad": None})
-        assert set(cfg.hook_types) == {"mlp_io", "param_grad"}
-
-    def test_dict_mlp_with_pattern(self):
-        cfg = HookManagerConfig(hook_types={"mlp_io": [r"mlp\.0"]})
-        assert cfg.mlp_name_patterns == [r"mlp\.0"]
-
-    def test_dict_param_with_pattern(self):
-        cfg = HookManagerConfig(hook_types={"param_grad": [r"mlp\.[02]"]})
-        assert cfg.param_name_patterns == [r"mlp\.[02]"]
-
-    def test_dict_unknown_key_raises(self):
-        with pytest.raises(ValueError, match="Unknown hook_types key"):
-            HookManagerConfig(hook_types={"mlp_io": None, "bogus": None})
-
-    def test_dict_empty_raises(self):
-        with pytest.raises(ValueError, match="hook_types must contain at least one entry"):
-            HookManagerConfig(hook_types={})
-
-    def test_dict_wrong_type_raises(self):
+    def test_hook_types_wrong_type_raises(self):
         with pytest.raises(TypeError, match="hook_types must be a dict"):
-            HookManagerConfig(hook_types=["mlp_io"])  # type: ignore[arg-type]
+            HookManagerConfig(hook_types=["mlp.0"])  # type: ignore[arg-type]
 
-    # ── shorthand form ───────────────────────────────────────────────────────
+    # ── REGISTER_ALL ──────────────────────────────────────────────────────────
 
-    def test_shorthand_mlp_only(self):
-        cfg = HookManagerConfig(mlp_name_patterns=None)
-        assert cfg.hook_types == ["mlp_io"]
-        assert "param_grad" not in cfg.hook_types
+    def test_register_all_is_singleton(self):
+        assert HookManagerConfig(linear_io=REGISTER_ALL).linear_io is REGISTER_ALL
 
-    def test_shorthand_param_only(self):
-        cfg = HookManagerConfig(param_name_patterns=None)
-        assert cfg.hook_types == ["param_grad"]
-        assert "mlp_io" not in cfg.hook_types
+    def test_linear_io_register_all(self):
+        cfg = HookManagerConfig(linear_io=REGISTER_ALL)
+        assert cfg.linear_io is REGISTER_ALL
+        assert cfg.param_grad is None
+        assert not cfg.is_default
 
-    def test_shorthand_both(self):
-        cfg = HookManagerConfig(mlp_name_patterns=[r"mlp\."], param_name_patterns=None)
-        assert set(cfg.hook_types) == {"mlp_io", "param_grad"}
-        assert cfg.mlp_name_patterns == [r"mlp\."]
-        assert cfg.param_name_patterns is None
+    def test_param_grad_register_all(self):
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
+        assert cfg.param_grad is REGISTER_ALL
+        assert cfg.linear_io is None
+        assert not cfg.is_default
 
-    def test_shorthand_mlp_pattern(self):
-        cfg = HookManagerConfig(mlp_name_patterns=[r"mlp\.0"])
-        assert cfg.mlp_name_patterns == [r"mlp\.0"]
+    # ── pattern lists ─────────────────────────────────────────────────────────
 
-    def test_shorthand_param_pattern(self):
-        cfg = HookManagerConfig(param_name_patterns=[r"mlp\.[02]"])
-        assert cfg.param_name_patterns == [r"mlp\.[02]"]
+    def test_linear_io_pattern(self):
+        cfg = HookManagerConfig(linear_io=[r"mlp\.0"])
+        assert cfg.linear_io == [r"mlp\.0"]
 
-    # ── mixing forms raises ───────────────────────────────────────────────────
+    def test_param_grad_pattern(self):
+        cfg = HookManagerConfig(param_grad=[r"mlp\.[02]"])
+        assert cfg.param_grad == [r"mlp\.[02]"]
 
-    def test_mixing_forms_raises(self):
-        with pytest.raises(ValueError, match="Provide either hook_types"):
-            HookManagerConfig(
-                hook_types={"mlp_io": None},
-                mlp_name_patterns=[r"mlp\.0"],
-            )
+    def test_both_selectors(self):
+        cfg = HookManagerConfig(linear_io=[r"mlp\."], param_grad=[r"lm_head"])
+        assert cfg.linear_io == [r"mlp\."]
+        assert cfg.param_grad == [r"lm_head"]
 
+    # ── validation ────────────────────────────────────────────────────────────
 
+    def test_invalid_selector_type_raises(self):
+        with pytest.raises(TypeError, match="must be None, REGISTER_ALL"):
+            HookManagerConfig(linear_io="mlp")  # type: ignore[arg-type]
+
+    def test_non_string_pattern_raises(self):
+        with pytest.raises(TypeError, match="regex strings"):
+            HookManagerConfig(param_grad=[123])  # type: ignore[list-item]
 
 
 # --------------------------------------------------------------------------- #
@@ -806,20 +795,20 @@ class TestHookManagerConfig:
 
 
 class TestHookManagerParamGrad:
-    def test_param_layer_names_empty_for_mlp_io_only(self, tiny_model):
+    def test_param_layer_names_empty_for_linear_io_only(self, tiny_model):
         collector = HookManager(tiny_model)
         assert collector.param_layer_names == []
         collector.remove()
 
     def test_param_layer_names_populated_for_param_grad(self, tiny_model):
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
         collector = HookManager(tiny_model, config=cfg)
         assert len(collector.param_layer_names) > 0
         collector.remove()
 
     def test_param_grad_only_emits_one_record_per_step(self, tiny_model, tiny_batch):
         """param_grad-only per-batch mode emits one record per step (not per sample)."""
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
         cb = RecordingCallback()
         B = tiny_batch["input_ids"].shape[0]
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
@@ -832,7 +821,7 @@ class TestHookManagerParamGrad:
 
     def test_param_grad_entries_in_gradient(self, tiny_model, tiny_batch):
         """Records from param_grad-only per-batch mode contain materialized entries."""
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -845,7 +834,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_tensors_are_finite(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -858,8 +847,12 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_combined_per_batch_emits_one_record_per_step(self, tiny_model, tiny_batch):
-        """Combined mlp_io + param_grad per-batch: one record per step."""
-        cfg = HookManagerConfig(hook_types={"mlp_io": None, "param_grad": None})
+        """Combined linear_io + param_grad per-batch: one record per step.
+
+        Uses disjoint selectors (mlp.* via linear_io, lm_head via param_grad)
+        so each family claims a distinct set of layers.
+        """
+        cfg = HookManagerConfig(linear_io=[r"mlp\."], param_grad=[r"lm_head"])
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -867,18 +860,18 @@ class TestHookManagerParamGrad:
         assert len(cb.records) == 1
         g = cb.records[0].gradient
         types = set((g.layer_types or {}).values())
-        # After the ops refactor, mlp_io layers store their canonical class names
-        # (e.g. "nn.Linear", "nn.Embedding") rather than the generic "mlp_io" marker.
+        # linear_io layers store their canonical class names (e.g. "nn.Linear")
+        # rather than the generic marker.
         non_param_types = types - {"param_grad"}
         assert len(non_param_types) > 0, (
-            "Expected at least one canonical layer type (mlp_io layers) in types"
+            "Expected at least one canonical layer type (linear_io layers) in types"
         )
         assert "param_grad" in types
         collector.remove()
 
-    def test_per_batch_mlp_io_only_emits_one_record_per_step(self, tiny_model, tiny_batch):
-        """per_batch with mlp_io only emits one record per step."""
-        cfg = HookManagerConfig(hook_types={"mlp_io": None})
+    def test_per_batch_linear_io_only_emits_one_record_per_step(self, tiny_model, tiny_batch):
+        """per_batch with linear_io only emits one record per step."""
+        cfg = HookManagerConfig(linear_io=REGISTER_ALL)
         cb = RecordingCallback()
         B = tiny_batch["input_ids"].shape[0]
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
@@ -890,7 +883,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_step_increments(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
         collector = HookManager(tiny_model, config=cfg)
         with collector.collect():
             for _ in range(3):
@@ -899,7 +892,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_step_ids_in_records(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -909,7 +902,7 @@ class TestHookManagerParamGrad:
         collector.remove()
 
     def test_param_grad_custom_patterns(self, tiny_model, tiny_batch):
-        cfg = HookManagerConfig(param_name_patterns=[r"mlp\.0"])
+        cfg = HookManagerConfig(param_grad=[r"mlp\.0"])
         cb = RecordingCallback()
         collector = HookManager(tiny_model, config=cfg, callbacks=[cb])
         with collector.collect():
@@ -921,13 +914,13 @@ class TestHookManagerParamGrad:
         assert all(k.startswith("mlp.0.") for k in param_grad_keys)
         collector.remove()
 
-    def test_param_grad_hook_type_valid(self, tiny_model):
-        """param_grad is a valid hook_type in HookManagerConfig."""
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
-        assert "param_grad" in cfg.hook_types
+    def test_param_grad_selector_set(self, tiny_model):
+        """param_grad selector is recorded on HookManagerConfig."""
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
+        assert cfg.param_grad is REGISTER_ALL
 
     def test_remove_clears_param_layer_names(self, tiny_model):
-        cfg = HookManagerConfig(hook_types={"param_grad": None})
+        cfg = HookManagerConfig(param_grad=REGISTER_ALL)
         collector = HookManager(tiny_model, config=cfg)
         assert len(collector.param_layer_names) > 0
         collector.remove()
@@ -1068,10 +1061,14 @@ class TestGradientFileManagerDDP:
         assert (tmp_path / "batch_000000.pt").exists()
         assert (tmp_path / "index.json").exists()
 
-    def test_backward_compat_name_patterns_still_works(self, tiny_model, tiny_batch):
-        """name_patterns kwarg still filters mlp_io layers when config is None."""
+    def test_linear_io_pattern_filters_layers(self, tiny_model, tiny_batch):
+        """A linear_io regex selector restricts collection to matching layers."""
         cb = RecordingCallback()
-        collector = HookManager(tiny_model, name_patterns=[r"mlp\.0"], callbacks=[cb])
+        collector = HookManager(
+            tiny_model,
+            config=HookManagerConfig(linear_io=[r"mlp\.0"]),
+            callbacks=[cb],
+        )
         assert collector.layer_names == ["mlp.0"]
         with collector.collect():
             tiny_model(tiny_batch["input_ids"]).mean().backward()

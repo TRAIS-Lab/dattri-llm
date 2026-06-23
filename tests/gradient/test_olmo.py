@@ -137,7 +137,7 @@ def _can_bind_localhost() -> bool:
 
 
 def _make_hook_cfg() -> HookManagerConfig:
-    return HookManagerConfig(mlp_name_patterns=OLMO_MLP_PATTERNS)
+    return HookManagerConfig(linear_io=OLMO_MLP_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +376,7 @@ def _fsdp_worker(
 
         # Register hooks BEFORE FSDP wrapping so they survive module restructuring.
         capture = _Capture()
-        hook_cfg = HookManagerConfig(mlp_name_patterns=OLMO_MLP_PATTERNS)
+        hook_cfg = HookManagerConfig(linear_io=OLMO_MLP_PATTERNS)
         collector = HookManager(model, config=hook_cfg, callbacks=[capture])
 
         fsdp_model = FSDP(
@@ -430,7 +430,7 @@ def _fsdp_worker(
                 ref_capture = _Capture()
                 ref_collector = HookManager(
                     ref_model,
-                    config=HookManagerConfig(mlp_name_patterns=OLMO_MLP_PATTERNS),
+                    config=HookManagerConfig(linear_io=OLMO_MLP_PATTERNS),
                     callbacks=[ref_capture],
                 )
                 _run_forward_backward(ref_model, ids.clone(), ref_collector, ref_capture)

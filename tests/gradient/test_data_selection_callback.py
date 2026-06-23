@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import pytest
 
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 from dattri_llm.gradient.callbacks import DataSelectionCallback
 
 
@@ -83,7 +83,7 @@ def _run_step_with_callback(
     """Run one forward + backward step with the callback attached."""
     collector = HookManager(
         model,
-        config=HookManagerConfig(hook_types={"mlp_io": None}),
+        config=HookManagerConfig(linear_io=REGISTER_ALL),
         callbacks=[callback],
     )
     with collector.collect():
@@ -664,12 +664,12 @@ def _capture_batch_gradient(
     loss_reduction: str = "mean",
 ):
     """Run one forward+backward and return the batch Gradient."""
-    from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+    from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 
     cap = _CaptureGradient()
     collector = HookManager(
         model,
-        config=HookManagerConfig(hook_types={"mlp_io": None}),
+        config=HookManagerConfig(linear_io=REGISTER_ALL),
         callbacks=[cap],
     )
     with collector.collect():
@@ -899,7 +899,7 @@ class TestTargetModes:
         )
         collector = HookManager(
             model,
-            config=HookManagerConfig(hook_types={"mlp_io": None}),
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
             callbacks=[cb],
         )
         with collector.collect():

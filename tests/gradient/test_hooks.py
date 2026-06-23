@@ -2,101 +2,174 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 import torch.nn as nn
 
 from dattri_llm.gradient.hooks import (
-    _is_hookable_layer,
-    register_mlp_hooks,
+    REGISTER_ALL,
+    HookManagerConfig,
+    _is_linear_io_capable,
+    register_linear_io_hooks,
     register_param_grad_hooks,
     remove_hooks,
+    resolve_hook_assignments,
 )
 
 
 # --------------------------------------------------------------------------- #
-# _is_hookable_layer                                                            #
+# _is_linear_io_capable — purely type-based, never name-based                  #
 # --------------------------------------------------------------------------- #
 
 
-class TestIsHookableLayer:
-    # --- nn.Linear / Conv1D: require an MLP-family parent keyword ----------- #
+class TestLinearIoCapable:
+    def test_linear_is_capable(self):
+        assert _is_linear_io_capable(nn.Linear(4, 4))
 
-    def test_linear_inside_mlp(self):
-        assert _is_hookable_layer("transformer.h.0.mlp.fc1", nn.Linear(4, 4))
+    def test_embedding_is_capable(self):
+        assert _is_linear_io_capable(nn.Embedding(32, 8))
 
-    def test_linear_inside_ffn(self):
-        assert _is_hookable_layer("model.layers.1.ffn.gate_proj", nn.Linear(4, 4))
+    def test_layernorm_is_capable(self):
+        assert _is_linear_io_capable(nn.LayerNorm(64))
 
-    def test_linear_not_in_mlp(self):
-        # attn projection — parent path has no MLP keyword
-        assert not _is_hookable_layer("transformer.h.0.attn.c_proj", nn.Linear(4, 4))
+    def test_conv2d_is_capable(self):
+        assert _is_linear_io_capable(nn.Conv2d(3, 3, 3))
 
-    def test_non_linear_inside_mlp(self):
-        assert not _is_hookable_layer("model.mlp.act", nn.ReLU())
+    def test_relu_not_capable(self):
+        assert not _is_linear_io_capable(nn.ReLU())
 
-    def test_top_level_linear(self):
-        # No parent path at all
-        assert not _is_hookable_layer("lm_head", nn.Linear(4, 4))
-
-    # --- nn.Embedding: always included regardless of parent path ------------ #
-
-    def test_embedding_top_level(self):
-        assert _is_hookable_layer("embedding", nn.Embedding(32, 8))
-
-    def test_embedding_nested(self):
-        assert _is_hookable_layer("model.transformer.wte", nn.Embedding(50257, 768))
-
-    def test_embedding_inside_attn(self):
-        # Even under a non-MLP parent, Embedding is hooked.
-        assert _is_hookable_layer("model.attn.embed", nn.Embedding(16, 16))
-
-    # --- nn.LayerNorm: always included regardless of parent path ------------ #
-
-    def test_layernorm_top_level(self):
-        assert _is_hookable_layer("ln_f", nn.LayerNorm(64))
-
-    def test_layernorm_nested(self):
-        assert _is_hookable_layer("model.layers.0.ln1", nn.LayerNorm(128))
-
-    def test_layernorm_inside_attn(self):
-        assert _is_hookable_layer("model.h.3.attn.ln", nn.LayerNorm(256))
-
-    # --- Other module types are still excluded ------------------------------ #
-
-    def test_relu_excluded(self):
-        assert not _is_hookable_layer("model.mlp.act", nn.ReLU())
-
-    def test_dropout_excluded(self):
-        assert not _is_hookable_layer("model.dropout", nn.Dropout())
+    def test_dropout_not_capable(self):
+        assert not _is_linear_io_capable(nn.Dropout())
 
 
 # --------------------------------------------------------------------------- #
-# register_mlp_hooks / remove_hooks                                            #
+# resolve_hook_assignments                                                      #
 # --------------------------------------------------------------------------- #
 
 
-class TestRegisterMlpHooks:
-    def test_hooks_registered_on_mlp_layers(self, tiny_model):
-        buffers, handles = register_mlp_hooks(tiny_model)
-        # TinyMLP has: embedding (Embedding — always hooked),
-        # mlp.0 and mlp.2 (Linear inside an MLP block).
-        # mlp.1 is ReLU → skipped; attn_proj and lm_head lack an MLP parent → skipped.
-        assert len(buffers) == 3
-        assert "embedding" in buffers
-        assert "mlp.0" in buffers
-        assert "mlp.2" in buffers
-        # Each layer has 2 handles (forward + backward)
-        assert len(handles) == 6
-        remove_hooks(handles)
+class _TopLevelLinear(nn.Module):
+    """Model whose only layer is a top-level ``nn.Linear`` named ``linear``.
 
-    def test_attn_proj_not_hooked(self, tiny_model):
-        buffers, handles = register_mlp_hooks(tiny_model)
-        assert "attn_proj" not in buffers
+    Regression guard: the old name-based heuristic skipped a top-level layer
+    named ``linear`` and silently registered zero layers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+class TestResolveHookAssignments:
+    def test_default_hooks_top_level_linear(self):
+        # The reported bug: a top-level layer named "linear" must be hooked.
+        model = _TopLevelLinear()
+        assignment = resolve_hook_assignments(model, HookManagerConfig())
+        assert assignment == {"linear": "linear_io"}
+
+    def test_default_assigns_all_capable_to_linear_io(self, tiny_model):
+        assignment = resolve_hook_assignments(tiny_model, HookManagerConfig())
+        # Every linear-family layer is hooked, regardless of name.
+        assert set(assignment) == {
+            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+        }
+        assert all(t == "linear_io" for t in assignment.values())
+
+    def test_register_all_linear_io(self, tiny_model):
+        assignment = resolve_hook_assignments(
+            tiny_model, HookManagerConfig(linear_io=REGISTER_ALL)
+        )
+        assert all(t == "linear_io" for t in assignment.values())
+        assert "lm_head" in assignment
+
+    def test_register_all_param_grad(self, tiny_model):
+        assignment = resolve_hook_assignments(
+            tiny_model, HookManagerConfig(param_grad=REGISTER_ALL)
+        )
+        assert all(t == "param_grad" for t in assignment.values())
+
+    def test_pattern_selects_subset(self, tiny_model):
+        assignment = resolve_hook_assignments(
+            tiny_model, HookManagerConfig(linear_io=[r"mlp\."])
+        )
+        assert set(assignment) == {"mlp.0", "mlp.2"}
+
+    def test_explicit_hook_types_assignment(self, tiny_model):
+        assignment = resolve_hook_assignments(
+            tiny_model,
+            HookManagerConfig(
+                hook_types={"mlp.0": "linear_io", "lm_head": "param_grad"}
+            ),
+        )
+        assert assignment == {"mlp.0": "linear_io", "lm_head": "param_grad"}
+
+    def test_selector_extends_explicit_assignment(self, tiny_model):
+        assignment = resolve_hook_assignments(
+            tiny_model,
+            HookManagerConfig(
+                hook_types={"lm_head": "param_grad"}, linear_io=[r"mlp\."]
+            ),
+        )
+        assert assignment == {
+            "lm_head": "param_grad", "mlp.0": "linear_io", "mlp.2": "linear_io",
+        }
+
+    def test_conflicting_assignment_raises(self, tiny_model):
+        with pytest.raises(ValueError, match="conflicting hook types"):
+            resolve_hook_assignments(
+                tiny_model,
+                HookManagerConfig(
+                    hook_types={"mlp.0": "param_grad"}, linear_io=[r"mlp\."]
+                ),
+            )
+
+    def test_explicit_incapable_layer_raises(self, tiny_model):
+        # mlp.1 is a ReLU — cannot support linear_io.
+        with pytest.raises(ValueError, match="does not support"):
+            resolve_hook_assignments(
+                tiny_model, HookManagerConfig(hook_types={"mlp.1": "linear_io"})
+            )
+
+    def test_explicit_missing_layer_raises(self, tiny_model):
+        with pytest.raises(ValueError, match="does not exist"):
+            resolve_hook_assignments(
+                tiny_model, HookManagerConfig(hook_types={"nope": "linear_io"})
+            )
+
+    def test_zero_layers_warns(self):
+        model = _TopLevelLinear()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assignment = resolve_hook_assignments(
+                model, HookManagerConfig(linear_io=[r"no_such_layer"])
+            )
+        assert assignment == {}
+        assert any("zero layers" in str(w.message) for w in caught)
+
+
+# --------------------------------------------------------------------------- #
+# register_linear_io_hooks / remove_hooks                                       #
+# --------------------------------------------------------------------------- #
+
+
+class TestRegisterLinearIoHooks:
+    def test_hooks_registered_on_all_linear_layers(self, tiny_model):
+        buffers, handles = register_linear_io_hooks(tiny_model)
+        # TinyMLP linear-family layers: embedding, attn_proj, mlp.0, mlp.2,
+        # lm_head.  mlp.1 is ReLU → skipped.
+        assert set(buffers) == {
+            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+        }
+        # Each layer has 2 handles (forward + backward).
+        assert len(handles) == 10
         remove_hooks(handles)
 
     def test_buffers_populated_after_forward_backward(self, tiny_model, tiny_batch):
-        buffers, handles = register_mlp_hooks(tiny_model)
+        buffers, handles = register_linear_io_hooks(tiny_model)
         input_ids = tiny_batch["input_ids"]
         logits = tiny_model(input_ids)
         loss = logits.mean()
@@ -108,7 +181,7 @@ class TestRegisterMlpHooks:
         remove_hooks(handles)
 
     def test_activation_shape(self, tiny_model, tiny_batch):
-        buffers, handles = register_mlp_hooks(tiny_model)
+        buffers, handles = register_linear_io_hooks(tiny_model)
         B, T = tiny_batch["input_ids"].shape
         tiny_model(tiny_batch["input_ids"]).mean().backward()
 
@@ -118,7 +191,7 @@ class TestRegisterMlpHooks:
         remove_hooks(handles)
 
     def test_grad_output_shape(self, tiny_model, tiny_batch):
-        buffers, handles = register_mlp_hooks(tiny_model)
+        buffers, handles = register_linear_io_hooks(tiny_model)
         B, T = tiny_batch["input_ids"].shape
         tiny_model(tiny_batch["input_ids"]).mean().backward()
 
@@ -128,30 +201,41 @@ class TestRegisterMlpHooks:
         remove_hooks(handles)
 
     def test_remove_hooks_clears_handles(self, tiny_model):
-        buffers, handles = register_mlp_hooks(tiny_model)
+        buffers, handles = register_linear_io_hooks(tiny_model)
         assert len(handles) > 0
         remove_hooks(handles)
         assert len(handles) == 0
 
     def test_hooks_do_not_fire_after_removal(self, tiny_model, tiny_batch):
-        buffers, handles = register_mlp_hooks(tiny_model)
+        buffers, handles = register_linear_io_hooks(tiny_model)
         remove_hooks(handles)
         # After removal buffers should remain None (no forward called yet)
         tiny_model(tiny_batch["input_ids"]).mean().backward()
         for buf in buffers.values():
             assert buf["activation"] is None
 
-    def test_custom_name_patterns(self, tiny_model, tiny_batch):
-        # Hook only mlp.0 via a custom pattern
-        buffers, handles = register_mlp_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+    def test_custom_layer_names(self, tiny_model, tiny_batch):
+        # Hook only mlp.0 via an explicit layer-name set.
+        buffers, handles = register_linear_io_hooks(
+            tiny_model, layer_names={"mlp.0"}
+        )
         assert list(buffers.keys()) == ["mlp.0"]
+        remove_hooks(handles)
+
+    def test_layer_names_filters_to_capable_only(self, tiny_model):
+        # Requesting a non-existent / non-capable name yields nothing.
+        buffers, handles = register_linear_io_hooks(
+            tiny_model, layer_names={"mlp.1"}  # ReLU, not capable
+        )
+        assert buffers == {}
         remove_hooks(handles)
 
     def test_dataparallel_unwrapping(self, tiny_model):
         dp_model = nn.DataParallel(tiny_model)
-        buffers, handles = register_mlp_hooks(dp_model)
-        # Same 3 layers as the plain-model case: embedding, mlp.0, mlp.2
-        assert len(buffers) == 3
+        buffers, handles = register_linear_io_hooks(dp_model)
+        assert set(buffers) == {
+            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+        }
         remove_hooks(handles)
 
 
@@ -161,9 +245,9 @@ class TestRegisterMlpHooks:
 
 
 class TestRegisterParamGradHooks:
-    def test_leaf_modules_hooked_by_default(self, tiny_model):
-        # Default (no patterns): hooks all leaf modules with trainable params.
-        # TinyMLP leaves: embedding, attn_proj, mlp.0, mlp.2, lm_head (mlp.1 is ReLU — no params)
+    def test_modules_hooked_by_default(self, tiny_model):
+        # Default (no layer_names): hooks every module with trainable params.
+        # TinyMLP: embedding, attn_proj, mlp.0, mlp.2, lm_head (mlp.1 is ReLU).
         buffers, handles = register_param_grad_hooks(tiny_model)
         assert len(buffers) > 0
         assert all("weight" in buf or "bias" in buf for buf in buffers.values())
@@ -187,7 +271,7 @@ class TestRegisterParamGradHooks:
 
     def test_grad_is_fresh_not_stale(self, tiny_model, tiny_batch):
         """Grad captured by hook matches param.grad immediately after backward."""
-        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        buffers, handles = register_param_grad_hooks(tiny_model, layer_names={"mlp.0"})
         tiny_model(tiny_batch["input_ids"]).mean().backward()
         # The hook-captured grad and param.grad should be identical tensors.
         hook_grad = buffers["mlp.0"]["weight"]
@@ -196,7 +280,7 @@ class TestRegisterParamGradHooks:
         remove_hooks(handles)
 
     def test_grad_shape_matches_param(self, tiny_model, tiny_batch):
-        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        buffers, handles = register_param_grad_hooks(tiny_model, layer_names={"mlp.0"})
         tiny_model(tiny_batch["input_ids"]).mean().backward()
         weight_grad = buffers["mlp.0"]["weight"]
         weight = dict(tiny_model.named_parameters())["mlp.0.weight"]
@@ -211,15 +295,17 @@ class TestRegisterParamGradHooks:
                 assert torch.isfinite(grad).all(), f"{layer_name}.{pname} has NaN/Inf"
         remove_hooks(handles)
 
-    def test_custom_name_patterns(self, tiny_model, tiny_batch):
-        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.[02]"])
+    def test_custom_layer_names(self, tiny_model, tiny_batch):
+        buffers, handles = register_param_grad_hooks(
+            tiny_model, layer_names={"mlp.0", "mlp.2"}
+        )
         assert set(buffers.keys()) == {"mlp.0", "mlp.2"}
         remove_hooks(handles)
 
     def test_frozen_params_not_hooked(self, tiny_model):
         # Freeze mlp.0 and verify it produces no buffer entry.
         tiny_model.mlp[0].weight.requires_grad_(False)
-        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        buffers, handles = register_param_grad_hooks(tiny_model, layer_names={"mlp.0"})
         # mlp.0 has no trainable params → no buffer created for it.
         assert "mlp.0" not in buffers
         tiny_model.mlp[0].weight.requires_grad_(True)  # restore
@@ -232,14 +318,14 @@ class TestRegisterParamGradHooks:
             fired.append((layer_name, param_name))
 
         buffers, handles = register_param_grad_hooks(
-            tiny_model, name_patterns=[r"mlp\.0"], on_param_grad=cb
+            tiny_model, layer_names={"mlp.0"}, on_param_grad=cb
         )
         tiny_model(tiny_batch["input_ids"]).mean().backward()
         assert ("mlp.0", "weight") in fired
         remove_hooks(handles)
 
     def test_remove_hooks_stops_updates(self, tiny_model, tiny_batch):
-        buffers, handles = register_param_grad_hooks(tiny_model, name_patterns=[r"mlp\.0"])
+        buffers, handles = register_param_grad_hooks(tiny_model, layer_names={"mlp.0"})
         remove_hooks(handles)
         # Run backward after removal — buffer should stay None.
         tiny_model(tiny_batch["input_ids"]).mean().backward()

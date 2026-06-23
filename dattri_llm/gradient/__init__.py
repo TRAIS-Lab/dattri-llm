@@ -6,10 +6,11 @@ from dattri_llm.gradient.callbacks import (
     OffloadCallback,
 )
 from dattri_llm.gradient.hooks import (
+    REGISTER_ALL,
     HookManager,
     HookManagerConfig,
-    register_mlp_hooks,
-    register_mlp_param_hooks,
+    register_linear_io_hooks,
+    register_linear_param_hooks,
     register_param_grad_hooks,
     remove_hooks,
 )
@@ -34,9 +35,10 @@ __all__ = [
     "HookManager",
     "HookManagerCallback",
     "HookManagerConfig",
+    "REGISTER_ALL",
     "OffloadCallback",
-    "register_mlp_hooks",
-    "register_mlp_param_hooks",
+    "register_linear_io_hooks",
+    "register_linear_param_hooks",
     "register_param_grad_hooks",
     "remove_hooks",
     "GradientRecord",
