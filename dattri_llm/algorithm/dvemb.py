@@ -64,6 +64,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import Dataset
+from tqdm.auto import tqdm
 
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import (
@@ -165,6 +166,7 @@ class DVEmbAttributor(BaseAttributor):
         output_steps: set,
         device: torch.device,
         loss_reduction: str,
+        verbose: bool,
     ) -> Tuple[torch.Tensor, List[str], List[int]]:
         """One latest→earliest sweep for the ``n_cols`` columns held in ``w``.
 
@@ -180,7 +182,15 @@ class DVEmbAttributor(BaseAttributor):
         row_chunks: List[torch.Tensor] = []
         row_train_ids: List[str] = []
         row_steps: List[int] = []
-        for ts in sorted(prop_steps, reverse=True):
+        steps = tqdm(
+            sorted(prop_steps, reverse=True),
+            desc="DVEmb: propagating",
+            unit="step",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not verbose or not self.args.should_log,
+        )
+        for ts in steps:
             lr = self._lr(ts)
             emit = ts in output_steps
             # Accumulate this step's Fisher contribution across all its blocks
@@ -236,6 +246,7 @@ class DVEmbAttributor(BaseAttributor):
         selected_training_steps: Optional[Iterable[int]] = None,
         final_step: Optional[int] = None,
         loss_reduction: str = "mean",
+        verbose: bool = False,
     ) -> AttributionScore:
         """Compute the ``(num_train_rows, num_test)`` DVEmb attribution score.
 
@@ -292,6 +303,7 @@ class DVEmbAttributor(BaseAttributor):
                 scale changes.  (``B_t`` is taken to be the number of recorded
                 samples at step ``t``, which assumes the full minibatch was
                 collected.)
+            verbose: Show tqdm progress bars on the logging process.
 
         Returns:
             An :class:`AttributionScore`; also persisted to ``args.output_dir``.
@@ -349,7 +361,9 @@ class DVEmbAttributor(BaseAttributor):
             test_index: Dict[str, int] = {}
             pending: List[Tuple[Dict[str, torch.Tensor], List[int]]] = []
             for _step, test_g, test_hashes in iter_gradient_blocks(
-                test_fm, test_steps, self.args, self.layer_name
+                test_fm, test_steps, self.args, self.layer_name,
+                desc="DVEmb: loading test",
+                verbose=verbose,
             ):
                 mat = self._materialize(test_g, device)
                 cols: List[int] = []
@@ -373,7 +387,7 @@ class DVEmbAttributor(BaseAttributor):
             del pending
             scores, row_train_ids, row_steps = self._propagate_and_score(
                 w, num_test, layers, train_fm, prop_steps, output_steps,
-                device, loss_reduction,
+                device, loss_reduction, verbose,
             )
         else:
             # ---- test outer: one block's embedding resident, train re-streamed.
@@ -384,7 +398,9 @@ class DVEmbAttributor(BaseAttributor):
             test_ids = []
             test_index = {}
             for _step, _tg, test_hashes in iter_gradient_blocks(
-                test_fm, test_steps, self.args, self.layer_name
+                test_fm, test_steps, self.args, self.layer_name,
+                desc="DVEmb: indexing test",
+                verbose=verbose,
             ):
                 for h in test_hashes:
                     if h not in test_index:
@@ -396,14 +412,16 @@ class DVEmbAttributor(BaseAttributor):
             row_train_ids = []
             row_steps = []
             for _step, test_g, test_hashes in iter_gradient_blocks(
-                test_fm, test_steps, self.args, self.layer_name
+                test_fm, test_steps, self.args, self.layer_name,
+                desc="DVEmb: scoring test blocks",
+                verbose=verbose,
             ):
                 w_block = self._materialize(test_g, device)  # (B_block, d) per layer
                 layers = list(w_block.keys())
                 block_cols = [test_index[h] for h in test_hashes]
                 block_scores, rtids, rsteps = self._propagate_and_score(
                     w_block, len(block_cols), layers, train_fm, prop_steps,
-                    output_steps, device, loss_reduction,
+                    output_steps, device, loss_reduction, verbose,
                 )
                 if scores is None:
                     scores = torch.zeros(

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.gradient.file_manager import GradientFileManager
@@ -59,6 +60,7 @@ class BaseAttributor(ABC):
         self,
         train_dataset: Dataset,
         test_dataset: Dataset,
+        verbose: bool = False,
     ) -> torch.Tensor:
         """Attribute the influence of training data on test data.
 
@@ -67,6 +69,7 @@ class BaseAttributor(ABC):
         Args:
             train_dataset (Dataset): Dataset for the training data.
             test_dataset (Dataset): Dataset for the test data.
+            verbose: Show progress bars while attributing.
 
         Returns:
             torch.Tensor: The influence of the training data on the test data.
@@ -123,6 +126,7 @@ class BaseInnerProductAttributor(BaseAttributor):
         test_dataset: Optional[Dataset] = None,
         train_gradients_dir: Optional[str] = None,
         test_gradients_dir: Optional[str] = None,
+        verbose: bool = False,
     ) -> torch.Tensor:
         """Calculate the influence of the training set on the test set.
 
@@ -141,6 +145,7 @@ class BaseInnerProductAttributor(BaseAttributor):
             test_gradients_dir (Optional[str]): The directory where the cached test gradients are stored.
                 If not None, the attributor will try to load the cached test gradients from
                 this directory to compute the influence.
+            verbose: Show progress bars while attributing.
 
         Returns:
             torch.Tensor: The influence of the training set on the test set, with
@@ -445,6 +450,8 @@ def iter_gradient_blocks(
     steps: List[int],
     args: AttributionArguments,
     layer_name: Optional[List[str]] = None,
+    desc: Optional[str] = None,
+    verbose: bool = False,
 ):
     """Yield ``(step, Gradient_block, hashes)`` for *steps*, one load per file.
 
@@ -455,11 +462,25 @@ def iter_gradient_blocks(
     """
     if not steps:
         return
-    for by_step in make_gradient_multistep_dataloader(
-        file_manager, list(steps), args, layer_name
-    ):
-        for step, (block, hashes) in by_step.items():
-            yield step, block, hashes
+    step_list = list(steps)
+    total = sum(len(by_step) for _, by_step in file_manager.iter_steps(step_list))
+    blocks = tqdm(
+        total=total,
+        desc=desc,
+        unit="block",
+        dynamic_ncols=True,
+        leave=False,
+        disable=desc is None or not verbose or not args.should_log,
+    )
+    try:
+        for by_step in make_gradient_multistep_dataloader(
+            file_manager, step_list, args, layer_name
+        ):
+            for step, (block, hashes) in by_step.items():
+                yield step, block, hashes
+                blocks.update(1)
+    finally:
+        blocks.close()
 
 
 def make_gradient_dataloader(

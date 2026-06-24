@@ -100,6 +100,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_fm: GradientFileManager,
         train_steps: List[int],
         device: torch.device,
+        verbose: bool,
     ) -> object:
         """Estimate the per-layer preconditioner from the selected training
         gradients (the records at *train_steps*).
@@ -136,6 +137,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         test_gradients_dir: Optional[str] = None,
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
+        verbose: bool = False,
     ) -> AttributionScore:
         """Compute the ``(num_train, num_test)`` attribution score from on-disk
         gradients — every train record against every test record.
@@ -158,6 +160,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 uses every step on disk.  Over-specified ranges are intersected
                 with what is available.  The test set always supplies every
                 column.
+            verbose: Show tqdm progress bars on the logging process.
 
         Returns:
             An :class:`AttributionScore` whose rows/columns are the train/test
@@ -185,7 +188,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         test_steps = test_fm.available_steps()
 
         # Fit the preconditioner once over the selected training gradients.
-        ctx = self._fit(train_fm, train_steps, device)
+        ctx = self._fit(train_fm, train_steps, device, verbose)
 
         # One pass over the test files: fix the column order (disk order) and,
         # unless looping, build + cache each block's test representation.
@@ -193,7 +196,9 @@ class _KroneckerBaseAttributor(BaseAttributor):
         test_index: dict = {}
         cached_test: List[Tuple[object, List[str]]] = []
         for _step, test_g, test_hashes in iter_gradient_blocks(
-            test_fm, test_steps, self.args, self.layer_name
+            test_fm, test_steps, self.args, self.layer_name,
+            desc=f"{self.algorithm}: preparing test",
+            verbose=verbose,
         ):
             for h in test_hashes:
                 if h not in test_index:
@@ -208,7 +213,9 @@ class _KroneckerBaseAttributor(BaseAttributor):
         row_train_ids: List[str] = []
         row_steps: List[int] = []
         for train_step, train_g, train_hashes in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name
+            train_fm, train_steps, self.args, self.layer_name,
+            desc=f"{self.algorithm}: scoring",
+            verbose=verbose,
         ):
             train_g = train_g.to(device)
             row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
@@ -296,10 +303,13 @@ class KFACAttributor(_KroneckerBaseAttributor):
         train_fm: GradientFileManager,
         train_steps: List[int],
         device: torch.device,
+        verbose: bool,
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         accums: Dict[str, ops.KFACAccumulator] = {}
         for _step, train_g, _ in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name
+            train_fm, train_steps, self.args, self.layer_name,
+            desc="KFAC: fitting",
+            verbose=verbose,
         ):
             train_g = train_g.to(device)
             for layer in self._kfac_layers(train_g):
@@ -410,11 +420,14 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         train_fm: GradientFileManager,
         train_steps: List[int],
         device: torch.device,
+        verbose: bool,
     ) -> dict:
         # Pass 1 — Kronecker covariance factors and their eigenbases.
         accums: Dict[str, ops.KFACAccumulator] = {}
         for _step, train_g, _ in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name
+            train_fm, train_steps, self.args, self.layer_name,
+            desc="EKFAC: fitting factors",
+            verbose=verbose,
         ):
             train_g = train_g.to(device)
             for layer in self._kfac_layers(train_g):
@@ -445,7 +458,9 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         lam_sum: Dict[str, torch.Tensor] = {}
         counts: Dict[str, int] = {}
         for _step, train_g, _ in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name
+            train_fm, train_steps, self.args, self.layer_name,
+            desc="EKFAC: fitting correction",
+            verbose=verbose,
         ):
             train_g = train_g.to(device)
             for layer, (U_A, U_G) in eig.items():

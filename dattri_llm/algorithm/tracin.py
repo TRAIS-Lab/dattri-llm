@@ -97,6 +97,7 @@ class TracInAttributor(BaseAttributor):
         test_gradients_dir: Optional[str] = None,
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
+        verbose: bool = False,
     ) -> AttributionScore:
         """Compute the ``(num_train, num_test)`` attribution score from on-disk
         gradients — every train record against every test record.
@@ -123,6 +124,7 @@ class TracInAttributor(BaseAttributor):
                 output rows) to these steps; ``None`` (default) uses every step
                 on disk.  Over-specified ranges are intersected with what is
                 available.  The test set always supplies every column.
+            verbose: Show tqdm progress bars on the logging process.
 
         Returns:
             An :class:`AttributionScore`.  Also persisted to
@@ -156,7 +158,9 @@ class TracInAttributor(BaseAttributor):
         test_index: dict = {}
         cached_test: List[Tuple[Gradient, List[str]]] = []
         for _step, test_g, test_hashes in iter_gradient_blocks(
-            test_fm, test_steps, self.args, self.layer_name
+            test_fm, test_steps, self.args, self.layer_name,
+            desc=f"{'GradCos' if self.normalized_grad else 'TracIn'}: loading test",
+            verbose=verbose,
         ):
             for h in test_hashes:
                 if h not in test_index:
@@ -171,7 +175,9 @@ class TracInAttributor(BaseAttributor):
         row_train_ids: List[str] = []
         row_steps: List[int] = []
         for train_step, train_g, train_hashes in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name
+            train_fm, train_steps, self.args, self.layer_name,
+            desc=f"{'GradCos' if self.normalized_grad else 'TracIn'}: scoring",
+            verbose=verbose,
         ):
             train_g = train_g.to(device)
             row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
