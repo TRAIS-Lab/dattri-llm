@@ -6,10 +6,12 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple, Union
 
 import torch
+import warnings
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.gradient import ops
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
 
@@ -317,14 +319,36 @@ def _records_to_block(
 ) -> Tuple[Gradient, List[str]]:
     grads: List[Gradient] = []
     hashes: List[str] = []
+    skipped_param_grad: set[str] = set()
     for idx in idxs:
         rec = records[idx]
         g = rec.gradient
-        if layer_name is not None:
-            g = g.select_layers(layer_name)
+        selected = g.layer_names if layer_name is None else set(layer_name)
+        missing = selected - g.layer_names
+        if missing:
+            raise KeyError(f"Unknown layers: {sorted(missing)}")
+        skipped_param_grad.update(
+            name
+            for name in selected
+            if g.layer_types[name] == ops.PARAM_GRAD_TYPES
+        )
+        per_sample = selected - skipped_param_grad
+        if not per_sample:
+            raise ValueError(
+                "No per-sample gradient layers remain after skipping batch-level "
+                f"param_grad layers in {file_rel!r} at step {step}."
+            )
+        g = g.select_layers(per_sample)
         grads.append(g)
         h = rec.input_hash
         hashes.extend(h if isinstance(h, list) else [h])
+
+    if skipped_param_grad:
+        warnings.warn(
+            "Skipping batch-level param_grad layers during per-sample "
+            f"attribution: {sorted(skipped_param_grad)}.",
+            stacklevel=3,
+        )
 
     if not grads:
         raise RuntimeError(f"No records selected for file {file_rel!r} at step {step}.")

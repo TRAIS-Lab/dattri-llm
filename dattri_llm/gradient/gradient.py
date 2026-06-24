@@ -149,7 +149,7 @@ class Gradient:
                 if value.ndim < 1:
                     raise ValueError(f"{name} must be at least 1D")
                 if (
-                    layer_type != ops.PARAM_GRAD_MARKER
+                    layer_type != ops.PARAM_GRAD_TYPES
                     and self._layer_indexing(name) == "batch_token"
                     and value.ndim != 3
                 ):
@@ -158,7 +158,7 @@ class Gradient:
                     )
                 cur_batch = value.shape[0]
 
-            is_param_grad = layer_type == ops.PARAM_GRAD_MARKER
+            is_param_grad = layer_type == ops.PARAM_GRAD_TYPES
             if not is_param_grad:
                 if batch_size is None:
                     batch_size = cur_batch
@@ -391,7 +391,11 @@ class Gradient:
             return y
 
         for name, value in self.data.items():
-            if isinstance(value, Factorized):
+            if self.layer_types[name] == ops.PARAM_GRAD_TYPES:
+                # Batch-level parameter gradients have no sample axis. Preserve
+                # them until per-sample attribution loading warns and skips them.
+                new_data[name] = value
+            elif isinstance(value, Factorized):
                 new_data[name] = Factorized(
                     activation=slice_tensor(value.activation),
                     pre_activation_grad=slice_tensor(value.pre_activation_grad),

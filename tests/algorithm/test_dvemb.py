@@ -308,8 +308,10 @@ class TestDVEmbOnDisk:
 
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", 0.1)
-        with pytest.raises(ValueError, match=r"train_gradients_dir"):
+        with pytest.raises(TypeError, match=r"train_gradients_dir"):
             attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]), final_step=2)
+        with pytest.raises(TypeError, match=r"test_gradients_dir"):
+            attr.attribute_from_cache(train_gradients_dir=str(collected["train_dir"]), final_step=2)
 
     def test_no_step_below_final_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", 0.1)

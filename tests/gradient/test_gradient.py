@@ -482,6 +482,18 @@ class TestSlice:
         gs = g.slice(dim="batch", index=0)
         assert gs.representation == g.representation
 
+    def test_batch_slice_preserves_param_grad_without_slicing(self):
+        param_grad = torch.randn(7, 3)
+        g = Gradient(
+            representation={"sample": "materialized", "weight": "materialized"},
+            data={"sample": torch.randn(B, 5), "weight": param_grad},
+            layer_types={"sample": "nn.Linear", "weight": ops.PARAM_GRAD_TYPES},
+            indexing={"sample": "batch", "weight": "batch"},
+        )
+        sliced = g.slice(dim="batch", index=0)
+        assert sliced.data["sample"].shape[0] == 1
+        assert torch.equal(sliced.data["weight"], param_grad)
+
 
 # --------------------------------------------------------------------------- #
 # Gradient.similarity                                                          #

@@ -19,6 +19,7 @@ from dattri_llm.gradient.hooks import (
 )
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 from dattri_llm.gradient.utils import hash_sample
 
 
@@ -828,7 +829,7 @@ class TestHookManagerParamGrad:
             tiny_model(tiny_batch["input_ids"]).mean().backward()
         g = cb.records[0].gradient
         param_grad_layers = [
-            n for n, t in (g.layer_types or {}).items() if t == "param_grad"
+            n for n, t in (g.layer_types or {}).items() if t == PARAM_GRAD_TYPES
         ]
         assert len(param_grad_layers) > 0
         collector.remove()
@@ -841,7 +842,7 @@ class TestHookManagerParamGrad:
             tiny_model(tiny_batch["input_ids"]).mean().backward()
         g = cb.records[0].gradient
         for name, val in g.data.items():
-            if (g.layer_types or {}).get(name) == "param_grad":
+            if (g.layer_types or {}).get(name) == PARAM_GRAD_TYPES:
                 assert isinstance(val, torch.Tensor)
                 assert torch.isfinite(val).all(), f"{name} has NaN/Inf"
         collector.remove()
@@ -862,11 +863,11 @@ class TestHookManagerParamGrad:
         types = set((g.layer_types or {}).values())
         # linear_io layers store their canonical class names (e.g. "nn.Linear")
         # rather than the generic marker.
-        non_param_types = types - {"param_grad"}
+        non_param_types = types - {PARAM_GRAD_TYPES}
         assert len(non_param_types) > 0, (
             "Expected at least one canonical layer type (linear_io layers) in types"
         )
-        assert "param_grad" in types
+        assert PARAM_GRAD_TYPES in types
         collector.remove()
 
     def test_per_batch_linear_io_only_emits_one_record_per_step(self, tiny_model, tiny_batch):
@@ -909,7 +910,7 @@ class TestHookManagerParamGrad:
             tiny_model(tiny_batch["input_ids"]).mean().backward()
         g = cb.records[0].gradient
         param_grad_keys = [
-            n for n, t in (g.layer_types or {}).items() if t == "param_grad"
+            n for n, t in (g.layer_types or {}).items() if t == PARAM_GRAD_TYPES
         ]
         assert all(k.startswith("mlp.0.") for k in param_grad_keys)
         collector.remove()

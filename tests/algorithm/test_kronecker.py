@@ -434,8 +434,10 @@ class TestStepSelection:
 class TestKroneckerShared:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")
-        with pytest.raises(ValueError, match=r"train_gradients_dir"):
+        with pytest.raises(TypeError, match=r"train_gradients_dir"):
             attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]))
+        with pytest.raises(TypeError, match=r"test_gradients_dir"):
+            attr.attribute_from_cache(train_gradients_dir=str(collected["train_dir"]))
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_loop_over_test_matches_cached(self, collected, tmp_path, cls):

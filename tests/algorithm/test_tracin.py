@@ -28,6 +28,8 @@ from dattri_llm.algorithm.base import make_gradient_multistep_dataloader
 from dattri_llm.algorithm.tracin import TracInAttributor
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 from dattri_llm.gradient.utils import hash_sample
 
@@ -218,10 +220,42 @@ class TestTracInOnDisk:
 
         assert res_false.test_ids == _disk_test_column_order(collected["test_dir"], 0)
 
+    def test_param_grad_layers_are_skipped_with_warning(self, collected, tmp_path):
+        def add_param_grad(source, destination):
+            records = _load_step_records(source, 0)
+            mixed = []
+            for record in records:
+                gradient = record.gradient
+                name = "custom.weight"
+                mixed_gradient = Gradient(
+                    representation={**gradient.representation, name: "materialized"},
+                    data={**gradient.data, name: torch.ones(3, 2)},
+                    layer_types={**gradient.layer_types, name: PARAM_GRAD_TYPES},
+                    indexing={**gradient.indexing, name: "batch"},
+                )
+                mixed.append(
+                    GradientRecord(record.step, record.input_hash, mixed_gradient)
+                )
+            GradientFileManager(str(destination)).save_batch(mixed)
+
+        train_dir = tmp_path / "mixed_train"
+        test_dir = tmp_path / "mixed_test"
+        add_param_grad(collected["train_dir"], train_dir)
+        add_param_grad(collected["test_dir"], test_dir)
+        attr = TracInAttributor(_args(tmp_path / "mixed_out"), normalized_grad=False)
+        with pytest.warns(UserWarning, match="Skipping batch-level param_grad"):
+            result = attr.attribute_from_cache(
+                train_gradients_dir=str(train_dir),
+                test_gradients_dir=str(test_dir),
+            )
+        assert result.scores.shape == (N_TRAIN, N_TEST)
+
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", normalized=False)
-        with pytest.raises(ValueError, match=r"train_gradients_dir"):
+        with pytest.raises(TypeError, match=r"train_gradients_dir"):
             attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]))
+        with pytest.raises(TypeError, match=r"test_gradients_dir"):
+            attr.attribute_from_cache(train_gradients_dir=str(collected["train_dir"]))
 
     def test_multistep_loader_loads_mixed_step_file_once(
         self, tmp_path, monkeypatch

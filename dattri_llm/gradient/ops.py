@@ -30,7 +30,7 @@ NORM_TYPES = frozenset({
 EMBEDDING_TYPES = frozenset({"nn.Embedding", "nn.EmbeddingBag"})
 
 # Special marker for aggregated param-level gradients (no batch dim).
-PARAM_GRAD_MARKER = "param_grad"
+PARAM_GRAD_TYPES = "param_grad_layers"
 
 ALL_LAYER_TYPES = LINEAR_TYPES | CONV_TYPES | CONV_TRANSPOSE_TYPES | NORM_TYPES | EMBEDDING_TYPES
 

@@ -52,7 +52,7 @@ import torch.nn as nn
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
-from dattri_llm.gradient.ops import canonical_class_name, extract_module_kwargs
+from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, canonical_class_name, extract_module_kwargs
 from dattri_llm.gradient.utils import hash_sample
 
 try:
@@ -507,8 +507,8 @@ class HookManagerConfig:
         param_grad: Selector = None,
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)
-        self.linear_io = self._validate_selector("linear_io", linear_io)
-        self.param_grad = self._validate_selector("param_grad", param_grad)
+        self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
+        self.param_grad = self._validate_selector(PARAM_GRAD, param_grad)
 
     @staticmethod
     def _validate_assignment(
@@ -726,7 +726,7 @@ def default_hook_assignment(
     (:attr:`HookManagerConfig.is_default` behaviour) restricted to those
     layers.  Pass the result as ``hook_types``::
 
-        assignment = maximal_hook_assignment(model, sample_input)
+        assignment = default_hook_assignment(model, sample_input)
         hm = HookManager(model, config=HookManagerConfig(hook_types=assignment))
 
     A ``linear_io`` candidate is kept when its forward hook fires (the module is
@@ -796,7 +796,7 @@ def default_hook_assignment(
             except Exception as exc:  # noqa: BLE001 - user loss_fn may fail
                 loss = None
                 warnings.warn(
-                    f"maximal_hook_assignment could not compute a loss "
+                    f"default_hook_assignment could not compute a loss "
                     f"({exc!r}); param_grad layers may be missed. Pass loss_fn.",
                     stacklevel=2,
                 )
@@ -805,7 +805,7 @@ def default_hook_assignment(
                 loss.backward()
             elif any(t == PARAM_GRAD for t in candidate.values()):
                 warnings.warn(
-                    "maximal_hook_assignment could not derive a differentiable "
+                    "default_hook_assignment could not derive a differentiable "
                     "scalar loss; param_grad layers may be missed. Pass loss_fn.",
                     stacklevel=2,
                 )
@@ -818,7 +818,7 @@ def default_hook_assignment(
     skipped = sorted(set(candidate) - set(assignment))
     if skipped:
         warnings.warn(
-            "maximal_hook_assignment skipped layers that did not fire during "
+            "default_hook_assignment skipped layers that did not fire during "
             f"the sample pass (e.g. invoked functionally): {skipped}.",
             stacklevel=2,
         )
@@ -1164,7 +1164,7 @@ class HookManager:
                 key = f"{layer_name}.{pname}"
                 data[key] = grad
                 representation[key] = "materialized"
-                layer_types[key] = "param_grad"
+                layer_types[key] = PARAM_GRAD_TYPES
 
         if not data:
             raise RuntimeError(
@@ -1174,7 +1174,7 @@ class HookManager:
 
         indexing: dict = {}
         for name, val in data.items():
-            if layer_types[name] == "param_grad":
+            if layer_types[name] == PARAM_GRAD_TYPES:
                 # param_grad tensors are always (B, …) without a token dim
                 indexing[name] = "batch"
             else:

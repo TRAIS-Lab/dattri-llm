@@ -341,7 +341,7 @@ class TestRegisterParamGradHooks:
 
 
 # --------------------------------------------------------------------------- #
-# maximal_hook_assignment                                                       #
+# default_hook_assignment                                                       #
 # --------------------------------------------------------------------------- #
 
 
@@ -363,7 +363,7 @@ class _GhostLinearModel(nn.Module):
         return F.linear(x, self.ghost.weight, self.ghost.bias)
 
 
-class TestMaximalHookAssignment:
+class TestDefaultHookAssignment:
     def test_skips_functionally_invoked_layer(self):
         model = _GhostLinearModel()
         with warnings.catch_warnings(record=True) as caught:
@@ -396,6 +396,21 @@ class TestMaximalHookAssignment:
             tiny_model, {"input_ids": tiny_batch["input_ids"]}
         )
         assert "mlp.0" in assignment
+
+    def test_sequence_first_layer_is_discovered_without_shape_filter(self):
+        class SequenceFirst(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.proj(x.transpose(0, 1)).transpose(0, 1)
+
+        model = SequenceFirst()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            assignment = default_hook_assignment(model, torch.randn(2, 3, 4))
+        assert assignment == {"proj": "linear_io"}
 
     def test_param_grad_layer_discovered_via_backward(self):
         class _CustomParam(nn.Module):
