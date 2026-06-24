@@ -170,7 +170,7 @@ class TestTracInOnDisk:
         oracle = g_tr @ g_te.T
 
         attr = _make_attr(tmp_path / f"out_{normalized}_{loop_over_test}", normalized=normalized)
-        result = attr.attribute(
+        result = attr.attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=loop_over_test,
@@ -184,7 +184,7 @@ class TestTracInOnDisk:
         )
 
     def test_algorithm_label_and_shape(self, collected, tmp_path):
-        res = _make_attr(tmp_path / "a", normalized=False).attribute(
+        res = _make_attr(tmp_path / "a", normalized=False).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -192,7 +192,7 @@ class TestTracInOnDisk:
         assert res.scores.shape == (N_TRAIN, N_TEST)
         assert res.algorithm_meta == {"selected_training_steps": [0]}
 
-        gradcos = _make_attr(tmp_path / "b", normalized=True).attribute(
+        gradcos = _make_attr(tmp_path / "b", normalized=True).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -201,12 +201,12 @@ class TestTracInOnDisk:
     def test_loop_modes_and_column_order_agree(self, collected, tmp_path):
         """Cached vs re-streamed test paths must be identical, and the lazily
         discovered columns must equal the on-disk order."""
-        res_false = _make_attr(tmp_path / "a", normalized=False).attribute(
+        res_false = _make_attr(tmp_path / "a", normalized=False).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=False,
         )
-        res_true = _make_attr(tmp_path / "b", normalized=False).attribute(
+        res_true = _make_attr(tmp_path / "b", normalized=False).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=True,
@@ -221,7 +221,7 @@ class TestTracInOnDisk:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", normalized=False)
         with pytest.raises(ValueError, match=r"train_gradients_dir"):
-            attr.attribute(test_gradients_dir=str(collected["test_dir"]))
+            attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]))
 
     def test_multistep_loader_loads_mixed_step_file_once(
         self, tmp_path, monkeypatch
@@ -271,7 +271,7 @@ class TestTracInOnDisk:
         train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
         test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
 
-        res = _make_attr(tmp_path / "o", normalized=False).attribute(
+        res = _make_attr(tmp_path / "o", normalized=False).attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
         # Two steps per train sample → 2 * N_TRAIN rows, stamped {0, 1}.
@@ -304,7 +304,7 @@ class TestTracInOnDisk:
         train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
         test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
 
-        res = _make_attr(tmp_path / "o", normalized=False).attribute(
+        res = _make_attr(tmp_path / "o", normalized=False).attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
             selected_training_steps=[1],
         )
@@ -323,7 +323,7 @@ class TestTracInOnDisk:
     def test_unknown_steps_raise(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", normalized=False)
         with pytest.raises(ValueError, match=r"requested steps"):
-            attr.attribute(
+            attr.attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 selected_training_steps=[99],
@@ -341,7 +341,7 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd], x_tr, y_tr, train_dir)
         _collect_to_disk(model, [sd], x_te, y_te, test_dir)
 
-        res = _make_attr(tmp_path / "o", normalized=False).attribute(
+        res = _make_attr(tmp_path / "o", normalized=False).attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
         distinct = len({hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)})

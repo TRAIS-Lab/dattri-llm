@@ -89,12 +89,10 @@ class TracInAttributor(BaseAttributor):
     def cache(self, train_dataset: Dataset) -> None:
         """No-op: gradients are already cached on disk in this workflow."""
 
-    def attribute(
+    def attribute_from_cache(
         self,
-        train_dataset: Optional[Dataset] = None,
-        test_dataset: Optional[Dataset] = None,
-        train_gradients_dir: Optional[str] = None,
-        test_gradients_dir: Optional[str] = None,
+        train_gradients_dir: str,
+        test_gradients_dir: str,
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
         verbose: bool = False,
@@ -105,12 +103,10 @@ class TracInAttributor(BaseAttributor):
         Rows and columns are derived from the saved records themselves: the
         column order is the test-sample hash order on disk, and rows are appended
         per train block in on-disk order, each stamped with the step it was
-        recorded at.  ``train_dataset`` / ``test_dataset`` are accepted for API
-        parity but are not used.
+        recorded at.
+
 
         Args:
-            train_dataset: Unused; kept for API parity.
-            test_dataset: Unused; kept for API parity.
             train_gradients_dir: Directory written by
                 :class:`GradientFileManager` during the training pass.
             test_gradients_dir: Directory written by

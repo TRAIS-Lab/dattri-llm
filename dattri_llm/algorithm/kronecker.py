@@ -129,12 +129,10 @@ class _KroneckerBaseAttributor(BaseAttributor):
     # Main entry point                                                   #
     # ------------------------------------------------------------------ #
 
-    def attribute(
+    def attribute_from_cache(
         self,
-        train_dataset: Optional[Dataset] = None,
-        test_dataset: Optional[Dataset] = None,
-        train_gradients_dir: Optional[str] = None,
-        test_gradients_dir: Optional[str] = None,
+        train_gradients_dir: str,
+        test_gradients_dir: str,
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
         verbose: bool = False,
@@ -143,8 +141,6 @@ class _KroneckerBaseAttributor(BaseAttributor):
         gradients — every train record against every test record.
 
         Args:
-            train_dataset: Unused; kept for API parity.
-            test_dataset: Unused; kept for API parity.
             train_gradients_dir: Directory written by
                 :class:`GradientFileManager` during the training pass.  Also the
                 data the Fisher is estimated from.

@@ -104,7 +104,7 @@ class TestDVEmbOnDisk:
     @pytest.mark.parametrize("loop_over_test", [False, True])
     def test_matches_explicit_oracle(self, collected, tmp_path, lr, loop_over_test):
         """Full propagated influence matches the explicit-matrix oracle."""
-        res = _make_attr(tmp_path / f"o_{lr}_{loop_over_test}", lr).attribute(
+        res = _make_attr(tmp_path / f"o_{lr}_{loop_over_test}", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=loop_over_test,
@@ -127,12 +127,12 @@ class TestDVEmbOnDisk:
             )
 
     def test_loop_modes_agree(self, collected, tmp_path):
-        a = _make_attr(tmp_path / "a", 0.3).attribute(
+        a = _make_attr(tmp_path / "a", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=False, final_step=2, loss_reduction="sum",
         )
-        b = _make_attr(tmp_path / "b", 0.3).attribute(
+        b = _make_attr(tmp_path / "b", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=True, final_step=2, loss_reduction="sum",
@@ -173,8 +173,8 @@ class TestDVEmbOnDisk:
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(test_dir2), final_step=2, loss_reduction="sum",
         )
-        res_f = _make_attr(tmp_path / "f", lr).attribute(loop_over_test=False, **common)
-        res_t = _make_attr(tmp_path / "t", lr).attribute(loop_over_test=True, **common)
+        res_f = _make_attr(tmp_path / "f", lr).attribute_from_cache(loop_over_test=False, **common)
+        res_t = _make_attr(tmp_path / "t", lr).attribute_from_cache(loop_over_test=True, **common)
 
         assert res_f.test_ids == res_t.test_ids
         assert len(res_t.test_ids) == TT.N_TEST          # both blocks' columns present
@@ -194,7 +194,7 @@ class TestDVEmbOnDisk:
         """The last step (t_s = T−1) has an empty propagation product, so its
         DVEmb rows are exactly η · ⟨g_train, g_test⟩ — plain TracIn."""
         lr = 0.4
-        res = _make_attr(tmp_path / "o", lr).attribute(
+        res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             final_step=2, loss_reduction="sum",
@@ -218,7 +218,7 @@ class TestDVEmbOnDisk:
         """Restricting output to step 0 still propagates through step 1: the
         step-0 rows keep their full (I − η H_1) correction."""
         lr = 0.5
-        res = _make_attr(tmp_path / "o", lr).attribute(
+        res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             selected_training_steps=[0], final_step=2, loss_reduction="sum",
@@ -248,7 +248,7 @@ class TestDVEmbOnDisk:
         propagation and so are identical to the ``"sum"`` reduction.
         """
         lr = 0.3
-        res = _make_attr(tmp_path / "o", lr).attribute(
+        res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             final_step=2, loss_reduction="mean",
@@ -271,7 +271,7 @@ class TestDVEmbOnDisk:
 
     def test_invalid_loss_reduction_raises(self, collected, tmp_path):
         with pytest.raises(ValueError, match=r"loss_reduction"):
-            _make_attr(tmp_path / "o", 0.1).attribute(
+            _make_attr(tmp_path / "o", 0.1).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 final_step=2, loss_reduction="average",
@@ -282,7 +282,7 @@ class TestDVEmbOnDisk:
         lrs = {0: 0.3, 1: 0.6}
         res = DVEmbAttributor(
             _args(tmp_path / "o"), learning_rate=lrs, layer_name=LAYERS
-        ).attribute(
+        ).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             final_step=2, loss_reduction="sum",
@@ -309,12 +309,12 @@ class TestDVEmbOnDisk:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", 0.1)
         with pytest.raises(ValueError, match=r"train_gradients_dir"):
-            attr.attribute(test_gradients_dir=str(collected["test_dir"]), final_step=2)
+            attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]), final_step=2)
 
     def test_no_step_below_final_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", 0.1)
         with pytest.raises(ValueError, match=r"step < final_step"):
-            attr.attribute(
+            attr.attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 final_step=0,

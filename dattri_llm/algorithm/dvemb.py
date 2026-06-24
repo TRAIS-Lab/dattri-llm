@@ -236,12 +236,10 @@ class DVEmbAttributor(BaseAttributor):
     # Main entry point                                                   #
     # ------------------------------------------------------------------ #
 
-    def attribute(
+    def attribute_from_cache(
         self,
-        train_dataset: Optional[Dataset] = None,
-        test_dataset: Optional[Dataset] = None,
-        train_gradients_dir: Optional[str] = None,
-        test_gradients_dir: Optional[str] = None,
+        train_gradients_dir: str,
+        test_gradients_dir: str,
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
         final_step: Optional[int] = None,
@@ -251,8 +249,6 @@ class DVEmbAttributor(BaseAttributor):
         """Compute the ``(num_train_rows, num_test)`` DVEmb attribution score.
 
         Args:
-            train_dataset: Unused; kept for API parity.
-            test_dataset: Unused; kept for API parity.
             train_gradients_dir: Directory written by
                 :class:`GradientFileManager` during training.  Supplies both the
                 scored train gradients and, at every step, the per-sample

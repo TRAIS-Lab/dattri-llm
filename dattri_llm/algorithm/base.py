@@ -56,23 +56,21 @@ class BaseAttributor(ABC):
         """
 
     @abstractmethod
-    def attribute(
+    def attribute_from_cache(
         self,
-        train_dataset: Dataset,
-        test_dataset: Dataset,
+        train_gradients_dir: str,
+        test_gradients_dir: str,
         verbose: bool = False,
     ) -> torch.Tensor:
-        """Attribute the influence of training data on test data.
-
-        DataLoaders are constructed internally from ``args``.
+        """Attribute using gradients previously persisted to disk.
 
         Args:
-            train_dataset (Dataset): Dataset for the training data.
-            test_dataset (Dataset): Dataset for the test data.
+            train_gradients_dir: Directory containing cached training gradients.
+            test_gradients_dir: Directory containing cached test gradients.
             verbose: Show progress bars while attributing.
 
         Returns:
-            torch.Tensor: The influence of the training data on the test data.
+            The training-by-test attribution matrix.
         """
 
 
@@ -120,25 +118,15 @@ class BaseInnerProductAttributor(BaseAttributor):
         """
 
     @abstractmethod
-    def attribute(
+    def attribute_from_cache(
         self,
-        train_dataset: Optional[Dataset] = None,
-        test_dataset: Optional[Dataset] = None,
-        train_gradients_dir: Optional[str] = None,
-        test_gradients_dir: Optional[str] = None,
+        train_gradients_dir: str,
+        test_gradients_dir: str,
         verbose: bool = False,
     ) -> torch.Tensor:
         """Calculate the influence of the training set on the test set.
 
-        DataLoaders are constructed internally from ``args``.
-
         Args:
-            train_dataset (Optional[Dataset]): Dataset for training samples to calculate
-                the influence. It can be a subset of the full training set if
-                `cache` is called before. A subset means that only a part of the
-                training set's influence is calculated.
-            test_dataset (Optional[Dataset]): Dataset for test samples to calculate
-                the influence.
             train_gradients_dir (Optional[str]): The directory where the cached training gradients are stored.
                 If not None, the attributor will try to load the cached training gradients from
                 this directory to compute the influence.

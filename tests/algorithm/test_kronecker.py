@@ -154,7 +154,7 @@ def _make(attr_cls, out_dir):
 
 class TestKFAC:
     def test_matches_kronecker_oracle(self, collected, tmp_path):
-        res = _make(KFACAttributor, tmp_path / "o").attribute(
+        res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -169,7 +169,7 @@ class TestKFAC:
         )
 
     def test_algorithm_label_and_shape(self, collected, tmp_path):
-        res = _make(KFACAttributor, tmp_path / "o").attribute(
+        res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -179,7 +179,7 @@ class TestKFAC:
 
 class TestEKFAC:
     def test_matches_eigenbasis_oracle(self, collected, tmp_path):
-        res = _make(EKFACAttributor, tmp_path / "o").attribute(
+        res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -194,7 +194,7 @@ class TestEKFAC:
         )
 
     def test_algorithm_label(self, collected, tmp_path):
-        res = _make(EKFACAttributor, tmp_path / "o").attribute(
+        res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -208,7 +208,7 @@ class TestEKFAC:
             AttributionArguments(output_dir=str(tmp_path / "o"),
                                  dataloader_num_workers=0, dataloader_pin_memory=False),
             damping=damping, layer_name=LAYERS,
-        ).attribute(
+        ).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -254,7 +254,7 @@ class TestEKFAC:
                 AttributionArguments(output_dir=str(tmp_path / mode),
                                      dataloader_num_workers=0, dataloader_pin_memory=False),
                 damping=1e-2, layer_name=LAYERS, mode=mode,
-            ).attribute(
+            ).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
             ).query(collected["train_hashes"], collected["test_hashes"], trajectory="agnostic")
@@ -323,7 +323,7 @@ class TestKFACMultiToken:
 
         args = AttributionArguments(output_dir=str(tmp_path / "o"),
                                     dataloader_num_workers=0, dataloader_pin_memory=False)
-        res = KFACAttributor(args, damping=DAMPING, layer_name=["fc"]).attribute(
+        res = KFACAttributor(args, damping=DAMPING, layer_name=["fc"]).attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
         matrix = res.query(train_hashes, test_hashes, trajectory="agnostic")
@@ -367,7 +367,7 @@ class TestRowStepsTracked:
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_row_steps_reflect_recorded_step(self, collected_step1, tmp_path, cls):
-        res = _make(cls, tmp_path / "o").attribute(
+        res = _make(cls, tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(collected_step1["train_dir"]),
             test_gradients_dir=str(collected_step1["test_dir"]),
         )
@@ -407,7 +407,7 @@ class TestStepSelection:
                                      dataloader_num_workers=0, dataloader_pin_memory=False),
                 damping=DAMPING, layer_name=LAYERS,
             )
-            return attr.attribute(
+            return attr.attribute_from_cache(
                 train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
                 selected_training_steps=steps,
             )
@@ -424,7 +424,7 @@ class TestStepSelection:
     def test_unknown_steps_raise(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")
         with pytest.raises(ValueError, match=r"requested steps"):
-            attr.attribute(
+            attr.attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 selected_training_steps=[99],
@@ -435,14 +435,14 @@ class TestKroneckerShared:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")
         with pytest.raises(ValueError, match=r"train_gradients_dir"):
-            attr.attribute(test_gradients_dir=str(collected["test_dir"]))
+            attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]))
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_loop_over_test_matches_cached(self, collected, tmp_path, cls):
         """Streaming the test set (loop_over_test=True) gives identical scores to
         the cached path — same result, lower peak memory."""
         def run(loop, tag):
-            return _make(cls, tmp_path / tag).attribute(
+            return _make(cls, tmp_path / tag).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 loop_over_test=loop,
@@ -454,7 +454,7 @@ class TestKroneckerShared:
         """Sanity bridge: EK-FAC with a *single*-token, rank-deficient setup still
         runs and returns finite, correctly-shaped scores for both attributors."""
         for cls, label in ((KFACAttributor, "KFAC"), (EKFACAttributor, "EKFAC")):
-            res = _make(cls, tmp_path / label).attribute(
+            res = _make(cls, tmp_path / label).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
             )
