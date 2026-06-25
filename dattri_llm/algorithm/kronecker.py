@@ -27,16 +27,26 @@ output-gradient covariance) fit over the whole training set.
   ``F_l⁻¹ ≈ (U_A ⊗ U_G) (Λ + λ)⁻¹ (U_A ⊗ U_G)ᵀ``.
 
 Only linear and convolution layers are K-FAC-eligible; normalisation and
-embedding layers (for which K-FAC is undefined) are skipped.  Token/spatial
-positions are summed (matching a sum-over-tokens loss).  Rows and columns of the
-returned :class:`~dattri_llm.algorithm.score.AttributionScore` are identified by
-the on-disk content hash, in disk order.
+embedding layers (for which K-FAC is undefined) are skipped by default.  Token/
+spatial positions are summed (matching a sum-over-tokens loss).  Rows and columns
+of the returned :class:`~dattri_llm.algorithm.score.AttributionScore` are
+identified by the on-disk content hash, in disk order.
+
+Normalisation layers are not heavily parametrised, so their per-layer Fisher can
+be estimated **directly** rather than with the Kronecker factorisation.  Passing
+``non_kfac_strategy="direct"`` to :meth:`attribute_from_cache` adds a dense
+empirical-Fisher preconditioner ``F_l⁻¹`` for each such layer (built from the
+token-summed ``(B, d)`` weight gradients), whose contribution is summed into the
+K-FAC score.  Layers whose parameter count exceeds ``direct_fim_max_params`` are
+left out to bound the ``O(d²)`` Fisher; embedding layers (heavily parametrised)
+stay ignored.
 """
 
 from __future__ import annotations
 
+import warnings
 from abc import abstractmethod
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -52,6 +62,19 @@ from dattri_llm.gradient import ops
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
 from torch.utils.data import Dataset
+
+
+def _select_layers(
+    grad: Gradient, layer_name: Optional[List[str]], predicate
+) -> List[str]:
+    """Names of layers in *grad* whose type satisfies *predicate*, restricted to
+    *layer_name* when given."""
+    return [
+        name
+        for name in grad.data
+        if predicate(grad.layer_types[name])
+        and (layer_name is None or name in layer_name)
+    ]
 
 
 class _KroneckerBaseAttributor(BaseAttributor):
@@ -101,12 +124,18 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_steps: List[int],
         device: torch.device,
         verbose: bool,
+        fisher_acc: Optional[ops.FisherAccumulator],
     ) -> object:
-        """Estimate the per-layer preconditioner from the selected training
+        """Estimate the per-layer K-FAC preconditioner from the selected training
         gradients (the records at *train_steps*).
 
-        Returns an opaque context object passed back to :meth:`_prepare_test`
-        and :meth:`_score`.
+        Returns an opaque context object (possibly empty if no K-FAC-eligible
+        layer is present) passed back to :meth:`_prepare_test` and :meth:`_score`.
+
+        When *fisher_acc* is not ``None`` the implementation must also feed every
+        streamed block to it (via :meth:`_accumulate_fisher`) during its **first**
+        pass, so the direct-Fisher estimate for non-K-FAC layers reuses the same
+        single sweep over the data.
         """
 
     @abstractmethod
@@ -136,6 +165,8 @@ class _KroneckerBaseAttributor(BaseAttributor):
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
         verbose: bool = False,
+        non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
+        direct_fim_max_params: int = 4096,
     ) -> AttributionScore:
         """Compute the ``(num_train, num_test)`` attribution score from on-disk
         gradients — every train record against every test record.
@@ -157,6 +188,15 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 with what is available.  The test set always supplies every
                 column.
             verbose: Show tqdm progress bars on the logging process.
+            non_kfac_strategy: How to treat non-K-FAC layers (normalisation
+                layers).  ``"ignore"`` (default) skips them — only linear/conv
+                layers contribute.  ``"direct"`` adds a dense empirical-Fisher
+                preconditioner for each such layer and sums its contribution into
+                the score.
+            direct_fim_max_params: Only used when ``non_kfac_strategy="direct"``.
+                A non-K-FAC layer is included only if its (token-summed) weight
+                gradient has at most this many parameters, bounding the dense
+                ``O(d²)`` Fisher.  Larger layers are skipped with a warning.
 
         Returns:
             An :class:`AttributionScore` whose rows/columns are the train/test
@@ -164,13 +204,22 @@ class _KroneckerBaseAttributor(BaseAttributor):
 
         Raises:
             ValueError: If a gradients dir is missing, ``selected_training_steps``
-                matches no step in the training gradients, or no K-FAC-eligible
-                layers are present in the training gradients.
+                matches no step in the training gradients, no eligible layers are
+                present in the training gradients, or an argument is invalid.
         """
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
                 f"{type(self).__name__} requires both train_gradients_dir and "
                 "test_gradients_dir."
+            )
+        if non_kfac_strategy not in ("ignore", "direct"):
+            raise ValueError(
+                "non_kfac_strategy must be 'ignore' or 'direct', got "
+                f"{non_kfac_strategy!r}."
+            )
+        if direct_fim_max_params <= 0:
+            raise ValueError(
+                f"direct_fim_max_params must be positive, got {direct_fim_max_params}."
             )
 
         train_fm = GradientFileManager(train_gradients_dir)
@@ -183,14 +232,43 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_steps = resolve_steps(train_fm, selected_training_steps)
         test_steps = test_fm.available_steps()
 
-        # Fit the preconditioner once over the selected training gradients.
-        ctx = self._fit(train_fm, train_steps, device, verbose)
+        # Fit the K-FAC preconditioner over the selected training gradients.  When
+        # the direct strategy is requested, an empirical-Fisher accumulator for the
+        # non-K-FAC (norm) layers is filled in the *same* first pass, so the data
+        # is streamed only once.
+        self._fisher_saw_embedding = set()
+        fisher_acc = (
+            ops.FisherAccumulator(direct_fim_max_params)
+            if non_kfac_strategy == "direct"
+            else None
+        )
+        ctx = self._fit(train_fm, train_steps, device, verbose, fisher_acc)
+        fim_ctx: Dict[str, torch.Tensor] = (
+            self._finalize_fisher(fisher_acc, direct_fim_max_params)
+            if fisher_acc is not None
+            else {}
+        )
+        if not ctx and not fim_ctx:
+            raise ValueError(
+                "No eligible layers found in the training gradients: no "
+                "K-FAC-eligible (linear/conv) layer"
+                + (
+                    " and no direct-Fisher (norm) layer within "
+                    f"direct_fim_max_params={direct_fim_max_params}"
+                    if non_kfac_strategy == "direct"
+                    else " (pass non_kfac_strategy='direct' to include norm layers)"
+                )
+                + ". Check `layer_name` and the collected layers."
+            )
+
+        def _test_reps(td: Gradient) -> Tuple[object, Dict[str, torch.Tensor]]:
+            return self._prepare_test(td, ctx), self._prepare_fim_test(td, fim_ctx)
 
         # One pass over the test files: fix the column order (disk order) and,
         # unless looping, build + cache each block's test representation.
         test_ids: List[str] = []
         test_index: dict = {}
-        cached_test: List[Tuple[object, List[str]]] = []
+        cached_test: List[Tuple[object, Dict[str, torch.Tensor], List[str]]] = []
         for _step, test_g, test_hashes in iter_gradient_blocks(
             test_fm, test_steps, self.args, self.layer_name,
             desc=f"{self.algorithm}: preparing test",
@@ -201,8 +279,16 @@ class _KroneckerBaseAttributor(BaseAttributor):
                     test_index[h] = len(test_ids)
                     test_ids.append(h)
             if not loop_over_test:
-                cached_test.append((self._prepare_test(test_g.to(device), ctx), test_hashes))
+                kfac_rep, fim_rep = _test_reps(test_g.to(device))
+                cached_test.append((kfac_rep, fim_rep, test_hashes))
         num_test = len(test_ids)
+
+        def _loop_test_reps():
+            for _s, g, h in iter_gradient_blocks(
+                test_fm, test_steps, self.args, self.layer_name
+            ):
+                kfac_rep, fim_rep = _test_reps(g.to(device))
+                yield kfac_rep, fim_rep, h
 
         # Score every selected train block against every test representation.
         row_chunks: List[torch.Tensor] = []
@@ -215,19 +301,12 @@ class _KroneckerBaseAttributor(BaseAttributor):
         ):
             train_g = train_g.to(device)
             row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
-            test_reps = (
-                (
-                    (self._prepare_test(g.to(device), ctx), h)
-                    for _s, g, h in iter_gradient_blocks(
-                        test_fm, test_steps, self.args, self.layer_name
-                    )
-                )
-                if loop_over_test
-                else cached_test
-            )
-            for test_rep, test_hashes in test_reps:
+            test_reps = _loop_test_reps() if loop_over_test else cached_test
+            for test_rep, fim_rep, test_hashes in test_reps:
                 cols = [test_index[h] for h in test_hashes]
-                block = self._score(train_g, test_rep, ctx)
+                block = self._combine_score(
+                    train_g, test_rep, fim_rep, ctx, fim_ctx, len(cols)
+                )
                 row[:, cols] = block.detach().to("cpu", torch.float)
             row_chunks.append(row)
             row_train_ids.extend(train_hashes)
@@ -250,6 +329,8 @@ class _KroneckerBaseAttributor(BaseAttributor):
             algorithm_meta={
                 "damping": self.damping,
                 "selected_training_steps": train_steps,
+                "non_kfac_strategy": non_kfac_strategy,
+                "direct_fim_layers": sorted(fim_ctx),
             },
             algorithm=self.algorithm,
             normalized_grad=False,
@@ -264,15 +345,122 @@ class _KroneckerBaseAttributor(BaseAttributor):
 
     def _kfac_layers(self, grad: Gradient) -> List[str]:
         """Layer names eligible for K-FAC (linear/conv), honouring ``layer_name``."""
-        out = []
-        for name in grad.data:
-            lt = grad.layer_types[name]
-            if not (ops.is_linear(lt) or ops.is_conv(lt) or ops.is_conv_transpose(lt)):
+        return _select_layers(
+            grad,
+            self.layer_name,
+            lambda lt: ops.is_linear(lt) or ops.is_conv(lt) or ops.is_conv_transpose(lt),
+        )
+
+    def _fisher_layers(self, grad: Gradient) -> List[str]:
+        """Layer names eligible for the direct-Fisher fallback (norm), honouring
+        ``layer_name``.  Symmetric to :meth:`_kfac_layers`."""
+        return _select_layers(grad, self.layer_name, ops.is_norm)
+
+    # ------------------------------------------------------------------ #
+    # Direct-Fisher fallback for non-K-FAC (norm) layers                  #
+    # ------------------------------------------------------------------ #
+
+    def _accumulate_fisher(
+        self, fisher_acc: ops.FisherAccumulator, grad: Gradient
+    ) -> None:
+        """Fold one streamed training block into the per-layer Fisher estimate.
+
+        Called from each subclass's :meth:`_fit` first pass.  Also records any
+        embedding layers seen so :meth:`_finalize_fisher` can warn that they were
+        left ignored (heavily parametrised — not covered by the direct fallback).
+        """
+        fisher_acc.update(grad, self._fisher_layers(grad))
+        self._fisher_saw_embedding.update(
+            _select_layers(grad, self.layer_name, ops.is_embedding)
+        )
+
+    def _finalize_fisher(
+        self, fisher_acc: ops.FisherAccumulator, max_params: int
+    ) -> Dict[str, torch.Tensor]:
+        """Turn the accumulated Fishers into ``{layer: F_l⁻¹}``, warning about the
+        norm layers dropped by the ``max_params`` cap and the ignored embeddings."""
+        if fisher_acc.skipped:
+            warnings.warn(
+                "non_kfac_strategy='direct' skipped norm layers whose parameter "
+                f"count exceeds direct_fim_max_params={max_params}: "
+                f"{dict(sorted(fisher_acc.skipped.items()))}.",
+                stacklevel=2,
+            )
+        if self._fisher_saw_embedding:
+            warnings.warn(
+                "non_kfac_strategy='direct' does not cover embedding layers "
+                f"(heavily parametrised); leaving ignored: "
+                f"{sorted(self._fisher_saw_embedding)}.",
+                stacklevel=2,
+            )
+        return {
+            layer: ops.sym_inverse(F, self.damping)
+            for layer, F in fisher_acc.result().items()
+        }
+
+    @staticmethod
+    def _fisher_grad(grad: Gradient, layer: str) -> torch.Tensor:
+        """Per-sample ``(B, P)`` weight gradient used for direct-Fisher scoring."""
+        f = grad.data[layer]
+        return ops.weight_grad(
+            f.activation, f.pre_activation_grad, grad.layer_types[layer], f.module_kwargs
+        )
+
+    def _prepare_fim_test(
+        self, test_g: Gradient, fim_ctx: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """``(B_te, P)`` weight gradient per direct-Fisher layer."""
+        return {
+            layer: self._fisher_grad(test_g, layer)
+            for layer in fim_ctx
+            if layer in test_g.data
+        }
+
+    def _score_fim(
+        self,
+        train_g: Gradient,
+        fim_test_rep: Dict[str, torch.Tensor],
+        fim_ctx: Dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """``(B_tr, B_te)`` direct-Fisher score, or ``None`` if no layer applies.
+
+        ``F_l⁻¹`` is symmetric, so ``score = M_tr F⁻¹ M_teᵀ``.
+        """
+        total: Optional[torch.Tensor] = None
+        for layer, F_inv in fim_ctx.items():
+            if layer not in train_g.data or layer not in fim_test_rep:
                 continue
-            if self.layer_name is not None and name not in self.layer_name:
-                continue
-            out.append(name)
-        return out
+            M_tr = self._fisher_grad(train_g, layer).float()     # (B_tr, P)
+            M_te = fim_test_rep[layer].float()                   # (B_te, P)
+            block = (M_tr @ F_inv) @ M_te.T                      # (B_tr, B_te)
+            total = block if total is None else total + block
+        return total
+
+    def _combine_score(
+        self,
+        train_g: Gradient,
+        test_rep: object,
+        fim_test_rep: Dict[str, torch.Tensor],
+        ctx: object,
+        fim_ctx: Dict[str, torch.Tensor],
+        n_test: int,
+    ) -> torch.Tensor:
+        """Sum the K-FAC and direct-Fisher contributions for one train/test pair.
+
+        Either side may be empty (no eligible layers); the other carries the
+        score.  At least one is non-empty (enforced by ``attribute_from_cache``);
+        *n_test* is the test block's column count, used only when neither side
+        shares a layer with this block (an all-zero contribution).
+        """
+        block: Optional[torch.Tensor] = None
+        if ctx:
+            block = self._score(train_g, test_rep, ctx)
+        fim_block = self._score_fim(train_g, fim_test_rep, fim_ctx)
+        if fim_block is not None:
+            block = fim_block if block is None else block + fim_block
+        if block is None:
+            block = torch.zeros(train_g.batch_size, n_test)
+        return block
 
 
 class KFACAttributor(_KroneckerBaseAttributor):
@@ -300,33 +488,26 @@ class KFACAttributor(_KroneckerBaseAttributor):
         train_steps: List[int],
         device: torch.device,
         verbose: bool,
+        fisher_acc: Optional[ops.FisherAccumulator],
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
-        accums: Dict[str, ops.KFACAccumulator] = {}
+        kron = ops.KroneckerAccumulator()
         for _step, train_g, _ in iter_gradient_blocks(
             train_fm, train_steps, self.args, self.layer_name,
             desc="KFAC: fitting",
             verbose=verbose,
         ):
             train_g = train_g.to(device)
-            for layer in self._kfac_layers(train_g):
-                f = train_g.data[layer]
-                accums.setdefault(layer, ops.KFACAccumulator()).update(
-                    f.activation, f.pre_activation_grad,
-                    train_g.layer_types[layer], f.module_kwargs,
-                )
-        if not accums:
-            raise ValueError(
-                "No K-FAC-eligible (linear/conv) layers found in the training "
-                "gradients; check `layer_name` and the collected layers."
-            )
-        precond: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer, acc in accums.items():
-            A, G = acc.result()
-            precond[layer] = (
+            kron.update(train_g, self._kfac_layers(train_g))
+            # Reuse this single sweep to fit the direct Fisher for norm layers.
+            if fisher_acc is not None:
+                self._accumulate_fisher(fisher_acc, train_g)
+        return {
+            layer: (
                 ops.sym_inverse(A, self.damping),
                 ops.sym_inverse(G, self.damping),
             )
-        return precond
+            for layer, (A, G) in kron.result().items()
+        }
 
     def _prepare_test(self, test_g: Gradient, ctx: object) -> Gradient:
         # K-FAC's factorised cross-gram reads the raw factors directly, so the
@@ -417,31 +598,24 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         train_steps: List[int],
         device: torch.device,
         verbose: bool,
+        fisher_acc: Optional[ops.FisherAccumulator],
     ) -> dict:
-        # Pass 1 — Kronecker covariance factors and their eigenbases.
-        accums: Dict[str, ops.KFACAccumulator] = {}
+        # Pass 1 — Kronecker covariance factors and their eigenbases (and, when
+        # requested, the direct Fisher for norm layers from the same sweep).
+        kron = ops.KroneckerAccumulator()
         for _step, train_g, _ in iter_gradient_blocks(
             train_fm, train_steps, self.args, self.layer_name,
             desc="EKFAC: fitting factors",
             verbose=verbose,
         ):
             train_g = train_g.to(device)
-            for layer in self._kfac_layers(train_g):
-                f = train_g.data[layer]
-                accums.setdefault(layer, ops.KFACAccumulator()).update(
-                    f.activation, f.pre_activation_grad,
-                    train_g.layer_types[layer], f.module_kwargs,
-                )
-        if not accums:
-            raise ValueError(
-                "No K-FAC-eligible (linear/conv) layers found in the training "
-                "gradients; check `layer_name` and the collected layers."
-            )
+            kron.update(train_g, self._kfac_layers(train_g))
+            if fisher_acc is not None:
+                self._accumulate_fisher(fisher_acc, train_g)
         # Eigenvectors are fed to ``ekfac_materialize`` (which does ``a @ U``),
         # giving the faithful projection ``M = U_Gᵀ ∇W U_A``.
         eig: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer, acc in accums.items():
-            A, G = acc.result()
+        for layer, (A, G) in kron.result().items():
             _, U_A, _, U_G = ops.kfac_eigh(A, G)
             if self.mode == "approx":
                 # 'approx' mirrors the dattri code path.  Its transpose here
@@ -451,13 +625,15 @@ class EKFACAttributor(_KroneckerBaseAttributor):
             eig[layer] = (U_A, U_G)
 
         # Pass 2 — empirical second moments of the projected gradients (Λ).
+        # Skipped entirely when no K-FAC layer is present (norm-only + direct),
+        # so the data is not streamed for nothing.
         lam_sum: Dict[str, torch.Tensor] = {}
         counts: Dict[str, int] = {}
         for _step, train_g, _ in iter_gradient_blocks(
             train_fm, train_steps, self.args, self.layer_name,
             desc="EKFAC: fitting correction",
             verbose=verbose,
-        ):
+        ) if eig else ():
             train_g = train_g.to(device)
             for layer, (U_A, U_G) in eig.items():
                 if layer not in train_g.data:

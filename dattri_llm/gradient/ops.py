@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from dattri_llm.gradient.gradient import Gradient
 
 # ---------------------------------------------------------------------------
 # Layer type constants
@@ -538,6 +541,30 @@ def materialize(
     return result.flatten(1)                   # (B, out*in)
 
 
+def weight_grad(
+    a: torch.Tensor,
+    g: torch.Tensor,
+    layer_type: str,
+    module_kwargs: Optional[dict] = None,
+    include_bias: bool = True,
+) -> torch.Tensor:
+    """Per-sample gradient over the layer's actual parameters, shape ``(B, P)``.
+
+    This is the parameter-level counterpart to :func:`materialize`.  For a
+    **norm** layer :func:`materialize` returns the gradient *per token*
+    (``(B, T*P)``); here the token axis is summed so the result is the gradient
+    of the layer's parameters — the granularity an empirical Fisher or an
+    influence score operates on, and a fixed dimension independent of sequence
+    length.  For every other layer type the token axis is already contracted, so
+    this equals :func:`materialize`.
+    """
+    mat = materialize(a, g, layer_type, module_kwargs, include_bias)
+    if is_norm(layer_type):
+        n_tokens = a.shape[1] if a.ndim == 3 else 1
+        mat = mat.reshape(mat.shape[0], n_tokens, -1).sum(1)   # (B, T*P) -> (B, P)
+    return mat
+
+
 # ---------------------------------------------------------------------------
 # cross_dot / pairwise_dot
 # ---------------------------------------------------------------------------
@@ -755,9 +782,11 @@ def fim(
 ) -> torch.Tensor:
     """Return (d, d) empirical Fisher information matrix.
 
-    *module_kwargs* is passed to :func:`preprocess_factorized` when provided.
+    Built from the per-sample :func:`weight_grad` (token-summed for norm layers,
+    so the Fisher is over the layer's actual parameters).  *module_kwargs* is
+    passed to :func:`preprocess_factorized` when provided.
     """
-    grad = materialize(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
+    grad = weight_grad(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
     B = grad.shape[0]
     return grad.T @ grad / B
 
@@ -832,12 +861,17 @@ def ekfac_materialize(
 
 
 # ---------------------------------------------------------------------------
-# Streaming accumulators
+# Per-layer streaming accumulators
 # ---------------------------------------------------------------------------
 
 @dataclass
-class KFACAccumulator:
-    """Streaming K-FAC covariance accumulator for one layer."""
+class LayerKroneckerAccumulator:
+    """Streaming K-FAC covariance accumulator for a *single* layer.
+
+    Accumulates the Kronecker factors ``(A, G)`` (input-activation and
+    output-gradient covariances).  For the across-layers version see
+    :class:`KroneckerAccumulator`.
+    """
 
     _A: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
     _G: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
@@ -883,8 +917,12 @@ class KFACAccumulator:
 
 
 @dataclass
-class FIMAccumulator:
-    """Streaming empirical Fisher accumulator for one layer."""
+class LayerFisherAccumulator:
+    """Streaming empirical Fisher accumulator for a *single* layer.
+
+    Accumulates ``Σ_i g_i g_iᵀ`` over the per-sample :func:`weight_grad` ``g_i``.
+    For the across-layers version see :class:`FisherAccumulator`.
+    """
 
     _F: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
     _n: int = field(default=0, init=False, repr=False)
@@ -897,11 +935,19 @@ class FIMAccumulator:
         module_kwargs: Optional[dict] = None,
         include_bias: bool = True,
     ) -> None:
-        """Accumulate one batch.
+        """Accumulate one batch from its factorized factors.
 
         *module_kwargs* is passed to :func:`preprocess_factorized` when provided.
         """
-        grad = materialize(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
+        self.update_from_grad(weight_grad(a, g, layer_type, module_kwargs, include_bias))
+
+    def update_from_grad(self, grad: torch.Tensor) -> None:
+        """Accumulate one batch from already-materialized per-sample gradients.
+
+        *grad* is ``(B, d)``.  Use this when the caller has materialized the
+        per-sample weight gradient itself (e.g. with a non-default token
+        reduction) and only needs the streaming outer-product accumulation.
+        """
         B = grad.shape[0]
         if self._F is None:
             self._F = torch.zeros(
@@ -920,3 +966,83 @@ class FIMAccumulator:
         """Reset accumulator state."""
         self._F = None
         self._n = 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer streaming accumulators
+# ---------------------------------------------------------------------------
+
+class KroneckerAccumulator:
+    """Streaming K-FAC covariance accumulator across a model's layers.
+
+    Holds one :class:`LayerKroneckerAccumulator` per layer and fans each streamed
+    :class:`~dattri_llm.gradient.gradient.Gradient` block out to the requested
+    layers, so a fit loop is a single ``update`` call per block::
+
+        acc = KroneckerAccumulator()
+        for block in blocks:
+            acc.update(block, kfac_eligible_layers)
+        factors = acc.result()          # {layer: (A, G)}
+    """
+
+    def __init__(self) -> None:
+        self._layers: Dict[str, LayerKroneckerAccumulator] = {}
+
+    def update(self, gradient: "Gradient", layers: Iterable[str]) -> None:
+        """Accumulate the factors for *layers* from one gradient block."""
+        for name in layers:
+            f = gradient.data[name]
+            self._layers.setdefault(name, LayerKroneckerAccumulator()).update(
+                f.activation, f.pre_activation_grad,
+                gradient.layer_types[name], f.module_kwargs,
+            )
+
+    def result(self) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+        """Return ``{layer: (A, G)}`` for every accumulated layer."""
+        return {name: acc.result() for name, acc in self._layers.items()}
+
+
+class FisherAccumulator:
+    """Streaming empirical-Fisher accumulator across a model's layers.
+
+    Holds one :class:`LayerFisherAccumulator` per layer, accumulating the dense
+    Fisher from each layer's per-sample :func:`weight_grad`.  When *max_params*
+    is given, layers whose parameter count exceeds it are skipped (and recorded
+    in :attr:`skipped`) to bound the dense ``O(d²)`` Fisher::
+
+        acc = FisherAccumulator(max_params=4096)
+        for block in blocks:
+            acc.update(block, fisher_eligible_layers)
+        fishers = acc.result()          # {layer: F}
+        dropped = acc.skipped           # {layer: param_count}
+    """
+
+    def __init__(self, max_params: Optional[int] = None) -> None:
+        self._max_params = max_params
+        self._layers: Dict[str, LayerFisherAccumulator] = {}
+        self._skipped: Dict[str, int] = {}
+
+    def update(self, gradient: "Gradient", layers: Iterable[str]) -> None:
+        """Accumulate the Fisher for *layers* from one gradient block."""
+        for name in layers:
+            if name in self._skipped:
+                continue
+            f = gradient.data[name]
+            g = weight_grad(
+                f.activation, f.pre_activation_grad,
+                gradient.layer_types[name], f.module_kwargs,
+            )                                        # (B, P)
+            if self._max_params is not None and g.shape[-1] > self._max_params:
+                self._skipped[name] = g.shape[-1]
+                self._layers.pop(name, None)
+                continue
+            self._layers.setdefault(name, LayerFisherAccumulator()).update_from_grad(g)
+
+    def result(self) -> Dict[str, torch.Tensor]:
+        """Return ``{layer: F}`` for every accumulated (non-skipped) layer."""
+        return {name: acc.result() for name, acc in self._layers.items()}
+
+    @property
+    def skipped(self) -> Dict[str, int]:
+        """``{layer: param_count}`` for layers dropped by the ``max_params`` cap."""
+        return dict(self._skipped)

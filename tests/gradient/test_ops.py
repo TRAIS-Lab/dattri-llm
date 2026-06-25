@@ -30,14 +30,17 @@ import pytest
 import torch
 
 from dattri_llm.gradient.ops import (
-    FIMAccumulator,
-    KFACAccumulator,
+    FisherAccumulator,
+    KroneckerAccumulator,
+    LayerFisherAccumulator,
+    LayerKroneckerAccumulator,
     dot,
     fim,
     grad_norm_sq,
     kfac,
     materialize,
     pairwise_dot,
+    weight_grad,
 )
 
 # ---------------------------------------------------------------------------
@@ -222,7 +225,7 @@ class TestStreamingAccumulators:
 
         A_b, G_b = kfac(torch.cat([a1, a2]), torch.cat([g1, g2]), lt)
 
-        acc = KFACAccumulator()
+        acc = LayerKroneckerAccumulator()
         acc.update(a1, g1, lt)
         acc.update(a2, g2, lt)
         A_s, G_s = acc.result()
@@ -237,17 +240,123 @@ class TestStreamingAccumulators:
 
         F_b = fim(torch.cat([a1, a2]), torch.cat([g1, g2]), lt)
 
-        acc = FIMAccumulator()
+        acc = LayerFisherAccumulator()
         acc.update(a1, g1, lt)
         acc.update(a2, g2, lt)
         F_s = acc.result()
 
         assert torch.allclose(F_b, F_s, atol=1e-5)
 
+    def test_fim_update_from_grad_equals_update(self):
+        """update_from_grad on the materialized gradient matches update()."""
+        a, g = _linear_2d()
+        lt = "nn.Linear"
+
+        ref = LayerFisherAccumulator()
+        ref.update(a, g, lt)
+
+        direct = LayerFisherAccumulator()
+        direct.update_from_grad(weight_grad(a, g, lt))
+
+        assert torch.allclose(ref.result(), direct.result(), atol=1e-6)
+
     def test_reset_clears_state(self):
-        acc = KFACAccumulator()
+        acc = LayerKroneckerAccumulator()
         a, g = _linear_2d()
         acc.update(a, g, "nn.Linear")
         acc.reset()
         with pytest.raises(RuntimeError):
             acc.result()
+
+
+# ---------------------------------------------------------------------------
+# weight_grad — parameter-level (token-summed) per-sample gradient
+# ---------------------------------------------------------------------------
+
+class TestWeightGrad:
+    def test_norm_sums_tokens(self):
+        a, g = _norm_3d()                                # (B, T, I)
+        per_token = materialize(a, g, "nn.LayerNorm")    # (B, T*I)
+        wg = weight_grad(a, g, "nn.LayerNorm")           # (B, I)
+        assert wg.shape == (B, I)
+        assert torch.allclose(wg, per_token.reshape(B, T, I).sum(1), atol=1e-5)
+
+    def test_norm_dim_independent_of_seq_len(self):
+        m1 = weight_grad(*[torch.randn(B, 3, I) for _ in range(2)], "nn.LayerNorm")
+        m2 = weight_grad(*[torch.randn(B, 7, I) for _ in range(2)], "nn.LayerNorm")
+        assert m1.shape == m2.shape == (B, I)
+
+    @pytest.mark.parametrize("lt,factory", [
+        ("nn.Linear", _linear_3d), ("nn.Embedding", _embedding),
+    ])
+    def test_noop_for_token_contracting_types(self, lt, factory):
+        a, g = factory()
+        assert torch.allclose(weight_grad(a, g, lt), materialize(a, g, lt), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer accumulators — fan a Gradient block out to per-layer estimators
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+
+class _Factor:
+    def __init__(self, a, g, module_kwargs=None):
+        self.activation = a
+        self.pre_activation_grad = g
+        self.module_kwargs = module_kwargs
+
+
+def _fake_gradient(layers):
+    """``layers`` maps name -> (layer_type, a, g)."""
+    return types.SimpleNamespace(
+        data={n: _Factor(a, g) for n, (_lt, a, g) in layers.items()},
+        layer_types={n: lt for n, (lt, _a, _g) in layers.items()},
+    )
+
+
+class TestMultiLayerAccumulators:
+    def test_kronecker_matches_per_layer(self):
+        a1, g1 = _linear_2d()
+        a2, g2 = _linear_2d()
+        block = _fake_gradient({"fc": ("nn.Linear", a1, g1), "out": ("nn.Linear", a2, g2)})
+
+        multi = KroneckerAccumulator()
+        multi.update(block, ["fc", "out"])
+        res = multi.result()
+
+        for name, (a, g) in {"fc": (a1, g1), "out": (a2, g2)}.items():
+            ref = LayerKroneckerAccumulator()
+            ref.update(a, g, "nn.Linear")
+            A_ref, G_ref = ref.result()
+            assert torch.allclose(res[name][0], A_ref, atol=1e-6)
+            assert torch.allclose(res[name][1], G_ref, atol=1e-6)
+
+    def test_fisher_matches_per_layer(self):
+        a, g = _norm_3d()
+        block = _fake_gradient({"ln": ("nn.LayerNorm", a, g)})
+
+        multi = FisherAccumulator()
+        multi.update(block, ["ln"])
+
+        ref = LayerFisherAccumulator()
+        ref.update(a, g, "nn.LayerNorm")
+        assert torch.allclose(multi.result()["ln"], ref.result(), atol=1e-6)
+
+    def test_fisher_skips_layers_over_cap(self):
+        a, g = _norm_3d()                                # norm param dim = I
+        block = _fake_gradient({"ln": ("nn.LayerNorm", a, g)})
+
+        multi = FisherAccumulator(max_params=I - 1)
+        multi.update(block, ["ln"])
+        assert "ln" not in multi.result()
+        assert multi.skipped == {"ln": I}
+
+    def test_fisher_within_cap_kept(self):
+        a, g = _norm_3d()
+        block = _fake_gradient({"ln": ("nn.LayerNorm", a, g)})
+        multi = FisherAccumulator(max_params=I)
+        multi.update(block, ["ln"])
+        assert "ln" in multi.result()
+        assert multi.skipped == {}
