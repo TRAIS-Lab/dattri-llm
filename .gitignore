@@ -2,3 +2,7 @@
 
 # Python bytecode
 __pycache__/
+
+# Hillclimb hook files
+/.claude/settings.local.json
+/.claude/settings.local.json.malformed-*
