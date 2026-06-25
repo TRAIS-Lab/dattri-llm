@@ -716,6 +716,73 @@ class TestHookManagerRemove:
 
 
 # --------------------------------------------------------------------------- #
+# HookManager.get_gradient — last-step gradient cache                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestGetGradient:
+    def test_after_completed_step(self, tiny_model, tiny_batch):
+        # A completed step clears the buffers; get_gradient must still return
+        # the assembled gradient from the single-slot cache.
+        hm = HookManager(tiny_model)
+        with hm.collect():
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+            g = hm.get_gradient()
+        assert set(g.layer_names) == {
+            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+        }
+
+    def test_cache_is_same_object_as_record(self, tiny_model, tiny_batch):
+        # The cached gradient is exactly the object handed to on_step_end —
+        # no duplicate copy is kept in memory.
+        cb = RecordingCallback()
+        hm = HookManager(tiny_model, callbacks=[cb])
+        with hm.collect():
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+        assert hm.get_gradient() is cb.records[-1].gradient
+
+    def test_cache_tracks_latest_step(self, tiny_model, tiny_batch):
+        # Across multiple steps only the most recent is cached.
+        hm = HookManager(tiny_model)
+        with hm.collect():
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+            g1 = hm.get_gradient()
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+            g2 = hm.get_gradient()
+        assert g1 is not g2
+
+    def test_cache_persists_after_context_exit(self, tiny_model, tiny_batch):
+        hm = HookManager(tiny_model)
+        with hm.collect():
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+        # Still retrievable after the collect() context closes.
+        assert len(hm.get_gradient().layer_names) == 5
+
+    def test_new_collect_clears_stale_cache(self, tiny_model, tiny_batch):
+        hm = HookManager(tiny_model)
+        with hm.collect():
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+        # Entering a fresh context drops the prior cache; before any backward
+        # there is nothing to return.
+        with hm.collect():
+            with pytest.raises(RuntimeError):
+                hm.get_gradient()
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+
+    def test_raises_when_nothing_captured(self, tiny_model):
+        hm = HookManager(tiny_model)
+        with pytest.raises(RuntimeError):
+            hm.get_gradient()
+
+    def test_remove_clears_cache(self, tiny_model, tiny_batch):
+        hm = HookManager(tiny_model)
+        with hm.collect():
+            tiny_model(tiny_batch["input_ids"]).mean().backward()
+        hm.remove()
+        assert hm._last_gradient is None
+
+
+# --------------------------------------------------------------------------- #
 # HookManagerConfig                                                            #
 # --------------------------------------------------------------------------- #
 

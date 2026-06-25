@@ -911,6 +911,12 @@ class HookManager:
         self._step_count: int = 0
         self._collecting: bool = False
 
+        # Single-slot cache holding the assembled gradient of the most recently
+        # *completed* step.  The per-layer buffers are cleared as soon as a step
+        # completes, so this is what :meth:`get_gradient` returns afterwards.
+        # Only ever holds one step's gradient at a time (see _on_step_complete).
+        self._last_gradient: Optional[Gradient] = None
+
         self._seen_bwd: set[str] = set()
         self._bwd_replica_counts: dict[str, int] = {}
         self._step_lock = threading.Lock()
@@ -1174,6 +1180,9 @@ class HookManager:
         return 1
 
     def _on_step_complete(self) -> None:
+        # Drop the previous step's cached gradient *before* assembling the new
+        # one so we never transiently hold two full step gradients in memory.
+        self._last_gradient = None
         gradient = self._assemble_gradient()
         step = self._step_count
 
@@ -1187,8 +1196,11 @@ class HookManager:
         self._backward_end_scheduled = False
         self._bwd_done = not self._has_linear_io
         self._grad_done = not self._has_param_grad
+        # The per-layer buffers are now cleared; the assembled ``gradient`` owns
+        # the only copy of this step's tensors and becomes the last-step cache.
         self._reset_layer_buffers()
         self._reset_param_buffers()
+        self._last_gradient = gradient
 
         batch_size = self._get_input_batch_size()
         input_hash = [hash_sample(self._last_inputs, i) for i in range(batch_size)]
@@ -1286,6 +1298,8 @@ class HookManager:
         """
         self._reset_layer_buffers()
         self._reset_param_buffers()
+        # Drop any cached gradient from a prior context before collecting anew.
+        self._last_gradient = None
         self._param_hook_count = 0
         self._mlp_params_ready = False
         self._backward_end_scheduled = False
@@ -1376,6 +1390,7 @@ class HookManager:
         remove_hooks(self._mlp_weight_handles)
         remove_hooks(self._param_handles)
         self._param_buffers.clear()
+        self._last_gradient = None
 
     def add_callback(self, callback: HookManagerCallback) -> None:
         """Attach a callback after construction and run its ``on_register``.
@@ -1406,24 +1421,31 @@ class HookManager:
         return self._step_count
 
     def get_gradient(self) -> Gradient:
-        """Assemble and return the :class:`~dattri_llm.gradient.Gradient` from
-        the most recent forward+backward pass captured in the current buffers.
-
-        Call this after a backward pass inside a :meth:`collect` context to
-        retrieve the gradient without waiting for a full training step to
-        complete via callbacks::
+        """Return the :class:`~dattri_llm.gradient.Gradient` of the most recently
+        completed step::
 
             with collector.collect():
                 loss = model(**inputs).loss
                 loss.backward()
                 grad = collector.get_gradient()
 
+        Step completion happens inside the backward hooks, so by the time
+        ``backward()`` returns the per-layer buffers have already been assembled
+        and cleared.  The assembled gradient is retained in a single-slot cache
+        (the *last-step gradient*), which is what this method returns.
+
         Returns:
             A :class:`~dattri_llm.gradient.Gradient` with ``layer_types``
             populated from the hooked module class names.
 
         Raises:
-            RuntimeError: If no gradient data has been captured yet (i.e.
-                backward has not been called inside the collect context).
+            RuntimeError: If no step has completed yet (no backward has run
+                inside the collect context).
         """
-        return self._assemble_gradient()
+        if self._last_gradient is None:
+            raise RuntimeError(
+                "No gradient available: no step has completed yet. "
+                "Ensure backward() was called inside the collect() context "
+                "before calling get_gradient()."
+            )
+        return self._last_gradient
