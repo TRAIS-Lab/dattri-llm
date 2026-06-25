@@ -9,8 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from dattri_llm.gradient.callbacks import HookManagerCallback
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
+    HookManager,
     HookManagerConfig,
     _is_linear_io_capable,
     default_hook_assignment,
@@ -240,6 +242,16 @@ class TestRegisterLinearIoHooks:
         }
         remove_hooks(handles)
 
+    def test_type_overrides_relabels_class_name(self, tiny_model):
+        # Override mlp.0's detected type; others keep canonical_class_name.
+        buffers, handles = register_linear_io_hooks(
+            tiny_model, type_overrides={"mlp.0": "nn.Bilinear"}
+        )
+        assert buffers["mlp.0"]["_class_name"] == "nn.Bilinear"
+        assert buffers["mlp.2"]["_class_name"] == "nn.Linear"
+        assert buffers["embedding"]["_class_name"] == "nn.Embedding"
+        remove_hooks(handles)
+
 
 # --------------------------------------------------------------------------- #
 # register_param_grad_hooks                                                    #
@@ -428,3 +440,98 @@ class TestDefaultHookAssignment:
         # the Linear is a real module call → linear_io.
         assert assignment[""] == "param_grad"
         assert assignment["lin"] == "linear_io"
+
+
+# --------------------------------------------------------------------------- #
+# HookManagerConfig.layer_types — manual layer-type overrides                  #
+# --------------------------------------------------------------------------- #
+
+
+class _CustomLinear(nn.Linear):
+    """A user-defined linear layer whose class name is not recognised by
+    ``canonical_class_name`` but which is still linear-IO-capable (it subclasses
+    ``nn.Linear``)."""
+
+
+class _CustomLinearModel(nn.Module):
+    """``embedding → custom (CustomLinear) → lm_head``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(32, 16)
+        self.custom = _CustomLinear(16, 16, bias=False)
+        self.lm_head = nn.Linear(16, 32, bias=False)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(self.custom(self.embedding(input_ids)))
+
+
+class _Recording(HookManagerCallback):
+    def __init__(self) -> None:
+        self.records: list = []
+
+    def on_step_end(self, record) -> None:
+        self.records.append(record)
+
+
+class TestLayerTypesConfig:
+    def test_validation_rejects_non_dict(self):
+        with pytest.raises(TypeError, match="layer_types must be a dict"):
+            HookManagerConfig(layer_types=["mlp.0"])  # type: ignore[arg-type]
+
+    def test_validation_rejects_non_str_values(self):
+        with pytest.raises(TypeError, match="str type names"):
+            HookManagerConfig(layer_types={"mlp.0": 123})  # type: ignore[dict-item]
+
+    def test_none_defaults_to_empty(self):
+        assert HookManagerConfig().layer_types == {}
+
+    def test_layer_types_does_not_affect_is_default(self):
+        # A pure relabel still uses the default hooking behaviour.
+        assert HookManagerConfig(layer_types={"custom": "nn.Linear"}).is_default
+
+    def test_override_relabels_captured_type(self):
+        model = _CustomLinearModel()
+        cb = _Recording()
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(layer_types={"custom": "nn.Linear"}),
+            callbacks=[cb],
+        )
+        with hm.collect():
+            model(torch.randint(0, 32, (2, 8))).mean().backward()
+        types = cb.records[0].gradient.layer_types
+        # Override applied to 'custom'; other layers keep their canonical type.
+        assert types["custom"] == "nn.Linear"
+        assert types["embedding"] == "nn.Embedding"
+        assert types["lm_head"] == "nn.Linear"
+
+    def test_without_override_custom_class_keeps_canonical_name(self):
+        model = _CustomLinearModel()
+        cb = _Recording()
+        hm = HookManager(model, callbacks=[cb])
+        with hm.collect():
+            model(torch.randint(0, 32, (2, 8))).mean().backward()
+        types = cb.records[0].gradient.layer_types
+        # canonical_class_name returns the (unrecognised) custom path.
+        assert types["custom"].endswith("_CustomLinear")
+
+    def test_warns_when_named_layer_not_hooked(self):
+        model = _CustomLinearModel()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            HookManager(
+                model,
+                config=HookManagerConfig(layer_types={"nope": "nn.Linear"}),
+            )
+        assert any("were not hooked" in str(w.message) for w in caught)
+
+    def test_no_warning_when_named_layer_hooked(self):
+        model = _CustomLinearModel()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            HookManager(
+                model,
+                config=HookManagerConfig(layer_types={"custom": "nn.Linear"}),
+            )
+        assert not any("were not hooked" in str(w.message) for w in caught)

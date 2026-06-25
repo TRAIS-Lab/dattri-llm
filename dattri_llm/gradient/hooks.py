@@ -151,6 +151,7 @@ def register_linear_io_hooks(
     layer_names: Optional[set[str]] = None,
     on_layer_forward: Optional[Callable[[str, torch.Tensor], None]] = None,
     on_layer_backward: Optional[Callable[[str, torch.Tensor], None]] = None,
+    type_overrides: Optional[dict[str, str]] = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
@@ -180,6 +181,12 @@ def register_linear_io_hooks(
         on_layer_backward: Optional callable fired after each backward hook
             capture.  Signature: ``(layer_name: str, grad_output: Tensor)``.
             The tensor is on CPU.
+        type_overrides: Optional mapping from layer name to a layer-type string
+            that overrides the type inferred by :func:`canonical_class_name`.
+            Use this for user-defined layer classes that subclass a supported
+            linear-family type but whose class name is not recognised (e.g. a
+            custom ``MyLinear`` that should be treated as ``"nn.Linear"``).
+            Layers absent from the mapping fall back to ``canonical_class_name``.
 
     Returns:
         ``(buffers, handles)`` where ``buffers`` maps layer name to a
@@ -198,7 +205,10 @@ def register_linear_io_hooks(
             continue
 
         buffers[name] = _make_layer_buffer()
-        layer_type = canonical_class_name(module)
+        if type_overrides is not None and name in type_overrides:
+            layer_type = type_overrides[name]
+        else:
+            layer_type = canonical_class_name(module)
         buffers[name]["_class_name"] = layer_type
         buffers[name]["_module_kwargs"] = extract_module_kwargs(module, layer_type)
 
@@ -498,6 +508,19 @@ class HookManagerConfig:
     **Default** (no arguments) — register ``linear_io`` on every
     linear-IO-capable layer, and fall back to ``param_grad`` for any remaining
     layer that has trainable parameters but is not linear-IO-capable.
+
+    **Manual layer types** — :attr:`layer_types` maps a layer name to a
+    layer-type string that overrides the type inferred by
+    :func:`canonical_class_name`.  This is for user-defined layer classes whose
+    class name is not recognised by the built-in type detection (e.g. a custom
+    ``MyLinear`` subclass that should be treated as ``"nn.Linear"``)::
+
+        HookManagerConfig(layer_types={"mlp.0": "nn.Linear"})
+
+    The mapping may be incomplete: layers it does not mention keep the
+    automatically detected type.  It is orthogonal to which layers get hooked —
+    a layer named here is only relabelled, not forced to be hooked.  If a named
+    layer is not hooked in the end, :class:`HookManager` emits a warning.
     """
 
     def __init__(
@@ -505,10 +528,12 @@ class HookManagerConfig:
         hook_types: Optional[dict[str, str]] = None,
         linear_io: Selector = None,
         param_grad: Selector = None,
+        layer_types: Optional[dict[str, str]] = None,
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
         self.param_grad = self._validate_selector(PARAM_GRAD, param_grad)
+        self.layer_types = self._validate_layer_types(layer_types)
 
     @staticmethod
     def _validate_assignment(
@@ -529,6 +554,25 @@ class HookManagerConfig:
                     f"hook type. Valid types: {sorted(_VALID_HOOK_TYPES)}."
                 )
         return dict(hook_types)
+
+    @staticmethod
+    def _validate_layer_types(
+        layer_types: Optional[dict[str, str]],
+    ) -> dict[str, str]:
+        if layer_types is None:
+            return {}
+        if not isinstance(layer_types, dict):
+            raise TypeError(
+                "layer_types must be a dict mapping layer name to a layer-type "
+                f"string, got {type(layer_types).__name__}."
+            )
+        for layer_name, layer_type in layer_types.items():
+            if not isinstance(layer_name, str) or not isinstance(layer_type, str):
+                raise TypeError(
+                    "layer_types must map str layer names to str type names, got "
+                    f"{layer_name!r}: {layer_type!r}."
+                )
+        return dict(layer_types)
 
     @staticmethod
     def _validate_selector(name: str, selector: Selector) -> Selector:
@@ -948,6 +992,7 @@ class HookManager:
                 layer_names=linear_io_layers,
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
+                type_overrides=self._config.layer_types,
             )
             self._n_layers = len(self._buffers)
             self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
@@ -968,6 +1013,20 @@ class HookManager:
                 on_param_grad=self._check_step_grad_complete,
             )
             self._n_params_hooked = len(self._param_handles)
+
+        # Warn about manual layer_types that never took effect because the named
+        # layer was not hooked (e.g. a typo, or a layer excluded by the hook
+        # selection).  Overrides only apply to factorized linear_io layers.
+        if self._config.layer_types:
+            hooked = set(self._buffers) | set(self._param_buffers)
+            unused = sorted(set(self._config.layer_types) - hooked)
+            if unused:
+                warnings.warn(
+                    "HookManagerConfig.layer_types designated a type for layers "
+                    f"that were not hooked: {unused}. These overrides had no "
+                    "effect.",
+                    stacklevel=2,
+                )
 
         # Notify callbacks of this HookManager so they can reference it
         # (e.g. to call pause() during a secondary pass).
