@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 if TYPE_CHECKING:
-    from dattri_llm.gradient.gradient import Gradient
+    from dattri_llm.gradient.gradient import Factorized, Gradient
 
 # ---------------------------------------------------------------------------
 # Layer type constants
@@ -320,7 +320,7 @@ def _preprocess_conv_transpose(
 
 
 def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
-    """Extract the minimal hyperparameters from *module* needed by :func:`preprocess_factorized`.
+    """Extract the minimal hyperparameters from *module* needed by :func:`_preprocess_factorized`.
 
     Returns a plain serialisable dict — no reference to the module object is
     retained, so the result can be pickled cheaply alongside gradient tensors.
@@ -359,7 +359,7 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
     return kwargs
 
 
-def preprocess_factorized(
+def _preprocess_factorized(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -403,7 +403,7 @@ def preprocess_factorized(
             to ``True``.
 
     Returns:
-        ``(a_processed, g_processed)`` ready for :func:`materialize` and
+        ``(a_processed, g_processed)`` ready for :func:`_materialize` and
         related functions.
     """
     if module_kwargs is None:
@@ -500,7 +500,7 @@ def _materialize_embedding(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
 # materialize
 # ---------------------------------------------------------------------------
 
-def materialize(
+def _materialize(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -510,7 +510,7 @@ def materialize(
     """Compute per-sample weight gradient, returning shape (B, d).
 
     When *module_kwargs* is provided the raw hook captures are preprocessed
-    first via :func:`preprocess_factorized` (im2col for Conv, x̂ for
+    first via :func:`_preprocess_factorized` (im2col for Conv, x̂ for
     LayerNorm, bias augmentation for Linear).  Pass ``module_kwargs=None``
     when the tensors are already in the preprocessed form.
 
@@ -518,7 +518,7 @@ def materialize(
     shape (B, T*d) for 3-D inputs, (B, d) for 2-D.  Summing over the
     token positions recovers the actual weight gradient.
     """
-    a, g = preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
 
     if is_embedding(layer_type):
         return _materialize_embedding(a, g)
@@ -541,7 +541,7 @@ def materialize(
     return result.flatten(1)                   # (B, out*in)
 
 
-def weight_grad(
+def _weight_grad(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -550,15 +550,15 @@ def weight_grad(
 ) -> torch.Tensor:
     """Per-sample gradient over the layer's actual parameters, shape ``(B, P)``.
 
-    This is the parameter-level counterpart to :func:`materialize`.  For a
-    **norm** layer :func:`materialize` returns the gradient *per token*
+    This is the parameter-level counterpart to :func:`_materialize`.  For a
+    **norm** layer :func:`_materialize` returns the gradient *per token*
     (``(B, T*P)``); here the token axis is summed so the result is the gradient
     of the layer's parameters — the granularity an empirical Fisher or an
     influence score operates on, and a fixed dimension independent of sequence
     length.  For every other layer type the token axis is already contracted, so
-    this equals :func:`materialize`.
+    this equals :func:`_materialize`.
     """
-    mat = materialize(a, g, layer_type, module_kwargs, include_bias)
+    mat = _materialize(a, g, layer_type, module_kwargs, include_bias)
     if is_norm(layer_type):
         n_tokens = a.shape[1] if a.ndim == 3 else 1
         mat = mat.reshape(mat.shape[0], n_tokens, -1).sum(1)   # (B, T*P) -> (B, P)
@@ -569,15 +569,15 @@ def weight_grad(
 # cross_dot / pairwise_dot
 # ---------------------------------------------------------------------------
 
-def _cross_dot(
+def _cross_gram(
     a1: torch.Tensor, g1: torch.Tensor,
     a2: torch.Tensor, g2: torch.Tensor,
     layer_type: str,
 ) -> torch.Tensor:
     """Cross-gram ``K[i, j] = ⟨∇W1_i, ∇W2_j⟩`` on *already-preprocessed* factors.
 
-    Shared kernel behind :func:`cross_dot` and :func:`pairwise_dot`.  Inputs
-    must already be in the form returned by :func:`preprocess_factorized`.
+    Shared kernel behind :func:`_cross_dot` and :func:`_pairwise_dot`.  Inputs
+    must already be in the form returned by :func:`_preprocess_factorized`.
     """
     if is_embedding(layer_type):
         # K[i,j] = sum_t g1_i[t] · G2_sum_j[tok1_i[t]]
@@ -611,7 +611,7 @@ def _cross_dot(
     return torch.einsum("btcs,btcs->bc", K_a, K_g)   # (B1, B2)
 
 
-def cross_dot(
+def _cross_dot(
     a1: torch.Tensor, g1: torch.Tensor,
     a2: torch.Tensor, g2: torch.Tensor,
     layer_type: str,
@@ -621,22 +621,22 @@ def cross_dot(
 ) -> torch.Tensor:
     """Return the (B1, B2) cross-gram ``K[i, j] = ⟨∇W1_i, ∇W2_j⟩``.
 
-    Generalises :func:`pairwise_dot` (which is the self case
-    ``cross_dot(a, g, a, g, ...)``) to two distinct sets of factorized
+    Generalises :func:`_pairwise_dot` (which is the self case
+    ``_cross_dot(a, g, a, g, ...)``) to two distinct sets of factorized
     gradients — e.g. a training batch against a fixed target gradient.  Each
-    side is preprocessed independently via :func:`preprocess_factorized`.
+    side is preprocessed independently via :func:`_preprocess_factorized`.
 
     For norm layers the per-position (diagonal) convention is used, so the two
     sides must share the same flattened ``T * d`` dimension (equal token/spatial
     count); this holds whenever both gradients come from the same model run at
     the same sequence length.
     """
-    a1, g1 = preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
-    a2, g2 = preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
-    return _cross_dot(a1, g1, a2, g2, layer_type)
+    a1, g1 = _preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
+    a2, g2 = _preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
+    return _cross_gram(a1, g1, a2, g2, layer_type)
 
 
-def pairwise_dot(
+def _pairwise_dot(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -645,18 +645,18 @@ def pairwise_dot(
 ) -> torch.Tensor:
     """Return (B, B) pairwise dot product matrix of per-sample gradients.
 
-    *module_kwargs* is passed to :func:`preprocess_factorized` when provided.
-    Equivalent to the self case of :func:`cross_dot`.
+    *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
+    Equivalent to the self case of :func:`_cross_dot`.
     """
-    a, g = preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
-    return _cross_dot(a, g, a, g, layer_type)
+    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    return _cross_gram(a, g, a, g, layer_type)
 
 
 # ---------------------------------------------------------------------------
 # dot
 # ---------------------------------------------------------------------------
 
-def dot(
+def _dot(
     a1: torch.Tensor, g1: torch.Tensor,
     a2: torch.Tensor, g2: torch.Tensor,
     layer_type: str,
@@ -667,10 +667,10 @@ def dot(
     """Return (B,) per-sample dot products ⟨∇W1_i, ∇W2_i⟩.
 
     *module_kwargs1* and *module_kwargs2* are passed to
-    :func:`preprocess_factorized` for the respective tensor pairs when provided.
+    :func:`_preprocess_factorized` for the respective tensor pairs when provided.
     """
-    a1, g1 = preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
-    a2, g2 = preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
+    a1, g1 = _preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
+    a2, g2 = _preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
 
     if is_embedding(layer_type):
         B = g1.shape[0]
@@ -705,7 +705,7 @@ def dot(
 # grad_norm_sq
 # ---------------------------------------------------------------------------
 
-def grad_norm_sq(
+def _grad_norm_sq(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -714,12 +714,12 @@ def grad_norm_sq(
 ) -> torch.Tensor:
     """Return (B,) per-sample squared Frobenius norms of weight gradients.
 
-    *module_kwargs* is passed to :func:`preprocess_factorized` when provided.
+    *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
     """
-    a, g = preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
 
     if is_embedding(layer_type):
-        return pairwise_dot(a, g, layer_type).diagonal()
+        return _pairwise_dot(a, g, layer_type).diagonal()
 
     a_f = _to_3d(a.float())   # (B, T, d_in)
     g_f = _to_3d(g.float())   # (B, T, d_out)
@@ -750,7 +750,7 @@ def _flatten_for_kfac(
     return a_f, g_f
 
 
-def kfac(
+def _kfac(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -759,9 +759,9 @@ def kfac(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return (A, G) K-FAC covariance factor matrices.
 
-    *module_kwargs* is passed to :func:`preprocess_factorized` when provided.
+    *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
     """
-    a, g = preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
     a_f, g_f = _flatten_for_kfac(a, g, layer_type)
     N = a_f.shape[0]
     A = a_f.T @ a_f / N
@@ -773,7 +773,7 @@ def kfac(
 # fim
 # ---------------------------------------------------------------------------
 
-def fim(
+def _fim(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -782,11 +782,11 @@ def fim(
 ) -> torch.Tensor:
     """Return (d, d) empirical Fisher information matrix.
 
-    Built from the per-sample :func:`weight_grad` (token-summed for norm layers,
+    Built from the per-sample :func:`_weight_grad` (token-summed for norm layers,
     so the Fisher is over the layer's actual parameters).  *module_kwargs* is
-    passed to :func:`preprocess_factorized` when provided.
+    passed to :func:`_preprocess_factorized` when provided.
     """
-    grad = weight_grad(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
+    grad = _weight_grad(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
     B = grad.shape[0]
     return grad.T @ grad / B
 
@@ -805,7 +805,7 @@ def sym_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
     return (evecs / (evals + damping)) @ evecs.T
 
 
-def kfac_cross(
+def _kfac_cross(
     a1: torch.Tensor, g1: torch.Tensor,
     a2: torch.Tensor, g2: torch.Tensor,
     layer_type: str,
@@ -818,16 +818,16 @@ def kfac_cross(
     """K-FAC preconditioned cross-gram between two factorized gradient sets.
 
     Returns ``K[i, j] = vec(∇W1_i)ᵀ (A⁻¹ ⊗ G⁻¹) vec(∇W2_j)`` — i.e.
-    :func:`cross_dot` with the side-1 factors whitened by the inverse K-FAC
+    :func:`_cross_dot` with the side-1 factors whitened by the inverse K-FAC
     covariances (``A_inv`` over the input dim, ``G_inv`` over the output dim).
     Both inverses are symmetric, so whitening either side gives the same value.
     Defined for linear and convolution layers.
     """
-    a1, g1 = preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
-    a2, g2 = preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
+    a1, g1 = _preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
+    a2, g2 = _preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
     a1 = a1.float() @ A_inv.float()
     g1 = g1.float() @ G_inv.float()
-    return _cross_dot(a1, g1, a2, g2, layer_type)
+    return _cross_gram(a1, g1, a2, g2, layer_type)
 
 
 def kfac_eigh(
@@ -839,7 +839,7 @@ def kfac_eigh(
     return s_A, U_A, s_G, U_G
 
 
-def ekfac_materialize(
+def _ekfac_materialize(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -854,10 +854,142 @@ def ekfac_materialize(
     coordinates whose empirical second moments are the EK-FAC corrected
     eigenvalues, and against which test/train gradients are scored.
     """
-    a, g = preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
     a = a.float() @ U_A.float()
     g = g.float() @ U_G.float()
-    return materialize(a, g, layer_type)
+    return _materialize(a, g, layer_type)
+
+
+# ---------------------------------------------------------------------------
+# Public Factorized-input API
+# ---------------------------------------------------------------------------
+#
+# The private ``_``-prefixed functions above operate on raw
+# ``(activation, pre_activation_grad)`` tensors and **always assume batch-first**
+# ``(B, T, ...)`` input.  The public functions below take the
+# :class:`~dattri_llm.gradient.gradient.Factorized` container instead: they call
+# :meth:`Factorized.as_batch_first` to normalise a sequence-first capture, unpack
+# ``module_kwargs``, and delegate to the private version.  These are the entry
+# points to prefer — the call is both shorter and automatically correct for
+# non-batch-first layers, so nothing downstream needs to reason about tensor
+# layout.  Reach for the raw ``_``-prefixed kernels only when you already hold
+# bare, batch-first factor tensors (e.g. inside another kernel).
+
+
+def preprocess_factorized(
+    f: "Factorized", layer_type: str, include_bias: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_preprocess_factorized` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _preprocess_factorized(
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+    )
+
+
+def materialize(
+    f: "Factorized", layer_type: str, include_bias: bool = True
+) -> torch.Tensor:
+    """:func:`_materialize` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _materialize(
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+    )
+
+
+def weight_grad(
+    f: "Factorized", layer_type: str, include_bias: bool = True
+) -> torch.Tensor:
+    """:func:`_weight_grad` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _weight_grad(
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+    )
+
+
+def grad_norm_sq(
+    f: "Factorized", layer_type: str, include_bias: bool = True
+) -> torch.Tensor:
+    """:func:`_grad_norm_sq` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _grad_norm_sq(
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+    )
+
+
+def kfac(
+    f: "Factorized", layer_type: str, include_bias: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_kfac` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _kfac(
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+    )
+
+
+def fim(
+    f: "Factorized", layer_type: str, include_bias: bool = True
+) -> torch.Tensor:
+    """:func:`_fim` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _fim(
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+    )
+
+
+def pairwise_dot(
+    f: "Factorized", layer_type: str, include_bias: bool = True
+) -> torch.Tensor:
+    """:func:`_pairwise_dot` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _pairwise_dot(
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+    )
+
+
+def dot(
+    f1: "Factorized", f2: "Factorized", layer_type: str, include_bias: bool = True
+) -> torch.Tensor:
+    """:func:`_dot` on two :class:`Factorized` (batch-first-safe)."""
+    b1, b2 = f1.as_batch_first(), f2.as_batch_first()
+    return _dot(
+        b1.activation, b1.pre_activation_grad, b2.activation, b2.pre_activation_grad,
+        layer_type, b1.module_kwargs, b2.module_kwargs, include_bias,
+    )
+
+
+def cross_dot(
+    f1: "Factorized", f2: "Factorized", layer_type: str, include_bias: bool = True
+) -> torch.Tensor:
+    """:func:`_cross_dot` on two :class:`Factorized` (batch-first-safe)."""
+    b1, b2 = f1.as_batch_first(), f2.as_batch_first()
+    return _cross_dot(
+        b1.activation, b1.pre_activation_grad, b2.activation, b2.pre_activation_grad,
+        layer_type, b1.module_kwargs, b2.module_kwargs, include_bias,
+    )
+
+
+def kfac_cross(
+    f1: "Factorized", f2: "Factorized", layer_type: str,
+    A_inv: torch.Tensor, G_inv: torch.Tensor, include_bias: bool = True,
+) -> torch.Tensor:
+    """:func:`_kfac_cross` on two :class:`Factorized` (batch-first-safe)."""
+    b1, b2 = f1.as_batch_first(), f2.as_batch_first()
+    return _kfac_cross(
+        b1.activation, b1.pre_activation_grad, b2.activation, b2.pre_activation_grad,
+        layer_type, A_inv, G_inv, b1.module_kwargs, b2.module_kwargs, include_bias,
+    )
+
+
+def ekfac_materialize(
+    f: "Factorized", layer_type: str,
+    U_A: torch.Tensor, U_G: torch.Tensor, include_bias: bool = True,
+) -> torch.Tensor:
+    """:func:`_ekfac_materialize` on a :class:`Factorized` (batch-first-safe)."""
+    bf = f.as_batch_first()
+    return _ekfac_materialize(
+        bf.activation, bf.pre_activation_grad, layer_type, U_A, U_G,
+        bf.module_kwargs, include_bias,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -887,9 +1019,9 @@ class LayerKroneckerAccumulator:
     ) -> None:
         """Accumulate one batch of factorized gradient data.
 
-        *module_kwargs* is passed to :func:`preprocess_factorized` when provided.
+        *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
         """
-        a, g = preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+        a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
         a_f, g_f = _flatten_for_kfac(a, g, layer_type)
         N = a_f.shape[0]
         if self._A is None:
@@ -920,7 +1052,7 @@ class LayerKroneckerAccumulator:
 class LayerFisherAccumulator:
     """Streaming empirical Fisher accumulator for a *single* layer.
 
-    Accumulates ``Σ_i g_i g_iᵀ`` over the per-sample :func:`weight_grad` ``g_i``.
+    Accumulates ``Σ_i g_i g_iᵀ`` over the per-sample :func:`_weight_grad` ``g_i``.
     For the across-layers version see :class:`FisherAccumulator`.
     """
 
@@ -937,9 +1069,9 @@ class LayerFisherAccumulator:
     ) -> None:
         """Accumulate one batch from its factorized factors.
 
-        *module_kwargs* is passed to :func:`preprocess_factorized` when provided.
+        *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
         """
-        self.update_from_grad(weight_grad(a, g, layer_type, module_kwargs, include_bias))
+        self.update_from_grad(_weight_grad(a, g, layer_type, module_kwargs, include_bias))
 
     def update_from_grad(self, grad: torch.Tensor) -> None:
         """Accumulate one batch from already-materialized per-sample gradients.
@@ -991,10 +1123,10 @@ class KroneckerAccumulator:
     def update(self, gradient: "Gradient", layers: Iterable[str]) -> None:
         """Accumulate the factors for *layers* from one gradient block."""
         for name in layers:
-            f = gradient.data[name]
+            bf = gradient.data[name].as_batch_first()
             self._layers.setdefault(name, LayerKroneckerAccumulator()).update(
-                f.activation, f.pre_activation_grad,
-                gradient.layer_types[name], f.module_kwargs,
+                bf.activation, bf.pre_activation_grad,
+                gradient.layer_types[name], bf.module_kwargs,
             )
 
     def result(self) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1006,7 +1138,7 @@ class FisherAccumulator:
     """Streaming empirical-Fisher accumulator across a model's layers.
 
     Holds one :class:`LayerFisherAccumulator` per layer, accumulating the dense
-    Fisher from each layer's per-sample :func:`weight_grad`.  When *max_params*
+    Fisher from each layer's per-sample :func:`_weight_grad`.  When *max_params*
     is given, layers whose parameter count exceeds it are skipped (and recorded
     in :attr:`skipped`) to bound the dense ``O(d²)`` Fisher::
 
@@ -1027,11 +1159,7 @@ class FisherAccumulator:
         for name in layers:
             if name in self._skipped:
                 continue
-            f = gradient.data[name]
-            g = weight_grad(
-                f.activation, f.pre_activation_grad,
-                gradient.layer_types[name], f.module_kwargs,
-            )                                        # (B, P)
+            g = weight_grad(gradient.data[name], gradient.layer_types[name])  # (B, P)
             if self._max_params is not None and g.shape[-1] > self._max_params:
                 self._skipped[name] = g.shape[-1]
                 self._layers.pop(name, None)

@@ -783,6 +783,9 @@ class DataSelectionCallback(HookManagerCallback):
         for layer_name, val in record.gradient.data.items():
             if not isinstance(val, Factorized):
                 continue
+            # Normalise sequence-first captures so the batch axis is dim 0 before
+            # we index samples / read the batch size below.
+            val = val.as_batch_first()
             # Skip layers whose gradient was summed over the batch dim during
             # the forward broadcast (e.g. wpe in GPT-2, where position_ids has
             # shape (1, T)).  Per-sample contributions cannot be isolated.
@@ -820,7 +823,7 @@ class DataSelectionCallback(HookManagerCallback):
 
         # (n, d_weight); sum over the dropped samples → (d_weight,).
         contrib = ops.materialize(
-            a_d, g_d, layer_type, module_kwargs, include_bias=False
+            Factorized(a_d, g_d, module_kwargs), layer_type, include_bias=False
         ).sum(0)
 
         if ops.is_embedding(layer_type):
@@ -993,6 +996,8 @@ class DataSelectionCallback(HookManagerCallback):
         for layer_name, val in sorted(record.gradient.data.items()):
             if not isinstance(val, Factorized):
                 continue
+            # Normalise sequence-first captures to batch-first before indexing.
+            val = val.as_batch_first()
             if val.pre_activation_grad.shape[0] < B:
                 continue
             try:
@@ -1041,7 +1046,7 @@ class DataSelectionCallback(HookManagerCallback):
         for embeddings, whose contribution covers just rows ``0..max_token``.
         """
         contrib = ops.materialize(
-            a_d, g_d, layer_type, module_kwargs, include_bias=False
+            Factorized(a_d, g_d, module_kwargs), layer_type, include_bias=False
         ).sum(0)
         if ops.is_embedding(layer_type):
             # materialize scatters into rows 0..max_token, flattened row-major

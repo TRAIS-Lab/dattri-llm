@@ -76,20 +76,20 @@ class TestFactorized:
             activation=torch.ones(B, I),
             pre_activation_grad=torch.ones(B, O),
         )
-        out = ops.materialize(f.activation, f.pre_activation_grad, "nn.Linear")
+        out = ops.materialize(f, "nn.Linear")
         assert out.shape == (B, O * I)
 
     def test_materialize_3d(self):
         f = factorized_bt()
         # ops.materialize sums over the token dimension, returning (B, O*I)
-        out = ops.materialize(f.activation, f.pre_activation_grad, "nn.Linear")
+        out = ops.materialize(f, "nn.Linear")
         assert out.shape == (B, O * I)
 
     def test_materialize_invalid_ndim(self):
         a = torch.randn(B, T, I, 1)
         g = torch.randn(B, T, O, 1)
         with pytest.raises((ValueError, RuntimeError)):
-            ops.materialize(a, g, "nn.Linear")
+            ops.materialize(Factorized(a, g), "nn.Linear")
 
     def test_to_device_dtype(self):
         f = factorized()
@@ -509,11 +509,7 @@ class TestSimilarity:
         cross = g.similarity(g, mode="factorized")
         for name, matrix in cross.items():
             v = g.data[name]
-            aligned = ops.dot(
-                v.activation, v.pre_activation_grad,
-                v.activation, v.pre_activation_grad,
-                g.layer_types[name],
-            )
+            aligned = ops.dot(v, v, g.layer_types[name])
             assert matrix.shape == (B, B)
             assert torch.allclose(matrix.diagonal(), aligned, atol=1e-4, rtol=1e-4)
 
@@ -629,3 +625,120 @@ class TestSimilarity:
             g.similarity(g, reduce="layer")  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="mode"):
             g.similarity(g, mode="ghost")  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# batch_first — sequence-first ``(T, B, ...)`` captures                         #
+# --------------------------------------------------------------------------- #
+
+
+def _seq_first_pair():
+    """Return (batch_first_grad, seq_first_grad) holding the *same* underlying
+    per-sample gradient for one ``batch_token`` linear layer — the seq-first one
+    is the batch-first factors with the leading two axes swapped."""
+    torch.manual_seed(0)
+    a = torch.randn(B, T, I)
+    g = torch.randn(B, T, O)
+
+    bf = Gradient(
+        representation={"l": "factorized"},
+        data={"l": Factorized(a, g)},
+        layer_types={"l": "nn.Linear"},
+        indexing={"l": "batch_token"},
+    )
+    sf = Gradient(
+        representation={"l": "factorized"},
+        data={"l": Factorized(a.transpose(0, 1), g.transpose(0, 1), batch_first=False)},
+        layer_types={"l": "nn.Linear"},
+        indexing={"l": "batch_token"},
+    )
+    return bf, sf
+
+
+class TestBatchFirst:
+    def test_default_is_batch_first(self):
+        assert Factorized(torch.randn(B, I), torch.randn(B, O)).batch_first is True
+
+    def test_as_batch_first_noop_when_already(self):
+        f = Factorized(torch.randn(B, T, I), torch.randn(B, T, O))
+        assert f.as_batch_first() is f
+
+    def test_as_batch_first_transposes(self):
+        f = Factorized(torch.randn(T, B, I), torch.randn(T, B, O), batch_first=False)
+        bf = f.as_batch_first()
+        assert bf.batch_first is True
+        assert bf.activation.shape == (B, T, I)
+        assert bf.pre_activation_grad.shape == (B, T, O)
+
+    def test_seq_first_batch_size(self):
+        # Regression: a (T, B, d) layer must report B, not T.
+        _bf, sf = _seq_first_pair()
+        assert sf.batch_size == B
+
+    def test_seq_first_validate_ok(self):
+        _bf, sf = _seq_first_pair()
+        sf.validate()  # must not raise "All layers must have the same batch size"
+
+    def test_seq_first_token_dim(self):
+        _bf, sf = _seq_first_pair()
+        assert sf.token_dim["l"] == T
+
+    def test_mixed_orientation_validates(self):
+        # A batch-first layer and a seq-first layer with the same batch size B.
+        a, g = torch.randn(B, T, I), torch.randn(B, T, O)
+        grad = Gradient(
+            representation={"bf": "factorized", "sf": "factorized"},
+            data={
+                "bf": Factorized(a, g),
+                "sf": Factorized(a.transpose(0, 1), g.transpose(0, 1), batch_first=False),
+            },
+            layer_types={"bf": "nn.Linear", "sf": "nn.Linear"},
+            indexing={"bf": "batch_token", "sf": "batch_token"},
+        )
+        grad.validate()
+        assert grad.batch_size == B
+
+    def test_seq_first_materialize_matches_batch_first(self):
+        bf, sf = _seq_first_pair()
+        assert torch.allclose(
+            bf.materialize().data["l"], sf.materialize().data["l"], atol=1e-5
+        )
+
+    def test_seq_first_similarity_matches_batch_first(self):
+        bf, sf = _seq_first_pair()
+        assert torch.allclose(
+            bf.similarity(bf)["l"], sf.similarity(sf)["l"], atol=1e-4
+        )
+
+    def test_seq_first_aggregate_matches_batch_first(self):
+        bf, sf = _seq_first_pair()
+        assert torch.allclose(
+            bf.aggregate().data["l"], sf.aggregate().data["l"], atol=1e-5
+        )
+
+    def test_clone_and_to_preserve_flag(self):
+        _bf, sf = _seq_first_pair()
+        assert sf.clone().data["l"].batch_first is False
+        assert sf.to(dtype=torch.float64).data["l"].batch_first is False
+
+    def test_slice_batch_preserves_flag_and_layout(self):
+        _bf, sf = _seq_first_pair()
+        sl = sf.slice("batch", 0)            # one sample
+        assert sl.data["l"].batch_first is False
+        assert sl.batch_size == 1
+        # Seq-first activation stays (T, 1, I).
+        assert sl.data["l"].activation.shape == (T, 1, I)
+
+    def test_concatenate_batch_matches_batch_first(self):
+        bf, sf = _seq_first_pair()
+        cat_bf = bf.concatenate(bf, dim="batch")
+        cat_sf = sf.concatenate(sf, dim="batch")
+        assert cat_sf.batch_size == 2 * B
+        assert torch.allclose(
+            cat_bf.materialize().data["l"], cat_sf.materialize().data["l"], atol=1e-5
+        )
+
+    def test_concatenate_mismatched_layout_raises(self):
+        bf, sf = _seq_first_pair()
+        with pytest.raises(ValueError, match="batch_first"):
+            bf.concatenate(sf, dim="batch")

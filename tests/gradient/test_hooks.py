@@ -535,3 +535,54 @@ class TestLayerTypesConfig:
                 config=HookManagerConfig(layer_types={"custom": "nn.Linear"}),
             )
         assert not any("were not hooked" in str(w.message) for w in caught)
+
+
+# --------------------------------------------------------------------------- #
+# HookManager(non_batch_first_layers=...) — sequence-first captures            #
+# --------------------------------------------------------------------------- #
+
+
+class _SeqFirstModel(nn.Module):
+    """``proj`` is applied to a sequence-first ``(T, B, d)`` tensor."""
+
+    def __init__(self, d: int = 8) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(16, d)
+        self.proj = nn.Linear(d, d, bias=False)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(input_ids)        # (B, T, d)
+        x = x.transpose(0, 1)                # (T, B, d) — sequence-first
+        x = self.proj(x)
+        return x.transpose(0, 1)
+
+
+class TestNonBatchFirstLayers:
+    def test_seq_first_layer_collects_without_error(self):
+        # Regression: a (T, B, d) layer must not raise "same batch size".
+        model = _SeqFirstModel()
+        cb = _Recording()
+        hm = HookManager(model, callbacks=[cb], non_batch_first_layers={"proj"})
+        B, T = 3, 5
+        with hm.collect():
+            model(torch.randint(0, 16, (B, T))).sum().backward()
+        g = cb.records[0].gradient
+        assert g.batch_size == B
+        assert g.data["proj"].batch_first is False
+        # Raw capture stays sequence-first; batch axis is dim 1.
+        assert g.data["proj"].activation.shape[1] == B
+
+    def test_without_flag_raises_batch_mismatch(self):
+        model = _SeqFirstModel()
+        cb = _Recording()
+        hm = HookManager(model, callbacks=[cb])  # proj NOT flagged
+        with pytest.raises(ValueError, match="same batch size"):
+            with hm.collect():
+                model(torch.randint(0, 16, (3, 5))).sum().backward()
+
+    def test_warns_when_named_layer_not_hooked(self):
+        model = _SeqFirstModel()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            HookManager(model, non_batch_first_layers={"nope"})
+        assert any("had no effect" in str(w.message) for w in caught)

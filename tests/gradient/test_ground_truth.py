@@ -318,27 +318,18 @@ def _channel_norm_diag_grad(
 # Thin wrappers that call ops on a Gradient layer, passing module_kwargs through.
 
 def _materialize(gradient, name: str, include_bias: bool = True) -> torch.Tensor:
-    v = gradient.data[name]
     lt = gradient.layer_types[name]
-    return ops.materialize(
-        v.activation, v.pre_activation_grad, lt, v.module_kwargs, include_bias
-    ).float()
+    return ops.materialize(gradient.data[name], lt, include_bias).float()
 
 
 def _grad_norm_sq(gradient, name: str, include_bias: bool = True) -> torch.Tensor:
-    v = gradient.data[name]
     lt = gradient.layer_types[name]
-    return ops.grad_norm_sq(
-        v.activation, v.pre_activation_grad, lt, v.module_kwargs, include_bias
-    ).float()
+    return ops.grad_norm_sq(gradient.data[name], lt, include_bias).float()
 
 
 def _pairwise_dot(gradient, name: str, include_bias: bool = True) -> torch.Tensor:
-    v = gradient.data[name]
     lt = gradient.layer_types[name]
-    return ops.pairwise_dot(
-        v.activation, v.pre_activation_grad, lt, v.module_kwargs, include_bias
-    ).float()
+    return ops.pairwise_dot(gradient.data[name], lt, include_bias).float()
 
 
 # ---------------------------------------------------------------------------

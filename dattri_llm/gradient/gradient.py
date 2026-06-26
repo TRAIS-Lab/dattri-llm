@@ -21,12 +21,37 @@ class Factorized:
     # two Factorized tensors with identical data compare equal regardless of
     # which layer produced them.
     module_kwargs: Optional[dict] = field(default=None, compare=False, repr=False, hash=False)
+    # Tensor layout flag.  ``True`` (default) means the batch axis is dim 0 and
+    # the token/sequence axis is dim 1 — the layout every ``ops`` kernel assumes.
+    # ``False`` marks a *sequence-first* capture ``(T, B, ...)`` (e.g. a layer
+    # internal to a sequence-first model such as MusicTransformer); call
+    # :meth:`as_batch_first` to get the canonical ``(B, T, ...)`` view.
+    batch_first: bool = field(default=True, compare=False)
 
     def to(self, device=None, dtype=None) -> "Factorized":
         return Factorized(
             activation=self.activation.to(device=device, dtype=dtype),
             pre_activation_grad=self.pre_activation_grad.to(device=device, dtype=dtype),
             module_kwargs=self.module_kwargs,
+            batch_first=self.batch_first,
+        )
+
+    def as_batch_first(self) -> "Factorized":
+        """Return a batch-first view of these factors.
+
+        For a sequence-first capture this swaps the leading two axes
+        (``(T, B, ...) -> (B, T, ...)``) of both factors; for an already
+        batch-first capture it returns ``self`` unchanged.  Every ``ops`` kernel
+        expects batch-first input, so call this before handing the raw factors to
+        :mod:`dattri_llm.gradient.ops`.
+        """
+        if self.batch_first:
+            return self
+        return Factorized(
+            activation=self.activation.transpose(0, 1),
+            pre_activation_grad=self.pre_activation_grad.transpose(0, 1),
+            module_kwargs=self.module_kwargs,
+            batch_first=True,
         )
 
 GradientData = Union[torch.Tensor, Factorized]
@@ -57,7 +82,10 @@ class Gradient:
     @property
     def batch_size(self) -> int:
         x = next(iter(self.data.values()))
-        return x.activation.shape[0] if isinstance(x, Factorized) else x.shape[0]
+        if isinstance(x, Factorized):
+            # Batch axis is dim 0 when batch-first, dim 1 when sequence-first.
+            return x.activation.shape[0 if x.batch_first else 1]
+        return x.shape[0]
 
     @property
     def token_dim(self) -> Dict[str, "int | None"]:
@@ -65,11 +93,11 @@ class Gradient:
         result: Dict[str, "int | None"] = {}
         for name, value in self.data.items():
             if self._layer_indexing(name) == "batch_token":
-                result[name] = (
-                    value.activation.shape[1]
-                    if isinstance(value, Factorized)
-                    else value.shape[1]
-                )
+                if isinstance(value, Factorized):
+                    # Token axis is dim 1 when batch-first, dim 0 when seq-first.
+                    result[name] = value.activation.shape[1 if value.batch_first else 0]
+                else:
+                    result[name] = value.shape[1]
             else:
                 result[name] = None
         return result
@@ -102,8 +130,11 @@ class Gradient:
                 if not isinstance(value, Factorized):
                     raise TypeError(f"{name} must be Factorized")
 
-                act = value.activation
-                gout = value.pre_activation_grad
+                # Validate against the canonical batch-first layout, so a
+                # sequence-first capture is checked exactly like a batch-first one.
+                bf = value.as_batch_first()
+                act = bf.activation
+                gout = bf.pre_activation_grad
 
                 if layer_type == "nn.EmbeddingBag":
                     # EmbeddingBag: activation is (B, T) int token indices,
@@ -174,6 +205,7 @@ class Gradient:
                     value.activation.clone(),
                     value.pre_activation_grad.clone(),
                     module_kwargs=value.module_kwargs,
+                    batch_first=value.batch_first,
                 )
             else:
                 new_data[name] = value.clone()
@@ -210,10 +242,7 @@ class Gradient:
             layer_repr = self.representation[name]
             if layer_repr == "factorized" and isinstance(value, Factorized):
                 layer_type = self.layer_types[name]
-                new_data[name] = ops.materialize(
-                    value.activation, value.pre_activation_grad, layer_type,
-                    module_kwargs=value.module_kwargs,
-                )
+                new_data[name] = ops.materialize(value, layer_type)
                 new_repr[name] = "materialized"
                 # ops.materialize always returns (B, d) — collapse to "batch".
                 new_indexing[name] = "batch"
@@ -261,14 +290,24 @@ class Gradient:
             if self.batch_size != other.batch_size:
                 raise ValueError("Token concatenation requires the same batch size")
 
-        cat_dim = 0 if dim == "batch" else 1
         new_data = {}
+
+        def cat_axis(batch_first: bool) -> int:
+            # Batch axis is 0 (1) and token axis 1 (0) for batch-first (seq-first).
+            if dim == "batch":
+                return 0 if batch_first else 1
+            return 1 if batch_first else 0
 
         for name in self.layer_names:
             a = self.data[name]
             b = other.data[name]
 
             if isinstance(a, Factorized) and isinstance(b, Factorized):
+                if a.batch_first != b.batch_first:
+                    raise ValueError(
+                        f"{name} has mismatched batch_first layout between gradients"
+                    )
+                cat_dim = cat_axis(a.batch_first)
                 new_data[name] = Factorized(
                     activation=torch.cat([a.activation, b.activation], dim=cat_dim),
                     pre_activation_grad=torch.cat(
@@ -276,9 +315,10 @@ class Gradient:
                         dim=cat_dim,
                     ),
                     module_kwargs=a.module_kwargs,
+                    batch_first=a.batch_first,
                 )
             elif isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-                new_data[name] = torch.cat([a, b], dim=cat_dim)
+                new_data[name] = torch.cat([a, b], dim=cat_axis(True))
             else:
                 raise TypeError(f"{name} has mismatched data types")
 
@@ -322,27 +362,19 @@ class Gradient:
             layer_type = self.layer_types[name]
             if self._layer_indexing(name) == "batch_token":
                 if isinstance(value, Factorized):
-                    mat = ops.materialize(
-                        value.activation, value.pre_activation_grad, layer_type,
-                        module_kwargs=value.module_kwargs,
-                    )  # (B, d) — already summed over T by ops.materialize
+                    mat = ops.materialize(value, layer_type)  # (B, d), summed over T
                     if mode == "mean":
                         # T is the token count after preprocessing: for raw Conv
                         # this is L_out (spatial positions), not C_in.
-                        if ops.is_embedding(layer_type):
-                            T = value.activation.shape[1]
-                        elif value.module_kwargs is not None and (
+                        if value.module_kwargs is not None and (
                             ops.is_conv(layer_type) or ops.is_conv_transpose(layer_type)
                         ):
-                            # L_out is encoded in mat's flattened dim; recover from
-                            # the preprocessed activation shape via a dry run.
-                            a_p, _ = ops.preprocess_factorized(
-                                value.activation[:1], value.pre_activation_grad[:1],
-                                layer_type, value.module_kwargs,
-                            )
+                            # L_out is encoded in mat's flattened dim; recover it
+                            # from the preprocessed activation shape.
+                            a_p, _ = ops.preprocess_factorized(value, layer_type)
                             T = a_p.shape[1]
                         else:
-                            T = value.activation.shape[1]
+                            T = value.as_batch_first().activation.shape[1]
                         mat = mat / T
                     new_data[name] = mat
                     new_repr[name] = "materialized"
@@ -377,10 +409,9 @@ class Gradient:
                     f"indexing='batch_token'. Non-conforming: {sorted(non_bt)}"
                 )
 
-        slice_dim = 0 if dim == "batch" else 1
         new_data = {}
 
-        def slice_tensor(x: torch.Tensor) -> torch.Tensor:
+        def slice_tensor(x: torch.Tensor, slice_dim: int) -> torch.Tensor:
             idx = [slice(None)] * x.ndim
             idx[slice_dim] = index
             y = x[tuple(idx)]
@@ -390,19 +421,27 @@ class Gradient:
 
             return y
 
+        def axis(batch_first: bool) -> int:
+            # Batch axis is 0 (1) and token axis 1 (0) for batch-first (seq-first).
+            if dim == "batch":
+                return 0 if batch_first else 1
+            return 1 if batch_first else 0
+
         for name, value in self.data.items():
             if self.layer_types[name] == ops.PARAM_GRAD_TYPES:
                 # Batch-level parameter gradients have no sample axis. Preserve
                 # them until per-sample attribution loading warns and skips them.
                 new_data[name] = value
             elif isinstance(value, Factorized):
+                sdim = axis(value.batch_first)
                 new_data[name] = Factorized(
-                    activation=slice_tensor(value.activation),
-                    pre_activation_grad=slice_tensor(value.pre_activation_grad),
+                    activation=slice_tensor(value.activation, sdim),
+                    pre_activation_grad=slice_tensor(value.pre_activation_grad, sdim),
                     module_kwargs=value.module_kwargs,
+                    batch_first=value.batch_first,
                 )
             else:
-                new_data[name] = slice_tensor(value)
+                new_data[name] = slice_tensor(value, axis(True))
 
         return Gradient(
             representation=dict(self.representation),
@@ -466,10 +505,9 @@ class Gradient:
         for name in self.layer_names:
             if name not in other.data:
                 continue
-            terms = self._layer_cross_matrix(other, name, mode)
-            if terms is None:
+            matrix = self._layer_cross_matrix(other, name, mode)
+            if matrix is None:
                 continue
-            matrix, _ = terms
             if metric == "cosine" and reduce == "none":
                 # Per-layer cosine: normalise each layer independently.
                 n_s = self.layer_norm_sq(name).clamp_min(0).sqrt()      # (B_self,)
@@ -498,8 +536,8 @@ class Gradient:
         return total
 
     def _layer_cross_matrix(self, other: "Gradient", name: str, mode: str):
-        """Return ``((B_self, B_other) cross-gram, source position count)`` for
-        one layer, or ``None`` when the representations are incompatible.
+        """Return the ``(B_self, B_other)`` cross-gram for one layer, or ``None``
+        when the representations are incompatible.
 
         ``mode="factorized"`` contracts the factors via :func:`ops.cross_dot`;
         ``mode="materialized"`` materializes both sides and matrix-multiplies.
@@ -509,26 +547,15 @@ class Gradient:
         layer_type = self.layer_types[name]
 
         if isinstance(sv, Factorized) and isinstance(ov, Factorized):
-            a_s, g_s = ops.preprocess_factorized(
-                sv.activation, sv.pre_activation_grad, layer_type, sv.module_kwargs
-            )
-            a_t, g_t = ops.preprocess_factorized(
-                ov.activation, ov.pre_activation_grad,
-                other.layer_types[name], ov.module_kwargs,
-            )
-            n_pos = self._position_count(a_s, layer_type)
             if mode == "factorized":
-                # Factors already preprocessed → pass module_kwargs=None.
-                matrix = ops.cross_dot(a_s, g_s, a_t, g_t, layer_type, None, None)
-            else:
-                mat_s = ops.materialize(a_s, g_s, layer_type).float()
-                mat_t = ops.materialize(a_t, g_t, layer_type).float()
-                if ops.is_embedding(layer_type) or not a_s.is_floating_point():
-                    mat_s, mat_t = self._align_embedding_width(
-                        mat_s, mat_t, g_s.shape[-1]
-                    )
-                matrix = mat_s @ mat_t.T
-            return matrix, n_pos
+                return ops.cross_dot(sv, ov, layer_type)
+            mat_s = ops.materialize(sv, layer_type).float()
+            mat_t = ops.materialize(ov, layer_type).float()
+            if ops.is_embedding(layer_type) or not sv.activation.is_floating_point():
+                mat_s, mat_t = self._align_embedding_width(
+                    mat_s, mat_t, sv.pre_activation_grad.shape[-1]
+                )
+            return mat_s @ mat_t.T
 
         if isinstance(sv, Factorized) or isinstance(ov, Factorized):
             # One side factorized, the other materialized — incompatible.
@@ -537,8 +564,7 @@ class Gradient:
         # Both plain materialized tensors: flatten non-batch dims and dot.
         xf = sv.reshape(sv.shape[0], -1).float()
         yf = ov.reshape(ov.shape[0], -1).float()
-        n_pos = sv.shape[1] if sv.ndim >= 3 else None
-        return xf @ yf.T, n_pos
+        return xf @ yf.T
 
     def layer_norm_sq(self, name: str) -> torch.Tensor:
         """Per-sample squared gradient norms ``(B,)`` for one layer.
@@ -549,26 +575,9 @@ class Gradient:
         """
         value = self.data[name]
         if isinstance(value, Factorized):
-            return ops.grad_norm_sq(
-                value.activation, value.pre_activation_grad,
-                self.layer_types[name], module_kwargs=value.module_kwargs,
-            )
+            return ops.grad_norm_sq(value, self.layer_types[name])
         flat = value.reshape(value.shape[0], -1).float()
         return (flat * flat).sum(-1)
-
-    @staticmethod
-    def _position_count(a_proc: torch.Tensor, layer_type: str) -> "int | None":
-        """Token/spatial position count of a *preprocessed* activation.
-
-        ``(B, T)`` int for embeddings, ``(B, L, P)`` after im2col for convs,
-        ``(B, T, d)`` for sequence layers — all return dim-1; ``(B, d)`` (no
-        position axis) returns ``None``.
-        """
-        if ops.is_embedding(layer_type) or not a_proc.is_floating_point():
-            return a_proc.shape[1]
-        if a_proc.ndim >= 3:
-            return a_proc.shape[1]
-        return None
 
     @staticmethod
     def _align_embedding_width(

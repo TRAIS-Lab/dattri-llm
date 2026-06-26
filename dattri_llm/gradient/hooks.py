@@ -45,7 +45,7 @@ import re
 import threading
 import warnings
 from contextlib import contextmanager
-from typing import Callable, Generator, Optional
+from typing import Callable, Generator, Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -893,6 +893,13 @@ class HookManager:
         callbacks: List of :class:`HookManagerCallback` objects.
         sample_id_key: Key in the model's forward kwargs used as a hint for
             batch size detection.  Defaults to ``"input_ids"``.
+        non_batch_first_layers: Optional set/list of fully-qualified layer names
+            whose captured activations are **sequence-first** (``(T, B, ...)``)
+            rather than the default batch-first (``(B, T, ...)``) — e.g. layers
+            internal to a sequence-first model such as MusicTransformer.  The
+            assembled :class:`~dattri_llm.gradient.gradient.Factorized` for these
+            layers is tagged ``batch_first=False`` so the gradient machinery reads
+            their batch axis from dim 1.  Names not actually hooked are ignored.
     """
 
     def __init__(
@@ -901,10 +908,14 @@ class HookManager:
         config: Optional[HookManagerConfig] = None,
         callbacks: Optional[list[HookManagerCallback]] = None,
         sample_id_key: str = "input_ids",
+        non_batch_first_layers: Optional[Iterable[str]] = None,
     ) -> None:
         self._model = model
         self._callbacks: list[HookManagerCallback] = callbacks or []
         self._sample_id_key = sample_id_key
+        self._non_batch_first_layers: set[str] = (
+            set(non_batch_first_layers) if non_batch_first_layers is not None else set()
+        )
 
         self._config = config if config is not None else HookManagerConfig()
 
@@ -1031,6 +1042,18 @@ class HookManager:
                     "HookManagerConfig.layer_types designated a type for layers "
                     f"that were not hooked: {unused}. These overrides had no "
                     "effect.",
+                    stacklevel=2,
+                )
+
+        # The sequence-first flag only applies to factorized (linear_io) layers;
+        # warn about names that are not hooked that way (typo / excluded / a
+        # param_grad layer, which is always batch-first).
+        if self._non_batch_first_layers:
+            unused = sorted(self._non_batch_first_layers - set(self._buffers))
+            if unused:
+                warnings.warn(
+                    "non_batch_first_layers names layers not hooked with factorized "
+                    f"(linear_io) capture; the flag had no effect: {unused}.",
                     stacklevel=2,
                 )
 
@@ -1223,8 +1246,10 @@ class HookManager:
                 )
             a = torch.cat([t for _, t in sorted(act_parts,  key=lambda x: x[0])], dim=0)
             g = torch.cat([t for _, t in sorted(grad_parts, key=lambda x: x[0])], dim=0)
+            batch_first = layer_name not in self._non_batch_first_layers
             data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
-                                          module_kwargs=buf["_module_kwargs"])
+                                          module_kwargs=buf["_module_kwargs"],
+                                          batch_first=batch_first)
             representation[layer_name] = "factorized"
             layer_types[layer_name] = buf["_class_name"]
 

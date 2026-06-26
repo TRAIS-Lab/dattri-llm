@@ -25,6 +25,7 @@ import tests.algorithm.test_tracin as TT
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.kronecker import EKFACAttributor, KFACAttributor
 from dattri_llm.gradient import ops
+from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
@@ -237,7 +238,9 @@ class TestEKFAC:
             rot_a, rot_g = (
                 (U_A.T.contiguous(), U_G.T.contiguous()) if transposed else (U_A, U_G)
             )
-            M = ops.ekfac_materialize(a, g, "nn.Linear", rot_a, rot_g, include_bias=False)
+            M = ops.ekfac_materialize(
+                Factorized(a, g), "nn.Linear", rot_a, rot_g, include_bias=False
+            )
             lam = (M * M).mean(0)
             return (M / (lam + 1e-3)) @ M.T
 
@@ -498,10 +501,8 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
             for i in idxs:
                 rec = recs[i]
                 hs = rec.input_hash if isinstance(rec.input_hash, list) else [rec.input_hash]
-                f = rec.gradient.data[layer]
                 mat = ops.weight_grad(
-                    f.activation, f.pre_activation_grad,
-                    rec.gradient.layer_types[layer], f.module_kwargs,
+                    rec.gradient.data[layer], rec.gradient.layer_types[layer]
                 )
                 for b, h in enumerate(hs):
                     out[h] = mat[b].float()

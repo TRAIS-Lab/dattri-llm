@@ -401,10 +401,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
     @staticmethod
     def _fisher_grad(grad: Gradient, layer: str) -> torch.Tensor:
         """Per-sample ``(B, P)`` weight gradient used for direct-Fisher scoring."""
-        f = grad.data[layer]
-        return ops.weight_grad(
-            f.activation, f.pre_activation_grad, grad.layer_types[layer], f.module_kwargs
-        )
+        return ops.weight_grad(grad.data[layer], grad.layer_types[layer])
 
     def _prepare_fim_test(
         self, test_g: Gradient, fim_ctx: Dict[str, torch.Tensor]
@@ -522,13 +519,9 @@ class KFACAttributor(_KroneckerBaseAttributor):
         for layer, (A_inv, G_inv) in ctx.items():
             if layer not in train_g.data or layer not in test_g.data:
                 continue
-            tf = train_g.data[layer]
-            ef = test_g.data[layer]
             block = ops.kfac_cross(
-                tf.activation, tf.pre_activation_grad,
-                ef.activation, ef.pre_activation_grad,
+                train_g.data[layer], test_g.data[layer],
                 train_g.layer_types[layer], A_inv, G_inv,
-                tf.module_kwargs, ef.module_kwargs,
             )
             total = block if total is None else total + block
         if total is None:
@@ -638,10 +631,8 @@ class EKFACAttributor(_KroneckerBaseAttributor):
             for layer, (U_A, U_G) in eig.items():
                 if layer not in train_g.data:
                     continue
-                f = train_g.data[layer]
                 M = ops.ekfac_materialize(
-                    f.activation, f.pre_activation_grad,
-                    train_g.layer_types[layer], U_A, U_G, f.module_kwargs,
+                    train_g.data[layer], train_g.layer_types[layer], U_A, U_G,
                 )  # (B, D)
                 lam_sum[layer] = lam_sum.get(layer, 0) + (M * M).sum(0)
                 counts[layer] = counts.get(layer, 0) + M.shape[0]
@@ -659,10 +650,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         # contracted against.
         return {
             layer: ops.ekfac_materialize(
-                test_g.data[layer].activation,
-                test_g.data[layer].pre_activation_grad,
-                test_g.layer_types[layer], U_A, U_G,
-                test_g.data[layer].module_kwargs,
+                test_g.data[layer], test_g.layer_types[layer], U_A, U_G,
             )
             for layer, (U_A, U_G, _) in ctx.items()
             if layer in test_g.data
@@ -676,10 +664,8 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         for layer, (U_A, U_G, lam) in ctx.items():
             if layer not in train_g.data or layer not in test_mats:
                 continue
-            tf = train_g.data[layer]
             M_tr = ops.ekfac_materialize(
-                tf.activation, tf.pre_activation_grad,
-                train_g.layer_types[layer], U_A, U_G, tf.module_kwargs,
+                train_g.data[layer], train_g.layer_types[layer], U_A, U_G,
             )  # (B_tr, D)
             M_te = test_mats[layer]  # (B_te, D)
             block = (M_tr / (lam + self.damping)) @ M_te.T  # (B_tr, B_te)
