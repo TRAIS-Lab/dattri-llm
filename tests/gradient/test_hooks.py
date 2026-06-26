@@ -586,3 +586,59 @@ class TestNonBatchFirstLayers:
             warnings.simplefilter("always")
             HookManager(model, non_batch_first_layers={"nope"})
         assert any("had no effect" in str(w.message) for w in caught)
+
+
+# --------------------------------------------------------------------------- #
+# Unbatched positional embeddings (nanoGPT: pos = arange(T), shape (T,))       #
+# --------------------------------------------------------------------------- #
+
+
+class _NanoGPT(nn.Module):
+    """Token + positional embeddings where ``wpe`` is fed an unbatched
+    ``pos = arange(T)`` (shape ``(T,)``), as in nanoGPT."""
+
+    def __init__(self, vocab: int = 16, d: int = 8, block: int = 5) -> None:
+        super().__init__()
+        self.wte = nn.Embedding(vocab, d)
+        self.wpe = nn.Embedding(block, d)
+        self.head = nn.Linear(d, vocab, bias=False)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        _B, T = idx.shape
+        pos = torch.arange(0, T, dtype=torch.long)        # (T,) — no batch dim
+        return self.head(self.wte(idx) + self.wpe(pos))   # broadcast add
+
+
+class TestUnbatchedPositionalEmbedding:
+    def test_collects_without_validation_error(self):
+        # Regression: a (T,) positional-embedding input previously failed with
+        # "invalid embedding factor dimensions".
+        model = _NanoGPT()
+        cb = _Recording()
+        hm = HookManager(model, callbacks=[cb])
+        B, T = 4, 5
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with hm.collect():
+                model(torch.randint(0, 16, (B, T))).sum().backward()
+        g = cb.records[0].gradient
+        g.validate()
+        # wpe is normalized to a single broadcast row; wte keeps the batch dim.
+        assert g.data["wpe"].activation.shape == (1, T)
+        assert g.data["wte"].activation.shape[0] == B
+        assert g.batch_size == B
+
+    def test_warns_about_broadcast_layer(self):
+        # The broadcast (batch-collapsed) wpe gradient is not per-sample; the
+        # user is warned once and told to exclude it.
+        model = _NanoGPT()
+        cb = _Recording()
+        hm = HookManager(model, callbacks=[cb])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with hm.collect():
+                for _ in range(3):  # only one warning across steps
+                    model(torch.randint(0, 16, (4, 5))).sum().backward()
+        broadcast = [str(w.message) for w in caught if "broadcast" in str(w.message)]
+        assert len(broadcast) == 1
+        assert "wpe" in broadcast[0]

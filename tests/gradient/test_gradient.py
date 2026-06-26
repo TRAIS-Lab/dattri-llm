@@ -154,6 +154,42 @@ class TestValidate:
             Gradient(representation=rep, data=data, layer_types={"l1": "nn.Linear"},
                      indexing={"l1": "batch_token"})
 
+    def _embedding_factor(self, b, t=T, d=O):
+        return Factorized(torch.randint(0, t, (b, t)), torch.randn(b, t, d))
+
+    def test_broadcast_embedding_validates(self):
+        # A positional embedding added to every sample has batch 1 (broadcast);
+        # it must validate alongside the batch-B layers and report batch B.
+        Bb = 3
+        g = Gradient(
+            representation={"wte": "factorized", "wpe": "factorized"},
+            data={"wte": self._embedding_factor(Bb), "wpe": self._embedding_factor(1)},
+            layer_types={"wte": "nn.Embedding", "wpe": "nn.Embedding"},
+            indexing={"wte": "batch_token", "wpe": "batch_token"},
+        )
+        assert g.batch_size == Bb
+
+    def test_broadcast_embedding_first_does_not_drive_batch_size(self):
+        # Even when the broadcast (batch-1) layer comes first, batch_size is B.
+        Bb = 3
+        g = Gradient(
+            representation={"wpe": "factorized", "wte": "factorized"},
+            data={"wpe": self._embedding_factor(1), "wte": self._embedding_factor(Bb)},
+            layer_types={"wpe": "nn.Embedding", "wte": "nn.Embedding"},
+            indexing={"wpe": "batch_token", "wte": "batch_token"},
+        )
+        assert g.batch_size == Bb
+
+    def test_genuine_batch_mismatch_still_raises(self):
+        # Two real (non-broadcast) batch sizes are still an error.
+        with pytest.raises(ValueError, match="same batch size"):
+            Gradient(
+                representation={"a": "factorized", "b": "factorized"},
+                data={"a": self._embedding_factor(2), "b": self._embedding_factor(3)},
+                layer_types={"a": "nn.Embedding", "b": "nn.Embedding"},
+                indexing={"a": "batch_token", "b": "batch_token"},
+            )
+
 
 # --------------------------------------------------------------------------- #
 # Gradient properties                                                          #

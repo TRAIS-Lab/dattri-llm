@@ -52,7 +52,12 @@ import torch.nn as nn
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
-from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, canonical_class_name, extract_module_kwargs
+from dattri_llm.gradient.ops import (
+    PARAM_GRAD_TYPES,
+    canonical_class_name,
+    extract_module_kwargs,
+    is_embedding,
+)
 from dattri_llm.gradient.utils import hash_sample
 
 try:
@@ -916,6 +921,9 @@ class HookManager:
         self._non_batch_first_layers: set[str] = (
             set(non_batch_first_layers) if non_batch_first_layers is not None else set()
         )
+        # Layers already warned about as broadcast (batch-collapsed) gradients,
+        # so the warning fires at most once per layer.
+        self._warned_broadcast: set[str] = set()
 
         self._config = config if config is not None else HookManagerConfig()
 
@@ -1246,6 +1254,14 @@ class HookManager:
                 )
             a = torch.cat([t for _, t in sorted(act_parts,  key=lambda x: x[0])], dim=0)
             g = torch.cat([t for _, t in sorted(grad_parts, key=lambda x: x[0])], dim=0)
+            # A positional embedding fed an *unbatched* index tensor — e.g.
+            # nanoGPT's ``pos = arange(T)`` (shape ``(T,)``) added to every
+            # sample — is captured with no batch dim.  Add a length-1 batch axis
+            # so it validates and materialises as a single broadcast row (its
+            # gradient is already summed over the batch by the broadcast add).
+            if a.ndim == 1 and is_embedding(buf["_class_name"]):
+                a = a.unsqueeze(0)
+                g = g.unsqueeze(0)
             batch_first = layer_name not in self._non_batch_first_layers
             data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
                                           module_kwargs=buf["_module_kwargs"],
@@ -1283,12 +1299,44 @@ class HookManager:
                     else "batch"
                 )
 
-        return Gradient(
+        gradient = Gradient(
             representation=representation,
             data=data,
             layer_types=layer_types,
             indexing=indexing,
         )
+        self._warn_broadcast_layers(gradient)
+        return gradient
+
+    def _warn_broadcast_layers(self, gradient: Gradient) -> None:
+        """Warn (once per layer) about broadcast / batch-collapsed gradients.
+
+        A factorized layer whose batch dim is 1 while the step batch is larger —
+        e.g. a positional embedding added to every sample — carries a gradient
+        that was *summed over the batch*, so it is **not** a per-sample gradient.
+        Downstream per-sample attribution treats it as a single shared row, which
+        is rarely what the user wants; surface it so they can exclude the layer.
+        """
+        batch = gradient.batch_size
+        if batch <= 1:
+            return
+        for name, val in gradient.data.items():
+            if not isinstance(val, Factorized):
+                continue
+            layer_batch = val.activation.shape[0 if val.batch_first else 1]
+            if layer_batch == 1 and name not in self._warned_broadcast:
+                self._warned_broadcast.add(name)
+                warnings.warn(
+                    f"Layer '{name}' produced a broadcast (batch-collapsed) "
+                    f"gradient: batch size 1 while the step batch is {batch} "
+                    "(e.g. a positional embedding added to every sample).  Its "
+                    "gradient is summed over the batch and is NOT per-sample; "
+                    "per-sample attribution will treat it as a single shared row. "
+                    f"Consider excluding '{name}' from gradient collection (e.g. "
+                    "via HookManagerConfig hook selection or the attributor's "
+                    "`layer_name`).",
+                    stacklevel=3,
+                )
 
     def _reset_layer_buffers(self) -> None:
         for buf in self._buffers.values():

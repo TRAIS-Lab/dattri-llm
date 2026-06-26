@@ -81,11 +81,24 @@ class Gradient:
 
     @property
     def batch_size(self) -> int:
+        # The real batch size is the largest per-layer batch dim: a broadcast
+        # layer (e.g. a positional embedding) carries batch 1 and must not be
+        # mistaken for the whole batch when it happens to come first.
+        # ``param_grad`` tensors have no sample axis, so they are excluded.
+        best = 0
+        for name, x in self.data.items():
+            if self.layer_types.get(name) == ops.PARAM_GRAD_TYPES:
+                continue
+            if isinstance(x, Factorized):
+                # Batch axis is dim 0 when batch-first, dim 1 when sequence-first.
+                best = max(best, x.activation.shape[0 if x.batch_first else 1])
+            else:
+                best = max(best, x.shape[0])
+        if best:
+            return best
+        # Only ``param_grad`` layers present — fall back to the first tensor.
         x = next(iter(self.data.values()))
-        if isinstance(x, Factorized):
-            # Batch axis is dim 0 when batch-first, dim 1 when sequence-first.
-            return x.activation.shape[0 if x.batch_first else 1]
-        return x.shape[0]
+        return x.activation.shape[0] if isinstance(x, Factorized) else x.shape[0]
 
     @property
     def token_dim(self) -> Dict[str, "int | None"]:
@@ -189,8 +202,13 @@ class Gradient:
                     )
                 cur_batch = value.shape[0]
 
+            # A layer with batch size 1 is a *broadcast* / shared gradient — e.g.
+            # a positional embedding added to every sample, whose gradient is
+            # summed over the batch.  Like ``param_grad`` it has no per-sample
+            # axis, so it is compatible with any real batch size and does not
+            # constrain the check.
             is_param_grad = layer_type == ops.PARAM_GRAD_TYPES
-            if not is_param_grad:
+            if not is_param_grad and cur_batch != 1:
                 if batch_size is None:
                     batch_size = cur_batch
                 elif batch_size != cur_batch:
