@@ -1,0 +1,497 @@
+"""On-the-fly gradient sources for attribution.
+
+The on-disk workflow feeds attributors with pre-collected gradients via
+:class:`~dattri_llm.gradient.file_manager.GradientFileManager` +
+``iter_gradient_blocks``.  This module provides the *live* counterpart: a
+:class:`GradientStreamer` that runs a forward+backward pass over a dataset and
+yields one per-step :class:`~dattri_llm.gradient.gradient.Gradient` block at a
+time, computed on demand and never persisted.
+
+Both sides satisfy one contract, :class:`GradientSource`, so an attributor can
+consume disk or live gradients through the same loop.  The only axis that
+matters to attributors is :attr:`GradientSource.reusable` — whether the source
+can be iterated more than once at the *same* parameters:
+
+* :class:`EvalGradientStreamer` — frozen probe at a fixed checkpoint;
+  ``reusable=True``.  Required by methods with a pre-pass (K-FAC/EK-FAC fit the
+  Fisher, then score).
+* :class:`TrainingGradientStreamer` — advances the optimizer as it streams, so
+  each step is a real checkpoint along the training trajectory;
+  ``reusable=False`` (single-shot).  Suits single-pass methods (TracIn).
+
+The method-specific logic (TracIn dot vs. K-FAC whitening) stays in the
+attributors; this module is method-agnostic.
+"""
+
+from __future__ import annotations
+
+from typing import (
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+    runtime_checkable,
+)
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.gradient.callbacks import HookManagerCallback
+from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+
+# (step, factorized per-sample gradient block, per-sample input hashes)
+StreamBatch = Tuple[int, Gradient, List[str]]
+
+# A loss callable: ``(model, batch) -> scalar loss``.  It MUST run the model on
+# ``batch`` (so HookManager's forward pre-hook captures the inputs for hashing)
+# and produce a loss whose ``.backward()`` flows through the hooked layers.
+LossFn = Callable[[nn.Module, object], torch.Tensor]
+
+
+@runtime_checkable
+class GradientSource(Protocol):
+    """A source of per-step ``(step, Gradient, hashes)`` blocks.
+
+    Satisfied by both the on-disk path (``iter_gradient_blocks`` over a
+    :class:`GradientFileManager`) and :class:`GradientStreamer`.  Attributors
+    depend only on this interface.
+    """
+
+    def __iter__(self) -> Iterator[StreamBatch]:
+        """(Re)start iteration from the first step."""
+
+    def __len__(self) -> int:
+        """Number of steps the source yields per pass."""
+
+    @property
+    def reusable(self) -> bool:
+        """Whether the source can be iterated more than once at the *same*
+        parameters (required by attributors with a pre-pass, e.g. K-FAC)."""
+
+    @property
+    def model(self) -> nn.Module:
+        """The model whose parameters the yielded gradients are taken at."""
+
+
+def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
+    """HuggingFace convention: ``model(**batch).loss``.
+
+    Override via the ``loss_fn`` constructor argument for non-HF models.
+    """
+    if not isinstance(batch, dict):
+        raise TypeError(
+            "The default loss_fn expects a dict batch (model(**batch).loss). "
+            "Pass a custom loss_fn for other batch formats."
+        )
+    out = model(**batch)
+    loss = getattr(out, "loss", None)
+    if loss is None:
+        raise ValueError(
+            "Default loss_fn expected the model output to carry a `.loss`; "
+            "none found. Pass an explicit loss_fn."
+        )
+    return loss
+
+
+class _CaptureCallback(HookManagerCallback):
+    """Stashes the most recent per-step :class:`GradientRecord` for the streamer."""
+
+    def __init__(self) -> None:
+        self.record: Optional[GradientRecord] = None
+
+    def on_step_end(self, record: GradientRecord) -> None:
+        self.record = record
+
+
+class GradientStreamer(GradientSource):
+    """Yields per-step ``(step, Gradient, hashes)`` from a live forward+backward pass.
+
+    Use as a context manager (it registers/removes the :class:`HookManager`
+    hooks), then iterate:
+
+    .. code-block:: python
+
+        with EvalGradientStreamer(model, ds, args, batch_size=8) as src:
+            for step, grad, hashes in src:
+                ...
+
+    Args:
+        model: The **unwrapped** model.  Hooks are registered on its submodules,
+            then the streamer wraps it in DDP/FSDP per ``args`` (mirroring HF
+            ``Trainer._wrap_model``), so the hooks survive wrapping.  Do not
+            pre-wrap it.
+        dataset: The dataset to stream.  Iterated with ``shuffle=False`` so the
+            row/column order is deterministic and the input hashes are stable.
+        args: :class:`AttributionArguments`; supplies ``device`` and the
+            ``dataloader_*`` settings.
+        batch_size: Per-step batch size (``per_device_train_batch_size`` or
+            ``per_device_eval_batch_size``, chosen by the caller).
+        enable_update: If ``True``, step the optimizer/scheduler after each
+            backward, so each step is a distinct checkpoint along the training
+            trajectory (single-shot; ``reusable=False``).  If ``False`` (default)
+            the model is frozen and the source is re-iterable.
+        layer_name: If given, restrict each yielded block to these layers via
+            :meth:`Gradient.select_layers` (post-filter on what ``config``
+            captured); mirrors the disk loader's ``layer_name``.
+        loss_fn: ``(model, batch) -> scalar``.  Defaults to ``model(**batch).loss``.
+            Must run the model on the batch so inputs are captured for hashing.
+        optimizer: Required iff ``enable_update``.
+        scheduler: Optional LR scheduler, stepped after the optimizer.
+        config: :class:`HookManagerConfig` controlling which layers are hooked.
+            Defaults to ``HookManagerConfig()`` (all linear-capable layers).
+        collate_fn: Optional DataLoader collate (e.g. an HF data collator).
+        checkpoint_step: The step index stamped on every yielded block when the
+            model is frozen (all batches share one checkpoint).  Ignored when
+            ``enable_update`` (the per-batch optimizer-step index is used).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        dataset: Dataset,
+        args: AttributionArguments,
+        *,
+        batch_size: int,
+        enable_update: bool = False,
+        layer_name: Optional[Union[str, List[str]]] = None,
+        loss_fn: Optional[LossFn] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        scheduler: Optional[object] = None,
+        config: Optional[HookManagerConfig] = None,
+        collate_fn: Optional[Callable] = None,
+        checkpoint_step: int = 0,
+    ) -> None:
+        if enable_update and optimizer is None:
+            raise ValueError("enable_update=True requires an optimizer.")
+
+        self._model = model
+        self._dataset = dataset
+        self._args = args
+        self._batch_size = batch_size
+        self.enable_update = enable_update
+        if isinstance(layer_name, str):
+            self._layer_name: Optional[List[str]] = [layer_name]
+        elif layer_name is None:
+            self._layer_name = None
+        else:
+            self._layer_name = list(layer_name)
+        self._loss_fn = loss_fn if loss_fn is not None else _default_loss_fn
+        self._optimizer = optimizer
+        self._scheduler = scheduler
+        self._collate_fn = collate_fn
+        self._checkpoint_step = checkpoint_step
+
+        self._capture = _CaptureCallback()
+        # Register hooks on the UNWRAPPED submodules first, then wrap, so the
+        # hooks survive DDP/FSDP wrapping (the documented collection ordering).
+        self._hm = HookManager(
+            model,
+            config=config if config is not None else HookManagerConfig(),
+            callbacks=[self._capture],
+        )
+        # ``_model`` is the unwrapped reference (hooks, params, eval/grad state);
+        # ``_fwd_model`` is what forward/backward actually run on (DDP/FSDP when
+        # distributed, otherwise the same object).
+        self._fwd_model = self._wrap_model(model, args)
+
+        self._loader = self._build_loader()
+        # Iteration state.
+        self._batch_iter: Optional[Iterator] = None
+        self._batch_index: int = 0
+        self._consumed: bool = False
+        # Saved-state for frozen probes (restored on __exit__).
+        self._entered: bool = False
+        self._collect_ctx = None
+        self._saved_grads: Optional[Dict[str, Optional[torch.Tensor]]] = None
+        self._was_training: bool = False
+
+    # ------------------------------------------------------------------ #
+    # GradientSource contract                                            #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def reusable(self) -> bool:
+        return not self.enable_update
+
+    @property
+    def model(self) -> nn.Module:
+        return self._model
+
+    def __len__(self) -> int:
+        return len(self._loader)
+
+    # ------------------------------------------------------------------ #
+    # Hook lifecycle                                                      #
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> "GradientStreamer":
+        if self._entered:
+            raise RuntimeError("GradientStreamer is already active.")
+        self._entered = True
+        if not self.enable_update:
+            # Freeze: snapshot grads + force eval() so repeated passes are
+            # bit-identical (dropout/etc. would make the K-FAC fit and score
+            # passes disagree).
+            self._saved_grads = {
+                n: (p.grad.detach().clone() if p.grad is not None else None)
+                for n, p in self._model.named_parameters()
+            }
+            self._was_training = self._fwd_model.training
+            self._fwd_model.eval()
+        self._collect_ctx = self._hm.collect()
+        self._collect_ctx.__enter__()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        try:
+            if self._collect_ctx is not None:
+                self._collect_ctx.__exit__(*exc)
+        finally:
+            self._hm.remove()
+            if not self.enable_update:
+                if self._was_training:
+                    self._fwd_model.train()
+                if self._saved_grads is not None:
+                    for n, p in self._model.named_parameters():
+                        p.grad = self._saved_grads[n]
+            self._entered = False
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Iteration                                                           #
+    # ------------------------------------------------------------------ #
+
+    def __iter__(self) -> Iterator[StreamBatch]:
+        if not self._entered:
+            raise RuntimeError(
+                "Use the streamer as a context manager before iterating: "
+                "`with streamer as s: for ... in s: ...`."
+            )
+        if self._consumed and not self.reusable:
+            raise RuntimeError(
+                "This streamer is single-shot (enable_update=True) and was "
+                "already consumed; the training trajectory cannot be replayed."
+            )
+        self._batch_iter = iter(self._loader)
+        self._batch_index = 0
+        self._consumed = True
+        return self
+
+    def __next__(self) -> StreamBatch:
+        if self._batch_iter is None:
+            raise RuntimeError("Call iter(streamer) before next(streamer).")
+        batch = next(self._batch_iter)  # raises StopIteration at the end
+        batch = self._to_device(batch)
+
+        # Run on the wrapped model so DDP/FSDP gradient sync engages; 
+        # hooks still fire on the unwrapped submodules they were registered on.
+        self._fwd_model.zero_grad(set_to_none=True)
+        self._capture.record = None
+        loss = self._loss_fn(self._fwd_model, batch)
+        loss.backward()
+        if self.enable_update:
+            self._optimizer.step()  # type: ignore[union-attr]
+            if self._scheduler is not None:
+                self._scheduler.step()
+
+        record = self._capture.record
+        if record is None:
+            raise RuntimeError(
+                "No gradient was captured this step. Ensure loss_fn runs the "
+                "model on the batch and backward flows through the hooked layers."
+            )
+
+        step = self._step_label()
+        grad = record.gradient
+        if self._layer_name is not None:
+            grad = grad.select_layers(self._layer_name)
+        hashes = (
+            list(record.input_hash)
+            if isinstance(record.input_hash, list)
+            else [record.input_hash]
+        )
+        self._batch_index += 1
+        return step, grad, hashes
+
+    # ------------------------------------------------------------------ #
+    # Internals                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _step_label(self) -> int:
+        """Step stamp for the current block.
+
+        Frozen: a constant checkpoint index (all batches share one checkpoint).
+        Updating: the optimizer-step index (each batch is its own checkpoint).
+        """
+        return self._batch_index if self.enable_update else self._checkpoint_step
+
+    def _build_loader(self) -> DataLoader:
+        kwargs: dict = {
+            "dataset": self._dataset,
+            "batch_size": self._batch_size,
+            "num_workers": self._args.dataloader_num_workers,
+            "pin_memory": self._args.dataloader_pin_memory,
+        }
+        # Distributed: each rank streams a disjoint shard via DistributedSampler
+        # (sampler and shuffle are mutually exclusive, so set only one). Content
+        # hashes stay globally unique, so per-rank rows concatenate cleanly — the
+        # on-the-fly analogue of GradientFileManager's per-rank index merge.
+        if self._args.world_size > 1:
+            kwargs["sampler"] = DistributedSampler(
+                self._dataset,
+                num_replicas=self._args.world_size,
+                rank=self._args.process_index,
+                shuffle=False,
+            )
+        else:
+            kwargs["shuffle"] = False
+        if self._collate_fn is not None:
+            kwargs["collate_fn"] = self._collate_fn
+        if self._args.dataloader_num_workers > 0:
+            kwargs["persistent_workers"] = self._args.dataloader_persistent_workers
+            if self._args.dataloader_prefetch_factor is not None:
+                kwargs["prefetch_factor"] = self._args.dataloader_prefetch_factor
+        return DataLoader(**kwargs)
+
+    def _wrap_model(self, model: nn.Module, args: AttributionArguments) -> nn.Module:
+        """Wrap the model for distributed execution, mirroring HF ``Trainer``.
+
+        Hooks are already registered on ``model``'s submodules (in ``__init__``),
+        so wrapping here preserves them.  Returns the model unchanged when not
+        distributed.  The returned module is the forward/backward target; the
+        unwrapped ``model`` stays the hook + parameter reference.
+
+        Args:
+            model: The unwrapped model.
+            args: Supplies ``fsdp``/``fsdp_config`` (FSDP), ``world_size`` +
+                ``ddp_find_unused_parameters`` (DDP), and the local rank.
+
+        Returns:
+            The (possibly wrapped) module to run forward/backward on.
+        """
+        fsdp = args.fsdp
+        fsdp_tokens = set(fsdp.split() if isinstance(fsdp, str) else (fsdp or []))
+
+        if fsdp_tokens:
+            from torch.distributed.fsdp import CPUOffload
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import ShardingStrategy
+
+            strategy = (
+                ShardingStrategy.SHARD_GRAD_OP
+                if "shard_grad_op" in fsdp_tokens
+                else ShardingStrategy.FULL_SHARD
+            )
+            fsdp_kwargs = dict(args.fsdp_config or {})
+            # use_orig_params keeps the original submodule params (what the hooks captured and what per-sample gradient reads need).
+            fsdp_kwargs.setdefault("use_orig_params", True)
+            fsdp_kwargs.setdefault("sharding_strategy", strategy)
+            if "offload" in fsdp_tokens:
+                fsdp_kwargs.setdefault("cpu_offload", CPUOffload(offload_params=True))
+            return FSDP(model, **fsdp_kwargs)
+
+        if args.world_size > 1:
+            device_ids = (
+                [args.local_process_index] if torch.cuda.is_available() else None
+            )
+            return nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=device_ids,
+                find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            )
+
+        return model
+
+    def _to_device(self, batch: object) -> object:
+        device = self._args.device
+        if isinstance(batch, dict):
+            return {
+                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items()
+            }
+        if isinstance(batch, (list, tuple)):
+            return type(batch)(
+                v.to(device) if isinstance(v, torch.Tensor) else v for v in batch
+            )
+        if isinstance(batch, torch.Tensor):
+            return batch.to(device)
+        return batch
+
+
+class EvalGradientStreamer(GradientStreamer):
+    """Frozen, re-iterable gradient probe at a fixed checkpoint (``reusable=True``).
+
+    The model is not updated; all yielded blocks are stamped with
+    ``checkpoint_step``.  Use for the test side of any attributor, and for the
+    train side of methods that need a pre-pass (K-FAC/EK-FAC fit then score).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        dataset: Dataset,
+        args: AttributionArguments,
+        *,
+        batch_size: int,
+        layer_name: Optional[Union[str, List[str]]] = None,
+        loss_fn: Optional[LossFn] = None,
+        config: Optional[HookManagerConfig] = None,
+        collate_fn: Optional[Callable] = None,
+        checkpoint_step: int = 0,
+    ) -> None:
+        super().__init__(
+            model,
+            dataset,
+            args,
+            batch_size=batch_size,
+            enable_update=False,
+            layer_name=layer_name,
+            loss_fn=loss_fn,
+            config=config,
+            collate_fn=collate_fn,
+            checkpoint_step=checkpoint_step,
+        )
+
+
+class TrainingGradientStreamer(GradientStreamer):
+    """Trajectory-following, single-shot gradient stream (``reusable=False``).
+
+    Steps the optimizer (and scheduler) after each backward, so each yielded
+    block is a distinct checkpoint, stamped with its optimizer-step index.
+    Suits single-pass attributors (TracIn). Cannot be re-iterated.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        dataset: Dataset,
+        args: AttributionArguments,
+        *,
+        batch_size: int,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[object] = None,
+        layer_name: Optional[Union[str, List[str]]] = None,
+        loss_fn: Optional[LossFn] = None,
+        config: Optional[HookManagerConfig] = None,
+        collate_fn: Optional[Callable] = None,
+    ) -> None:
+        super().__init__(
+            model,
+            dataset,
+            args,
+            batch_size=batch_size,
+            enable_update=True,
+            layer_name=layer_name,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            config=config,
+            collate_fn=collate_fn,
+        )
