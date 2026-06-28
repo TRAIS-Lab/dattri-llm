@@ -25,6 +25,8 @@ attributors; this module is method-agnostic.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from typing import (
     Callable,
     Dict,
@@ -42,6 +44,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from dattri_llm.algorithm.arguments import AttributionArguments
+
+logger = logging.getLogger(__name__)
 from dattri_llm.gradient.callbacks import HookManagerCallback
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
@@ -112,6 +116,16 @@ class _CaptureCallback(HookManagerCallback):
 
 class GradientStreamer(GradientSource):
     """Yields per-step ``(step, Gradient, hashes)`` from a live forward+backward pass.
+
+    Each step mirrors :meth:`transformers.Trainer.training_step` and the inner
+    training loop, so that **under the same arguments the trajectory matches the
+    HF Trainer**: ``args`` drives mixed precision (``bf16``/``fp16`` autocast, with
+    a dynamic ``GradScaler`` for fp16), gradient clipping (``max_grad_norm``), and
+    gradient checkpointing, and the per-step order is
+    forward → backward → clip → ``optimizer.step`` → ``scheduler.step`` → ``zero_grad``.
+    DeepSpeed is **not** supported (the hook capture is incompatible with its
+    engine); a ``deepspeed`` config is ignored with a warning.  Verified bit-exact
+    against ``Trainer`` in ``scripts/verify_streamer_vs_trainer.py``.
 
     Use as a context manager (it registers/removes the :class:`HookManager`
     hooks), then iterate:
@@ -196,6 +210,33 @@ class GradientStreamer(GradientSource):
             config=config if config is not None else HookManagerConfig(),
             callbacks=[self._capture],
         )
+
+        # ── Compute-shaping options, mirroring HF ``Trainer`` so that the same
+        # ``AttributionArguments`` yield the same forward/backward and (for the
+        # training streamer) the same optimizer trajectory. ──────────────────
+        if args.deepspeed:
+            raise NotImplementedError(
+                "GradientStreamer does not support DeepSpeed (the hook-based "
+                "capture is incompatible with its engine); the `deepspeed` config "
+                "is ignored. Run single-process, DDP, or FSDP instead."
+            )
+        # Gradient checkpointing must be enabled on the *unwrapped* model, before
+        # DDP/FSDP wrapping — exactly as Trainer does (Trainer._inner_training_loop).
+        if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs
+            )
+        # Mixed precision: bf16/fp16 autocast around the forward; fp16 also needs a
+        # dynamic GradScaler — but only when we actually step the optimizer (a
+        # frozen probe must capture *unscaled* gradients).  bf16 needs no scaler.
+        self._amp_dtype: Optional[torch.dtype] = (
+            torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else None
+        )
+        self._scaler = torch.amp.GradScaler(
+            "cuda", enabled=bool(args.fp16 and enable_update and not args.use_cpu)
+        )
+        self._max_grad_norm = args.max_grad_norm
+
         # ``_model`` is the unwrapped reference (hooks, params, eval/grad state);
         # ``_fwd_model`` is what forward/backward actually run on (DDP/FSDP when
         # distributed, otherwise the same object).
@@ -235,6 +276,14 @@ class GradientStreamer(GradientSource):
         if self._entered:
             raise RuntimeError("GradientStreamer is already active.")
         self._entered = True
+        # Seed at the start of the pass, exactly as Trainer does at the top of
+        # `_inner_training_loop`: enable_full_determinism (also seeds) or set_seed.
+        from transformers import enable_full_determinism, set_seed
+
+        if self._args.full_determinism:
+            enable_full_determinism(self._args.seed)
+        else:
+            set_seed(self._args.seed)
         if not self.enable_update:
             # Freeze: snapshot grads + force eval() so repeated passes are
             # bit-identical (dropout/etc. would make the K-FAC fit and score
@@ -290,16 +339,9 @@ class GradientStreamer(GradientSource):
         batch = next(self._batch_iter)  # raises StopIteration at the end
         batch = self._to_device(batch)
 
-        # Run on the wrapped model so DDP/FSDP gradient sync engages; 
-        # hooks still fire on the unwrapped submodules they were registered on.
-        self._fwd_model.zero_grad(set_to_none=True)
-        self._capture.record = None
-        loss = self._loss_fn(self._fwd_model, batch)
-        loss.backward()
+        self._forward_backward(batch)
         if self.enable_update:
-            self._optimizer.step()  # type: ignore[union-attr]
-            if self._scheduler is not None:
-                self._scheduler.step()
+            self._optimizer_step()
 
         record = self._capture.record
         if record is None:
@@ -319,6 +361,60 @@ class GradientStreamer(GradientSource):
         )
         self._batch_index += 1
         return step, grad, hashes
+
+    # ------------------------------------------------------------------ #
+    # Forward / backward / optimizer step (mirrors HF Trainer)            #
+    # ------------------------------------------------------------------ #
+
+    def _autocast(self):
+        """Mixed-precision context for the forward pass (``Trainer``'s
+        ``autocast_smart_context_manager`` / accelerate autocast).  No-op in
+        full precision."""
+        if self._amp_dtype is None:
+            return contextlib.nullcontext()
+        device_type = "cuda" if (
+            torch.cuda.is_available() and not self._args.use_cpu
+        ) else "cpu"
+        return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
+
+    def _forward_backward(self, batch: object) -> torch.Tensor:
+        """One forward + backward, mirroring ``Trainer.training_step``.
+
+        Runs on the wrapped model so DDP/FSDP gradient sync engages; the hooks
+        still fire on the unwrapped submodules they were registered on.  fp16
+        scales the loss before backward (``accelerator.backward``); bf16/fp32 do
+        not.  Leaves the per-sample gradient in ``self._capture.record``.
+        """
+        if self.enable_update:
+            self._fwd_model.train()        # Trainer calls model.train() each step
+        self._fwd_model.zero_grad(set_to_none=True)
+        self._capture.record = None
+        with self._autocast():
+            loss = self._loss_fn(self._fwd_model, batch)
+        if self._scaler.is_enabled():
+            self._scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        return loss
+
+    def _optimizer_step(self) -> None:
+        """Clip → step → schedule, mirroring ``Trainer``'s inner loop.
+
+        Order matches ``Trainer._inner_training_loop``: unscale (fp16) →
+        ``clip_grad_norm_(max_grad_norm)`` → ``optimizer.step`` → ``scheduler.step``.
+        ``zero_grad`` happens at the start of the next ``_forward_backward``.
+        """
+        if self._scaler.is_enabled():
+            self._scaler.unscale_(self._optimizer)
+        if self._max_grad_norm is not None and self._max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
+        if self._scaler.is_enabled():
+            self._scaler.step(self._optimizer)
+            self._scaler.update()
+        else:
+            self._optimizer.step()          # type: ignore[union-attr]
+        if self._scheduler is not None:
+            self._scheduler.step()
 
     # ------------------------------------------------------------------ #
     # Internals                                                           #
