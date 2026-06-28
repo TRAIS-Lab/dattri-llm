@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 
@@ -966,6 +967,61 @@ def cross_dot(
         b1.activation, b1.pre_activation_grad, b2.activation, b2.pre_activation_grad,
         layer_type, b1.module_kwargs, b2.module_kwargs, include_bias,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Representation routing heuristic (factorized vs materialized)               #
+#                                                                             #
+# The per-sample weight gradient G = gᵀa (Dx K, summed over S token/patch     #
+# positions) can be dotted/normed either factorized ("ghost") or materialized.#
+# Which is cheaper is governed by S relative to H = DK/(D+K); see             #
+# docs/gradient_representation_complexity.md.  These are pure predicates — the #
+# actual contraction stays in the caller (Gradient._layer_cross_matrix /      #
+# layer_norm_sq), which just dispatches to cross_dot vs materialize+GEMM.      #
+# --------------------------------------------------------------------------- #
+
+
+def effective_dims(f: "Factorized", layer_type: str) -> Tuple[int, int, int, int]:
+    """Cheap ``(B, S, K, D)`` for the cost heuristic: batch, token/patch count,
+    input width, output width — the *post-preprocess* dims, read straight from the
+    raw factor shapes (no im2col / materialization).  Bias's ``+1`` on ``K`` is
+    ignored (it is a heuristic)."""
+    bf = f.as_batch_first()
+    a, g = bf.activation, bf.pre_activation_grad
+    mk = bf.module_kwargs or {}
+    if is_conv(layer_type):
+        # a=(B,C_in,*sp_in), g=(B,C_out,*sp_out): S = output positions,
+        # K = C_in·∏kernel, D = C_out
+        kprod = math.prod(mk["kernel_size"]) if "kernel_size" in mk else 1
+        return a.shape[0], math.prod(g.shape[2:]), a.shape[1] * kprod, g.shape[1]
+    if is_conv_transpose(layer_type):
+        # roles reversed: a flattened over spatial (K=C_in), g unfolded (D=C_out·∏K)
+        kprod = math.prod(mk["kernel_size"]) if "kernel_size" in mk else 1
+        return a.shape[0], math.prod(a.shape[2:]), a.shape[1], g.shape[1] * kprod
+    # linear-family (and norm layers): a=(B, *T, K), g=(B, *T, D)
+    return a.shape[0], math.prod(a.shape[1:-1]), a.shape[-1], g.shape[-1]
+
+
+def maybe_use_materialized_gram(
+    B1: int, B2: int, S: int, K: int, D: int, kappa: float = 1.0
+) -> bool:
+    """``True`` when materialize-then-GEMM is the cheaper way to form the
+    ``(B1, B2)`` cross-gram (§3.2):
+
+        cost_F = B1·B2·S²·(D+K)            cost_M = (B1+B2)·S·D·K + B1·B2·D·K
+
+    Materialize iff ``κ·cost_F ≥ cost_M`` (``κ=1`` is the pure-flop rule).
+    """
+    cost_f = B1 * B2 * S * S * (D + K)
+    cost_m = (B1 + B2) * S * D * K + B1 * B2 * D * K
+    return kappa * cost_f >= cost_m
+
+
+def maybe_use_materialized_norm(S: int, K: int, D: int) -> bool:
+    """``True`` when materializing is cheaper for per-sample norms (§3.1).  Here
+    ``cost_F = S²(D+K)`` and ``cost_M = S·D·K`` (per sample, batch cancels), so
+    materialize iff ``S·(D+K) ≥ DK``, i.e. ``S ≥ H = DK/(D+K)``."""
+    return S * (D + K) >= D * K
 
 
 def kfac_cross(

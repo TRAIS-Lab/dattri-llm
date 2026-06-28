@@ -473,7 +473,7 @@ class Gradient:
         other: "Gradient",
         metric: Literal["dot", "cosine"] = "dot",
         reduce: Literal["none", "all"] = "none",
-        mode: Literal["factorized", "materialized"] = "factorized",
+        mode: Literal["factorized", "materialized", "auto"] = "auto",
         eps: float = 1e-8,
     ) -> Dict[str, torch.Tensor] | torch.Tensor:
         """Per-sample gradient similarity between this gradient and ``other``.
@@ -499,8 +499,11 @@ class Gradient:
                 (``⟨g_i, g_j⟩ = Σ_layer ⟨g_i^layer, g_j^layer⟩``).  Either way
                 the per-sample pair structure is preserved.
             mode: ``"factorized"`` (ghost, no materialisation, via
-                :func:`ops.cross_dot`) or ``"materialized"`` (materialize each
-                side then matrix-multiply).  Numerically equivalent.
+                :func:`ops.cross_dot`), ``"materialized"`` (materialize each side
+                then matrix-multiply), or ``"auto"`` (choose per layer by the cost
+                heuristic in :func:`ops.cross_gram_auto` — factorized for small
+                token/patch counts, materialized once the $S^2$ factor dominates).
+                All three are numerically equivalent.
             eps: Numerical floor added to the cosine denominator.
 
         Returns:
@@ -516,8 +519,8 @@ class Gradient:
             raise ValueError("metric must be 'dot' or 'cosine'")
         if reduce not in {"none", "all"}:
             raise ValueError("reduce must be 'none' or 'all'")
-        if mode not in {"factorized", "materialized"}:
-            raise ValueError("mode must be 'factorized' or 'materialized'")
+        if mode not in {"factorized", "materialized", "auto"}:
+            raise ValueError("mode must be 'factorized', 'materialized', or 'auto'")
 
         per_layer: Dict[str, torch.Tensor] = {}
         for name in self.layer_names:
@@ -528,8 +531,8 @@ class Gradient:
                 continue
             if metric == "cosine" and reduce == "none":
                 # Per-layer cosine: normalise each layer independently.
-                n_s = self.layer_norm_sq(name).clamp_min(0).sqrt()      # (B_self,)
-                n_o = other.layer_norm_sq(name).clamp_min(0).sqrt()     # (B_other,)
+                n_s = self._layer_norm_sq(name, mode).clamp_min(0).sqrt()   # (B_self,)
+                n_o = other._layer_norm_sq(name, mode).clamp_min(0).sqrt()  # (B_other,)
                 matrix = matrix / (n_s[:, None] * n_o[None, :] + eps)
 
             per_layer[name] = matrix
@@ -545,27 +548,48 @@ class Gradient:
             # Full-model cosine: normalise by the concatenated-gradient norms,
             # i.e. sqrt(sum of per-layer squared norms).
             norm_sq_s = torch.stack(
-                [self.layer_norm_sq(n) for n in per_layer]
+                [self._layer_norm_sq(n, mode) for n in per_layer]
             ).sum(0).clamp_min(0)                                         # (B_self,)
             norm_sq_o = torch.stack(
-                [other.layer_norm_sq(n) for n in per_layer]
+                [other._layer_norm_sq(n, mode) for n in per_layer]
             ).sum(0).clamp_min(0)                                         # (B_other,)
             total = total / (norm_sq_s.sqrt()[:, None] * norm_sq_o.sqrt()[None, :] + eps)
         return total
 
-    def _layer_cross_matrix(self, other: "Gradient", name: str, mode: str):
+    def _layer_cross_matrix(
+        self,
+        other: "Gradient",
+        name: str,
+        mode: Literal["factorized", "materialized", "auto"],
+    ):
         """Return the ``(B_self, B_other)`` cross-gram for one layer, or ``None``
         when the representations are incompatible.
 
         ``mode="factorized"`` contracts the factors via :func:`ops.cross_dot`;
-        ``mode="materialized"`` materializes both sides and matrix-multiplies.
+        ``mode="materialized"`` materializes both sides and matrix-multiplies;
+        ``mode="auto"`` picks one of those two per layer from the cost heuristic
+        (:func:`ops.maybe_use_materialized_gram`).
         """
         sv = self.data[name]
         ov = other.data[name]
         layer_type = self.layer_types[name]
 
         if isinstance(sv, Factorized) and isinstance(ov, Factorized):
-            if mode == "factorized":
+            resolved = mode
+            if mode == "auto":
+                # Embeddings/norms stay factorized (densifying a vocab is wasteful,
+                # a norm gradient is diagonal); otherwise route by the gram cost.
+                if ops.is_embedding(layer_type) or ops.is_norm(layer_type):
+                    resolved = "factorized"
+                else:
+                    B1, S, K, D = ops.effective_dims(sv, layer_type)
+                    B2 = ops.effective_dims(ov, layer_type)[0]
+                    resolved = (
+                        "materialized"
+                        if ops.maybe_use_materialized_gram(B1, B2, S, K, D)
+                        else "factorized"
+                    )
+            if resolved == "factorized":
                 return ops.cross_dot(sv, ov, layer_type)
             mat_s = ops.materialize(sv, layer_type).float()
             mat_t = ops.materialize(ov, layer_type).float()
@@ -584,18 +608,45 @@ class Gradient:
         yf = ov.reshape(ov.shape[0], -1).float()
         return xf @ yf.T
 
-    def layer_norm_sq(self, name: str) -> torch.Tensor:
+    def _layer_norm_sq(
+        self,
+        name: str,
+        mode: Literal["factorized", "materialized", "auto"],
+    ) -> torch.Tensor:
         """Per-sample squared gradient norms ``(B,)`` for one layer.
 
-        Used by :meth:`similarity` for the cosine denominator.  Independent of
-        ``mode`` (the norm is the same whether computed from factors or the
-        materialized gradient).
+        Used by :meth:`similarity` for the cosine denominator.  The *value* is
+        identical across modes — only the path differs:
+
+        * ``"factorized"`` — :func:`ops.grad_norm_sq` (cost ``S²(D+K)``).
+        * ``"materialized"`` — materialize the gradient, then sum of squares
+          (cost ``S·D·K``).
+        * ``"auto"`` — pick by the norm cost heuristic
+          (:func:`ops.maybe_use_materialized_norm`): materialize iff ``S ≥ H``.
+          Embeddings/norm layers stay factorized (materializing an embedding would
+          densify the vocab; the heuristic's outer-product cost model does not
+          apply to them).
         """
         value = self.data[name]
-        if isinstance(value, Factorized):
-            return ops.grad_norm_sq(value, self.layer_types[name])
-        flat = value.reshape(value.shape[0], -1).float()
-        return (flat * flat).sum(-1)
+        if not isinstance(value, Factorized):
+            flat = value.reshape(value.shape[0], -1).float()
+            return (flat * flat).sum(-1)
+
+        layer_type = self.layer_types[name]
+        resolved = mode
+        if mode == "auto":
+            if ops.is_embedding(layer_type) or ops.is_norm(layer_type):
+                resolved = "factorized"
+            else:
+                _, S, K, D = ops.effective_dims(value, layer_type)
+                resolved = (
+                    "materialized" if ops.maybe_use_materialized_norm(S, K, D)
+                    else "factorized"
+                )
+        if resolved == "materialized":
+            mat = ops.materialize(value, layer_type).float()
+            return (mat * mat).sum(-1)
+        return ops.grad_norm_sq(value, layer_type)
 
     @staticmethod
     def _align_embedding_width(
