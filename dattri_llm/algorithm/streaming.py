@@ -1,26 +1,27 @@
-"""On-the-fly gradient sources for attribution.
+"""Gradient sources for attribution — on-disk and live, behind one contract.
 
-The on-disk workflow feeds attributors with pre-collected gradients via
-:class:`~dattri_llm.gradient.file_manager.GradientFileManager` +
-``iter_gradient_blocks``.  This module provides the *live* counterpart: a
-:class:`GradientStreamer` that runs a forward+backward pass over a dataset and
-yields one per-step :class:`~dattri_llm.gradient.gradient.Gradient` block at a
-time, computed on demand and never persisted.
+An attributor scores by iterating ``(step, Gradient, hashes)`` blocks.  Where
+those blocks come from is abstracted by :class:`GradientSource`, which has two
+concrete implementations so the same scoring loop serves both workflows:
 
-Both sides satisfy one contract, :class:`GradientSource`, so an attributor can
-consume disk or live gradients through the same loop.  The only axis that
-matters to attributors is :attr:`GradientSource.reusable` — whether the source
-can be iterated more than once at the *same* parameters:
+* :class:`DiskGradientSource` — *store-then-attribute*: reads pre-collected
+  gradients off disk via a
+  :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  ``reusable=True``.
+* :class:`GradientStreamer` — *on-the-fly*: runs a forward+backward pass over a
+  dataset and yields each per-step block on demand, never persisting it.  Two
+  flavours:
 
-* :class:`EvalGradientStreamer` — frozen probe at a fixed checkpoint;
-  ``reusable=True``.  Required by methods with a pre-pass (K-FAC/EK-FAC fit the
-  Fisher, then score).
-* :class:`TrainingGradientStreamer` — advances the optimizer as it streams, so
-  each step is a real checkpoint along the training trajectory;
-  ``reusable=False`` (single-shot).  Suits single-pass methods (TracIn).
+  * :class:`EvalGradientStreamer` — frozen probe at a fixed checkpoint;
+    ``reusable=True``.  Required by methods with a pre-pass (K-FAC/EK-FAC fit the
+    Fisher, then score).
+  * :class:`TrainingGradientStreamer` — advances the optimizer as it streams, so
+    each step is a real checkpoint along the training trajectory;
+    ``reusable=False`` (single-shot).  Suits single-pass methods (TracIn).
 
-The method-specific logic (TracIn dot vs. K-FAC whitening) stays in the
-attributors; this module is method-agnostic.
+The only axis attributors branch on is :attr:`GradientSource.reusable` — whether
+the source can be iterated more than once at the *same* parameters.  The
+method-specific logic (TracIn dot vs. K-FAC whitening) stays in the attributors;
+this module is method-agnostic.
 """
 
 from __future__ import annotations
@@ -30,11 +31,13 @@ import logging
 from typing import (
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Optional,
     Protocol,
     Tuple,
+    Union,
     runtime_checkable,
 )
 
@@ -43,7 +46,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.algorithm.base import iter_gradient_blocks, resolve_steps
 from dattri_llm.gradient.callbacks import CaptureCallback
+from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 
@@ -62,25 +67,85 @@ LossFn = Callable[[nn.Module, object], torch.Tensor]
 class GradientSource(Protocol):
     """A source of per-step ``(step, Gradient, hashes)`` blocks.
 
-    Satisfied by both the on-disk path (``iter_gradient_blocks`` over a
-    :class:`GradientFileManager`) and :class:`GradientStreamer`.  Attributors
-    depend only on this interface.
+    Satisfied by :class:`DiskGradientSource` (on-disk) and
+    :class:`GradientStreamer` (live), so an attributor scores either through the
+    same loop.  The only behavioural axis is :attr:`reusable`.
     """
 
     def __iter__(self) -> Iterator[StreamBatch]:
         """(Re)start iteration from the first step."""
 
     def __len__(self) -> int:
-        """Number of steps the source yields per pass."""
+        """Number of ``(step, Gradient, hashes)`` blocks yielded per pass."""
 
     @property
     def reusable(self) -> bool:
         """Whether the source can be iterated more than once at the *same*
         parameters (required by attributors with a pre-pass, e.g. K-FAC)."""
 
+
+class DiskGradientSource(GradientSource):
+    """A re-iterable :class:`GradientSource` backed by on-disk gradients.
+
+    Wraps a :class:`GradientFileManager` and yields the same
+    ``(step, Gradient, hashes)`` blocks as :class:`GradientStreamer`, but read
+    from disk (the *store-then-attribute* workflow) rather than computed live.
+    Each file is ``torch.load``-ed once even when it holds several requested
+    steps.  ``reusable=True``: the parameters are already fixed on disk, so the
+    blocks can be re-read any number of times.
+
+    Args:
+        file_manager: Manager opened on the gradient directory.
+        args: :class:`AttributionArguments` (dataloader settings + logging).
+        steps: Which stored steps to consume (e.g. the checkpoint subset for a
+            TracIn ensemble).  ``None`` reads every step present.  Validated and
+            intersected with what is on disk via :func:`resolve_steps`.
+        layer_name: Restrict each block to these layers (``str`` or list);
+            ``None`` keeps every stored layer.
+        desc: Optional tqdm label for the read (shown when ``verbose``).
+        verbose: Whether to show the per-block progress bar (rank-0 only).
+    """
+
+    def __init__(
+        self,
+        file_manager: GradientFileManager,
+        args: AttributionArguments,
+        *,
+        steps: Optional[Iterable[int]] = None,
+        layer_name: Optional[Union[str, List[str]]] = None,
+        desc: Optional[str] = None,
+        verbose: bool = False,
+    ) -> None:
+        self._fm = file_manager
+        self._args = args
+        if isinstance(layer_name, str):
+            self._layer_name: Optional[List[str]] = [layer_name]
+        elif layer_name is None:
+            self._layer_name = None
+        else:
+            self._layer_name = list(layer_name)
+        # Resolve + validate the step set once (disk is immutable for our run).
+        self._steps = resolve_steps(file_manager, steps)
+        self._desc = desc
+        self._verbose = verbose
+
     @property
-    def model(self) -> nn.Module:
-        """The model whose parameters the yielded gradients are taken at."""
+    def reusable(self) -> bool:
+        return True
+
+    def __len__(self) -> int:
+        # One block per (file, step) pair — matches what __iter__ yields.
+        return sum(len(by_step) for _, by_step in self._fm.iter_steps(self._steps))
+
+    def __iter__(self) -> Iterator[StreamBatch]:
+        return iter_gradient_blocks(
+            self._fm,
+            self._steps,
+            self._args,
+            layer_name=self._layer_name,
+            desc=self._desc,
+            verbose=self._verbose,
+        )
 
 
 def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
