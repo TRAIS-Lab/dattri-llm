@@ -35,7 +35,6 @@ from typing import (
     Optional,
     Protocol,
     Tuple,
-    Union,
     runtime_checkable,
 )
 
@@ -44,11 +43,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.gradient.callbacks import CaptureCallback
+from dattri_llm.gradient.gradient import Gradient
+from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 
 logger = logging.getLogger(__name__)
-from dattri_llm.gradient.callbacks import HookManagerCallback
-from dattri_llm.gradient.gradient import Gradient, GradientRecord
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 
 # (step, factorized per-sample gradient block, per-sample input hashes)
 StreamBatch = Tuple[int, Gradient, List[str]]
@@ -104,16 +103,6 @@ def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
     return loss
 
 
-class _CaptureCallback(HookManagerCallback):
-    """Stashes the most recent per-step :class:`GradientRecord` for the streamer."""
-
-    def __init__(self) -> None:
-        self.record: Optional[GradientRecord] = None
-
-    def on_step_end(self, record: GradientRecord) -> None:
-        self.record = record
-
-
 class GradientStreamer(GradientSource):
     """Yields per-step ``(step, Gradient, hashes)`` from a live forward+backward pass.
 
@@ -151,9 +140,6 @@ class GradientStreamer(GradientSource):
             backward, so each step is a distinct checkpoint along the training
             trajectory (single-shot; ``reusable=False``).  If ``False`` (default)
             the model is frozen and the source is re-iterable.
-        layer_name: If given, restrict each yielded block to these layers via
-            :meth:`Gradient.select_layers` (post-filter on what ``config``
-            captured); mirrors the disk loader's ``layer_name``.
         loss_fn: ``(model, batch) -> scalar``.  Defaults to ``model(**batch).loss``.
             Must run the model on the batch so inputs are captured for hashing.
         optimizer: Required iff ``enable_update``.
@@ -174,7 +160,6 @@ class GradientStreamer(GradientSource):
         *,
         batch_size: int,
         enable_update: bool = False,
-        layer_name: Optional[Union[str, List[str]]] = None,
         loss_fn: Optional[LossFn] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[object] = None,
@@ -190,19 +175,13 @@ class GradientStreamer(GradientSource):
         self._args = args
         self._batch_size = batch_size
         self.enable_update = enable_update
-        if isinstance(layer_name, str):
-            self._layer_name: Optional[List[str]] = [layer_name]
-        elif layer_name is None:
-            self._layer_name = None
-        else:
-            self._layer_name = list(layer_name)
         self._loss_fn = loss_fn if loss_fn is not None else _default_loss_fn
         self._optimizer = optimizer
         self._scheduler = scheduler
         self._collate_fn = collate_fn
         self._checkpoint_step = checkpoint_step
 
-        self._capture = _CaptureCallback()
+        self._capture = CaptureCallback()
         # Register hooks on the UNWRAPPED submodules first, then wrap, so the
         # hooks survive DDP/FSDP wrapping (the documented collection ordering).
         self._hm = HookManager(
@@ -352,8 +331,6 @@ class GradientStreamer(GradientSource):
 
         step = self._step_label()
         grad = record.gradient
-        if self._layer_name is not None:
-            grad = grad.select_layers(self._layer_name)
         hashes = (
             list(record.input_hash)
             if isinstance(record.input_hash, list)
@@ -536,7 +513,6 @@ class EvalGradientStreamer(GradientStreamer):
         args: AttributionArguments,
         *,
         batch_size: int,
-        layer_name: Optional[Union[str, List[str]]] = None,
         loss_fn: Optional[LossFn] = None,
         config: Optional[HookManagerConfig] = None,
         collate_fn: Optional[Callable] = None,
@@ -548,7 +524,6 @@ class EvalGradientStreamer(GradientStreamer):
             args,
             batch_size=batch_size,
             enable_update=False,
-            layer_name=layer_name,
             loss_fn=loss_fn,
             config=config,
             collate_fn=collate_fn,
@@ -573,7 +548,6 @@ class TrainingGradientStreamer(GradientStreamer):
         batch_size: int,
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[object] = None,
-        layer_name: Optional[Union[str, List[str]]] = None,
         loss_fn: Optional[LossFn] = None,
         config: Optional[HookManagerConfig] = None,
         collate_fn: Optional[Callable] = None,
@@ -584,7 +558,6 @@ class TrainingGradientStreamer(GradientStreamer):
             args,
             batch_size=batch_size,
             enable_update=True,
-            layer_name=layer_name,
             loss_fn=loss_fn,
             optimizer=optimizer,
             scheduler=scheduler,

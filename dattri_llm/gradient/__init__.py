@@ -1,6 +1,7 @@
 """Gradient collection utilities for training data attribution."""
 
 from dattri_llm.gradient.callbacks import (
+    CaptureCallback,
     DataSelectionCallback,
     HookManagerCallback,
     OffloadCallback,
@@ -35,6 +36,7 @@ from dattri_llm.gradient.ops import (
 )
 
 __all__ = [
+    "CaptureCallback",
     "DataSelectionCallback",
     "HookManager",
     "HookManagerCallback",
