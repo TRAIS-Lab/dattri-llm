@@ -1493,6 +1493,21 @@ class HookManager:
         """Total number of batch steps collected since construction."""
         return self._step_count
 
+    def reset_steps(self) -> None:
+        """Reset the capture-step counter to ``0``.
+
+        ``_step_count`` (stamped on each :attr:`GradientRecord.step` and exposed
+        via :attr:`steps_collected`) is monotonic for the manager's lifetime by
+        default.  A caller that restarts collection from a fresh logical baseline
+        — e.g. the live streamer beginning a new pass — can reset it so
+        ``record.step`` is pass-local and aligns with the caller's own per-pass
+        index.  Only the label counter is reset; in-flight per-step buffers and
+        completion flags are left untouched (callers reset between steps, never
+        mid-backward).
+        """
+        with self._step_lock:
+            self._step_count = 0
+
     def get_gradient(self) -> Gradient:
         """Return the :class:`~dattri_llm.gradient.Gradient` of the most recently
         completed step::

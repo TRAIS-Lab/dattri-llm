@@ -309,6 +309,10 @@ class GradientStreamer(GradientSource):
             )
         self._batch_iter = iter(self._loader)
         self._batch_index = 0
+        # Share a zero baseline with the HookManager's capture counter, so this
+        # pass's ``record.step`` aligns with ``_batch_index`` and can be used to
+        # validate that exactly one capture step happened per yielded batch.
+        self._hm.reset_steps()
         self._consumed = True
         return self
 
@@ -327,6 +331,16 @@ class GradientStreamer(GradientSource):
             raise RuntimeError(
                 "No gradient was captured this step. Ensure loss_fn runs the "
                 "model on the batch and backward flows through the hooked layers."
+            )
+        # Consistency check: with both counters zeroed at __iter__, the manager's
+        # capture index must advance exactly once per batch.  A mismatch means a
+        # step was captured that the streamer did not account for (e.g. an extra
+        # backward, gradient accumulation, or a missed/duplicated capture).
+        if record.step != self._batch_index:
+            raise RuntimeError(
+                f"Step desync: HookManager captured step {record.step} but the "
+                f"streamer is on batch {self._batch_index}. Exactly one capture "
+                f"step is expected per streamed batch."
             )
 
         step = self._step_label()
@@ -398,10 +412,13 @@ class GradientStreamer(GradientSource):
     # ------------------------------------------------------------------ #
 
     def _step_label(self) -> int:
-        """Step stamp for the current block.
+        """Semantic step stamp for the current block (the attribution index).
 
         Frozen: a constant checkpoint index (all batches share one checkpoint).
-        Updating: the optimizer-step index (each batch is its own checkpoint).
+        Updating: the optimizer-step index (each batch is its own checkpoint) —
+        which equals the manager's per-pass ``record.step`` (cross-checked in
+        :meth:`__next__`).  ``_batch_index`` always tracks capture order; only the
+        *label* differs between the two modes.
         """
         return self._batch_index if self.enable_update else self._checkpoint_step
 
