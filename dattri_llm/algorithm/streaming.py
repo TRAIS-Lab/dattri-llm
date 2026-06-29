@@ -317,7 +317,6 @@ class GradientStreamer(GradientSource):
         self._entered: bool = False
         self._collect_ctx = None
         self._saved_grads: Optional[Dict[str, Optional[torch.Tensor]]] = None
-        self._was_training: bool = False
 
     # ------------------------------------------------------------------ #
     # GradientSource contract                                            #
@@ -358,15 +357,13 @@ class GradientStreamer(GradientSource):
         else:
             set_seed(self._args.seed)
         if not self.enable_update:
-            # Freeze: snapshot grads + force eval() so repeated passes are
-            # bit-identical (dropout/etc. would make the K-FAC fit and score
-            # passes disagree).
+            # Freeze: snapshot grads so the probe leaves them untouched.  (The
+            # eval() that keeps repeated passes bit-identical — e.g. K-FAC's fit
+            # and score passes — is applied per-pass in __iter__.)
             self._saved_grads = {
                 n: (p.grad.detach().clone() if p.grad is not None else None)
                 for n, p in self._model.named_parameters()
             }
-            self._was_training = self._fwd_model.training
-            self._fwd_model.eval()
         # Only the owner registers/activates hooks; a sharer rides the owner's
         # collection context (the owner is entered first under ``with a, b:``).
         if self._owns_hm:
@@ -381,12 +378,11 @@ class GradientStreamer(GradientSource):
         finally:
             if self._owns_hm:
                 self._hm.remove()
-            if not self.enable_update:
-                if self._was_training:
-                    self._fwd_model.train()
-                if self._saved_grads is not None:
-                    for n, p in self._model.named_parameters():
-                        p.grad = self._saved_grads[n]
+            # The mode is owned per-pass by __iter__, so it is left as-is; only a
+            # frozen probe's snapshotted grads need restoring.
+            if not self.enable_update and self._saved_grads is not None:
+                for n, p in self._model.named_parameters():
+                    p.grad = self._saved_grads[n]
             self._entered = False
         return False
 
@@ -405,6 +401,12 @@ class GradientStreamer(GradientSource):
                 "This streamer is single-shot (enable_update=True) and was "
                 "already consumed; the training trajectory cannot be replayed."
             )
+        # Set the train/eval mode for THIS pass on the (possibly shared) model: a
+        # training trajectory runs in train() to match real training (dropout/BN
+        # active); a frozen probe runs in eval() for deterministic, repeatable
+        # scoring.  Per-pass — not per-context — so a frozen test probe and an
+        # updating train pass over the same model each get the correct mode.
+        self._fwd_model.train(self.enable_update)
         self._batch_iter = iter(self._loader)
         self._batch_index = 0
         # Share a zero baseline with the HookManager's capture counter, so this
