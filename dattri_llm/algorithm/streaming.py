@@ -195,8 +195,12 @@ class GradientStreamer(GradientSource):
             then the streamer wraps it in DDP/FSDP per ``args`` (mirroring HF
             ``Trainer._wrap_model``), so the hooks survive wrapping.  Do not
             pre-wrap it.
-        dataset: The dataset to stream.  Iterated with ``shuffle=False`` so the
-            row/column order is deterministic and the input hashes are stable.
+        dataset: The dataset to stream.  A frozen probe (``enable_update=False``)
+            iterates it deterministically (``shuffle=False``) so its order is
+            stable and the source re-reads identically; a training trajectory
+            (``enable_update=True``) shuffles each epoch like HF Trainer, seeded by
+            ``data_seed``.  Either way rows/columns are keyed by per-sample content
+            hash, so the score is order-independent.
         args: :class:`AttributionArguments`; supplies ``device`` and the
             ``dataloader_*`` settings.
         batch_size: Per-step batch size (``per_device_train_batch_size`` or
@@ -232,6 +236,7 @@ class GradientStreamer(GradientSource):
         config: Optional[HookManagerConfig] = None,
         collate_fn: Optional[Callable] = None,
         checkpoint_step: int = 0,
+        hook_manager: Optional[HookManager] = None,
     ) -> None:
         self._model = model
         self._dataset = dataset
@@ -244,14 +249,29 @@ class GradientStreamer(GradientSource):
         self._collate_fn = collate_fn
         self._checkpoint_step = checkpoint_step
 
-        self._capture = CaptureCallback()
-        # Register hooks on the UNWRAPPED submodules first, then wrap, so the
-        # hooks survive DDP/FSDP wrapping (the documented collection ordering).
-        self._hm = HookManager(
-            model,
-            config=config if config is not None else HookManagerConfig(),
-            callbacks=[self._capture],
-        )
+        if hook_manager is not None:
+            self._hm = hook_manager
+            self._owns_hm = False
+            shared = next(
+                (cb for cb in hook_manager._callbacks if isinstance(cb, CaptureCallback)),
+                None,
+            )
+            if shared is None:
+                raise ValueError(
+                    "A shared hook_manager must carry a CaptureCallback; pass the "
+                    "`.hook_manager` of another GradientStreamer."
+                )
+            self._capture = shared
+        else:
+            # Register hooks on the UNWRAPPED submodules first, then wrap, so the
+            # hooks survive DDP/FSDP wrapping (the documented collection ordering).
+            self._capture = CaptureCallback()
+            self._hm = HookManager(
+                model,
+                config=config if config is not None else HookManagerConfig(),
+                callbacks=[self._capture],
+            )
+            self._owns_hm = True
 
         # ── Compute-shaping options, mirroring HF ``Trainer`` so that the same
         # ``AttributionArguments`` yield the same forward/backward and (for the
@@ -311,6 +331,13 @@ class GradientStreamer(GradientSource):
     def model(self) -> nn.Module:
         return self._model
 
+    @property
+    def hook_manager(self) -> HookManager:
+        """The underlying :class:`HookManager`.  Pass it to another streamer's
+        ``hook_manager=`` (over the same model) so both share one set of hooks —
+        the cleaner alternative to two managers cross-capturing each backward."""
+        return self._hm
+
     def __len__(self) -> int:
         return len(self._loader)
 
@@ -340,16 +367,20 @@ class GradientStreamer(GradientSource):
             }
             self._was_training = self._fwd_model.training
             self._fwd_model.eval()
-        self._collect_ctx = self._hm.collect()
-        self._collect_ctx.__enter__()
+        # Only the owner registers/activates hooks; a sharer rides the owner's
+        # collection context (the owner is entered first under ``with a, b:``).
+        if self._owns_hm:
+            self._collect_ctx = self._hm.collect()
+            self._collect_ctx.__enter__()
         return self
 
     def __exit__(self, *exc) -> bool:
         try:
-            if self._collect_ctx is not None:
+            if self._owns_hm and self._collect_ctx is not None:
                 self._collect_ctx.__exit__(*exc)
         finally:
-            self._hm.remove()
+            if self._owns_hm:
+                self._hm.remove()
             if not self.enable_update:
                 if self._was_training:
                     self._fwd_model.train()
@@ -532,6 +563,14 @@ class GradientStreamer(GradientSource):
             "num_workers": self._args.dataloader_num_workers,
             "pin_memory": self._args.dataloader_pin_memory,
         }
+        # A *training* trajectory shuffles each epoch (matching HF Trainer); a
+        # *frozen* probe keeps a deterministic order so its row/column hashes are
+        # stable and the source re-reads identically (K-FAC's pre-pass).  The
+        # shuffle is seeded by ``data_seed`` for reproducibility (per-sample
+        # content hashes keep rows hash-keyed regardless of order, so shuffling is
+        # safe for correctness).
+        shuffle = self.enable_update
+        seed = self._args.data_seed if self._args.data_seed is not None else self._args.seed
         # Distributed: each rank streams a disjoint shard via DistributedSampler
         # (sampler and shuffle are mutually exclusive, so set only one). Content
         # hashes stay globally unique, so per-rank rows concatenate cleanly — the
@@ -541,10 +580,13 @@ class GradientStreamer(GradientSource):
                 self._dataset,
                 num_replicas=self._args.world_size,
                 rank=self._args.process_index,
-                shuffle=False,
+                shuffle=shuffle,
+                seed=seed,
             )
         else:
-            kwargs["shuffle"] = False
+            kwargs["shuffle"] = shuffle
+            if shuffle:
+                kwargs["generator"] = torch.Generator().manual_seed(seed)
         if self._collate_fn is not None:
             kwargs["collate_fn"] = self._collate_fn
         if self._args.dataloader_num_workers > 0:
