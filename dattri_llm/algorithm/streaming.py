@@ -8,15 +8,15 @@ concrete implementations so the same scoring loop serves both workflows:
   gradients off disk via a
   :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  ``reusable=True``.
 * :class:`GradientStreamer` — *on-the-fly*: runs a forward+backward pass over a
-  dataset and yields each per-step block on demand, never persisting it.  Two
-  flavours:
+  dataset and yields each per-step block on demand, never persisting it.  Its
+  ``enable_update`` flag selects the two regimes:
 
-  * :class:`EvalGradientStreamer` — frozen probe at a fixed checkpoint;
+  * ``enable_update=False`` (default) — a **frozen probe** at a fixed checkpoint;
     ``reusable=True``.  Required by methods with a pre-pass (K-FAC/EK-FAC fit the
     Fisher, then score).
-  * :class:`TrainingGradientStreamer` — advances the optimizer as it streams, so
-    each step is a real checkpoint along the training trajectory;
-    ``reusable=False`` (single-shot).  Suits single-pass methods (TracIn).
+  * ``enable_update=True`` — **advances the optimizer** as it streams, so each
+    step is a real checkpoint along the training trajectory; ``reusable=False``
+    (single-shot).  Suits single-pass methods (TracIn).
 
 The only axis attributors branch on is :attr:`GradientSource.reusable` — whether
 the source can be iterated more than once at the *same* parameters.  The
@@ -186,7 +186,7 @@ class GradientStreamer(GradientSource):
 
     .. code-block:: python
 
-        with EvalGradientStreamer(model, ds, args, batch_size=8) as src:
+        with GradientStreamer(model, ds, args, batch_size=8) as src:   # frozen probe
             for step, grad, hashes in src:
                 ...
 
@@ -207,7 +207,8 @@ class GradientStreamer(GradientSource):
             the model is frozen and the source is re-iterable.
         loss_fn: ``(model, batch) -> scalar``.  Defaults to ``model(**batch).loss``.
             Must run the model on the batch so inputs are captured for hashing.
-        optimizer: Required iff ``enable_update``.
+        optimizer: Optional; when ``enable_update`` and omitted, it is built from
+            ``args`` (optim, learning_rate, scheduler) like HF Trainer.
         scheduler: Optional LR scheduler, stepped after the optimizer.
         config: :class:`HookManagerConfig` controlling which layers are hooked.
             Defaults to ``HookManagerConfig()`` (all linear-capable layers).
@@ -232,9 +233,6 @@ class GradientStreamer(GradientSource):
         collate_fn: Optional[Callable] = None,
         checkpoint_step: int = 0,
     ) -> None:
-        if enable_update and optimizer is None:
-            raise ValueError("enable_update=True requires an optimizer.")
-
         self._model = model
         self._dataset = dataset
         self._args = args
@@ -287,6 +285,10 @@ class GradientStreamer(GradientSource):
         self._fwd_model = self._wrap_model(model, args)
 
         self._loader = self._build_loader()
+        # Trajectory optimizer/scheduler: when stepping but none supplied, build
+        # them from ``args`` (mirroring Trainer.create_optimizer_and_scheduler).
+        if self.enable_update and self._optimizer is None:
+            self._optimizer, self._scheduler = self._create_optimizer_and_scheduler()
         # Iteration state.
         self._batch_iter: Optional[Iterator] = None
         self._batch_index: int = 0
@@ -472,6 +474,42 @@ class GradientStreamer(GradientSource):
         if self._scheduler is not None:
             self._scheduler.step()
 
+    def _create_optimizer_and_scheduler(self):
+        """Build the trajectory optimizer + LR scheduler from ``args`` — the
+        streamer analogue of ``Trainer.create_optimizer_and_scheduler``.
+
+        Weight decay excludes biases and 1-D (norm) parameters, as in HF; the
+        scheduler is sized to one pass over the loader.
+        """
+        a = self._args
+        decay, no_decay = [], []
+        for name, p in self._model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if (p.ndim < 2 or name.endswith(".bias")) else decay).append(p)
+        groups = [
+            {"params": decay, "weight_decay": a.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+        if a.optim == "sgd":
+            optimizer: torch.optim.Optimizer = torch.optim.SGD(groups, lr=a.learning_rate)
+        elif a.optim in ("adamw_torch", "adamw"):
+            optimizer = torch.optim.AdamW(
+                groups, lr=a.learning_rate,
+                betas=(a.adam_beta1, a.adam_beta2), eps=a.adam_epsilon,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported args.optim={a.optim!r}; use 'adamw_torch' or 'sgd'."
+            )
+        from transformers import get_scheduler
+
+        scheduler = get_scheduler(
+            a.lr_scheduler_type, optimizer,
+            num_warmup_steps=a.warmup_steps, num_training_steps=len(self._loader),
+        )
+        return optimizer, scheduler
+
     # ------------------------------------------------------------------ #
     # Internals                                                           #
     # ------------------------------------------------------------------ #
@@ -578,71 +616,3 @@ class GradientStreamer(GradientSource):
         if isinstance(batch, torch.Tensor):
             return batch.to(device)
         return batch
-
-
-class EvalGradientStreamer(GradientStreamer):
-    """Frozen, re-iterable gradient probe at a fixed checkpoint (``reusable=True``).
-
-    The model is not updated; all yielded blocks are stamped with
-    ``checkpoint_step``.  Use for the test side of any attributor, and for the
-    train side of methods that need a pre-pass (K-FAC/EK-FAC fit then score).
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        dataset: Dataset,
-        args: AttributionArguments,
-        *,
-        batch_size: int,
-        loss_fn: Optional[LossFn] = None,
-        config: Optional[HookManagerConfig] = None,
-        collate_fn: Optional[Callable] = None,
-        checkpoint_step: int = 0,
-    ) -> None:
-        super().__init__(
-            model,
-            dataset,
-            args,
-            batch_size=batch_size,
-            enable_update=False,
-            loss_fn=loss_fn,
-            config=config,
-            collate_fn=collate_fn,
-            checkpoint_step=checkpoint_step,
-        )
-
-
-class TrainingGradientStreamer(GradientStreamer):
-    """Trajectory-following, single-shot gradient stream (``reusable=False``).
-
-    Steps the optimizer (and scheduler) after each backward, so each yielded
-    block is a distinct checkpoint, stamped with its optimizer-step index.
-    Suits single-pass attributors (TracIn). Cannot be re-iterated.
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        dataset: Dataset,
-        args: AttributionArguments,
-        *,
-        batch_size: int,
-        optimizer: torch.optim.Optimizer,
-        scheduler: Optional[object] = None,
-        loss_fn: Optional[LossFn] = None,
-        config: Optional[HookManagerConfig] = None,
-        collate_fn: Optional[Callable] = None,
-    ) -> None:
-        super().__init__(
-            model,
-            dataset,
-            args,
-            batch_size=batch_size,
-            enable_update=True,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            config=config,
-            collate_fn=collate_fn,
-        )
