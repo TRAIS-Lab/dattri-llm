@@ -44,6 +44,7 @@ stay ignored.
 
 from __future__ import annotations
 
+import os
 import warnings
 from abc import abstractmethod
 from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
@@ -53,11 +54,17 @@ import torch
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import (
     BaseAttributor,
-    iter_gradient_blocks,
-    resolve_steps,
+    collect_to_disk,
+    score_sources,
+    task_loss_fn,
 )
 from dattri_llm.algorithm.score import AttributionScore
-from dattri_llm.algorithm.task import AttributionTask
+from dattri_llm.algorithm.streaming import (
+    DiskGradientSource,
+    GradientStreamer,
+    GradientSource,
+)
+from dattri.task import AttributionTask
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
@@ -110,8 +117,66 @@ class _KroneckerBaseAttributor(BaseAttributor):
         else:
             self.layer_name = list(layer_name)
 
-    def cache(self, train_dataset: Dataset) -> None:
-        """No-op: gradients are already cached on disk in this workflow."""
+    def cache(
+        self,
+        train_dataset: Dataset,
+        test_dataset: Dataset,
+        *,
+        cache_dir: Optional[str] = None,
+    ) -> List[Tuple[str, str]]:
+        """Collect the gradients K-FAC/EK-FAC needs, live, to disk.
+
+        Both sides are frozen probes at the task's **first** checkpoint (K-FAC and
+        EK-FAC are single-checkpoint); the train gradients also build the Fisher.
+        Reproducing :meth:`attribute` is *cache + attribute_from_cache* on the
+        single returned pair.  A list (of length 1) is returned for parity with
+        the multi-checkpoint :class:`TracInAttributor.cache`.
+
+        Args:
+            train_dataset, test_dataset: Datasets to stream.
+            cache_dir: Parent dir; the pair goes under ``<cache_dir>/ckpt_0/``.
+                Defaults to ``args.output_dir``.
+
+        Returns:
+            A one-element list ``[(train_gradients_dir, test_gradients_dir)]``.
+        """
+        if self.task is None:
+            raise ValueError(
+                "cache() (live collection) requires a `task` with a model; pass "
+                "pre-collected gradients to attribute_from_cache() instead."
+            )
+        n_ckpt = len(self.task.get_checkpoints())
+        if n_ckpt > 1:
+            warnings.warn(
+                f"{type(self).__name__} is single-checkpoint; only checkpoint 0 is "
+                f"used and the other {n_ckpt - 1} provided checkpoint(s) are ignored.",
+                stacklevel=2,
+            )
+        cache_dir = cache_dir if cache_dir is not None else self.args.output_dir
+        train_dir = os.path.join(cache_dir, "ckpt_0", "train_grads")
+        test_dir = os.path.join(cache_dir, "ckpt_0", "test_grads")
+
+        self.task._load_checkpoints(0)
+        model = self.task.get_model()
+        collect_to_disk(
+            GradientStreamer(
+                model, train_dataset, self.args,
+                batch_size=self.args.per_device_train_batch_size,
+                enable_update=False,
+                loss_fn=task_loss_fn(self.task.original_loss_func),
+            ),
+            GradientFileManager(train_dir),
+        )
+        collect_to_disk(
+            GradientStreamer(
+                model, test_dataset, self.args,
+                batch_size=self.args.per_device_eval_batch_size,
+                enable_update=False,
+                loss_fn=task_loss_fn(self.task.original_target_func),
+            ),
+            GradientFileManager(test_dir),
+        )
+        return [(train_dir, test_dir)]
 
     # ------------------------------------------------------------------ #
     # Subclass hooks                                                      #
@@ -120,22 +185,20 @@ class _KroneckerBaseAttributor(BaseAttributor):
     @abstractmethod
     def _fit(
         self,
-        train_fm: GradientFileManager,
-        train_steps: List[int],
+        train_source: GradientSource,
         device: torch.device,
-        verbose: bool,
         fisher_acc: Optional[ops.FisherAccumulator],
     ) -> object:
-        """Estimate the per-layer K-FAC preconditioner from the selected training
-        gradients (the records at *train_steps*).
+        """Estimate the per-layer K-FAC preconditioner from the training gradients.
 
-        Returns an opaque context object (possibly empty if no K-FAC-eligible
-        layer is present) passed back to :meth:`_prepare_test` and :meth:`_score`.
+        Iterates ``train_source`` (a re-iterable ``GradientSource`` — disk or a
+        frozen streamer; EK-FAC iterates it twice).  Returns an opaque context
+        object (possibly empty if no K-FAC-eligible layer is present) passed back
+        to :meth:`_prepare_test` and :meth:`_score`.
 
         When *fisher_acc* is not ``None`` the implementation must also feed every
-        streamed block to it (via :meth:`_accumulate_fisher`) during its **first**
-        pass, so the direct-Fisher estimate for non-K-FAC layers reuses the same
-        single sweep over the data.
+        block to it (via :meth:`_accumulate_fisher`) during its **first** pass, so
+        the direct-Fisher estimate for non-K-FAC layers reuses that sweep.
         """
 
     @abstractmethod
@@ -158,60 +221,24 @@ class _KroneckerBaseAttributor(BaseAttributor):
     # Main entry point                                                   #
     # ------------------------------------------------------------------ #
 
-    def attribute_from_cache(
+    def _run(
         self,
-        train_gradients_dir: str,
-        test_gradients_dir: str,
+        train_source: GradientSource,
+        test_source: GradientSource,
+        *,
         loop_over_test: bool = False,
-        selected_training_steps: Optional[Iterable[int]] = None,
-        verbose: bool = False,
         non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
         direct_fim_max_params: int = 4096,
+        algorithm_meta_extra: Optional[dict] = None,
     ) -> AttributionScore:
-        """Compute the ``(num_train, num_test)`` attribution score from on-disk
-        gradients — every train record against every test record.
+        """Fit the K-FAC preconditioner from ``train_source``, then score it
+        against ``test_source`` — the shared loop behind :meth:`attribute_from_cache`
+        and :meth:`attribute`.
 
-        Args:
-            train_gradients_dir: Directory written by
-                :class:`GradientFileManager` during the training pass.  Also the
-                data the Fisher is estimated from.
-            test_gradients_dir: Directory written during the test pass.
-            loop_over_test: If ``False`` (default), the test representations are
-                prepared once and reused across all train blocks (peak memory:
-                all test reps + one train block).  If ``True``, they are
-                re-streamed and rebuilt for every train block (peak memory: one
-                train + one test block) at the cost of more disk reads — use this
-                when the test set does not fit in memory.
-            selected_training_steps: Restrict the training checkpoints used (the
-                Fisher fit and the output rows) to these steps; ``None`` (default)
-                uses every step on disk.  Over-specified ranges are intersected
-                with what is available.  The test set always supplies every
-                column.
-            verbose: Show tqdm progress bars on the logging process.
-            non_kfac_strategy: How to treat non-K-FAC layers (normalisation
-                layers).  ``"ignore"`` (default) skips them — only linear/conv
-                layers contribute.  ``"direct"`` adds a dense empirical-Fisher
-                preconditioner for each such layer and sums its contribution into
-                the score.
-            direct_fim_max_params: Only used when ``non_kfac_strategy="direct"``.
-                A non-K-FAC layer is included only if its (token-summed) weight
-                gradient has at most this many parameters, bounding the dense
-                ``O(d²)`` Fisher.  Larger layers are skipped with a warning.
-
-        Returns:
-            An :class:`AttributionScore` whose rows/columns are the train/test
-            content hashes (disk order); also persisted to ``args.output_dir``.
-
-        Raises:
-            ValueError: If a gradients dir is missing, ``selected_training_steps``
-                matches no step in the training gradients, no eligible layers are
-                present in the training gradients, or an argument is invalid.
+        ``train_source`` must be **re-iterable**: the Fisher pre-pass re-reads the
+        train gradients before scoring (EK-FAC reads them twice more), so a
+        single-shot trajectory stream is rejected.
         """
-        if train_gradients_dir is None or test_gradients_dir is None:
-            raise ValueError(
-                f"{type(self).__name__} requires both train_gradients_dir and "
-                "test_gradients_dir."
-            )
         if non_kfac_strategy not in ("ignore", "direct"):
             raise ValueError(
                 "non_kfac_strategy must be 'ignore' or 'direct', got "
@@ -221,28 +248,26 @@ class _KroneckerBaseAttributor(BaseAttributor):
             raise ValueError(
                 f"direct_fim_max_params must be positive, got {direct_fim_max_params}."
             )
+        if not getattr(train_source, "reusable", False):
+            raise ValueError(
+                f"{type(self).__name__} needs a re-iterable train source: the "
+                "Fisher pre-pass re-reads the train gradients before scoring. Use "
+                "on-disk gradients or a frozen GradientStreamer (enable_update=False, "
+                "single-shot trajectory stream)."
+            )
 
-        train_fm = GradientFileManager(train_gradients_dir)
-        test_fm = GradientFileManager(test_gradients_dir)
         device = self.args.device
 
-        # ``selected_training_steps`` picks which training checkpoints to
-        # attribute from (the Fisher fit and the output rows).  The test set
-        # defines the query columns and is always used in full.
-        train_steps = resolve_steps(train_fm, selected_training_steps)
-        test_steps = test_fm.available_steps()
-
-        # Fit the K-FAC preconditioner over the selected training gradients.  When
-        # the direct strategy is requested, an empirical-Fisher accumulator for the
-        # non-K-FAC (norm) layers is filled in the *same* first pass, so the data
-        # is streamed only once.
+        # Fit the K-FAC preconditioner over the training gradients.  When the
+        # direct strategy is requested, an empirical-Fisher accumulator for the
+        # non-K-FAC (norm) layers is filled in the *same* first pass.
         self._fisher_saw_embedding = set()
         fisher_acc = (
             ops.FisherAccumulator(direct_fim_max_params)
             if non_kfac_strategy == "direct"
             else None
         )
-        ctx = self._fit(train_fm, train_steps, device, verbose, fisher_acc)
+        ctx = self._fit(train_source, device, fisher_acc)
         fim_ctx: Dict[str, torch.Tensor] = (
             self._finalize_fisher(fisher_acc, direct_fim_max_params)
             if fisher_acc is not None
@@ -261,76 +286,31 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 + ". Check `layer_name` and the collected layers."
             )
 
-        def _test_reps(td: Gradient) -> Tuple[object, Dict[str, torch.Tensor]]:
-            return self._prepare_test(td, ctx), self._prepare_fim_test(td, fim_ctx)
+        # Per test block: (K-FAC rep, direct-Fisher rep).  Per (train, test) pair:
+        # the summed K-FAC + direct-Fisher score.
+        def prepare(test_g: Gradient) -> Tuple[object, Dict[str, torch.Tensor]]:
+            return self._prepare_test(test_g, ctx), self._prepare_fim_test(test_g, fim_ctx)
 
-        # One pass over the test files: fix the column order (disk order) and,
-        # unless looping, build + cache each block's test representation.
-        test_ids: List[str] = []
-        test_index: dict = {}
-        cached_test: List[Tuple[object, Dict[str, torch.Tensor], List[str]]] = []
-        for _step, test_g, test_hashes in iter_gradient_blocks(
-            test_fm, test_steps, self.args, self.layer_name,
-            desc=f"{self.algorithm}: preparing test",
-            verbose=verbose,
-        ):
-            for h in test_hashes:
-                if h not in test_index:
-                    test_index[h] = len(test_ids)
-                    test_ids.append(h)
-            if not loop_over_test:
-                kfac_rep, fim_rep = _test_reps(test_g.to(device))
-                cached_test.append((kfac_rep, fim_rep, test_hashes))
-        num_test = len(test_ids)
+        def score(train_g: Gradient, rep: object, n_test: int) -> torch.Tensor:
+            test_rep, fim_rep = rep
+            return self._combine_score(train_g, test_rep, fim_rep, ctx, fim_ctx, n_test)
 
-        def _loop_test_reps():
-            for _s, g, h in iter_gradient_blocks(
-                test_fm, test_steps, self.args, self.layer_name
-            ):
-                kfac_rep, fim_rep = _test_reps(g.to(device))
-                yield kfac_rep, fim_rep, h
-
-        # Score every selected train block against every test representation.
-        row_chunks: List[torch.Tensor] = []
-        row_train_ids: List[str] = []
-        row_steps: List[int] = []
-        for train_step, train_g, train_hashes in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name,
-            desc=f"{self.algorithm}: scoring",
-            verbose=verbose,
-        ):
-            train_g = train_g.to(device)
-            row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
-            test_reps = _loop_test_reps() if loop_over_test else cached_test
-            for test_rep, fim_rep, test_hashes in test_reps:
-                cols = [test_index[h] for h in test_hashes]
-                block = self._combine_score(
-                    train_g, test_rep, fim_rep, ctx, fim_ctx, len(cols)
-                )
-                row[:, cols] = block.detach().to("cpu", torch.float)
-            row_chunks.append(row)
-            row_train_ids.extend(train_hashes)
-            row_steps.extend([train_step] * train_g.batch_size)
-
-        scores = (
-            torch.cat(row_chunks, dim=0)
-            if row_chunks
-            else torch.zeros(0, num_test, dtype=torch.float)
+        scores, row_train_ids, row_steps, test_ids = score_sources(
+            train_source, test_source, device,
+            prepare_test=prepare, score_block=score, loop_over_test=loop_over_test,
         )
 
         result = AttributionScore(
             scores=scores,
             row_train_ids=row_train_ids,
             # One row per train sample, stamped with the step it was recorded at.
-            # These are single-checkpoint methods, so a given dir typically holds
-            # one step; the real step is preserved rather than forced to 0.
             row_steps=row_steps,
             test_ids=test_ids,
             algorithm_meta={
                 "damping": self.damping,
-                "selected_training_steps": train_steps,
                 "non_kfac_strategy": non_kfac_strategy,
                 "direct_fim_layers": sorted(fim_ctx),
+                **(algorithm_meta_extra or {}),
             },
             algorithm=self.algorithm,
             normalized_grad=False,
@@ -338,6 +318,105 @@ class _KroneckerBaseAttributor(BaseAttributor):
         )
         result.save(self.args.output_path)
         return result
+
+    def attribute_from_cache(
+        self,
+        train_gradients_dir: str,
+        test_gradients_dir: str,
+        *,
+        selected_training_steps: Optional[Iterable[int]] = None,
+        loop_over_test: bool = False,
+        verbose: bool = False,
+        non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
+        direct_fim_max_params: int = 4096,
+    ) -> AttributionScore:
+        """Score pre-collected on-disk gradients (the *store-then-attribute* path).
+
+        The Fisher is estimated from the (selected) train gradients; the test set
+        supplies every column.
+
+        Args:
+            train_gradients_dir, test_gradients_dir: Directories written by
+                :class:`GradientFileManager` for the train / test passes.
+            selected_training_steps: Restrict the train checkpoints (Fisher fit +
+                output rows) to these steps; ``None`` uses all on disk.
+            loop_over_test: Re-stream + rebuild the test reps per train block (low
+                memory) instead of caching them once (default).
+            verbose: Show tqdm progress bars on the logging process.
+            non_kfac_strategy: ``"ignore"`` (default) skips norm layers; ``"direct"``
+                adds a dense empirical-Fisher preconditioner for each, bounded by
+                ``direct_fim_max_params``.
+        """
+        if train_gradients_dir is None or test_gradients_dir is None:
+            raise ValueError(
+                f"{type(self).__name__} requires both train_gradients_dir and "
+                "test_gradients_dir."
+            )
+        train = DiskGradientSource(
+            GradientFileManager(train_gradients_dir), self.args,
+            steps=selected_training_steps, layer_name=self.layer_name,
+            desc=f"{self.algorithm}: train", verbose=verbose,
+        )
+        test = DiskGradientSource(
+            GradientFileManager(test_gradients_dir), self.args,
+            layer_name=self.layer_name, desc=f"{self.algorithm}: preparing test",
+            verbose=verbose,
+        )
+        return self._run(
+            train, test, loop_over_test=loop_over_test,
+            non_kfac_strategy=non_kfac_strategy,
+            direct_fim_max_params=direct_fim_max_params,
+            algorithm_meta_extra={"selected_training_steps": train._steps},
+        )
+
+    def attribute(
+        self,
+        train_dataset: Dataset,
+        test_dataset: Dataset,
+        *,
+        loop_over_test: bool = False,
+        non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
+        direct_fim_max_params: int = 4096,
+    ) -> AttributionScore:
+        """Score by collecting gradients **live** at the task's first checkpoint.
+
+        K-FAC/EK-FAC are **single-checkpoint** methods, so only the first
+        checkpoint of the task is used (matching dattri).  Both sides are frozen
+        probes; the model, loss (and optional ``target_func`` for the test side),
+        and the batch sizes come from the task and ``args``.
+        """
+        if self.task is None:
+            raise ValueError(
+                "attribute() (live collection) requires a `task` with a model; "
+                "use attribute_from_cache()."
+            )
+        n_ckpt = len(self.task.get_checkpoints())
+        if n_ckpt > 1:
+            warnings.warn(
+                f"{type(self).__name__} is single-checkpoint; only checkpoint 0 is "
+                f"used and the other {n_ckpt - 1} provided checkpoint(s) are "
+                "ignored.",
+                stacklevel=2,
+            )
+        self.task._load_checkpoints(0)
+        model = self.task.get_model()
+        train = GradientStreamer(
+            model, train_dataset, self.args,
+            batch_size=self.args.per_device_train_batch_size,
+            loss_fn=task_loss_fn(self.task.original_loss_func),
+        )
+        test = GradientStreamer(
+            model, test_dataset, self.args,
+            batch_size=self.args.per_device_eval_batch_size,
+            loss_fn=task_loss_fn(self.task.original_target_func),
+            hook_manager=train.hook_manager,  # one set of hooks over the model
+        )
+        with train, test:
+            return self._run(
+                train, test, loop_over_test=loop_over_test,
+                non_kfac_strategy=non_kfac_strategy,
+                direct_fim_max_params=direct_fim_max_params,
+            )
 
     # ------------------------------------------------------------------ #
     # Shared helpers                                                     #
@@ -481,18 +560,12 @@ class KFACAttributor(_KroneckerBaseAttributor):
 
     def _fit(
         self,
-        train_fm: GradientFileManager,
-        train_steps: List[int],
+        train_source: GradientSource,
         device: torch.device,
-        verbose: bool,
         fisher_acc: Optional[ops.FisherAccumulator],
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         kron = ops.KroneckerAccumulator()
-        for _step, train_g, _ in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name,
-            desc="KFAC: fitting",
-            verbose=verbose,
-        ):
+        for _step, train_g, _ in train_source:
             train_g = train_g.to(device)
             kron.update(train_g, self._kfac_layers(train_g))
             # Reuse this single sweep to fit the direct Fisher for norm layers.
@@ -587,20 +660,14 @@ class EKFACAttributor(_KroneckerBaseAttributor):
 
     def _fit(
         self,
-        train_fm: GradientFileManager,
-        train_steps: List[int],
+        train_source: GradientSource,
         device: torch.device,
-        verbose: bool,
         fisher_acc: Optional[ops.FisherAccumulator],
     ) -> dict:
         # Pass 1 — Kronecker covariance factors and their eigenbases (and, when
         # requested, the direct Fisher for norm layers from the same sweep).
         kron = ops.KroneckerAccumulator()
-        for _step, train_g, _ in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name,
-            desc="EKFAC: fitting factors",
-            verbose=verbose,
-        ):
+        for _step, train_g, _ in train_source:
             train_g = train_g.to(device)
             kron.update(train_g, self._kfac_layers(train_g))
             if fisher_acc is not None:
@@ -622,11 +689,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         # so the data is not streamed for nothing.
         lam_sum: Dict[str, torch.Tensor] = {}
         counts: Dict[str, int] = {}
-        for _step, train_g, _ in iter_gradient_blocks(
-            train_fm, train_steps, self.args, self.layer_name,
-            desc="EKFAC: fitting correction",
-            verbose=verbose,
-        ) if eig else ():
+        for _step, train_g, _ in (train_source if eig else ()):
             train_g = train_g.to(device)
             for layer, (U_A, U_G) in eig.items():
                 if layer not in train_g.data:

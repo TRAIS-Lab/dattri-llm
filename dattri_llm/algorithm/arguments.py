@@ -137,6 +137,31 @@ class AttributionArguments:
         },
     )
 
+    # ── Optimizer / scheduler (live trajectory collection) ───────────────────
+    # Used only by GradientStreamer when ``enable_update=True`` and no optimizer is
+    # supplied: the trajectory optimizer/scheduler are built from these, mirroring
+    # transformers.TrainingArguments.
+
+    learning_rate: float = field(
+        default=5e-5, metadata={"help": "Initial learning rate for the trajectory optimizer."},
+    )
+    weight_decay: float = field(
+        default=0.0, metadata={"help": "Weight decay (excludes bias / norm params, as in HF)."},
+    )
+    optim: str = field(
+        default="adamw_torch",
+        metadata={"help": "Trajectory optimizer: 'adamw_torch' or 'sgd'.",
+                  "choices": ["adamw_torch", "sgd"]},
+    )
+    adam_beta1: float = field(default=0.9, metadata={"help": "AdamW beta1."})
+    adam_beta2: float = field(default=0.999, metadata={"help": "AdamW beta2."})
+    adam_epsilon: float = field(default=1e-8, metadata={"help": "AdamW epsilon."})
+    lr_scheduler_type: str = field(
+        default="linear",
+        metadata={"help": "LR schedule (transformers.get_scheduler name), e.g. 'linear', 'constant'."},
+    )
+    warmup_steps: int = field(default=0, metadata={"help": "LR warmup steps."})
+
     # ── Gradient behaviour ───────────────────────────────────────────────────
 
     max_grad_norm: Optional[float] = field(

@@ -60,6 +60,9 @@ on-disk order — identical bookkeeping to TracIn and the K-FAC family.
 
 from __future__ import annotations
 
+import json
+import os
+import warnings
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -67,13 +70,11 @@ from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
 from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import (
-    BaseAttributor,
-    iter_gradient_blocks,
-    resolve_steps,
-)
+from dattri_llm.algorithm.base import BaseAttributor, resolve_steps, task_loss_fn
 from dattri_llm.algorithm.score import AttributionScore
-from dattri_llm.algorithm.task import AttributionTask
+from dattri_llm.algorithm.streaming import DiskGradientSource, GradientStreamer
+from dattri.task import AttributionTask
+from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
 
@@ -99,7 +100,9 @@ class DVEmbAttributor(BaseAttributor):
             mapping must cover every propagated step (``step < final_step``).
         layer_name: Restrict the gradients (and therefore the Fisher) to these
             layer names.  ``None`` uses every layer present in the gradients.
-        task: Accepted for parity with the workflow-1 API but unused here.
+        task: Required by the on-the-fly :meth:`cache` / :meth:`attribute`
+            (supplies the model, the loss, and the optional ``target_func`` for
+            the test side); unused by :meth:`attribute_from_cache`.
     """
 
     algorithm = "DVEmb"
@@ -130,8 +133,99 @@ class DVEmbAttributor(BaseAttributor):
         else:
             self.layer_name = list(layer_name)
 
-    def cache(self, train_dataset: Dataset) -> None:
-        """No-op: gradients are already cached on disk in this workflow."""
+    def cache(
+        self,
+        train_dataset: Dataset,
+        test_dataset: Dataset,
+        *,
+        cache_dir: Optional[str] = None,
+        offload_interval: int = 1,
+    ) -> Tuple[str, str]:
+        """Run the training trajectory live and cache the gradients DVEmb needs.
+
+        DVEmb is trajectory-aware, so — unlike the trajectory-agnostic attributors
+        — it cannot collect both sides at one checkpoint.  It needs (a) the
+        per-step **train** gradients along the trajectory and (b) the **test**
+        gradients at the *final* model ``θ_T``, which only exists once training
+        finishes.  This method therefore:
+
+        1. drives one live training pass from the task's first checkpoint
+           (``GradientStreamer`` with ``enable_update=True``), offloading each
+           step's per-batch train gradient to disk;
+        2. then — with the model now advanced to ``θ_T`` — runs a frozen pass
+           over the test set, offloading those gradients.
+
+        The two directories feed straight into :meth:`attribute_from_cache`, so
+        on-the-fly :meth:`attribute` is exactly *cache + attribute_from_cache*.
+
+        Args:
+            train_dataset, test_dataset: Datasets to stream (batches go straight
+                to the task's loss / ``target_func``).
+            cache_dir: Parent directory for the two gradient stores
+                (``<cache_dir>/train_grads`` and ``<cache_dir>/test_grads``);
+                defaults to ``args.output_dir``.
+            offload_interval: Steps accumulated per gradient file.  ``1``
+                (default) writes one file per step — best for DVEmb's per-step
+                sweep (no redundant multi-step file reloads).
+
+        Returns:
+            ``(train_gradients_dir, test_gradients_dir)``.
+        """
+        if self.task is None:
+            raise ValueError(
+                "cache() (live collection) requires a `task` with a model; pass "
+                "pre-collected gradients to attribute_from_cache() instead."
+            )
+        n_ckpt = len(self.task.get_checkpoints())
+        if n_ckpt > 1:
+            warnings.warn(
+                f"DVEmb regenerates the trajectory live from checkpoint 0; the "
+                f"other {n_ckpt - 1} provided checkpoint(s) are ignored.",
+                stacklevel=2,
+            )
+        cache_dir = cache_dir if cache_dir is not None else self.args.output_dir
+        train_dir = os.path.join(cache_dir, "train_grads")
+        test_dir = os.path.join(cache_dir, "test_grads")
+        train_fm = GradientFileManager(train_dir)
+        test_fm = GradientFileManager(test_dir)
+
+        self.task._load_checkpoints(0)
+        model = self.task.get_model()
+        train_loss = task_loss_fn(self.task.original_loss_func)
+        # The test side is collected against the task's target_func (which dattri
+        # defaults to the loss when none is given), at the final model θ_T.
+        test_loss = task_loss_fn(self.task.original_target_func)
+
+        # 1) Train trajectory θ_0 → θ_T: offload each step's per-batch gradient.
+        train_streamer = GradientStreamer(
+            model, train_dataset, self.args,
+            batch_size=self.args.per_device_train_batch_size,
+            enable_update=True, loss_fn=train_loss,
+        )
+        train_streamer.hook_manager.add_callback(
+            OffloadCallback(offload_interval, train_fm, recording_type="per_batch")
+        )
+        with train_streamer:
+            for _ in train_streamer:
+                pass
+        # Record the LR actually applied per step, so attribute_from_cache can
+        # verify the configured ``learning_rate`` matches the real trajectory.
+        self._write_lr_schedule(train_dir, train_streamer.learning_rates)
+
+        # 2) Test gradients at the now-final model θ_T (frozen probe).
+        test_streamer = GradientStreamer(
+            model, test_dataset, self.args,
+            batch_size=self.args.per_device_eval_batch_size,
+            enable_update=False, loss_fn=test_loss,
+        )
+        test_streamer.hook_manager.add_callback(
+            OffloadCallback(offload_interval, test_fm, recording_type="per_batch")
+        )
+        with test_streamer:
+            for _ in test_streamer:
+                pass
+
+        return train_dir, test_dir
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
@@ -156,12 +250,64 @@ class DVEmbAttributor(BaseAttributor):
         mat = block.to(device).materialize()
         return {name: value.float() for name, value in mat.data.items()}
 
+    @staticmethod
+    def _lr_schedule_path(train_gradients_dir: str) -> str:
+        return os.path.join(train_gradients_dir, "lr_schedule.json")
+
+    def _write_lr_schedule(
+        self, train_gradients_dir: str, lrs: Mapping[int, float]
+    ) -> None:
+        """Persist the per-step LR actually applied during training."""
+        os.makedirs(train_gradients_dir, exist_ok=True)
+        with open(self._lr_schedule_path(train_gradients_dir), "w") as f:
+            json.dump({str(k): float(v) for k, v in lrs.items()}, f)
+
+    def _read_lr_schedule(
+        self, train_gradients_dir: str
+    ) -> Optional[Dict[int, float]]:
+        """The per-step LR recorded by :meth:`cache`, or ``None`` if absent (e.g.
+        a directory produced outside the on-the-fly workflow)."""
+        path = self._lr_schedule_path(train_gradients_dir)
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return {int(k): float(v) for k, v in json.load(f).items()}
+
+    def _warn_on_lr_mismatch(
+        self, recorded_lr: Mapping[int, float], prop_steps: List[int]
+    ) -> None:
+        """Warn if the configured ``learning_rate`` disagrees with the recorded
+        training schedule over any propagated step.  The configured schedule is
+        still the one used for the Fisher factors ``(I − η H)`` — this only flags
+        a likely mismatch with the trajectory that produced the gradients."""
+        mismatched: List[Tuple[int, float, float]] = []
+        for s in sorted(prop_steps):
+            want = recorded_lr.get(s)
+            if want is None:
+                continue
+            try:
+                got = self._lr(s)
+            except ValueError:
+                continue  # configured schedule missing this step; surfaces later
+            if abs(got - want) > 1e-9 + 1e-6 * abs(want):
+                mismatched.append((s, got, want))
+        if mismatched:
+            s0, g0, w0 = mismatched[0]
+            warnings.warn(
+                f"DVEmb learning_rate disagrees with the schedule recorded during "
+                f"training at {len(mismatched)}/{len(prop_steps)} step(s) (e.g. "
+                f"step {s0}: configured {g0:g} vs recorded {w0:g}). The configured "
+                f"schedule is used, but the Fisher factors (I − η H) will not match "
+                f"the trajectory — set learning_rate to the recorded schedule.",
+                stacklevel=2,
+            )
+
     def _propagate_and_score(
         self,
         w: Dict[str, torch.Tensor],
         n_cols: int,
         layers: List[str],
-        train_fm: GradientFileManager,
+        train_source: DiskGradientSource,
         prop_steps: List[int],
         output_steps: set,
         device: torch.device,
@@ -170,12 +316,14 @@ class DVEmbAttributor(BaseAttributor):
     ) -> Tuple[torch.Tensor, List[str], List[int]]:
         """One latest→earliest sweep for the ``n_cols`` columns held in ``w``.
 
-        The step is the outer loop, so each train block is loaded/materialised
-        once **per call**; ``w[name]`` (shape ``(n_cols, d)``) is scored against
-        the step's train gradients and then advanced in place by that step's
-        Fisher factor.  Because every test column propagates independently,
-        scoring a subset of columns gives identical values to scoring them all —
-        this is what makes the ``loop_over_test`` column-blocking exact.
+        The step is the outer loop; each step's train blocks are pulled from
+        ``train_source`` via :meth:`DiskGradientSource.for_steps` (random-access
+        by step) and materialised once **per call**.  ``w[name]`` (shape
+        ``(n_cols, d)``) is scored against the step's train gradients and then
+        advanced in place by that step's Fisher factor.  Because every test column
+        propagates independently, scoring a subset of columns gives identical
+        values to scoring them all — this is what makes the ``loop_over_test``
+        column-blocking exact.
 
         Returns ``(scores (num_rows, n_cols), row_train_ids, row_steps)``.
         """
@@ -200,9 +348,7 @@ class DVEmbAttributor(BaseAttributor):
                 name: torch.zeros_like(w[name]) for name in layers
             }
             n_t = 0
-            for _s, train_g, train_hashes in iter_gradient_blocks(
-                train_fm, [ts], self.args, self.layer_name
-            ):
+            for _s, train_g, train_hashes in train_source.for_steps([ts]):
                 mat = self._materialize(train_g, device)
                 shared = [n for n in layers if n in mat]
                 if not shared:
@@ -233,8 +379,47 @@ class DVEmbAttributor(BaseAttributor):
         return scores, row_train_ids, row_steps
 
     # ------------------------------------------------------------------ #
-    # Main entry point                                                   #
+    # Main entry points                                                  #
     # ------------------------------------------------------------------ #
+
+    def attribute(
+        self,
+        train_dataset: Dataset,
+        test_dataset: Dataset,
+        *,
+        loop_over_test: bool = False,
+        selected_training_steps: Optional[Iterable[int]] = None,
+        loss_reduction: str = "mean",
+        verbose: bool = False,
+    ) -> AttributionScore:
+        """Score **on the fly**: cache the trajectory, then attribute from cache.
+
+        Exactly :meth:`cache` (live train trajectory + final-model ``θ_T`` test
+        gradients) followed by :meth:`attribute_from_cache`.  ``final_step`` is
+        not exposed here — it is the number of training steps just run.
+
+        The learning-rate schedule used for the Fisher product
+        (``self.learning_rate``) and ``loss_reduction`` should match the live
+        training run configured by ``args`` (e.g. for a constant schedule, set
+        ``learning_rate == args.learning_rate``); otherwise the propagation
+        factors ``(I − η H_k)`` will not match the trajectory.  :meth:`cache`
+        records the *actual* per-step LR and :meth:`attribute_from_cache` warns
+        if the configured schedule disagrees with it.
+
+        Args:
+            train_dataset, test_dataset: Datasets to stream.
+            loop_over_test, selected_training_steps, loss_reduction, verbose: As
+                in :meth:`attribute_from_cache`.
+        """
+        train_dir, test_dir = self.cache(train_dataset, test_dataset)
+        return self.attribute_from_cache(
+            train_dir,
+            test_dir,
+            loop_over_test=loop_over_test,
+            selected_training_steps=selected_training_steps,
+            loss_reduction=loss_reduction,
+            verbose=verbose,
+        )
 
     def attribute_from_cache(
         self,
@@ -322,7 +507,6 @@ class DVEmbAttributor(BaseAttributor):
 
         train_fm = GradientFileManager(train_gradients_dir)
         test_fm = GradientFileManager(test_gradients_dir)
-        device = self.args.device
 
         available = train_fm.available_steps()
         if final_step is None:
@@ -334,8 +518,13 @@ class DVEmbAttributor(BaseAttributor):
                 f"No training step satisfies step < final_step ({final_step}); "
                 f"available steps: {available}."
             )
+        # If the train dir carries a schedule recorded by cache(), check the
+        # configured learning_rate against it (warn-only; configured one is used).
+        recorded_lr = self._read_lr_schedule(train_gradients_dir)
+        if recorded_lr is not None:
+            self._warn_on_lr_mismatch(recorded_lr, prop_steps)
         # ``selected_training_steps`` filters only which steps are emitted as
-        # rows; the propagation below always sweeps every step in ``prop_steps``.
+        # rows; the propagation always sweeps every step in ``prop_steps``.
         if selected_training_steps is None:
             output_steps = set(prop_steps)
         else:
@@ -343,11 +532,56 @@ class DVEmbAttributor(BaseAttributor):
                 prop_steps
             )
 
-        test_steps = test_fm.available_steps()
+        # The train source is restricted to the propagated steps; the sweep pulls
+        # one step at a time from it (DiskGradientSource.for_steps).  The test
+        # source supplies every column (the final-model gradients).
+        train_source = DiskGradientSource(
+            train_fm, self.args, steps=prop_steps, layer_name=self.layer_name,
+        )
+        test_source = DiskGradientSource(
+            test_fm, self.args, layer_name=self.layer_name,
+            desc="DVEmb: test", verbose=verbose,
+        )
+        return self._run(
+            train_source,
+            test_source,
+            prop_steps=prop_steps,
+            output_steps=output_steps,
+            loss_reduction=loss_reduction,
+            loop_over_test=loop_over_test,
+            verbose=verbose,
+            algorithm_meta={
+                "final_step": final_step,
+                "selected_training_steps": sorted(output_steps),
+                "propagated_steps": sorted(prop_steps),
+                "learning_rate": self.learning_rate,
+                "loss_reduction": loss_reduction,
+            },
+        )
 
-        # The test embedding w starts at the final-model test gradients and is
-        # back-propagated through the steps.  Each test column evolves
-        # independently, so loop_over_test trades memory for disk reads.
+    def _run(
+        self,
+        train_source: DiskGradientSource,
+        test_source: DiskGradientSource,
+        *,
+        prop_steps: List[int],
+        output_steps: set,
+        loss_reduction: str,
+        loop_over_test: bool,
+        verbose: bool,
+        algorithm_meta: dict,
+    ) -> AttributionScore:
+        """Score a train source against a test source — the shared DVEmb loop.
+
+        The test embedding ``w`` starts at the final-model test gradients and is
+        back-propagated through ``prop_steps`` (latest→earliest) by
+        :meth:`_propagate_and_score`, pulling each step's train blocks from
+        ``train_source``.  Because every test column propagates independently,
+        ``loop_over_test`` trades memory for disk reads without changing the
+        result.  Both sources are re-iterable (``reusable``); the train source is
+        swept once per test pass.
+        """
+        device = self.args.device
         if not loop_over_test:
             # ---- step outer / test inner: one dense embedding, train read once.
             # Materialise every test gradient into one (num_test, d) embedding and
@@ -356,11 +590,7 @@ class DVEmbAttributor(BaseAttributor):
             test_ids: List[str] = []
             test_index: Dict[str, int] = {}
             pending: List[Tuple[Dict[str, torch.Tensor], List[int]]] = []
-            for _step, test_g, test_hashes in iter_gradient_blocks(
-                test_fm, test_steps, self.args, self.layer_name,
-                desc="DVEmb: loading test",
-                verbose=verbose,
-            ):
+            for _step, test_g, test_hashes in test_source:
                 mat = self._materialize(test_g, device)
                 cols: List[int] = []
                 for h in test_hashes:
@@ -382,7 +612,7 @@ class DVEmbAttributor(BaseAttributor):
                     w[name].index_copy_(0, idx, mat[name])
             del pending
             scores, row_train_ids, row_steps = self._propagate_and_score(
-                w, num_test, layers, train_fm, prop_steps, output_steps,
+                w, num_test, layers, train_source, prop_steps, output_steps,
                 device, loss_reduction, verbose,
             )
         else:
@@ -390,14 +620,10 @@ class DVEmbAttributor(BaseAttributor):
             # Bounds peak memory to a single test block's embedding by giving each
             # test block its own full sweep (re-reading the train gradients once
             # per block).  Use when the full test embedding does not fit.
-            # Pass 1 fixes the column order from hashes alone (no materialise).
+            # Pass 1 fixes the column order from hashes alone.
             test_ids = []
             test_index = {}
-            for _step, _tg, test_hashes in iter_gradient_blocks(
-                test_fm, test_steps, self.args, self.layer_name,
-                desc="DVEmb: indexing test",
-                verbose=verbose,
-            ):
+            for _step, _tg, test_hashes in test_source:
                 for h in test_hashes:
                     if h not in test_index:
                         test_index[h] = len(test_ids)
@@ -407,16 +633,12 @@ class DVEmbAttributor(BaseAttributor):
             scores = None
             row_train_ids = []
             row_steps = []
-            for _step, test_g, test_hashes in iter_gradient_blocks(
-                test_fm, test_steps, self.args, self.layer_name,
-                desc="DVEmb: scoring test blocks",
-                verbose=verbose,
-            ):
+            for _step, test_g, test_hashes in test_source:
                 w_block = self._materialize(test_g, device)  # (B_block, d) per layer
                 layers = list(w_block.keys())
                 block_cols = [test_index[h] for h in test_hashes]
                 block_scores, rtids, rsteps = self._propagate_and_score(
-                    w_block, len(block_cols), layers, train_fm, prop_steps,
+                    w_block, len(block_cols), layers, train_source, prop_steps,
                     output_steps, device, loss_reduction, verbose,
                 )
                 if scores is None:
@@ -434,13 +656,7 @@ class DVEmbAttributor(BaseAttributor):
             row_train_ids=row_train_ids,
             row_steps=row_steps,
             test_ids=test_ids,
-            algorithm_meta={
-                "final_step": final_step,
-                "selected_training_steps": sorted(output_steps),
-                "propagated_steps": sorted(prop_steps),
-                "learning_rate": self.learning_rate,
-                "loss_reduction": loss_reduction,
-            },
+            algorithm_meta=algorithm_meta,
             algorithm=self.algorithm,
             normalized_grad=False,
             layer_name=self.layer_name,

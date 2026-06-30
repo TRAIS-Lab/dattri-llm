@@ -50,7 +50,7 @@ from dattri_llm.algorithm.base import iter_gradient_blocks, resolve_steps
 from dattri_llm.gradient.callbacks import CaptureCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_ALL
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,22 @@ class DiskGradientSource(GradientSource):
             verbose=self._verbose,
         )
 
+    def for_steps(self, steps: Iterable[int]) -> "DiskGradientSource":
+        """A view of this source restricted to ``steps`` (same file manager and
+        layer filter).  Disk is random-access by step, so a trajectory attributor
+        (e.g. DVEmb) can pull one step's blocks at a time for its latest→earliest
+        sweep while still going through the source abstraction.  The sub-read
+        shows no progress bar (``verbose=False``) to avoid nesting under the
+        sweep's own bar."""
+        return DiskGradientSource(
+            self._fm,
+            self._args,
+            steps=steps,
+            layer_name=self._layer_name,
+            desc=self._desc,
+            verbose=False,
+        )
+
 
 def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
     """HuggingFace convention: ``model(**batch).loss``.
@@ -215,7 +231,11 @@ class GradientStreamer(GradientSource):
             ``args`` (optim, learning_rate, scheduler) like HF Trainer.
         scheduler: Optional LR scheduler, stepped after the optimizer.
         config: :class:`HookManagerConfig` controlling which layers are hooked.
-            Defaults to ``HookManagerConfig()`` (all linear-capable layers).
+            Defaults to factorized per-sample hooks on every linear-IO-capable
+            layer (``linear_io=REGISTER_ALL``) — *without* the ``param_grad``
+            fallback, since batch-collapsed parameter gradients (e.g. BatchNorm,
+            which couples samples across the batch) are incompatible with
+            per-sample attribution and would be silently skipped.
         collate_fn: Optional DataLoader collate (e.g. an HF data collator).
         checkpoint_step: The step index stamped on every yielded block when the
             model is frozen (all batches share one checkpoint).  Ignored when
@@ -268,7 +288,9 @@ class GradientStreamer(GradientSource):
             self._capture = CaptureCallback()
             self._hm = HookManager(
                 model,
-                config=config if config is not None else HookManagerConfig(),
+                config=config if config is not None else HookManagerConfig(
+                    linear_io=REGISTER_ALL
+                ),
                 callbacks=[self._capture],
             )
             self._owns_hm = True
@@ -313,6 +335,9 @@ class GradientStreamer(GradientSource):
         self._batch_iter: Optional[Iterator] = None
         self._batch_index: int = 0
         self._consumed: bool = False
+        # Per-step LR actually applied (``enable_update``), keyed by step index —
+        # so a trajectory attributor can use/verify the true schedule.
+        self._step_lrs: Dict[int, float] = {}
         # Saved-state for frozen probes (restored on __exit__).
         self._entered: bool = False
         self._collect_ctx = None
@@ -336,6 +361,13 @@ class GradientStreamer(GradientSource):
         ``hook_manager=`` (over the same model) so both share one set of hooks —
         the cleaner alternative to two managers cross-capturing each backward."""
         return self._hm
+
+    @property
+    def learning_rates(self) -> Dict[int, float]:
+        """The LR actually applied at each optimizer step of the last pass
+        (``enable_update``), keyed by step index.  Empty for a frozen probe.
+        Lets a trajectory attributor (DVEmb) recover the true schedule."""
+        return dict(self._step_lrs)
 
     def __len__(self) -> int:
         return len(self._loader)
@@ -409,6 +441,7 @@ class GradientStreamer(GradientSource):
         self._fwd_model.train(self.enable_update)
         self._batch_iter = iter(self._loader)
         self._batch_index = 0
+        self._step_lrs = {}
         # Share a zero baseline with the HookManager's capture counter, so this
         # pass's ``record.step`` aligns with ``_batch_index`` and can be used to
         # validate that exactly one capture step happened per yielded batch.
@@ -495,6 +528,12 @@ class GradientStreamer(GradientSource):
         ``clip_grad_norm_(max_grad_norm)`` → ``optimizer.step`` → ``scheduler.step``.
         ``zero_grad`` happens at the start of the next ``_forward_backward``.
         """
+        # Record the LR applied at this step (the value used by ``optimizer.step``
+        # below, before ``scheduler.step`` advances it), keyed by the current
+        # step index (``_batch_index`` is incremented only after __next__).
+        self._step_lrs[self._batch_index] = float(
+            self._optimizer.param_groups[0]["lr"]  # type: ignore[union-attr]
+        )
         if self._scaler.is_enabled():
             self._scaler.unscale_(self._optimizer)
         if self._max_grad_norm is not None and self._max_grad_norm > 0:
