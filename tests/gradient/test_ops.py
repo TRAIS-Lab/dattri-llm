@@ -15,9 +15,10 @@ Two suites:
         _grad_norm_sq(a, g, lt)[i]     ==  ||mat[i]||²
         _dot(a1,g1, a2,g2, lt)[i]      ==  mat1[i] · mat2[i]
 
-    where ``mat = _materialize(a, g, lt)``.  Factors are supplied already in the
-    preprocessed form (no ``module_kwargs``), so these tests exercise the core
-    einsum kernels independently of layer-specific preprocessing.
+    where ``mat = _materialize(a, g, lt, per_token=True)`` (the per-position form,
+    so a norm layer's diagonal cross-gram matches).  Factors are supplied already
+    in the preprocessed form (no ``module_kwargs``), so these tests exercise the
+    core einsum kernels independently of layer-specific preprocessing.
 
 2.  **K-FAC / FIM tests**: covariance-factor shapes, the NotImplementedError
     contract for norm/embedding layers, and streaming-equals-batch consistency
@@ -40,7 +41,6 @@ from dattri_llm.gradient.ops import (
     _kfac,
     _materialize,
     _pairwise_dot,
-    _weight_grad,
 )
 
 # ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ class TestPairwiseDotIdentity:
 
     @pytest.mark.parametrize("lt,a,g", _PARAMS)
     def test_matches_materialized_gram(self, lt, a, g):
-        mat = _materialize(a, g, lt).float()          # (B, d)
+        mat = _materialize(a, g, lt, per_token=True).float()   # norm: per-position
         expected = mat @ mat.T                        # (B, B)
         actual = _pairwise_dot(a, g, lt).float()
         assert actual.shape == (B, B)
@@ -150,7 +150,7 @@ class TestGradNormSqIdentity:
 
     @pytest.mark.parametrize("lt,a,g", _PARAMS)
     def test_matches_materialized_norm(self, lt, a, g):
-        mat = _materialize(a, g, lt).float()          # (B, d)
+        mat = _materialize(a, g, lt, per_token=True).float()   # norm: per-position
         expected = mat.pow(2).sum(-1)                 # (B,)
         actual = _grad_norm_sq(a, g, lt).float()
         assert actual.shape == (B,)
@@ -169,8 +169,8 @@ class TestDotIdentity:
 
     @pytest.mark.parametrize("lt,a1,g1,a2,g2", _PARAMS_CROSS)
     def test_matches_materialized_dot(self, lt, a1, g1, a2, g2):
-        mat1 = _materialize(a1, g1, lt).float()
-        mat2 = _materialize(a2, g2, lt).float()
+        mat1 = _materialize(a1, g1, lt, per_token=True).float()  # norm: per-position
+        mat2 = _materialize(a2, g2, lt, per_token=True).float()
         expected = (mat1 * mat2).sum(-1)              # (B,)
         actual = _dot(a1, g1, a2, g2, lt).float()
         assert actual.shape == (B,)
@@ -256,7 +256,7 @@ class TestStreamingAccumulators:
         ref.update(a, g, lt)
 
         direct = LayerFisherAccumulator()
-        direct.update_from_grad(_weight_grad(a, g, lt))
+        direct.update_from_grad(_materialize(a, g, lt))
 
         assert torch.allclose(ref.result(), direct.result(), atol=1e-6)
 
@@ -270,28 +270,30 @@ class TestStreamingAccumulators:
 
 
 # ---------------------------------------------------------------------------
-# weight_grad — parameter-level (token-summed) per-sample gradient
+# materialize — token-collapse (default) vs per_token=True for norm layers
 # ---------------------------------------------------------------------------
 
-class TestWeightGrad:
+class TestMaterializeCollapse:
     def test_norm_sums_tokens(self):
-        a, g = _norm_3d()                                # (B, T, I)
-        per_token = _materialize(a, g, "nn.LayerNorm")    # (B, T*I)
-        wg = _weight_grad(a, g, "nn.LayerNorm")           # (B, I)
+        a, g = _norm_3d()                                            # (B, T, I)
+        per_token = _materialize(a, g, "nn.LayerNorm", per_token=True)  # (B, T*I)
+        wg = _materialize(a, g, "nn.LayerNorm")                       # (B, I), default collapse
         assert wg.shape == (B, I)
         assert torch.allclose(wg, per_token.reshape(B, T, I).sum(1), atol=1e-5)
 
     def test_norm_dim_independent_of_seq_len(self):
-        m1 = _weight_grad(*[torch.randn(B, 3, I) for _ in range(2)], "nn.LayerNorm")
-        m2 = _weight_grad(*[torch.randn(B, 7, I) for _ in range(2)], "nn.LayerNorm")
+        m1 = _materialize(*[torch.randn(B, 3, I) for _ in range(2)], "nn.LayerNorm")
+        m2 = _materialize(*[torch.randn(B, 7, I) for _ in range(2)], "nn.LayerNorm")
         assert m1.shape == m2.shape == (B, I)
 
     @pytest.mark.parametrize("lt,factory", [
         ("nn.Linear", _linear_3d), ("nn.Embedding", _embedding),
     ])
-    def test_noop_for_token_contracting_types(self, lt, factory):
+    def test_per_token_noop_for_token_contracting_types(self, lt, factory):
         a, g = factory()
-        assert torch.allclose(_weight_grad(a, g, lt), _materialize(a, g, lt), atol=1e-6)
+        assert torch.allclose(
+            _materialize(a, g, lt, per_token=True), _materialize(a, g, lt), atol=1e-6
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +386,12 @@ class TestFactorizedWrappers:
         f = Factorized(a, g)
         assert torch.allclose(ops.materialize(f, "nn.Linear"), _materialize(a, g, "nn.Linear"))
 
-    def test_weight_grad_f_matches_raw(self):
+    def test_materialize_norm_f_matches_raw(self):
         a, g = _norm_3d()
         f = Factorized(a, g)
-        assert torch.allclose(ops.weight_grad(f, "nn.LayerNorm"), _weight_grad(a, g, "nn.LayerNorm"))
+        assert torch.allclose(
+            ops.materialize(f, "nn.LayerNorm"), _materialize(a, g, "nn.LayerNorm")
+        )
 
     def test_grad_norm_sq_f_matches_raw(self):
         a, g = _linear_3d()
@@ -419,12 +423,12 @@ class TestFactorizedWrappers:
         sf = _seq_first(bf)
         assert torch.allclose(ops.materialize(bf, lt), ops.materialize(sf, lt), atol=1e-5)
 
-    def test_weight_grad_f_seq_first_equals_batch_first(self):
+    def test_materialize_norm_seq_first_equals_batch_first(self):
         bf = Factorized(*_norm_3d())
         sf = _seq_first(bf)
         assert torch.allclose(
-            ops.weight_grad(bf, "nn.LayerNorm"),
-            ops.weight_grad(sf, "nn.LayerNorm"), atol=1e-5,
+            ops.materialize(bf, "nn.LayerNorm"),
+            ops.materialize(sf, "nn.LayerNorm"), atol=1e-5,
         )
 
     def test_kfac_cross_f_seq_first_equals_batch_first(self):

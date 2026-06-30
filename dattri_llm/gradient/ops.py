@@ -507,17 +507,22 @@ def _materialize(
     layer_type: str,
     module_kwargs: Optional[dict] = None,
     include_bias: bool = True,
+    per_token: bool = False,
 ) -> torch.Tensor:
-    """Compute per-sample weight gradient, returning shape (B, d).
+    """Compute the per-sample weight gradient, returning shape (B, d).
 
     When *module_kwargs* is provided the raw hook captures are preprocessed
     first via :func:`_preprocess_factorized` (im2col for Conv, x̂ for
     LayerNorm, bias augmentation for Linear).  Pass ``module_kwargs=None``
     when the tensors are already in the preprocessed form.
 
-    For norm layers the per-position gradient is returned flattened:
-    shape (B, T*d) for 3-D inputs, (B, d) for 2-D.  Summing over the
-    token positions recovers the actual weight gradient.
+    A norm layer's gradient is per-position (elementwise).  By default
+    (``per_token=False``) the token axis is summed, giving the actual weight
+    gradient ``(B, d)`` — a fixed dimension independent of sequence length, the
+    granularity an empirical Fisher or influence score operates on.  Pass
+    ``per_token=True`` to keep the un-summed per-position products ``(B, T*d)``.
+    For every other layer type the token/spatial axis is already contracted by
+    the gradient's structure, so ``per_token`` has no effect.
     """
     a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
 
@@ -528,9 +533,8 @@ def _materialize(
     g_f = _to_3d(g.float())   # (B, T, d_out)
 
     if is_norm(layer_type):
-        # Per-position elementwise product, flattened over T.
-        # Summing the (T, d) result over T gives the actual weight gradient.
-        return (a_f * g_f).flatten(1)          # (B, T*d)
+        prod = a_f * g_f                       # (B, T, d) per-position gradient
+        return prod.flatten(1) if per_token else prod.sum(1)  # (B, T*d) or (B, d)
 
     if is_conv_transpose(layer_type):
         # a=(B,L,C_in), g=(B,L,P): ∇W_i = Σ_l a_il g_il^T
@@ -540,30 +544,6 @@ def _materialize(
     # Linear and Conv: ∇W_i = Σ_t g_it ⊗ a_it
     result = torch.einsum("bto,bti->boi", g_f, a_f)
     return result.flatten(1)                   # (B, out*in)
-
-
-def _weight_grad(
-    a: torch.Tensor,
-    g: torch.Tensor,
-    layer_type: str,
-    module_kwargs: Optional[dict] = None,
-    include_bias: bool = True,
-) -> torch.Tensor:
-    """Per-sample gradient over the layer's actual parameters, shape ``(B, P)``.
-
-    This is the parameter-level counterpart to :func:`_materialize`.  For a
-    **norm** layer :func:`_materialize` returns the gradient *per token*
-    (``(B, T*P)``); here the token axis is summed so the result is the gradient
-    of the layer's parameters — the granularity an empirical Fisher or an
-    influence score operates on, and a fixed dimension independent of sequence
-    length.  For every other layer type the token axis is already contracted, so
-    this equals :func:`_materialize`.
-    """
-    mat = _materialize(a, g, layer_type, module_kwargs, include_bias)
-    if is_norm(layer_type):
-        n_tokens = a.shape[1] if a.ndim == 3 else 1
-        mat = mat.reshape(mat.shape[0], n_tokens, -1).sum(1)   # (B, T*P) -> (B, P)
-    return mat
 
 
 # ---------------------------------------------------------------------------
@@ -819,11 +799,11 @@ def _fim(
 ) -> torch.Tensor:
     """Return (d, d) empirical Fisher information matrix.
 
-    Built from the per-sample :func:`_weight_grad` (token-summed for norm layers,
+    Built from the per-sample :func:`_materialize` (token-summed for norm layers,
     so the Fisher is over the layer's actual parameters).  *module_kwargs* is
     passed to :func:`_preprocess_factorized` when provided.
     """
-    grad = _weight_grad(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
+    grad = _materialize(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
     B = grad.shape[0]
     return grad.T @ grad / B
 
@@ -924,22 +904,16 @@ def preprocess_factorized(
 
 
 def materialize(
-    f: "Factorized", layer_type: str, include_bias: bool = True
+    f: "Factorized", layer_type: str, include_bias: bool = True, per_token: bool = False
 ) -> torch.Tensor:
-    """:func:`_materialize` on a :class:`Factorized` (batch-first-safe)."""
+    """:func:`_materialize` on a :class:`Factorized` (batch-first-safe).
+
+    ``per_token=False`` (default) sums a norm layer's token axis to the actual
+    weight gradient; ``per_token=True`` keeps the per-position products."""
     bf = f.as_batch_first()
     return _materialize(
-        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
-    )
-
-
-def weight_grad(
-    f: "Factorized", layer_type: str, include_bias: bool = True
-) -> torch.Tensor:
-    """:func:`_weight_grad` on a :class:`Factorized` (batch-first-safe)."""
-    bf = f.as_batch_first()
-    return _weight_grad(
-        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs,
+        include_bias, per_token,
     )
 
 
@@ -1154,7 +1128,7 @@ class LayerKroneckerAccumulator:
 class LayerFisherAccumulator:
     """Streaming empirical Fisher accumulator for a *single* layer.
 
-    Accumulates ``Σ_i g_i g_iᵀ`` over the per-sample :func:`_weight_grad` ``g_i``.
+    Accumulates ``Σ_i g_i g_iᵀ`` over the per-sample :func:`_materialize` ``g_i``.
     For the across-layers version see :class:`FisherAccumulator`.
     """
 
@@ -1173,7 +1147,7 @@ class LayerFisherAccumulator:
 
         *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
         """
-        self.update_from_grad(_weight_grad(a, g, layer_type, module_kwargs, include_bias))
+        self.update_from_grad(_materialize(a, g, layer_type, module_kwargs, include_bias))
 
     def update_from_grad(self, grad: torch.Tensor) -> None:
         """Accumulate one batch from already-materialized per-sample gradients.
@@ -1240,7 +1214,7 @@ class FisherAccumulator:
     """Streaming empirical-Fisher accumulator across a model's layers.
 
     Holds one :class:`LayerFisherAccumulator` per layer, accumulating the dense
-    Fisher from each layer's per-sample :func:`_weight_grad`.  When *max_params*
+    Fisher from each layer's per-sample :func:`_materialize`.  When *max_params*
     is given, layers whose parameter count exceeds it are skipped (and recorded
     in :attr:`skipped`) to bound the dense ``O(d²)`` Fisher::
 
@@ -1261,7 +1235,7 @@ class FisherAccumulator:
         for name in layers:
             if name in self._skipped:
                 continue
-            g = weight_grad(gradient.data[name], gradient.layer_types[name])  # (B, P)
+            g = materialize(gradient.data[name], gradient.layer_types[name])  # (B, P)
             if self._max_params is not None and g.shape[-1] > self._max_params:
                 self._skipped[name] = g.shape[-1]
                 self._layers.pop(name, None)

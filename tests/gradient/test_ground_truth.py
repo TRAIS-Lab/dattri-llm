@@ -319,7 +319,9 @@ def _channel_norm_diag_grad(
 
 def _materialize(gradient, name: str, include_bias: bool = True) -> torch.Tensor:
     lt = gradient.layer_types[name]
-    return ops.materialize(gradient.data[name], lt, include_bias).float()
+    # per_token=True keeps norm layers' un-summed per-position products, which the
+    # norm ground-truth tests sum over positions to recover param.grad.
+    return ops.materialize(gradient.data[name], lt, include_bias, per_token=True).float()
 
 
 def _grad_norm_sq(gradient, name: str, include_bias: bool = True) -> torch.Tensor:

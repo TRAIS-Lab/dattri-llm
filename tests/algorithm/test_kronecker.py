@@ -501,7 +501,7 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
             for i in idxs:
                 rec = recs[i]
                 hs = rec.input_hash if isinstance(rec.input_hash, list) else [rec.input_hash]
-                mat = ops.weight_grad(
+                mat = ops.materialize(
                     rec.gradient.data[layer], rec.gradient.layer_types[layer]
                 )
                 for b, h in enumerate(hs):

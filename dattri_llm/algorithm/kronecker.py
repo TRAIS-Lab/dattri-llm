@@ -480,7 +480,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
     @staticmethod
     def _fisher_grad(grad: Gradient, layer: str) -> torch.Tensor:
         """Per-sample ``(B, P)`` weight gradient used for direct-Fisher scoring."""
-        return ops.weight_grad(grad.data[layer], grad.layer_types[layer])
+        return ops.materialize(grad.data[layer], grad.layer_types[layer])
 
     def _prepare_fim_test(
         self, test_g: Gradient, fim_ctx: Dict[str, torch.Tensor]
