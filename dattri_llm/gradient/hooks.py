@@ -52,6 +52,7 @@ import torch.nn as nn
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.gradient import ops
 from dattri_llm.gradient.ops import (
     PARAM_GRAD_TYPES,
     canonical_class_name,
@@ -147,6 +148,17 @@ def _make_layer_buffer() -> LayerBuffer:
         "grad_output": None,
         "_act_parts": [],
         "_grad_parts": [],
+        # Projected per-sample gradient parts for a materialized (TRAK) layer;
+        # for factorized (LoGRA) layers the projected factors live in
+        # _act_parts/_grad_parts (already projected).  ``_proj_kw`` is the layer's
+        # resolved proj_kwargs (or None to capture raw factors as before).
+        # ``_device_id`` maps each replica's device id to a stack of on-device
+        # forward activations, so the backward hook can pair (a, g) *per device*
+        # (LIFO) before projecting — a single shared slot would race across DDP
+        # replica threads and drop calls for layers invoked more than once.
+        "_proj_parts": [],
+        "_proj_kw": None,
+        "_device_id": {},
         "_lock": threading.Lock(),
     }
 
@@ -157,6 +169,8 @@ def register_linear_io_hooks(
     on_layer_forward: Optional[Callable[[str, torch.Tensor], None]] = None,
     on_layer_backward: Optional[Callable[[str, torch.Tensor], None]] = None,
     type_overrides: Optional[dict[str, str]] = None,
+    projection: Optional[dict[str, dict]] = None,
+    projector: Optional[Callable] = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
@@ -216,35 +230,89 @@ def register_linear_io_hooks(
             layer_type = canonical_class_name(module)
         buffers[name]["_class_name"] = layer_type
         buffers[name]["_module_kwargs"] = extract_module_kwargs(module, layer_type)
+        if projection is not None:
+            buffers[name]["_proj_kw"] = projection.get(name, projection.get("__default__"))
 
         def _make_forward_hook(layer_name: str):
             def _fwd(_module, inp, _out):
-                t = inp[0].detach().cpu()
+                a = inp[0].detach()
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
                 buf = buffers[layer_name]
-                with buf["_lock"]:
-                    buf["_act_parts"].append((dev_idx, t))
-                buf["activation"] = t
+                if buf["_proj_kw"] is None:
+                    a = a.cpu()
+                    with buf["_lock"]:
+                        buf["_act_parts"].append((dev_idx, a))
+                    buf["activation"] = a
+                else:
+                    # Projected layer: keep the raw activation on-device so the
+                    # backward hook projects (a, g) together; the full factor is
+                    # never buffered.  A per-device *stack* pairs each call's a
+                    # with its g even when a layer is invoked multiple times per
+                    # forward (weight tying / RNN unroll) — backward pops in the
+                    # reverse (LIFO) order the forwards ran.
+                    with buf["_lock"]:
+                        buf["_device_id"].setdefault(dev_idx, []).append(a)
                 if on_layer_forward is not None:
-                    on_layer_forward(layer_name, t)
+                    on_layer_forward(layer_name, a)
             return _fwd
 
         def _make_backward_hook(layer_name: str):
             def _bwd(_module, _grad_input, grad_output):
-                t = grad_output[0].detach().cpu()
+                g = grad_output[0].detach()
                 dev_idx = grad_output[0].device.index if grad_output[0].is_cuda else 0
                 buf = buffers[layer_name]
-                with buf["_lock"]:
-                    buf["_grad_parts"].append((dev_idx, t))
-                buf["grad_output"] = t
+                if buf["_proj_kw"] is None:
+                    g = g.cpu()
+                    with buf["_lock"]:
+                        buf["_grad_parts"].append((dev_idx, g))
+                    buf["grad_output"] = g
+                else:
+                    _capture_projected(buf, g, dev_idx, projector)
                 if on_layer_backward is not None:
-                    on_layer_backward(layer_name, t)
+                    on_layer_backward(layer_name, g)
             return _bwd
 
         handles.append(module.register_forward_hook(_make_forward_hook(name)))
         handles.append(module.register_full_backward_hook(_make_backward_hook(name)))
 
     return buffers, handles
+
+
+def _capture_projected(
+    buf: LayerBuffer, g: torch.Tensor, dev_idx: int, projector: Callable
+) -> None:
+    """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
+
+    Called from the backward hook of a projected layer, pairing ``g`` with the
+    matching per-replica forward activation.  For a **factorized** (LoGRA) layer
+    the projected factors are appended to ``_act_parts``/``_grad_parts``; for a
+    **materialized** (TRAK) layer the projected per-sample gradient is appended to
+    ``_proj_parts``.  Only the small projected result is retained on CPU — the raw
+    factors are discarded here, so the buffer never holds the full gradient.
+    """
+    with buf["_lock"]:
+        stack = buf["_device_id"].get(dev_idx)
+        a = stack.pop() if stack else None
+    if a is None:
+        return   # backward without a matching forward capture — nothing to project
+
+    kw = dict(buf["_proj_kw"])
+    factorize = kw.pop("factorize", True)
+    kw.pop("device", None)          # project on the tensors' own (training) device
+    layer_type = buf["_class_name"]
+    module_kwargs = buf["_module_kwargs"]
+    if a.ndim == 1 and is_embedding(layer_type):
+        a, g = a.unsqueeze(0), g.unsqueeze(0)
+
+    if factorize:
+        a_p, g_p = ops._project_factorized(a, g, layer_type, projector, module_kwargs, **kw)
+        with buf["_lock"]:
+            buf["_act_parts"].append((dev_idx, a_p.cpu()))
+            buf["_grad_parts"].append((dev_idx, g_p.cpu()))
+    else:
+        mat = ops._project_materialized(a, g, layer_type, projector, module_kwargs, **kw)
+        with buf["_lock"]:
+            buf["_proj_parts"].append((dev_idx, mat.cpu()))
 
 
 def remove_hooks(handles: list[torch.utils.hooks.RemovableHook]) -> None:
@@ -534,11 +602,20 @@ class HookManagerConfig:
         linear_io: Selector = None,
         param_grad: Selector = None,
         layer_types: Optional[dict[str, str]] = None,
+        projection: Optional[dict[str, dict]] = None,
+        projector: Optional[Callable] = None,
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
         self.param_grad = self._validate_selector(PARAM_GRAD, param_grad)
         self.layer_types = self._validate_layer_types(layer_types)
+        # Optional per-layer random projection applied to every assembled step
+        # gradient (see :meth:`Gradient.project`).  ``projection`` is the per-layer
+        # proj_kwargs map ``{layer_name: {factorize, proj_dim, ...}}`` (a
+        # ``"__default__"`` entry covers unlisted layers); ``projector`` is the
+        # projection factory, defaulting to dattri's ``random_project``.
+        self.projection = self._validate_projection(projection)
+        self.projector = projector
 
     @staticmethod
     def _validate_assignment(
@@ -559,6 +636,22 @@ class HookManagerConfig:
                     f"hook type. Valid types: {sorted(_VALID_HOOK_TYPES)}."
                 )
         return dict(hook_types)
+
+    @staticmethod
+    def _validate_projection(
+        projection: Optional[dict[str, dict]],
+    ) -> Optional[dict[str, dict]]:
+        if projection is None:
+            return None
+        if not isinstance(projection, dict) or not all(
+            isinstance(v, dict) for v in projection.values()
+        ):
+            raise TypeError(
+                "projection must be a dict mapping layer name (or '__default__') "
+                "to a proj_kwargs dict, e.g. "
+                "{'__default__': {'factorize': True, 'proj_dim': 512}}."
+            )
+        return {k: dict(v) for k, v in projection.items()}
 
     @staticmethod
     def _validate_layer_types(
@@ -602,6 +695,18 @@ class HookManagerConfig:
             and self.linear_io is None
             and self.param_grad is None
         )
+
+
+def _resolve_projector(projector: Optional[Callable]) -> Callable:
+    """Return *projector*, or lazily fall back to dattri's ``random_project``.
+
+    The import is deferred so configuring projection is the only thing that pulls
+    in dattri's projection backend.
+    """
+    if projector is not None:
+        return projector
+    from dattri.func.projection import random_project
+    return random_project
 
 
 def _selector_matches(selector: Selector, name: str) -> bool:
@@ -1018,6 +1123,11 @@ class HookManager:
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
                 type_overrides=self._config.layer_types,
+                projection=self._config.projection,
+                projector=(
+                    _resolve_projector(self._config.projector)
+                    if self._config.projection is not None else None
+                ),
             )
             self._n_layers = len(self._buffers)
             self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
@@ -1243,8 +1353,29 @@ class HookManager:
         data: dict = {}
         representation: dict = {}
         layer_types: dict = {}
+        indexing: dict = {}
 
         for layer_name, buf in self._buffers.items():
+            batch_first = layer_name not in self._non_batch_first_layers
+            proj_kw = buf["_proj_kw"]
+
+            # Materialized (TRAK) projection: the projected per-sample gradient was
+            # already assembled per micro-batch into _proj_parts at capture time.
+            if proj_kw is not None and not proj_kw.get("factorize", True):
+                parts = buf["_proj_parts"]
+                if not parts:
+                    raise RuntimeError(
+                        f"Layer '{layer_name}' has no buffered data. "
+                        "Ensure backward() was called inside the collect() context."
+                    )
+                data[layer_name] = torch.cat(
+                    [t for _, t in sorted(parts, key=lambda x: x[0])], dim=0
+                )
+                representation[layer_name] = "materialized"
+                layer_types[layer_name] = buf["_class_name"]
+                indexing[layer_name] = "batch"
+                continue
+
             act_parts = buf["_act_parts"]
             grad_parts = buf["_grad_parts"]
             if not act_parts or not grad_parts:
@@ -1254,6 +1385,19 @@ class HookManager:
                 )
             a = torch.cat([t for _, t in sorted(act_parts,  key=lambda x: x[0])], dim=0)
             g = torch.cat([t for _, t in sorted(grad_parts, key=lambda x: x[0])], dim=0)
+
+            # Factorized (LoGRA) projection: _act_parts/_grad_parts already hold the
+            # projected, final factors (module_kwargs=None → no re-preprocessing).
+            if proj_kw is not None:
+                data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
+                                              module_kwargs=None, batch_first=batch_first)
+                representation[layer_name] = "factorized"
+                layer_types[layer_name] = "nn.Linear"
+                tokens = a.shape[1 if batch_first else 0]   # 1 ⇒ 2-D-origin layer
+                indexing[layer_name] = "batch_token" if tokens > 1 else "batch"
+                continue
+
+            # Un-projected raw factorized capture (original behaviour).
             # A positional embedding fed an *unbatched* index tensor — e.g.
             # nanoGPT's ``pos = arange(T)`` (shape ``(T,)``) added to every
             # sample — is captured with no batch dim.  Add a length-1 batch axis
@@ -1262,12 +1406,16 @@ class HookManager:
             if a.ndim == 1 and is_embedding(buf["_class_name"]):
                 a = a.unsqueeze(0)
                 g = g.unsqueeze(0)
-            batch_first = layer_name not in self._non_batch_first_layers
             data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
                                           module_kwargs=buf["_module_kwargs"],
                                           batch_first=batch_first)
             representation[layer_name] = "factorized"
             layer_types[layer_name] = buf["_class_name"]
+            indexing[layer_name] = (
+                "batch_token"
+                if a.ndim >= 3 or not a.is_floating_point()
+                else "batch"
+            )
 
         for layer_name, buf in self._param_buffers.items():
             for pname, grad in buf.items():
@@ -1277,6 +1425,7 @@ class HookManager:
                 data[key] = grad
                 representation[key] = "materialized"
                 layer_types[key] = PARAM_GRAD_TYPES
+                indexing[key] = "batch"   # param_grad tensors have no token dim
 
         if not data:
             raise RuntimeError(
@@ -1284,31 +1433,17 @@ class HookManager:
                 "Ensure backward() was called inside the collect() context."
             )
 
-        indexing: dict = {}
-        for name, val in data.items():
-            if layer_types[name] == PARAM_GRAD_TYPES:
-                # param_grad tensors are always (B, …) without a token dim
-                indexing[name] = "batch"
-            else:
-                indexing[name] = (
-                    "batch_token"
-                    if isinstance(val, Factorized) and (
-                        val.activation.ndim >= 3   # 3D seq, 4D Conv2d, 5D Conv3d
-                        or not val.activation.is_floating_point()  # Embedding int
-                    )
-                    else "batch"
-                )
+        # Broadcast warning runs on the assembled (projected or raw) factors.
+        self._warn_broadcast_layers(data, layer_types)
 
-        gradient = Gradient(
+        return Gradient(
             representation=representation,
             data=data,
             layer_types=layer_types,
             indexing=indexing,
         )
-        self._warn_broadcast_layers(gradient)
-        return gradient
 
-    def _warn_broadcast_layers(self, gradient: Gradient) -> None:
+    def _warn_broadcast_layers(self, data: dict, layer_types: dict) -> None:
         """Warn (once per layer) about broadcast / batch-collapsed gradients.
 
         A factorized layer whose batch dim is 1 while the step batch is larger —
@@ -1316,11 +1451,23 @@ class HookManager:
         that was *summed over the batch*, so it is **not** a per-sample gradient.
         Downstream per-sample attribution treats it as a single shared row, which
         is rarely what the user wants; surface it so they can exclude the layer.
+
+        Operates on the raw ``data``/``layer_types`` dicts (before any projection)
+        so it can run without materializing a full :class:`Gradient`.
         """
-        batch = gradient.batch_size
+        # Step batch = largest per-layer sample dim (matches Gradient.batch_size);
+        # param_grad tensors have no sample axis and are excluded.
+        batch = 0
+        for name, val in data.items():
+            if layer_types.get(name) == PARAM_GRAD_TYPES:
+                continue
+            if isinstance(val, Factorized):
+                batch = max(batch, val.activation.shape[0 if val.batch_first else 1])
+            else:
+                batch = max(batch, val.shape[0])
         if batch <= 1:
             return
-        for name, val in gradient.data.items():
+        for name, val in data.items():
             if not isinstance(val, Factorized):
                 continue
             layer_batch = val.activation.shape[0 if val.batch_first else 1]
@@ -1344,6 +1491,8 @@ class HookManager:
             buf["grad_output"] = None
             buf["_act_parts"] = []
             buf["_grad_parts"] = []
+            buf["_proj_parts"] = []
+            buf["_device_id"] = {}
 
     def _reset_param_buffers(self) -> None:
         for buf in self._param_buffers.values():

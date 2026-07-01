@@ -325,6 +325,64 @@ class TestMaterialize:
 
 
 # --------------------------------------------------------------------------- #
+# Gradient.project                                                             #
+# --------------------------------------------------------------------------- #
+
+from dattri.func.projection import random_project  # noqa: E402
+
+_PROJ = dict(proj_max_batch_size=8, proj_type="rademacher", proj_seed=0)
+
+
+class TestProject:
+    def test_factorize_stays_factorized(self):
+        g = make_gradient(repr_type="factorized")
+        p = g.project(random_project, {"__default__": {"factorize": True, "proj_dim": 32, **_PROJ}})
+        for name in p.layer_names:
+            assert p.representation[name] == "factorized"
+            assert p.layer_types[name] == "nn.Linear"
+            f = p.data[name]
+            assert f.activation.shape[-1] == 32 and f.pre_activation_grad.shape[-1] == 32
+            assert f.module_kwargs is None  # factors are final, not re-preprocessed
+
+    def test_materialize_collapses_to_proj_dim(self):
+        g = make_gradient(repr_type="factorized")
+        p = g.project(random_project, {"__default__": {"factorize": False, "proj_dim": 24, **_PROJ}})
+        for name in p.layer_names:
+            assert p.representation[name] == "materialized"
+            assert p.data[name].shape == (B, 24)
+            assert p.indexing[name] == "batch"
+
+    def test_per_layer_kwargs_override_default(self):
+        data = {"l1": factorized(), "l2": factorized()}
+        rep = {"l1": "factorized", "l2": "factorized"}
+        g = Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
+        p = g.project(random_project, {
+            "l1": {"factorize": True, "proj_dim": 16, **_PROJ},
+            "l2": {"factorize": False, "proj_dim": 16, **_PROJ},
+        })
+        assert p.representation["l1"] == "factorized"
+        assert p.representation["l2"] == "materialized"
+
+    def test_unconfigured_layers_pass_through(self):
+        # No entry and no "__default__" -> layer is left unchanged.
+        g = make_gradient(repr_type="factorized")
+        p = g.project(random_project, {})
+        for name in p.layer_names:
+            assert p.representation[name] == g.representation[name]
+            assert p.data[name] is g.data[name]  # untouched reference
+
+    def test_partial_config_projects_only_named_layer(self):
+        data = {"l1": factorized(), "l2": factorized()}
+        rep = {"l1": "factorized", "l2": "factorized"}
+        g = Gradient(representation=rep, data=data,
+                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
+        p = g.project(random_project, {"l1": {"factorize": False, "proj_dim": 8, **_PROJ}})
+        assert p.representation["l1"] == "materialized" and p.data["l1"].shape == (B, 8)
+        assert p.data["l2"] is data["l2"]  # l2 untouched
+
+
+# --------------------------------------------------------------------------- #
 # Gradient.select_layers                                                       #
 # --------------------------------------------------------------------------- #
 

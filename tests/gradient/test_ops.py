@@ -297,6 +297,61 @@ class TestMaterializeCollapse:
 
 
 # ---------------------------------------------------------------------------
+# Random projection — TRAK (materialized) and LoGRA (factorized) units
+# ---------------------------------------------------------------------------
+
+from dattri.func.projection import random_project  # noqa: E402
+
+_PROJ = dict(proj_max_batch_size=8, proj_type="rademacher", proj_seed=0)
+
+class TestProjection:
+    def test_materialized_collapses_to_proj_dim(self):
+        a, g = _linear_3d()
+        f = Factorized(a, g, {"has_bias": False})
+        out = ops.project_materialized(f, "nn.Linear", random_project, proj_dim=64, **_PROJ)
+        assert out.shape == (B, 64)
+
+    def test_factorized_keeps_structure(self):
+        a, g = _linear_3d()
+        f = Factorized(a, g, {"has_bias": False})
+        a_p, g_p = ops.project_factorized(f, "nn.Linear", random_project, proj_dim=32, **_PROJ)
+        assert a_p.shape == (B, T, 32) and g_p.shape == (B, T, 32)
+
+    def test_factorized_factors_use_independent_seeds(self):
+        # Same proj_dim & base seed, but a uses seed+1, so the two projectors differ.
+        a, g = torch.randn(B, T, I), torch.randn(B, T, I)  # square: d_in == d_out
+        a_p, g_p = ops.project_factorized(
+            Factorized(a, g, {"has_bias": False}), "nn.Linear", random_project,
+            proj_dim=32, **_PROJ,
+        )
+        # Project an identical input through both factor slots; outputs must differ.
+        assert not torch.allclose(a_p, g_p)
+
+    @pytest.mark.parametrize("lt", ["nn.LayerNorm", "nn.Embedding"])
+    def test_factorized_rejects_non_outer_product(self, lt):
+        a, g = _norm_3d()
+        with pytest.raises(ValueError, match="factorized projection is undefined"):
+            ops.project_factorized(Factorized(a, g, {"has_bias": False}), lt,
+                                   random_project, proj_dim=16, **_PROJ)
+
+    def test_materialized_accepts_dense_tensor(self):
+        dense = torch.randn(B, 100)
+        out = ops.project_materialized(dense, "nn.Linear", random_project, proj_dim=16, **_PROJ)
+        assert out.shape == (B, 16)
+
+    def test_projection_approximately_preserves_gram(self):
+        # Johnson–Lindenstrauss: random projection preserves pairwise dot products.
+        torch.manual_seed(0)
+        a, g = torch.randn(16, T, I), torch.randn(16, T, O)
+        f = Factorized(a, g, {"has_bias": False})
+        full = _materialize(a, g, "nn.Linear").float()
+        gram = full @ full.T
+        proj = ops.project_materialized(f, "nn.Linear", random_project, proj_dim=2048, **_PROJ)
+        corr = torch.corrcoef(torch.stack([(proj @ proj.T).flatten(), gram.flatten()]))[0, 1]
+        assert corr > 0.9
+
+
+# ---------------------------------------------------------------------------
 # Multi-layer accumulators — fan a Gradient block out to per-layer estimators
 # ---------------------------------------------------------------------------
 

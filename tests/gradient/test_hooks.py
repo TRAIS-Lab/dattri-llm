@@ -538,6 +538,115 @@ class TestLayerTypesConfig:
 
 
 # --------------------------------------------------------------------------- #
+# HookManagerConfig(projection=...) — per-layer random projection on capture    #
+# --------------------------------------------------------------------------- #
+
+
+class TestProjectionConfig:
+    def test_validation_rejects_non_dict(self):
+        with pytest.raises(TypeError, match="projection must be a dict"):
+            HookManagerConfig(projection=[{"proj_dim": 8}])  # type: ignore[arg-type]
+
+    def test_validation_rejects_non_dict_values(self):
+        with pytest.raises(TypeError, match="projection must be a dict"):
+            HookManagerConfig(projection={"__default__": 8})  # type: ignore[dict-item]
+
+    def test_none_keeps_projection_off(self):
+        assert HookManagerConfig().projection is None
+
+    def test_projection_does_not_affect_is_default(self):
+        assert HookManagerConfig(projection={"__default__": {"proj_dim": 8}}).is_default
+
+    def _run(self, projection, projector=None):
+        torch.manual_seed(0)   # identical weights + input across calls, for comparisons
+        model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8))
+        cb = _Recording()
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL,
+                                     projection=projection, projector=projector),
+            callbacks=[cb],
+        )
+        with hm.collect():
+            model(torch.randn(4, 16)).sum().backward()
+        return cb.records[-1].gradient
+
+    def test_trak_projection_materializes(self):
+        g = self._run({"__default__": {"factorize": False, "proj_dim": 64,
+                       "proj_max_batch_size": 8, "proj_type": "rademacher"}})
+        for n in g.layer_names:
+            assert g.representation[n] == "materialized"
+            assert g.data[n].shape == (4, 64)
+
+    def test_logra_projection_stays_factorized(self):
+        g = self._run({"__default__": {"factorize": True, "proj_dim": 16,
+                       "proj_max_batch_size": 8, "proj_type": "rademacher"}})
+        for n in g.layer_names:
+            assert g.representation[n] == "factorized"
+            assert g.data[n].activation.shape[-1] == 16
+
+    def test_off_by_default_keeps_factorized(self):
+        g = self._run(None)
+        assert all(g.representation[n] == "factorized" for n in g.layer_names)
+
+    def test_only_configured_layers_projected(self):
+        # Project just layer "0"; layer "2" has no entry and no __default__.
+        g = self._run({"0": {"factorize": False, "proj_dim": 64,
+                             "proj_max_batch_size": 8, "proj_type": "rademacher"}})
+        assert g.representation["0"] == "materialized" and g.data["0"].shape == (4, 64)
+        assert g.representation["2"] == "factorized"
+
+    def test_custom_projector_is_used(self):
+        # A sentinel projector (truncate-to-proj_dim) overrides the dattri default.
+        called = {"n": 0}
+
+        def fake_projector(feature, batch_size, *, proj_dim, **kw):
+            called["n"] += 1
+            return lambda x, ensemble_id=0: x[:, :proj_dim]
+
+        g = self._run({"__default__": {"factorize": False, "proj_dim": 4}},
+                      projector=fake_projector)
+        assert called["n"] > 0
+        for n in g.layer_names:
+            assert g.data[n].shape == (4, 4)
+
+    @pytest.mark.parametrize("factorize", [True, False])
+    def test_capture_time_equals_assembly_time_projection(self, factorize):
+        # Projecting at capture (per micro-batch) must be bit-identical to
+        # projecting the fully-assembled gradient — project(cat) == cat(project).
+        from dattri.func.projection import random_project
+        from dattri_llm.gradient import ops
+        from dattri_llm.gradient.gradient import Factorized
+        cfg = {"factorize": factorize, "proj_dim": 12, "proj_max_batch_size": 8,
+               "proj_type": "rademacher", "proj_seed": 7}
+        raw = self._run(None)                                   # un-projected capture
+        ref = raw.project(random_project, {"__default__": dict(cfg)})
+        cap = self._run({"__default__": dict(cfg)})             # capture-time projection
+        for n in cap.layer_names:
+            a, b = cap.data[n], ref.data[n]
+            if isinstance(a, Factorized):
+                a = ops.materialize(a, "nn.Linear"); b = ops.materialize(b, "nn.Linear")
+            assert torch.allclose(a, b, atol=1e-5), n
+
+    def test_shared_layer_pairs_each_call(self):
+        # A layer invoked twice per forward must project each call's (a, g) pair
+        # (LIFO per-device stack), producing 2*B rows with no dropped call.
+        class Shared(nn.Module):
+            def __init__(self): super().__init__(); self.lin = nn.Linear(10, 6)
+            def forward(self, x1, x2): return self.lin(x1) + self.lin(x2)
+        m = Shared()
+        cb = _Recording()
+        hm = HookManager(m, config=HookManagerConfig(
+            linear_io=REGISTER_ALL,
+            projection={"__default__": {"factorize": False, "proj_dim": 12,
+                        "proj_max_batch_size": 8, "proj_type": "rademacher"}}),
+            callbacks=[cb])
+        with hm.collect():
+            m(torch.randn(4, 10), torch.randn(4, 10)).sum().backward()
+        assert cb.records[-1].gradient.data["lin"].shape == (8, 12)   # 2*B rows
+
+
+# --------------------------------------------------------------------------- #
 # HookManager(non_batch_first_layers=...) — sequence-first captures            #
 # --------------------------------------------------------------------------- #
 
