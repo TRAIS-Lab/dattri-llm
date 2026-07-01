@@ -223,6 +223,9 @@ def register_linear_io_hooks(
         if layer_names is not None and name not in layer_names:
             continue
 
+        if not _has_trainable_params(module):
+            continue
+
         buffers[name] = _make_layer_buffer()
         if type_overrides is not None and name in type_overrides:
             layer_type = type_overrides[name]

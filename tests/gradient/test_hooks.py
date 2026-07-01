@@ -538,6 +538,74 @@ class TestLayerTypesConfig:
 
 
 # --------------------------------------------------------------------------- #
+# linear_io hooks skip frozen (non-trainable) layers — LoRA / frozen backbones  #
+# --------------------------------------------------------------------------- #
+
+
+class TestTrainabilityFilter:
+    def test_frozen_leading_layer_skipped_and_completes(self):
+        # A frozen layer fed a leaf input never fires its backward (its output
+        # needs no grad), which would stall completion if it were hooked.  It must
+        # be skipped, leaving only the trainable layer — mirrors a LoRA base_layer.
+        model = nn.Sequential()
+        model.add_module("frozen", nn.Linear(8, 8, bias=False))
+        model.add_module("trainable", nn.Linear(8, 4, bias=False))
+        for p in model.frozen.parameters():
+            p.requires_grad_(False)
+        cb = _Recording()
+        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL),
+                         callbacks=[cb])
+        with hm.collect():
+            model(torch.randn(4, 8)).sum().backward()
+        hm.remove()
+        assert len(cb.records) == 1                          # step completed
+        assert set(cb.records[-1].gradient.layer_names) == {"trainable"}
+
+    def test_lora_adapters_captured_exactly(self):
+        peft = pytest.importorskip("peft")
+        from dattri_llm.gradient import ops
+
+        class Wrap(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(8, 4, bias=False)
+
+            def forward(self, x):
+                return self.fc(x)
+
+        torch.manual_seed(0)
+        model = peft.get_peft_model(
+            Wrap(), peft.LoraConfig(r=4, target_modules=["fc"], lora_alpha=8,
+                                    bias="none", lora_dropout=0.0)
+        ).eval()
+        x = torch.randn(4, 8)
+
+        cb = _Recording()
+        # REGISTER_ALL now works out of the box: the frozen base_layer is skipped,
+        # only the trainable lora_A / lora_B adapters are captured.
+        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL),
+                         callbacks=[cb])
+        with hm.collect():
+            model(x).sum().backward()
+        hm.remove()
+        grad = cb.records[-1].gradient
+        names = set(grad.layer_names)
+        assert all("base_layer" not in n for n in names)
+        assert any("lora_A" in n for n in names) and any("lora_B" in n for n in names)
+
+        # The captured factorized adapter gradient equals the true per-sample one.
+        a_name = next(n for n in names if "lora_A" in n)
+        mat = ops.materialize(grad.data[a_name], "nn.Linear").float()
+        module = dict(model.named_modules())[a_name]
+        rows = []
+        for i in range(x.shape[0]):
+            model.zero_grad(set_to_none=True)
+            model(x[i : i + 1]).sum().backward()
+            rows.append(module.weight.grad.flatten().clone())
+        assert torch.allclose(mat, torch.stack(rows), atol=1e-5)
+
+
+# --------------------------------------------------------------------------- #
 # HookManagerConfig(projection=...) — per-layer random projection on capture    #
 # --------------------------------------------------------------------------- #
 
