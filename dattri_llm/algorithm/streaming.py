@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import warnings
 from typing import (
     Callable,
     Dict,
@@ -320,6 +321,9 @@ class GradientStreamer(GradientSource):
             "cuda", enabled=bool(args.fp16 and enable_update and not args.use_cpu)
         )
         self._max_grad_norm = args.max_grad_norm
+
+        # Place the model on its device before wrapping.
+        model = model.to(args.device)
 
         # ``_model`` is the unwrapped reference (hooks, params, eval/grad state);
         # ``_fwd_model`` is what forward/backward actually run on (DDP/FSDP when
@@ -655,27 +659,39 @@ class GradientStreamer(GradientSource):
         fsdp = args.fsdp
         fsdp_tokens = set(fsdp.split() if isinstance(fsdp, str) else (fsdp or []))
 
-        if fsdp_tokens:
-            from torch.distributed.fsdp import CPUOffload
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardingStrategy
-
-            strategy = (
-                ShardingStrategy.SHARD_GRAD_OP
-                if "shard_grad_op" in fsdp_tokens
-                else ShardingStrategy.FULL_SHARD
+        if fsdp_tokens and args.use_cpu:
+            warnings.warn(
+                "fsdp is set together with use_cpu, but FSDP is a GPU sharding "
+                "strategy (it shards params across CUDA devices with NCCL). The "
+                "fsdp setting is ignored under use_cpu; use DDP (gloo) for CPU "
+                "distributed collection instead.",
+                stacklevel=2,
             )
-            fsdp_kwargs = dict(args.fsdp_config or {})
-            # use_orig_params keeps the original submodule params (what the hooks captured and what per-sample gradient reads need).
-            fsdp_kwargs.setdefault("use_orig_params", True)
-            fsdp_kwargs.setdefault("sharding_strategy", strategy)
-            if "offload" in fsdp_tokens:
-                fsdp_kwargs.setdefault("cpu_offload", CPUOffload(offload_params=True))
-            return FSDP(model, **fsdp_kwargs)
 
         if args.world_size > 1:
+            if args.device.type == "cuda":
+                torch.cuda.set_device(args.local_process_index)
+
+            if fsdp_tokens:
+                from torch.distributed.fsdp import CPUOffload
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import ShardingStrategy
+
+                strategy = (
+                    ShardingStrategy.SHARD_GRAD_OP
+                    if "shard_grad_op" in fsdp_tokens
+                    else ShardingStrategy.FULL_SHARD
+                )
+                fsdp_kwargs = dict(args.fsdp_config or {})
+                # use_orig_params keeps the original submodule params (what the hooks captured and what per-sample gradient reads need).
+                fsdp_kwargs.setdefault("use_orig_params", True)
+                fsdp_kwargs.setdefault("sharding_strategy", strategy)
+                if "offload" in fsdp_tokens:
+                    fsdp_kwargs.setdefault("cpu_offload", CPUOffload(offload_params=True))
+                return FSDP(model, **fsdp_kwargs)
+
             device_ids = (
-                [args.local_process_index] if torch.cuda.is_available() else None
+                [args.local_process_index] if args.device.type == "cuda" else None
             )
             return nn.parallel.DistributedDataParallel(
                 model,
