@@ -70,12 +70,18 @@ from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
 from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import BaseAttributor, resolve_steps, task_loss_fn
+from dattri_llm.algorithm.base import (
+    BaseAttributor,
+    normalize_layer_names,
+    resolve_steps,
+    task_loss_fn,
+)
 from dattri_llm.algorithm.score import AttributionScore
 from dattri_llm.algorithm.streaming import DiskGradientSource, GradientStreamer
 from dattri.task import AttributionTask
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.hooks import HookManagerConfig
 from dattri_llm.gradient.gradient import Gradient
 
 
@@ -98,11 +104,15 @@ class DVEmbAttributor(BaseAttributor):
             score scale ``η_{t_s}`` and the Fisher factors ``(I − η_k H_k)``, so
             it must match the schedule the gradients were collected under.  A
             mapping must cover every propagated step (``step < final_step``).
-        layer_name: Restrict the gradients (and therefore the Fisher) to these
-            layer names.  ``None`` uses every layer present in the gradients.
         task: Required by the on-the-fly :meth:`cache` / :meth:`attribute`
             (supplies the model, the loss, and the optional ``target_func`` for
             the test side); unused by :meth:`attribute_from_cache`.
+
+    Layer selection happens at **capture** (the ``hook_config`` of the live
+    methods, or whatever was hooked when the cache was collected).  By default
+    every stored layer enters the Fisher and the score;
+    :meth:`attribute_from_cache` additionally takes a ``layer_name`` read-time
+    filter to score a subset of the stored layers.
     """
 
     algorithm = "DVEmb"
@@ -112,7 +122,6 @@ class DVEmbAttributor(BaseAttributor):
         args: AttributionArguments,
         *,
         learning_rate: Union[float, Mapping[int, float]] = 1.0,
-        layer_name: Optional[Union[str, List[str]]] = None,
         task: Optional[AttributionTask] = None,
     ) -> None:
         if isinstance(learning_rate, Mapping):
@@ -126,12 +135,6 @@ class DVEmbAttributor(BaseAttributor):
             self.learning_rate = lr
         self.args = args
         self.task = task
-        if isinstance(layer_name, str):
-            self.layer_name: Optional[List[str]] = [layer_name]
-        elif layer_name is None:
-            self.layer_name = None
-        else:
-            self.layer_name = list(layer_name)
 
     def cache(
         self,
@@ -140,6 +143,7 @@ class DVEmbAttributor(BaseAttributor):
         *,
         cache_dir: Optional[str] = None,
         offload_interval: int = 1,
+        hook_config: Optional[HookManagerConfig] = None,
     ) -> Tuple[str, str]:
         """Run the training trajectory live and cache the gradients DVEmb needs.
 
@@ -167,6 +171,9 @@ class DVEmbAttributor(BaseAttributor):
             offload_interval: Steps accumulated per gradient file.  ``1``
                 (default) writes one file per step — best for DVEmb's per-step
                 sweep (no redundant multi-step file reloads).
+            hook_config: :class:`HookManagerConfig` for the internal streamers
+                (which layers to hook, per-layer projection, ...).  ``None`` uses
+                the streamer default (factorized hooks on every linear-family layer).
 
         Returns:
             ``(train_gradients_dir, test_gradients_dir)``.
@@ -200,7 +207,7 @@ class DVEmbAttributor(BaseAttributor):
         train_streamer = GradientStreamer(
             model, train_dataset, self.args,
             batch_size=self.args.per_device_train_batch_size,
-            enable_update=True, loss_fn=train_loss,
+            enable_update=True, loss_fn=train_loss, config=hook_config,
         )
         train_streamer.hook_manager.add_callback(
             OffloadCallback(offload_interval, train_fm, recording_type="per_batch")
@@ -216,7 +223,7 @@ class DVEmbAttributor(BaseAttributor):
         test_streamer = GradientStreamer(
             model, test_dataset, self.args,
             batch_size=self.args.per_device_eval_batch_size,
-            enable_update=False, loss_fn=test_loss,
+            enable_update=False, loss_fn=test_loss, config=hook_config,
         )
         test_streamer.hook_manager.add_callback(
             OffloadCallback(offload_interval, test_fm, recording_type="per_batch")
@@ -391,6 +398,7 @@ class DVEmbAttributor(BaseAttributor):
         selected_training_steps: Optional[Iterable[int]] = None,
         loss_reduction: str = "mean",
         verbose: bool = False,
+        hook_config: Optional[HookManagerConfig] = None,
     ) -> AttributionScore:
         """Score **on the fly**: cache the trajectory, then attribute from cache.
 
@@ -410,8 +418,10 @@ class DVEmbAttributor(BaseAttributor):
             train_dataset, test_dataset: Datasets to stream.
             loop_over_test, selected_training_steps, loss_reduction, verbose: As
                 in :meth:`attribute_from_cache`.
+            hook_config: As in :meth:`cache`.
         """
-        train_dir, test_dir = self.cache(train_dataset, test_dataset)
+        train_dir, test_dir = self.cache(train_dataset, test_dataset,
+                                         hook_config=hook_config)
         return self.attribute_from_cache(
             train_dir,
             test_dir,
@@ -430,6 +440,7 @@ class DVEmbAttributor(BaseAttributor):
         final_step: Optional[int] = None,
         loss_reduction: str = "mean",
         verbose: bool = False,
+        layer_name: Optional[Union[str, List[str]]] = None,
     ) -> AttributionScore:
         """Compute the ``(num_train_rows, num_test)`` DVEmb attribution score.
 
@@ -485,6 +496,10 @@ class DVEmbAttributor(BaseAttributor):
                 samples at step ``t``, which assumes the full minibatch was
                 collected.)
             verbose: Show tqdm progress bars on the logging process.
+            layer_name: Restrict scoring (and the per-step Fisher) to this subset
+                of the *stored* layers (``str`` or list; unknown names raise).
+                ``None`` (default) uses every stored layer.  A read-time filter —
+                the same cache can be re-queried per layer.
 
         Returns:
             An :class:`AttributionScore`; also persisted to ``args.output_dir``.
@@ -535,11 +550,12 @@ class DVEmbAttributor(BaseAttributor):
         # The train source is restricted to the propagated steps; the sweep pulls
         # one step at a time from it (DiskGradientSource.for_steps).  The test
         # source supplies every column (the final-model gradients).
+        layer_name = normalize_layer_names(layer_name)
         train_source = DiskGradientSource(
-            train_fm, self.args, steps=prop_steps, layer_name=self.layer_name,
+            train_fm, self.args, steps=prop_steps, layer_name=layer_name,
         )
         test_source = DiskGradientSource(
-            test_fm, self.args, layer_name=self.layer_name,
+            test_fm, self.args, layer_name=layer_name,
             desc="DVEmb: test", verbose=verbose,
         )
         return self._run(
@@ -550,6 +566,7 @@ class DVEmbAttributor(BaseAttributor):
             loss_reduction=loss_reduction,
             loop_over_test=loop_over_test,
             verbose=verbose,
+            layer_name=layer_name,
             algorithm_meta={
                 "final_step": final_step,
                 "selected_training_steps": sorted(output_steps),
@@ -570,6 +587,7 @@ class DVEmbAttributor(BaseAttributor):
         loop_over_test: bool,
         verbose: bool,
         algorithm_meta: dict,
+        layer_name: Optional[List[str]] = None,
     ) -> AttributionScore:
         """Score a train source against a test source — the shared DVEmb loop.
 
@@ -659,7 +677,7 @@ class DVEmbAttributor(BaseAttributor):
             algorithm_meta=algorithm_meta,
             algorithm=self.algorithm,
             normalized_grad=False,
-            layer_name=self.layer_name,
+            layer_name=layer_name,
         )
         result.save(self.args.output_path)
         return result

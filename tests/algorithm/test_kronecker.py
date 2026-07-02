@@ -145,7 +145,7 @@ def _make(attr_cls, out_dir):
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
     )
-    return attr_cls(args, damping=DAMPING, layer_name=LAYERS)
+    return attr_cls(args, damping=DAMPING)
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +208,7 @@ class TestEKFAC:
         res = EKFACAttributor(
             AttributionArguments(output_dir=str(tmp_path / "o"),
                                  dataloader_num_workers=0, dataloader_pin_memory=False),
-            damping=damping, layer_name=LAYERS,
+            damping=damping,
         ).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
@@ -256,7 +256,7 @@ class TestEKFAC:
             return EKFACAttributor(
                 AttributionArguments(output_dir=str(tmp_path / mode),
                                      dataloader_num_workers=0, dataloader_pin_memory=False),
-                damping=1e-2, layer_name=LAYERS, mode=mode,
+                damping=1e-2, mode=mode,
             ).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
@@ -326,7 +326,7 @@ class TestKFACMultiToken:
 
         args = AttributionArguments(output_dir=str(tmp_path / "o"),
                                     dataloader_num_workers=0, dataloader_pin_memory=False)
-        res = KFACAttributor(args, damping=DAMPING, layer_name=["fc"]).attribute_from_cache(
+        res = KFACAttributor(args, damping=DAMPING).attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
         matrix = res.query(train_hashes, test_hashes, trajectory="agnostic")
@@ -408,7 +408,7 @@ class TestStepSelection:
             attr = cls(
                 AttributionArguments(output_dir=str(tmp_path / f"o_{steps}"),
                                      dataloader_num_workers=0, dataloader_pin_memory=False),
-                damping=DAMPING, layer_name=LAYERS,
+                damping=DAMPING,
             )
             return attr.attribute_from_cache(
                 train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
@@ -516,9 +516,10 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
     return (G_tr @ F_inv) @ G_te.T
 
 
-@pytest.fixture()
-def norm_collected(tmp_path):
-    """Collect ``norm`` and ``head`` factorised gradients to disk (one step)."""
+def _collect_norm_model(tmp_path, patterns):
+    """Collect the _NormModel's factorised gradients to disk (one step), hooking
+    only the layers matching *patterns* — layer selection now happens at capture
+    (via the hook config), not at scoring."""
     torch.manual_seed(0)
     model = _NormModel().eval()
     gen = torch.Generator().manual_seed(1)
@@ -528,7 +529,7 @@ def norm_collected(tmp_path):
     def collect(x, out_dir):
         fm = GradientFileManager(str(out_dir))
         hm = HookManager(
-            model, config=HookManagerConfig(linear_io=[r"norm", r"head"]),
+            model, config=HookManagerConfig(linear_io=patterns),
             callbacks=[OffloadCallback(offload_interval=1, file_manager=fm,
                                        recording_type="per_sample")],
         )
@@ -547,29 +548,35 @@ def norm_collected(tmp_path):
     )
 
 
-def _attr(cls, out_dir, layer_name):
+@pytest.fixture()
+def norm_collected(tmp_path):
+    """Both ``norm`` and ``head`` collected (one step)."""
+    return _collect_norm_model(tmp_path, [r"norm", r"head"])
+
+
+def _attr(cls, out_dir):
     args = AttributionArguments(output_dir=str(out_dir),
                                 dataloader_num_workers=0, dataloader_pin_memory=False)
-    return cls(args, damping=DAMPING, layer_name=layer_name)
+    return cls(args, damping=DAMPING)
 
 
 class TestDirectFIM:
-    def _run(self, norm_collected, out_dir, *, layer_name, **kw):
-        res = _attr(KFACAttributor, out_dir, layer_name).attribute_from_cache(
-            train_gradients_dir=str(norm_collected["train_dir"]),
-            test_gradients_dir=str(norm_collected["test_dir"]),
+    def _run(self, collected, out_dir, **kw):
+        res = _attr(KFACAttributor, out_dir).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
             **kw,
         )
-        return res.query(norm_collected["train_hashes"],
-                         norm_collected["test_hashes"], trajectory="agnostic")
+        return res.query(collected["train_hashes"],
+                         collected["test_hashes"], trajectory="agnostic")
 
-    def test_norm_only_matches_fim_oracle(self, norm_collected, tmp_path):
-        """Restricted to the norm layer, 'direct' is a pure empirical-Fisher score."""
-        m = self._run(norm_collected, tmp_path / "o", layer_name=["norm"],
-                      non_kfac_strategy="direct")
+    def test_norm_only_matches_fim_oracle(self, tmp_path):
+        """Collected norm-only, 'direct' is a pure empirical-Fisher score."""
+        collected = _collect_norm_model(tmp_path / "norm_only", [r"norm"])
+        m = self._run(collected, tmp_path / "o", non_kfac_strategy="direct")
         oracle = _fim_oracle(
-            norm_collected["train_dir"], norm_collected["test_dir"],
-            norm_collected["train_hashes"], norm_collected["test_hashes"],
+            collected["train_dir"], collected["test_dir"],
+            collected["train_hashes"], collected["test_hashes"],
             "norm", DAMPING,
         )
         assert torch.allclose(m, oracle, atol=1e-4, rtol=1e-3), \
@@ -577,9 +584,9 @@ class TestDirectFIM:
 
     def test_direct_equals_kfac_plus_fim(self, norm_collected, tmp_path):
         """With both layers, 'direct' == K-FAC(head) ['ignore'] + FIM(norm)."""
-        ignore = self._run(norm_collected, tmp_path / "i", layer_name=None,
+        ignore = self._run(norm_collected, tmp_path / "i",
                            non_kfac_strategy="ignore")
-        direct = self._run(norm_collected, tmp_path / "d", layer_name=None,
+        direct = self._run(norm_collected, tmp_path / "d",
                            non_kfac_strategy="direct")
         fim = _fim_oracle(
             norm_collected["train_dir"], norm_collected["test_dir"],
@@ -590,15 +597,15 @@ class TestDirectFIM:
         assert torch.allclose(direct, ignore + fim, atol=1e-4, rtol=1e-3)
 
     def test_ignore_is_default(self, norm_collected, tmp_path):
-        default = self._run(norm_collected, tmp_path / "a", layer_name=None)
-        ignore = self._run(norm_collected, tmp_path / "b", layer_name=None,
+        default = self._run(norm_collected, tmp_path / "a")
+        ignore = self._run(norm_collected, tmp_path / "b",
                            non_kfac_strategy="ignore")
         assert torch.allclose(default, ignore)
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_loop_over_test_matches_cached_with_fim(self, norm_collected, tmp_path, cls):
         def run(loop, tag):
-            return _attr(cls, tmp_path / tag, None).attribute_from_cache(
+            return _attr(cls, tmp_path / tag).attribute_from_cache(
                 train_gradients_dir=str(norm_collected["train_dir"]),
                 test_gradients_dir=str(norm_collected["test_dir"]),
                 non_kfac_strategy="direct", loop_over_test=loop,
@@ -609,27 +616,27 @@ class TestDirectFIM:
     def test_cap_skips_layer_with_warning(self, norm_collected, tmp_path):
         """A cap below the norm's param count skips it (with a warning), so the
         result collapses to the K-FAC-only ('ignore') score."""
-        ignore = self._run(norm_collected, tmp_path / "i", layer_name=None,
+        ignore = self._run(norm_collected, tmp_path / "i",
                            non_kfac_strategy="ignore")
         with pytest.warns(UserWarning, match="direct_fim_max_params"):
-            capped = self._run(norm_collected, tmp_path / "c", layer_name=None,
+            capped = self._run(norm_collected, tmp_path / "c",
                                non_kfac_strategy="direct", direct_fim_max_params=4)
         assert torch.allclose(capped, ignore, atol=1e-5)
 
-    def test_norm_only_ignore_raises(self, norm_collected, tmp_path):
-        """No K-FAC layer and strategy='ignore' → nothing eligible."""
+    def test_norm_only_ignore_raises(self, tmp_path):
+        """No K-FAC layer collected and strategy='ignore' → nothing eligible."""
+        collected = _collect_norm_model(tmp_path / "norm_only", [r"norm"])
         with pytest.raises(ValueError, match="No eligible layers"):
-            self._run(norm_collected, tmp_path / "o", layer_name=["norm"],
-                      non_kfac_strategy="ignore")
+            self._run(collected, tmp_path / "o", non_kfac_strategy="ignore")
 
     def test_invalid_strategy_raises(self, norm_collected, tmp_path):
         with pytest.raises(ValueError, match="non_kfac_strategy"):
-            self._run(norm_collected, tmp_path / "o", layer_name=["head"],
+            self._run(norm_collected, tmp_path / "o",
                       non_kfac_strategy="bogus")
 
     def test_invalid_max_params_raises(self, norm_collected, tmp_path):
         with pytest.raises(ValueError, match="direct_fim_max_params"):
-            self._run(norm_collected, tmp_path / "o", layer_name=["head"],
+            self._run(norm_collected, tmp_path / "o",
                       non_kfac_strategy="direct", direct_fim_max_params=0)
 
     def test_embedding_layer_warns_under_direct(self, tmp_path):
@@ -658,8 +665,7 @@ class TestDirectFIM:
         train_hashes = [hash_sample({"x": x_tr}, i) for i in range(6)]
         test_hashes = [hash_sample({"x": x_te}, j) for j in range(4)]
         with pytest.warns(UserWarning, match="embedding"):
-            _attr(KFACAttributor, tmp_path / "o",
-                  ["embedding", "norm", "head"]).attribute_from_cache(
+            _attr(KFACAttributor, tmp_path / "o").attribute_from_cache(
                 train_gradients_dir=str(tmp_path / "tr"),
                 test_gradients_dir=str(tmp_path / "te"),
                 non_kfac_strategy="direct",

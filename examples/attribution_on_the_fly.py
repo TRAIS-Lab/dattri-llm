@@ -88,7 +88,7 @@ def main() -> None:
             use_cpu=True,
             dataloader_pin_memory=False,
         )
-        attr = TracInAttributor(args, layer_name=["mlp.fc1", "mlp.fc2"], task=task)
+        attr = TracInAttributor(args, task=task)
         score = attr.attribute(train_ds, test_ds)   # GradCos: normalized_grad=True
 
         # ── 4. Read the result ─────────────────────────────────────────────────

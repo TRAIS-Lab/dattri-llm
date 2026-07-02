@@ -136,7 +136,7 @@ def _args(out_dir: Path) -> AttributionArguments:
 
 def _make_attr(out_dir: Path, *, normalized):
     return TracInAttributor(
-        _args(out_dir), layer_name=LAYER_NAMES, normalized_grad=normalized
+        _args(out_dir), normalized_grad=normalized
     )
 
 
@@ -199,6 +199,38 @@ class TestTracInOnDisk:
             test_gradients_dir=str(collected["test_dir"]),
         )
         assert gradcos.algorithm == "GradCos"
+
+    def test_layer_name_subsets_stored_layers(self, collected, tmp_path):
+        """attribute_from_cache(layer_name=...) is a read-time filter: the fc1-only
+        score matches the fc1-only autograd oracle, and the metadata records it."""
+        def fc1_grads(x, y):
+            collected["model"].load_state_dict(collected["sd"])
+            p = dict(collected["model"].named_parameters())["mlp.fc1.weight"]
+            rows = []
+            for i in range(x.shape[0]):
+                loss = ((collected["model"](x[i : i + 1]) - y[i : i + 1]) ** 2).sum()
+                rows.append(torch.autograd.grad(loss, [p])[0].reshape(-1))
+            return torch.stack(rows)
+
+        oracle = fc1_grads(collected["x_tr"], collected["y_tr"]) @ \
+            fc1_grads(collected["x_te"], collected["y_te"]).T
+        res = _make_attr(tmp_path / "s", normalized=False).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            layer_name="mlp.fc1",   # str form; normalized to a list
+        )
+        matrix = res.query(collected["train_hashes"], collected["test_hashes"],
+                           trajectory="agnostic")
+        assert torch.allclose(matrix, oracle, atol=1e-5, rtol=1e-4)
+        assert res.layer_name == ["mlp.fc1"]
+
+    def test_layer_name_unknown_raises(self, collected, tmp_path):
+        with pytest.raises(KeyError, match="Unknown layers"):
+            _make_attr(tmp_path / "u", normalized=False).attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                layer_name=["nope"],
+            )
 
     def test_loop_modes_and_column_order_agree(self, collected, tmp_path):
         """Cached vs re-streamed test paths must be identical, and the lazily

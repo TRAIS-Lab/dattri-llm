@@ -422,6 +422,21 @@ def make_gradient_multistep_dataloader(
     return DataLoader(**kwargs)
 
 
+def normalize_layer_names(
+    layer_name: Optional[Union[str, List[str]]],
+) -> Optional[List[str]]:
+    """Normalize an ``attribute_from_cache`` ``layer_name`` argument.
+
+    A single string becomes a one-element list; ``None`` (score every stored
+    layer) passes through.
+    """
+    if layer_name is None:
+        return None
+    if isinstance(layer_name, str):
+        return [layer_name]
+    return list(layer_name)
+
+
 def resolve_steps(
     file_manager: GradientFileManager,
     requested: Optional[Iterable[int]],

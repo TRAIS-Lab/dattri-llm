@@ -55,6 +55,7 @@ from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import (
     BaseAttributor,
     collect_to_disk,
+    normalize_layer_names,
     score_sources,
     task_loss_fn,
 )
@@ -68,20 +69,13 @@ from dattri.task import AttributionTask
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
+from dattri_llm.gradient.hooks import HookManagerConfig
 from torch.utils.data import Dataset
 
 
-def _select_layers(
-    grad: Gradient, layer_name: Optional[List[str]], predicate
-) -> List[str]:
-    """Names of layers in *grad* whose type satisfies *predicate*, restricted to
-    *layer_name* when given."""
-    return [
-        name
-        for name in grad.data
-        if predicate(grad.layer_types[name])
-        and (layer_name is None or name in layer_name)
-    ]
+def _select_layers(grad: Gradient, predicate) -> List[str]:
+    """Names of layers in *grad* whose type satisfies *predicate*."""
+    return [name for name in grad.data if predicate(grad.layer_types[name])]
 
 
 class _KroneckerBaseAttributor(BaseAttributor):
@@ -102,7 +96,6 @@ class _KroneckerBaseAttributor(BaseAttributor):
         args: AttributionArguments,
         *,
         damping: float = 1e-3,
-        layer_name: Optional[Union[str, List[str]]] = None,
         task: Optional[AttributionTask] = None,
     ) -> None:
         if damping < 0:
@@ -110,12 +103,6 @@ class _KroneckerBaseAttributor(BaseAttributor):
         self.args = args
         self.task = task
         self.damping = float(damping)
-        if isinstance(layer_name, str):
-            self.layer_name: Optional[List[str]] = [layer_name]
-        elif layer_name is None:
-            self.layer_name = None
-        else:
-            self.layer_name = list(layer_name)
 
     def cache(
         self,
@@ -123,6 +110,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         test_dataset: Dataset,
         *,
         cache_dir: Optional[str] = None,
+        hook_config: Optional[HookManagerConfig] = None,
     ) -> List[Tuple[str, str]]:
         """Collect the gradients K-FAC/EK-FAC needs, live, to disk.
 
@@ -136,6 +124,9 @@ class _KroneckerBaseAttributor(BaseAttributor):
             train_dataset, test_dataset: Datasets to stream.
             cache_dir: Parent dir; the pair goes under ``<cache_dir>/ckpt_0/``.
                 Defaults to ``args.output_dir``.
+            hook_config: :class:`HookManagerConfig` for the internal streamers
+                (which layers to hook, per-layer projection, ...).  ``None`` uses
+                the streamer default (factorized hooks on every linear-family layer).
 
         Returns:
             A one-element list ``[(train_gradients_dir, test_gradients_dir)]``.
@@ -164,6 +155,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 batch_size=self.args.per_device_train_batch_size,
                 enable_update=False,
                 loss_fn=task_loss_fn(self.task.original_loss_func),
+                config=hook_config,
             ),
             GradientFileManager(train_dir),
         )
@@ -173,6 +165,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 batch_size=self.args.per_device_eval_batch_size,
                 enable_update=False,
                 loss_fn=task_loss_fn(self.task.original_target_func),
+                config=hook_config,
             ),
             GradientFileManager(test_dir),
         )
@@ -230,6 +223,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
         direct_fim_max_params: int = 4096,
         algorithm_meta_extra: Optional[dict] = None,
+        layer_name: Optional[List[str]] = None,
     ) -> AttributionScore:
         """Fit the K-FAC preconditioner from ``train_source``, then score it
         against ``test_source`` — the shared loop behind :meth:`attribute_from_cache`
@@ -283,7 +277,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                     if non_kfac_strategy == "direct"
                     else " (pass non_kfac_strategy='direct' to include norm layers)"
                 )
-                + ". Check `layer_name` and the collected layers."
+                + ". Check the hook config and the collected layers."
             )
 
         # Per test block: (K-FAC rep, direct-Fisher rep).  Per (train, test) pair:
@@ -314,7 +308,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             },
             algorithm=self.algorithm,
             normalized_grad=False,
-            layer_name=self.layer_name,
+            layer_name=layer_name,
         )
         result.save(self.args.output_path)
         return result
@@ -329,6 +323,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         verbose: bool = False,
         non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
         direct_fim_max_params: int = 4096,
+        layer_name: Optional[Union[str, List[str]]] = None,
     ) -> AttributionScore:
         """Score pre-collected on-disk gradients (the *store-then-attribute* path).
 
@@ -346,20 +341,26 @@ class _KroneckerBaseAttributor(BaseAttributor):
             non_kfac_strategy: ``"ignore"`` (default) skips norm layers; ``"direct"``
                 adds a dense empirical-Fisher preconditioner for each, bounded by
                 ``direct_fim_max_params``.
+            layer_name: Restrict scoring (and the Fisher fit) to this subset of the
+                *stored* layers (``str`` or list; unknown names raise).  ``None``
+                (default) uses every stored layer.  A read-time filter — the same
+                cache can be re-queried per layer.
         """
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
                 f"{type(self).__name__} requires both train_gradients_dir and "
                 "test_gradients_dir."
             )
+        layer_name = normalize_layer_names(layer_name)
         train = DiskGradientSource(
             GradientFileManager(train_gradients_dir), self.args,
-            steps=selected_training_steps, layer_name=self.layer_name,
+            steps=selected_training_steps, layer_name=layer_name,
             desc=f"{self.algorithm}: train", verbose=verbose,
         )
         test = DiskGradientSource(
             GradientFileManager(test_gradients_dir), self.args,
-            layer_name=self.layer_name, desc=f"{self.algorithm}: preparing test",
+            layer_name=layer_name,
+            desc=f"{self.algorithm}: preparing test",
             verbose=verbose,
         )
         return self._run(
@@ -367,6 +368,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             non_kfac_strategy=non_kfac_strategy,
             direct_fim_max_params=direct_fim_max_params,
             algorithm_meta_extra={"selected_training_steps": train._steps},
+            layer_name=layer_name,
         )
 
     def attribute(
@@ -377,13 +379,17 @@ class _KroneckerBaseAttributor(BaseAttributor):
         loop_over_test: bool = False,
         non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
         direct_fim_max_params: int = 4096,
+        hook_config: Optional[HookManagerConfig] = None,
     ) -> AttributionScore:
         """Score by collecting gradients **live** at the task's first checkpoint.
 
         K-FAC/EK-FAC are **single-checkpoint** methods, so only the first
         checkpoint of the task is used (matching dattri).  Both sides are frozen
         probes; the model, loss (and optional ``target_func`` for the test side),
-        and the batch sizes come from the task and ``args``.
+        and the batch sizes come from the task and ``args``.  ``hook_config``
+        configures the internal streamers' capture (which layers to hook,
+        per-layer projection, ...); ``None`` uses the streamer default.  The test
+        streamer shares the train streamer's hooks, so one config governs both.
         """
         if self.task is None:
             raise ValueError(
@@ -404,6 +410,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             model, train_dataset, self.args,
             batch_size=self.args.per_device_train_batch_size,
             loss_fn=task_loss_fn(self.task.original_loss_func),
+            config=hook_config,
         )
         test = GradientStreamer(
             model, test_dataset, self.args,
@@ -416,6 +423,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 train, test, loop_over_test=loop_over_test,
                 non_kfac_strategy=non_kfac_strategy,
                 direct_fim_max_params=direct_fim_max_params,
+                layer_name=train.hook_manager.layer_name,  # what was hooked
             )
 
     # ------------------------------------------------------------------ #
@@ -423,17 +431,16 @@ class _KroneckerBaseAttributor(BaseAttributor):
     # ------------------------------------------------------------------ #
 
     def _kfac_layers(self, grad: Gradient) -> List[str]:
-        """Layer names eligible for K-FAC (linear/conv), honouring ``layer_name``."""
+        """Layer names eligible for K-FAC (linear/conv)."""
         return _select_layers(
             grad,
-            self.layer_name,
             lambda lt: ops.is_linear(lt) or ops.is_conv(lt) or ops.is_conv_transpose(lt),
         )
 
     def _fisher_layers(self, grad: Gradient) -> List[str]:
-        """Layer names eligible for the direct-Fisher fallback (norm), honouring
-        ``layer_name``.  Symmetric to :meth:`_kfac_layers`."""
-        return _select_layers(grad, self.layer_name, ops.is_norm)
+        """Layer names eligible for the direct-Fisher fallback (norm).
+        Symmetric to :meth:`_kfac_layers`."""
+        return _select_layers(grad, ops.is_norm)
 
     # ------------------------------------------------------------------ #
     # Direct-Fisher fallback for non-K-FAC (norm) layers                  #
@@ -450,7 +457,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         """
         fisher_acc.update(grad, self._fisher_layers(grad))
         self._fisher_saw_embedding.update(
-            _select_layers(grad, self.layer_name, ops.is_embedding)
+            _select_layers(grad, ops.is_embedding)
         )
 
     def _finalize_fisher(
@@ -549,7 +556,6 @@ class KFACAttributor(_KroneckerBaseAttributor):
         args: :class:`AttributionArguments` (``dataloader_*``, ``device``,
             ``output_dir`` are consulted).
         damping: Tikhonov term added to each covariance factor before inversion.
-        layer_name: Restrict to these layers; ``None`` uses every eligible layer.
         task: Accepted for API parity; unused.
 
     The training checkpoints used are chosen per call via
@@ -628,7 +634,6 @@ class EKFACAttributor(_KroneckerBaseAttributor):
     Args:
         args: :class:`AttributionArguments`.
         damping: Added to the corrected eigenvalues before inversion.
-        layer_name: Restrict to these layers; ``None`` uses every eligible layer.
         task: Accepted for API parity; unused.
         mode: ``"exact"`` (default) or ``"approx"``; see above.  Currently
             equivalent.
@@ -645,7 +650,6 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         args: AttributionArguments,
         *,
         damping: float = 1e-3,
-        layer_name: Optional[Union[str, List[str]]] = None,
         task: Optional[AttributionTask] = None,
         mode: str = "exact",
     ) -> None:
@@ -653,9 +657,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
             raise ValueError(
                 f"mode must be one of {self.EKFAC_MODES}, got {mode!r}."
             )
-        super().__init__(
-            args, damping=damping, layer_name=layer_name, task=task
-        )
+        super().__init__(args, damping=damping, task=task)
         self.mode = mode
 
     def _fit(

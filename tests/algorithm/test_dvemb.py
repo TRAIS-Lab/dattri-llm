@@ -96,7 +96,7 @@ def collected(tmp_path):
 
 
 def _make_attr(out_dir, lr):
-    return DVEmbAttributor(_args(out_dir), learning_rate=lr, layer_name=LAYERS)
+    return DVEmbAttributor(_args(out_dir), learning_rate=lr)
 
 
 class TestDVEmbOnDisk:
@@ -281,7 +281,7 @@ class TestDVEmbOnDisk:
         """A {step: η} mapping uses each step's own rate in score and Fisher."""
         lrs = {0: 0.3, 1: 0.6}
         res = DVEmbAttributor(
-            _args(tmp_path / "o"), learning_rate=lrs, layer_name=LAYERS
+            _args(tmp_path / "o"), learning_rate=lrs
         ).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),

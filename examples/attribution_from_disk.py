@@ -124,7 +124,7 @@ def main() -> None:
             use_cpu=True,
             dataloader_pin_memory=False,
         )
-        attr = TracInAttributor(args, layer_name=["mlp.fc1", "mlp.fc2"])
+        attr = TracInAttributor(args)
         score = attr.attribute_from_cache(train_dir, test_dir)
 
         train_ids, matrix = score.agnostic_matrix()

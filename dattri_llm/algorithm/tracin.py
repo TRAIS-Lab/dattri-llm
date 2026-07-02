@@ -39,6 +39,7 @@ from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import (
     BaseAttributor,
     collect_to_disk,
+    normalize_layer_names,
     score_sources,
     task_loss_fn,
 )
@@ -50,6 +51,7 @@ from dattri_llm.algorithm.streaming import (
 )
 from dattri.task import AttributionTask
 from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.hooks import HookManagerConfig
 
 
 class TracInAttributor(BaseAttributor):
@@ -68,11 +70,12 @@ class TracInAttributor(BaseAttributor):
         normalized_grad: If ``True``, use cosine similarity per ``(i, j)`` pair
             (GradCos / CosIn); if ``False``, the raw inner product (TracIn /
             GradDot).
-        layer_name: Restrict the inner product to these layer names.  ``None``
-            uses every layer shared between the train and test gradients.
         task: Accepted for parity with the workflow-1 API but unused here.
 
-
+    Layer selection happens at **capture** (via the ``hook_config`` of the live
+    methods, or whatever was hooked when the cache was collected).  By default
+    every stored layer is scored; :meth:`attribute_from_cache` additionally takes
+    a ``layer_name`` read-time filter to score a subset of the stored layers.
     """
 
     def __init__(
@@ -80,18 +83,11 @@ class TracInAttributor(BaseAttributor):
         args: AttributionArguments,
         *,
         normalized_grad: bool = False,
-        layer_name: Optional[Union[str, List[str]]] = None,
         task: Optional[AttributionTask] = None,
     ) -> None:
         self.args = args
         self.task = task
         self.normalized_grad = normalized_grad
-        if isinstance(layer_name, str):
-            self.layer_name: Optional[List[str]] = [layer_name]
-        elif layer_name is None:
-            self.layer_name = None
-        else:
-            self.layer_name = list(layer_name)
 
     def cache(
         self,
@@ -100,6 +96,7 @@ class TracInAttributor(BaseAttributor):
         *,
         cache_dir: Optional[str] = None,
         enable_update: bool = False,
+        hook_config: Optional[HookManagerConfig] = None,
     ) -> List[Tuple[str, str]]:
         """Collect the gradients TracIn/GradCos needs, live, to disk.
 
@@ -127,6 +124,9 @@ class TracInAttributor(BaseAttributor):
             cache_dir: Parent dir; each pair goes under ``<cache_dir>/ckpt_<k>/``.
                 Defaults to ``args.output_dir``.
             enable_update: Trajectory (train as it streams) vs. per-checkpoint.
+            hook_config: :class:`HookManagerConfig` for the internal streamers
+                (which layers to hook, per-layer projection, ...).  ``None`` uses
+                the streamer default (factorized hooks on every linear-family layer).
 
         Returns:
             A list of ``(train_gradients_dir, test_gradients_dir)`` pairs — one per
@@ -163,12 +163,14 @@ class TracInAttributor(BaseAttributor):
             # the test side before the training pass advances the model.
             collect_to_disk(
                 GradientStreamer(model, test_dataset, self.args, batch_size=vb,
-                                 enable_update=False, loss_fn=test_loss),
+                                 enable_update=False, loss_fn=test_loss,
+                                 config=hook_config),
                 GradientFileManager(test_dir),
             )
             collect_to_disk(
                 GradientStreamer(model, train_dataset, self.args, batch_size=tb,
-                                 enable_update=True, loss_fn=train_loss),
+                                 enable_update=True, loss_fn=train_loss,
+                                 config=hook_config),
                 GradientFileManager(train_dir),
             )
             return [(train_dir, test_dir)]
@@ -182,13 +184,13 @@ class TracInAttributor(BaseAttributor):
             collect_to_disk(
                 GradientStreamer(model, test_dataset, self.args, batch_size=vb,
                                  enable_update=False, loss_fn=test_loss,
-                                 checkpoint_step=k),
+                                 checkpoint_step=k, config=hook_config),
                 GradientFileManager(test_dir),
             )
             collect_to_disk(
                 GradientStreamer(model, train_dataset, self.args, batch_size=tb,
                                  enable_update=False, loss_fn=train_loss,
-                                 checkpoint_step=k),
+                                 checkpoint_step=k, config=hook_config),
                 GradientFileManager(train_dir),
             )
             pairs.append((train_dir, test_dir))
@@ -209,6 +211,7 @@ class TracInAttributor(BaseAttributor):
         *,
         loop_over_test: bool = False,
         algorithm_meta: Optional[dict] = None,
+        layer_name: Optional[List[str]] = None,
     ) -> AttributionScore:
         """Score a train source against a test source — the shared loop.
 
@@ -235,7 +238,7 @@ class TracInAttributor(BaseAttributor):
             algorithm_meta=algorithm_meta or {},
             algorithm=self._name,
             normalized_grad=self.normalized_grad,
-            layer_name=self.layer_name,
+            layer_name=layer_name,
         )
         result.save(self.args.output_path)
         return result
@@ -248,6 +251,7 @@ class TracInAttributor(BaseAttributor):
         selected_training_steps: Optional[Iterable[int]] = None,
         loop_over_test: bool = False,
         verbose: bool = False,
+        layer_name: Optional[Union[str, List[str]]] = None,
     ) -> AttributionScore:
         """Score pre-collected on-disk gradients (the *store-then-attribute* path).
 
@@ -266,6 +270,10 @@ class TracInAttributor(BaseAttributor):
             loop_over_test: Re-stream the test blocks per train block (low memory)
                 instead of caching them once (default).
             verbose: Show tqdm progress bars on the logging process.
+            layer_name: Restrict scoring to this subset of the *stored* layers
+                (``str`` or list; unknown names raise).  ``None`` (default) scores
+                every stored layer.  This is a read-time filter — the cache itself
+                is unchanged, so the same cache can be re-queried per layer.
 
         Returns:
             An :class:`AttributionScore`, also persisted to ``args.output_dir``.
@@ -275,18 +283,21 @@ class TracInAttributor(BaseAttributor):
                 f"{type(self).__name__}.attribute_from_cache requires both "
                 "train_gradients_dir and test_gradients_dir."
             )
+        layer_name = normalize_layer_names(layer_name)
         train = DiskGradientSource(
             GradientFileManager(train_gradients_dir), self.args,
-            steps=selected_training_steps, layer_name=self.layer_name,
+            steps=selected_training_steps, layer_name=layer_name,
             desc=f"{self._name}: scoring", verbose=verbose,
         )
         test = DiskGradientSource(
             GradientFileManager(test_gradients_dir), self.args,
-            layer_name=self.layer_name, desc=f"{self._name}: loading test", verbose=verbose,
+            layer_name=layer_name,
+            desc=f"{self._name}: loading test", verbose=verbose,
         )
         return self._run(
             train, test, loop_over_test=loop_over_test,
             algorithm_meta={"selected_training_steps": train._steps},
+            layer_name=layer_name,
         )
 
     def attribute(
@@ -296,6 +307,7 @@ class TracInAttributor(BaseAttributor):
         *,
         loop_over_test: bool = False,
         enable_update: bool = False,
+        hook_config: Optional[HookManagerConfig] = None,
     ) -> AttributionScore:
         """Score by collecting gradients **live** (on-the-fly, workflow 1).
 
@@ -318,6 +330,11 @@ class TracInAttributor(BaseAttributor):
             loop_over_test: As in :meth:`attribute_from_cache`.
             enable_update: Train the model as it streams (trajectory) vs. frozen
                 multi-checkpoint scoring.
+            hook_config: :class:`HookManagerConfig` for the internal streamers
+                (which layers to hook, per-layer projection, ...).  ``None`` uses
+                the streamer default (factorized hooks on every linear-family
+                layer).  The test streamer shares the train streamer's hooks, so
+                one config governs both sides.
         """
         if self.task is None:
             raise ValueError(
@@ -333,18 +350,23 @@ class TracInAttributor(BaseAttributor):
         device = self.args.device
         metric = self._metric
         score_block = lambda tr, te, _n: tr.similarity(te, metric=metric, reduce="all")
+        # Layer selection is the hook config's job; record what was hooked (the
+        # scored layer set) for the AttributionScore metadata.
+        hooked_layers: List[str] = []
 
         def _score_one(checkpoint_step: int, update: bool):
             model = self.task.get_model()
             train = GradientStreamer(
                 model, train_dataset, self.args, batch_size=tb,
                 enable_update=update, loss_fn=train_loss, checkpoint_step=checkpoint_step,
+                config=hook_config,
             )
             test = GradientStreamer(
                 model, test_dataset, self.args, batch_size=vb,
                 loss_fn=test_loss, checkpoint_step=checkpoint_step,
                 hook_manager=train.hook_manager,  # one set of hooks over the model
             )
+            hooked_layers[:] = train.hook_manager.layer_name
             with train, test:
                 return score_sources(
                     train, test, device, prepare_test=lambda g: g,
@@ -390,7 +412,7 @@ class TracInAttributor(BaseAttributor):
             algorithm_meta={"n_checkpoints": len(self.task.get_checkpoints())},
             algorithm=self._name,
             normalized_grad=self.normalized_grad,
-            layer_name=self.layer_name,
+            layer_name=hooked_layers or None,   # what the hook manager captured
         )
         result.save(self.args.output_path)
         return result

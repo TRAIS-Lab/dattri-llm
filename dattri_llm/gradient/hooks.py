@@ -1636,6 +1636,15 @@ class HookManager:
         return list(self._buffers.keys())
 
     @property
+    def layer_name(self) -> list[str]:
+        """The layer set an attributor scores: the hooked per-sample (linear-IO)
+        layers.  Layer selection is decided here, at capture, via
+        :class:`HookManagerConfig` — attributors read it back through this
+        property (e.g. for :class:`AttributionScore` metadata) instead of taking
+        their own ``layer_name`` argument."""
+        return list(self._buffers.keys())
+
+    @property
     def param_layer_names(self) -> list[str]:
         """Fully-qualified names of all param-grad hooked layers."""
         return list(self._param_buffers.keys())
