@@ -134,10 +134,8 @@ def _args(out_dir: Path) -> AttributionArguments:
     )
 
 
-def _make_attr(out_dir: Path, *, normalized):
-    return TracInAttributor(
-        _args(out_dir), normalized_grad=normalized
-    )
+def _make_attr(out_dir: Path):
+    return TracInAttributor(_args(out_dir))
 
 
 @pytest.fixture()
@@ -171,11 +169,12 @@ class TestTracInOnDisk:
                          collected["x_te"], collected["y_te"], normalized=normalized)
         oracle = g_tr @ g_te.T
 
-        attr = _make_attr(tmp_path / f"out_{normalized}_{loop_over_test}", normalized=normalized)
+        attr = _make_attr(tmp_path / f"out_{normalized}_{loop_over_test}")
         result = attr.attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=loop_over_test,
+            normalized_grad=normalized,
         )
         # Realign the hash-keyed score back to sample order for comparison.
         matrix = result.query(
@@ -186,17 +185,19 @@ class TestTracInOnDisk:
         )
 
     def test_algorithm_label_and_shape(self, collected, tmp_path):
-        res = _make_attr(tmp_path / "a", normalized=False).attribute_from_cache(
+        res = _make_attr(tmp_path / "a").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
         assert res.algorithm == "TracIn"
         assert res.scores.shape == (N_TRAIN, N_TEST)
-        assert res.algorithm_meta == {"selected_training_steps": [0]}
+        assert res.algorithm_meta == {"normalized_grad": False,
+                                      "selected_training_steps": [0]}
 
-        gradcos = _make_attr(tmp_path / "b", normalized=True).attribute_from_cache(
+        gradcos = _make_attr(tmp_path / "b").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
+            normalized_grad=True,
         )
         assert gradcos.algorithm == "GradCos"
 
@@ -214,7 +215,7 @@ class TestTracInOnDisk:
 
         oracle = fc1_grads(collected["x_tr"], collected["y_tr"]) @ \
             fc1_grads(collected["x_te"], collected["y_te"]).T
-        res = _make_attr(tmp_path / "s", normalized=False).attribute_from_cache(
+        res = _make_attr(tmp_path / "s").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             layer_name="mlp.fc1",   # str form; normalized to a list
@@ -226,7 +227,7 @@ class TestTracInOnDisk:
 
     def test_layer_name_unknown_raises(self, collected, tmp_path):
         with pytest.raises(KeyError, match="Unknown layers"):
-            _make_attr(tmp_path / "u", normalized=False).attribute_from_cache(
+            _make_attr(tmp_path / "u").attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 layer_name=["nope"],
@@ -235,12 +236,12 @@ class TestTracInOnDisk:
     def test_loop_modes_and_column_order_agree(self, collected, tmp_path):
         """Cached vs re-streamed test paths must be identical, and the lazily
         discovered columns must equal the on-disk order."""
-        res_false = _make_attr(tmp_path / "a", normalized=False).attribute_from_cache(
+        res_false = _make_attr(tmp_path / "a").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=False,
         )
-        res_true = _make_attr(tmp_path / "b", normalized=False).attribute_from_cache(
+        res_true = _make_attr(tmp_path / "b").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             loop_over_test=True,
@@ -274,7 +275,7 @@ class TestTracInOnDisk:
         test_dir = tmp_path / "mixed_test"
         add_param_grad(collected["train_dir"], train_dir)
         add_param_grad(collected["test_dir"], test_dir)
-        attr = TracInAttributor(_args(tmp_path / "mixed_out"), normalized_grad=False)
+        attr = TracInAttributor(_args(tmp_path / "mixed_out"))
         with pytest.warns(UserWarning, match="Skipping batch-level param_grad"):
             result = attr.attribute_from_cache(
                 train_gradients_dir=str(train_dir),
@@ -283,7 +284,7 @@ class TestTracInOnDisk:
         assert result.scores.shape == (N_TRAIN, N_TEST)
 
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
-        attr = _make_attr(tmp_path / "o", normalized=False)
+        attr = _make_attr(tmp_path / "o")
         with pytest.raises(TypeError, match=r"train_gradients_dir"):
             attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]))
         with pytest.raises(TypeError, match=r"test_gradients_dir"):
@@ -337,7 +338,7 @@ class TestTracInOnDisk:
         train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
         test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
 
-        res = _make_attr(tmp_path / "o", normalized=False).attribute_from_cache(
+        res = _make_attr(tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
         # Two steps per train sample → 2 * N_TRAIN rows, stamped {0, 1}.
@@ -370,7 +371,7 @@ class TestTracInOnDisk:
         train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
         test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
 
-        res = _make_attr(tmp_path / "o", normalized=False).attribute_from_cache(
+        res = _make_attr(tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
             selected_training_steps=[1],
         )
@@ -387,7 +388,7 @@ class TestTracInOnDisk:
         assert torch.allclose(matrix, oracle, atol=1e-5, rtol=1e-4)
 
     def test_unknown_steps_raise(self, collected, tmp_path):
-        attr = _make_attr(tmp_path / "o", normalized=False)
+        attr = _make_attr(tmp_path / "o")
         with pytest.raises(ValueError, match=r"requested steps"):
             attr.attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
@@ -407,7 +408,7 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd], x_tr, y_tr, train_dir)
         _collect_to_disk(model, [sd], x_te, y_te, test_dir)
 
-        res = _make_attr(tmp_path / "o", normalized=False).attribute_from_cache(
+        res = _make_attr(tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
         distinct = len({hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)})

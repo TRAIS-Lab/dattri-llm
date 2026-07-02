@@ -307,7 +307,6 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 **(algorithm_meta_extra or {}),
             },
             algorithm=self.algorithm,
-            normalized_grad=False,
             layer_name=layer_name,
         )
         result.save(self.args.output_path)

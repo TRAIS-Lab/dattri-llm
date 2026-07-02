@@ -96,7 +96,14 @@ def collected(tmp_path):
 
 
 def _make_attr(out_dir, lr):
-    return DVEmbAttributor(_args(out_dir), learning_rate=lr)
+    """Attributor whose ``attribute_from_cache`` defaults to this test's
+    per-attribution ``learning_rate`` (now a method argument, not a ctor one)."""
+    attr = DVEmbAttributor(_args(out_dir))
+    orig = attr.attribute_from_cache
+    attr.attribute_from_cache = (
+        lambda *a, **k: orig(*a, **{"learning_rate": lr, **k})
+    )
+    return attr
 
 
 class TestDVEmbOnDisk:
@@ -280,12 +287,10 @@ class TestDVEmbOnDisk:
     def test_per_step_learning_rate_mapping(self, collected, tmp_path):
         """A {step: η} mapping uses each step's own rate in score and Fisher."""
         lrs = {0: 0.3, 1: 0.6}
-        res = DVEmbAttributor(
-            _args(tmp_path / "o"), learning_rate=lrs
-        ).attribute_from_cache(
+        res = DVEmbAttributor(_args(tmp_path / "o")).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            final_step=2, loss_reduction="sum",
+            final_step=2, loss_reduction="sum", learning_rate=lrs,
         )
         # Oracle with per-step rates: η_{t_s} scale and η_k factors.
         model, train_sds = collected["model"], collected["train_sds"]

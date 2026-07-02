@@ -48,10 +48,9 @@ class AttributionScore:
         test_ids: Length-``num_test`` list giving the test-sample hash for each
             column.
         algorithm: The specific attribution algorithm used.
-        algorithm_meta: Algorithm-specific metadata (e.g. ``"damping"`` for the
-            K-FAC family); empty for TracIn/GradCos.
-        normalized_grad: Whether per-sample gradients were L2-normalised
-            (cosine / GradCos) before the inner product.
+        algorithm_meta: Algorithm-specific metadata — e.g. ``"damping"`` for
+            the K-FAC family, ``"normalized_grad"`` for TracIn/GradCos,
+            ``"learning_rate"`` for DVEmb.
         layer_name: Layers the inner product was restricted to, or ``None``.
     """
 
@@ -62,7 +61,6 @@ class AttributionScore:
 
     algorithm: str
     algorithm_meta: Dict[str, Any]
-    normalized_grad: bool
     layer_name: Optional[List[str]]
 
     # Rebuilt from the lists above; never persisted directly.
@@ -332,7 +330,6 @@ class AttributionScore:
             "test_ids": self.test_ids,
             "algorithm": self.algorithm,
             "algorithm_meta": self.algorithm_meta,
-            "normalized_grad": self.normalized_grad,
             "layer_name": self.layer_name,
             "num_train": self.num_train,
             "num_test": self.num_test,
@@ -357,6 +354,9 @@ class AttributionScore:
         with open(out / cls._META_FILE) as f:
             meta = json.load(f)
         algorithm_meta = meta.get("algorithm_meta", {})
+        # Older saves carried normalized_grad as a top-level field; fold it in.
+        if "normalized_grad" in meta:
+            algorithm_meta.setdefault("normalized_grad", meta["normalized_grad"])
         return cls(
             scores=scores,
             row_train_ids=meta["row_train_ids"],
@@ -364,6 +364,5 @@ class AttributionScore:
             test_ids=meta["test_ids"],
             algorithm=meta["algorithm"],
             algorithm_meta=algorithm_meta,
-            normalized_grad=meta["normalized_grad"],
             layer_name=meta["layer_name"],
         )

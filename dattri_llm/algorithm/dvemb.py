@@ -98,15 +98,15 @@ class DVEmbAttributor(BaseAttributor):
             device placement, and the output directory.  Only the
             ``dataloader_*`` fields, ``device``, and ``output_dir`` are
             consulted in this workflow.
-        learning_rate: The SGD learning rate ``η`` used during training.  Either
-            a single float (constant schedule) or a mapping ``{step: η_step}``
-            giving the rate at each recorded step.  It enters both the per-step
-            score scale ``η_{t_s}`` and the Fisher factors ``(I − η_k H_k)``, so
-            it must match the schedule the gradients were collected under.  A
-            mapping must cover every propagated step (``step < final_step``).
         task: Required by the on-the-fly :meth:`cache` / :meth:`attribute`
             (supplies the model, the loss, and the optional ``target_func`` for
             the test side); unused by :meth:`attribute_from_cache`.
+
+    The learning-rate schedule ``η`` is a per-attribution argument of
+    :meth:`attribute` / :meth:`attribute_from_cache` (a float for a constant
+    schedule or a ``{step: η_step}`` mapping); it enters both the per-step score
+    scale ``η_{t_s}`` and the Fisher factors ``(I − η_k H_k)``, so it must match
+    the schedule the gradients were collected under.
 
     Layer selection happens at **capture** (the ``hook_config`` of the live
     methods, or whatever was hooked when the cache was collected).  By default
@@ -121,18 +121,8 @@ class DVEmbAttributor(BaseAttributor):
         self,
         args: AttributionArguments,
         *,
-        learning_rate: Union[float, Mapping[int, float]] = 1.0,
         task: Optional[AttributionTask] = None,
     ) -> None:
-        if isinstance(learning_rate, Mapping):
-            self.learning_rate: Union[float, Dict[int, float]] = {
-                int(k): float(v) for k, v in learning_rate.items()
-            }
-        else:
-            lr = float(learning_rate)
-            if lr < 0:
-                raise ValueError(f"learning_rate must be non-negative, got {lr}.")
-            self.learning_rate = lr
         self.args = args
         self.task = task
 
@@ -238,18 +228,31 @@ class DVEmbAttributor(BaseAttributor):
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
 
-    def _lr(self, step: int) -> float:
+    @staticmethod
+    def _normalize_lr(
+        learning_rate: Union[float, Mapping[int, float]],
+    ) -> Union[float, Dict[int, float]]:
+        """Validate / canonicalise a per-attribution learning-rate schedule."""
+        if isinstance(learning_rate, Mapping):
+            return {int(k): float(v) for k, v in learning_rate.items()}
+        lr = float(learning_rate)
+        if lr < 0:
+            raise ValueError(f"learning_rate must be non-negative, got {lr}.")
+        return lr
+
+    @staticmethod
+    def _lr(learning_rate: Union[float, Dict[int, float]], step: int) -> float:
         """Learning rate ``η`` at *step*."""
-        if isinstance(self.learning_rate, dict):
+        if isinstance(learning_rate, dict):
             try:
-                return self.learning_rate[step]
+                return learning_rate[step]
             except KeyError:
                 raise ValueError(
                     f"learning_rate mapping has no entry for step {step}; it must "
                     f"cover every propagated step (step < final_step). "
-                    f"Provided steps: {sorted(self.learning_rate)}."
+                    f"Provided steps: {sorted(learning_rate)}."
                 ) from None
-        return self.learning_rate
+        return learning_rate
 
     @staticmethod
     def _materialize(block: Gradient, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -281,7 +284,10 @@ class DVEmbAttributor(BaseAttributor):
             return {int(k): float(v) for k, v in json.load(f).items()}
 
     def _warn_on_lr_mismatch(
-        self, recorded_lr: Mapping[int, float], prop_steps: List[int]
+        self,
+        learning_rate: Union[float, Dict[int, float]],
+        recorded_lr: Mapping[int, float],
+        prop_steps: List[int],
     ) -> None:
         """Warn if the configured ``learning_rate`` disagrees with the recorded
         training schedule over any propagated step.  The configured schedule is
@@ -293,7 +299,7 @@ class DVEmbAttributor(BaseAttributor):
             if want is None:
                 continue
             try:
-                got = self._lr(s)
+                got = self._lr(learning_rate, s)
             except ValueError:
                 continue  # configured schedule missing this step; surfaces later
             if abs(got - want) > 1e-9 + 1e-6 * abs(want):
@@ -320,6 +326,7 @@ class DVEmbAttributor(BaseAttributor):
         device: torch.device,
         loss_reduction: str,
         verbose: bool,
+        learning_rate: Union[float, Dict[int, float]],
     ) -> Tuple[torch.Tensor, List[str], List[int]]:
         """One latest→earliest sweep for the ``n_cols`` columns held in ``w``.
 
@@ -346,7 +353,7 @@ class DVEmbAttributor(BaseAttributor):
             disable=not verbose or not self.args.should_log,
         )
         for ts in steps:
-            lr = self._lr(ts)
+            lr = self._lr(learning_rate, ts)
             emit = ts in output_steps
             # Accumulate this step's Fisher contribution across all its blocks
             # before advancing w, so the whole batch B_ts forms one (I − η H_ts)
@@ -399,6 +406,7 @@ class DVEmbAttributor(BaseAttributor):
         loss_reduction: str = "mean",
         verbose: bool = False,
         hook_config: Optional[HookManagerConfig] = None,
+        learning_rate: Union[float, Mapping[int, float]] = 1.0,
     ) -> AttributionScore:
         """Score **on the fly**: cache the trajectory, then attribute from cache.
 
@@ -406,9 +414,9 @@ class DVEmbAttributor(BaseAttributor):
         gradients) followed by :meth:`attribute_from_cache`.  ``final_step`` is
         not exposed here — it is the number of training steps just run.
 
-        The learning-rate schedule used for the Fisher product
-        (``self.learning_rate``) and ``loss_reduction`` should match the live
-        training run configured by ``args`` (e.g. for a constant schedule, set
+        The ``learning_rate`` schedule used for the Fisher product and
+        ``loss_reduction`` should match the live training run configured by
+        ``args`` (e.g. for a constant schedule, set
         ``learning_rate == args.learning_rate``); otherwise the propagation
         factors ``(I − η H_k)`` will not match the trajectory.  :meth:`cache`
         records the *actual* per-step LR and :meth:`attribute_from_cache` warns
@@ -416,8 +424,8 @@ class DVEmbAttributor(BaseAttributor):
 
         Args:
             train_dataset, test_dataset: Datasets to stream.
-            loop_over_test, selected_training_steps, loss_reduction, verbose: As
-                in :meth:`attribute_from_cache`.
+            loop_over_test, selected_training_steps, loss_reduction, verbose,
+                learning_rate: As in :meth:`attribute_from_cache`.
             hook_config: As in :meth:`cache`.
         """
         train_dir, test_dir = self.cache(train_dataset, test_dataset,
@@ -429,6 +437,7 @@ class DVEmbAttributor(BaseAttributor):
             selected_training_steps=selected_training_steps,
             loss_reduction=loss_reduction,
             verbose=verbose,
+            learning_rate=learning_rate,
         )
 
     def attribute_from_cache(
@@ -441,6 +450,7 @@ class DVEmbAttributor(BaseAttributor):
         loss_reduction: str = "mean",
         verbose: bool = False,
         layer_name: Optional[Union[str, List[str]]] = None,
+        learning_rate: Union[float, Mapping[int, float]] = 1.0,
     ) -> AttributionScore:
         """Compute the ``(num_train_rows, num_test)`` DVEmb attribution score.
 
@@ -500,6 +510,12 @@ class DVEmbAttributor(BaseAttributor):
                 of the *stored* layers (``str`` or list; unknown names raise).
                 ``None`` (default) uses every stored layer.  A read-time filter —
                 the same cache can be re-queried per layer.
+            learning_rate: The SGD learning-rate schedule ``η`` used during
+                training — a float (constant) or ``{step: η_step}`` mapping
+                covering every propagated step.  Enters both the per-step score
+                scale and the Fisher factors ``(I − η_k H_k)``, so it must match
+                the schedule the gradients were collected under (a mismatch with
+                the recorded schedule warns).
 
         Returns:
             An :class:`AttributionScore`; also persisted to ``args.output_dir``.
@@ -535,9 +551,10 @@ class DVEmbAttributor(BaseAttributor):
             )
         # If the train dir carries a schedule recorded by cache(), check the
         # configured learning_rate against it (warn-only; configured one is used).
+        learning_rate = self._normalize_lr(learning_rate)
         recorded_lr = self._read_lr_schedule(train_gradients_dir)
         if recorded_lr is not None:
-            self._warn_on_lr_mismatch(recorded_lr, prop_steps)
+            self._warn_on_lr_mismatch(learning_rate, recorded_lr, prop_steps)
         # ``selected_training_steps`` filters only which steps are emitted as
         # rows; the propagation always sweeps every step in ``prop_steps``.
         if selected_training_steps is None:
@@ -567,11 +584,12 @@ class DVEmbAttributor(BaseAttributor):
             loop_over_test=loop_over_test,
             verbose=verbose,
             layer_name=layer_name,
+            learning_rate=learning_rate,
             algorithm_meta={
                 "final_step": final_step,
                 "selected_training_steps": sorted(output_steps),
                 "propagated_steps": sorted(prop_steps),
-                "learning_rate": self.learning_rate,
+                "learning_rate": learning_rate,
                 "loss_reduction": loss_reduction,
             },
         )
@@ -588,6 +606,7 @@ class DVEmbAttributor(BaseAttributor):
         verbose: bool,
         algorithm_meta: dict,
         layer_name: Optional[List[str]] = None,
+        learning_rate: Union[float, Dict[int, float]] = 1.0,
     ) -> AttributionScore:
         """Score a train source against a test source — the shared DVEmb loop.
 
@@ -631,7 +650,7 @@ class DVEmbAttributor(BaseAttributor):
             del pending
             scores, row_train_ids, row_steps = self._propagate_and_score(
                 w, num_test, layers, train_source, prop_steps, output_steps,
-                device, loss_reduction, verbose,
+                device, loss_reduction, verbose, learning_rate,
             )
         else:
             # ---- test outer: one block's embedding resident, train re-streamed.
@@ -657,7 +676,7 @@ class DVEmbAttributor(BaseAttributor):
                 block_cols = [test_index[h] for h in test_hashes]
                 block_scores, rtids, rsteps = self._propagate_and_score(
                     w_block, len(block_cols), layers, train_source, prop_steps,
-                    output_steps, device, loss_reduction, verbose,
+                    output_steps, device, loss_reduction, verbose, learning_rate,
                 )
                 if scores is None:
                     scores = torch.zeros(
@@ -676,7 +695,6 @@ class DVEmbAttributor(BaseAttributor):
             test_ids=test_ids,
             algorithm_meta=algorithm_meta,
             algorithm=self.algorithm,
-            normalized_grad=False,
             layer_name=layer_name,
         )
         result.save(self.args.output_path)

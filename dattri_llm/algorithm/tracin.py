@@ -14,8 +14,8 @@ i.e. the full ``(num_train, num_test)`` cross-gram, exactly mirroring the
 :class:`~dattri_llm.algorithm.kronecker.KFACAttributor` assembly — there is no
 train/test step alignment.  With ``normalized_grad=True`` the inner product
 becomes a cosine similarity (the GradCos / CosIn variant);
-``GradCos = TracInAttributor(normalized_grad=True)`` — there is no separate
-subclass.
+``GradCos`` is TracIn with ``normalized_grad=True`` passed to the attribute
+methods — there is no separate subclass.
 
 The result is a :class:`~dattri_llm.algorithm.score.AttributionScore`.  Rows are
 stamped with the step each train gradient was recorded at (read straight off the
@@ -67,10 +67,11 @@ class TracInAttributor(BaseAttributor):
             device placement, and the output directory where the score is
             persisted.  Only the ``dataloader_*`` fields, ``device``, and
             ``output_dir`` are consulted in this workflow.
-        normalized_grad: If ``True``, use cosine similarity per ``(i, j)`` pair
-            (GradCos / CosIn); if ``False``, the raw inner product (TracIn /
-            GradDot).
         task: Accepted for parity with the workflow-1 API but unused here.
+
+    ``normalized_grad`` (cosine / GradCos vs raw inner product / TracIn) is a
+    per-attribution choice passed to :meth:`attribute` /
+    :meth:`attribute_from_cache`.
 
     Layer selection happens at **capture** (via the ``hook_config`` of the live
     methods, or whatever was hooked when the cache was collected).  By default
@@ -82,12 +83,10 @@ class TracInAttributor(BaseAttributor):
         self,
         args: AttributionArguments,
         *,
-        normalized_grad: bool = False,
         task: Optional[AttributionTask] = None,
     ) -> None:
         self.args = args
         self.task = task
-        self.normalized_grad = normalized_grad
 
     def cache(
         self,
@@ -196,13 +195,12 @@ class TracInAttributor(BaseAttributor):
             pairs.append((train_dir, test_dir))
         return pairs
 
-    @property
-    def _name(self) -> str:
-        return "GradCos" if self.normalized_grad else "TracIn"
-
-    @property
-    def _metric(self) -> str:
-        return "cosine" if self.normalized_grad else "dot"
+    @staticmethod
+    def _label(normalized_grad: bool) -> Tuple[str, str]:
+        """(algorithm name, similarity metric) for the normalization choice."""
+        return (
+            ("GradCos", "cosine") if normalized_grad else ("TracIn", "dot")
+        )
 
     def _run(
         self,
@@ -212,6 +210,7 @@ class TracInAttributor(BaseAttributor):
         loop_over_test: bool = False,
         algorithm_meta: Optional[dict] = None,
         layer_name: Optional[List[str]] = None,
+        normalized_grad: bool = False,
     ) -> AttributionScore:
         """Score a train source against a test source — the shared loop.
 
@@ -221,7 +220,7 @@ class TracInAttributor(BaseAttributor):
         ``prepare_test`` is the identity and ``score_block`` is the cross-gram
         (``"dot"``, or ``"cosine"`` for GradCos).
         """
-        metric = self._metric
+        name, metric = self._label(normalized_grad)
         scores, row_train_ids, row_steps, test_ids = score_sources(
             train_source,
             test_source,
@@ -235,9 +234,9 @@ class TracInAttributor(BaseAttributor):
             row_train_ids=row_train_ids,
             row_steps=row_steps,
             test_ids=test_ids,
-            algorithm_meta=algorithm_meta or {},
-            algorithm=self._name,
-            normalized_grad=self.normalized_grad,
+            algorithm_meta={"normalized_grad": normalized_grad,
+                            **(algorithm_meta or {})},
+            algorithm=name,
             layer_name=layer_name,
         )
         result.save(self.args.output_path)
@@ -252,6 +251,7 @@ class TracInAttributor(BaseAttributor):
         loop_over_test: bool = False,
         verbose: bool = False,
         layer_name: Optional[Union[str, List[str]]] = None,
+        normalized_grad: bool = False,
     ) -> AttributionScore:
         """Score pre-collected on-disk gradients (the *store-then-attribute* path).
 
@@ -274,6 +274,8 @@ class TracInAttributor(BaseAttributor):
                 (``str`` or list; unknown names raise).  ``None`` (default) scores
                 every stored layer.  This is a read-time filter — the cache itself
                 is unchanged, so the same cache can be re-queried per layer.
+            normalized_grad: ``True`` scores by cosine similarity (GradCos);
+                ``False`` (default) by the raw inner product (TracIn / GradDot).
 
         Returns:
             An :class:`AttributionScore`, also persisted to ``args.output_dir``.
@@ -284,20 +286,22 @@ class TracInAttributor(BaseAttributor):
                 "train_gradients_dir and test_gradients_dir."
             )
         layer_name = normalize_layer_names(layer_name)
+        name, _ = self._label(normalized_grad)
         train = DiskGradientSource(
             GradientFileManager(train_gradients_dir), self.args,
             steps=selected_training_steps, layer_name=layer_name,
-            desc=f"{self._name}: scoring", verbose=verbose,
+            desc=f"{name}: scoring", verbose=verbose,
         )
         test = DiskGradientSource(
             GradientFileManager(test_gradients_dir), self.args,
             layer_name=layer_name,
-            desc=f"{self._name}: loading test", verbose=verbose,
+            desc=f"{name}: loading test", verbose=verbose,
         )
         return self._run(
             train, test, loop_over_test=loop_over_test,
             algorithm_meta={"selected_training_steps": train._steps},
             layer_name=layer_name,
+            normalized_grad=normalized_grad,
         )
 
     def attribute(
@@ -308,6 +312,7 @@ class TracInAttributor(BaseAttributor):
         loop_over_test: bool = False,
         enable_update: bool = False,
         hook_config: Optional[HookManagerConfig] = None,
+        normalized_grad: bool = False,
     ) -> AttributionScore:
         """Score by collecting gradients **live** (on-the-fly, workflow 1).
 
@@ -335,6 +340,8 @@ class TracInAttributor(BaseAttributor):
                 the streamer default (factorized hooks on every linear-family
                 layer).  The test streamer shares the train streamer's hooks, so
                 one config governs both sides.
+            normalized_grad: ``True`` scores by cosine similarity (GradCos);
+                ``False`` (default) by the raw inner product (TracIn / GradDot).
         """
         if self.task is None:
             raise ValueError(
@@ -348,7 +355,7 @@ class TracInAttributor(BaseAttributor):
         tb = self.args.per_device_train_batch_size
         vb = self.args.per_device_eval_batch_size
         device = self.args.device
-        metric = self._metric
+        name, metric = self._label(normalized_grad)
         score_block = lambda tr, te, _n: tr.similarity(te, metric=metric, reduce="all")
         # Layer selection is the hook config's job; record what was hooked (the
         # scored layer set) for the AttributionScore metadata.
@@ -409,9 +416,9 @@ class TracInAttributor(BaseAttributor):
             row_train_ids=row_train_ids,
             row_steps=row_steps,
             test_ids=test_ids or [],
-            algorithm_meta={"n_checkpoints": len(self.task.get_checkpoints())},
-            algorithm=self._name,
-            normalized_grad=self.normalized_grad,
+            algorithm_meta={"n_checkpoints": len(self.task.get_checkpoints()),
+                            "normalized_grad": normalized_grad},
+            algorithm=name,
             layer_name=hooked_layers or None,   # what the hook manager captured
         )
         result.save(self.args.output_path)
