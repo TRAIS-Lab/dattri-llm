@@ -1,35 +1,23 @@
-"""On-the-fly attribution (workflow 1): score directly, no gradient files.
-
-One ``TracInAttributor.attribute(train_ds, test_ds)`` call runs forward/backward
-live and scores the per-sample gradients as they stream — nothing is persisted.
-The model, loss, and checkpoints come from a ``dattri`` ``AttributionTask``;
-batch sizes and device from ``AttributionArguments``.
-
-Use this when you attribute once; to re-query the same gradients (different
-layers or methods) without recomputing, use ``attribution_from_disk.py``.
-
-Run:
-    python examples/attribution_on_the_fly.py
-"""
+"""This example shows on-the-fly attribution: score live, nothing written to disk."""
 
 from __future__ import annotations
 
+import argparse
 import pathlib
 import sys
 import tempfile
 
 # Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import Dataset
 
 from dattri.task import AttributionTask
 
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.tracin import TracInAttributor
-
 
 IN, HID, OUT = 8, 16, 4
 
@@ -60,18 +48,24 @@ class DictDataset(Dataset):
         return {"x": self.x[i], "y": self.y[i]}
 
 
-def main() -> None:
-    # ── 1. Model + data ───────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_train", type=int, default=6)
+    parser.add_argument("--n_test", type=int, default=3)
+    args_cli = parser.parse_args()
+    n_train, n_test = args_cli.n_train, args_cli.n_test
+
+    # generate the toy model and data
     torch.manual_seed(0)
     model = MLP().eval()
     g = torch.Generator().manual_seed(0)
-    x_tr, y_tr = torch.randn(6, IN, generator=g), torch.randn(6, OUT, generator=g)
-    x_te, y_te = torch.randn(3, IN, generator=g), torch.randn(3, OUT, generator=g)
+    x_tr, y_tr = torch.randn(n_train, IN, generator=g), torch.randn(n_train, OUT, generator=g)
+    x_te, y_te = torch.randn(n_test, IN, generator=g), torch.randn(n_test, OUT, generator=g)
     train_ds, test_ds = DictDataset(x_tr, y_tr), DictDataset(x_te, y_te)
 
-    # ── 2. Describe the attribution target with a dattri AttributionTask ───────
-    # The loss is functorch-style ``(params, data) -> loss``; checkpoints is the
-    # list of model states to score at (here just the current weights).
+    # describe the attribution target with a dattri AttributionTask: the loss is
+    # functorch-style (params, data) -> loss; checkpoints is the list of model
+    # states to score at (here just the current weights)
     def loss_func(params, data):
         yhat = torch.func.functional_call(model, params, (data["x"],))
         return ((yhat - data["y"]) ** 2).sum()
@@ -80,35 +74,39 @@ def main() -> None:
     task = AttributionTask(loss_func=loss_func, model=model, checkpoints=[checkpoint])
 
     with tempfile.TemporaryDirectory() as tmp:
-        # ── 3. Attribute — one call collects gradients live and scores them ────
-        args = AttributionArguments(
+        # attribute — one call streams the gradients live and scores them;
+        # nothing is persisted.  Pass normalized_grad=True for GradCos, or a
+        # hook_config=HookManagerConfig(...) to control which layers are hooked
+        # (and, optionally, per-layer random projection).
+        attr_args = AttributionArguments(
             output_dir=tmp,
             per_device_train_batch_size=4,
             per_device_eval_batch_size=3,
             use_cpu=True,
             dataloader_pin_memory=False,
         )
-        attr = TracInAttributor(args, task=task)
-        score = attr.attribute(train_ds, test_ds)   # GradCos: normalized_grad=True
+        attributor = TracInAttributor(attr_args, task=task)
+        score = attributor.attribute(train_ds, test_ds)
 
-        # ── 4. Read the result ─────────────────────────────────────────────────
         # agnostic_matrix() returns the full (num_train, num_test) matrix; its
         # rows/cols follow the order the samples were streamed in.  (To look a
         # sample up by identity instead, use score.query(train_hashes, ...).)
         train_ids, matrix = score.agnostic_matrix()
 
-        print(f"Influence matrix {tuple(matrix.shape)}  (num_train, num_test)")
-        print("     " + "".join(f"  test{j:<5}" for j in range(matrix.shape[1])))
+        print("TracIn score[train i, test j]")
+        header = f"{'':<10}" + "".join(f"{f'test{j}':>12}" for j in range(matrix.shape[1]))
+        print("-" * len(header))
+        print(header)
+        print("-" * len(header))
         for i, row in enumerate(matrix):
-            print(f"  train{i}" + "".join(f"  {v:+8.3f}" for v in row.tolist()))
+            print(f"{f'train{i}':<10}" + "".join(f"{v:>+12.4f}" for v in row.tolist()))
+        print("-" * len(header))
 
-        # A typical TDA question: which training example most influences each
-        # test prediction?  (Largest TracIn inner product down each column.)
-        print("\nMost influential training example per test example:")
+        # a typical TDA question: which training example most influences each
+        # test prediction?  (largest inner product down each column)
+        print(f"\n{'Test sample':<15}{'Most influential train':<25}{'Score':>10}")
+        print("-" * 50)
         for j in range(matrix.shape[1]):
             i = int(matrix[:, j].argmax())
-            print(f"  test{j}  <-  train{i}  (score {matrix[i, j]:+.3f})")
-
-
-if __name__ == "__main__":
-    main()
+            print(f"{f'test{j}':<15}{f'train{i}':<25}{matrix[i, j]:>+10.3f}")
+        print("-" * 50)

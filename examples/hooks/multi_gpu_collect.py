@@ -1,16 +1,14 @@
-"""Collect per-sample gradients across multiple GPUs (DDP / FSDP).
+"""This example shows per-sample gradient collection across multiple GPUs (DDP).
 
-Collection is unchanged under distributed training: launch with ``torchrun`` and
-each rank collects its own ``DistributedSampler`` shard. Rows are keyed by content
-hash, so the shards recombine into the full dataset with no duplicates.
-
-Pass the **unwrapped** model — ``GradientStreamer`` registers the hooks and then
-wraps it in DDP/FSDP itself. Set ``fsdp="full_shard"`` in ``AttributionArguments``
-to collect under FSDP instead of DDP.
+Launch with torchrun and each rank collects its own DistributedSampler shard;
+rows are keyed by content hash, so the shards recombine into the full dataset
+with no duplicates.  Pass the UNWRAPPED model — GradientStreamer registers the
+hooks, places the model on its device, and wraps it in DDP/FSDP itself (set
+fsdp="full_shard" in AttributionArguments to collect under FSDP instead).
 
 Run:
-    torchrun --nproc_per_node=2 examples/multi_gpu_collect.py          # GPUs
-    torchrun --nproc_per_node=2 examples/multi_gpu_collect.py --cpu    # CPU (gloo)
+    torchrun --nproc_per_node=2 examples/hooks/multi_gpu_collect.py          # GPUs
+    torchrun --nproc_per_node=2 examples/hooks/multi_gpu_collect.py --cpu    # CPU (gloo)
 """
 
 from __future__ import annotations
@@ -22,17 +20,16 @@ import sys
 import tempfile
 
 # Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import Dataset
 
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.streaming import GradientStreamer
 from dattri_llm.gradient.hooks import HookManagerConfig, REGISTER_ALL
-
 
 IN, HID, OUT = 8, 16, 4
 N_SAMPLES = 8
@@ -61,34 +58,15 @@ class DictDataset(Dataset):
         return {"x": self.x[i], "y": self.y[i]}
 
 
-def collect_gradients(model, dataset, args):
-    """Stream one frozen pass; return this process's ``(hashes, gradients)``."""
-    def loss_fn(m, batch):
-        out = m(x=batch["x"], y=batch["y"])
-        return ((out - batch["y"]) ** 2).sum()
-
-    hashes, grads = [], []
-    streamer = GradientStreamer(
-        model, dataset, args, batch_size=args.per_device_train_batch_size,
-        enable_update=False, loss_fn=loss_fn,
-        config=HookManagerConfig(linear_io=REGISTER_ALL),
-    )
-    with streamer as s:
-        for _step, grad, batch_hashes in s:
-            hashes.extend(batch_hashes)
-            grads.append(grad)
-    return hashes, grads
-
-
-def main() -> None:
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpu", action="store_true",
                         help="Use the gloo backend on CPU (no GPU required).")
-    cli = parser.parse_args()
+    args_cli = parser.parse_args()
 
+    # initialize the process group when launched under torchrun
     distributed = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1
-    use_cpu = cli.cpu or not torch.cuda.is_available()
-
+    use_cpu = args_cli.cpu or not torch.cuda.is_available()
     if distributed:
         dist.init_process_group("gloo" if use_cpu else "nccl")
         rank, world = dist.get_rank(), dist.get_world_size()
@@ -98,16 +76,20 @@ def main() -> None:
               "unsharded pass.  For the multi-process version, run:\n"
               f"    torchrun --nproc_per_node=2 {os.path.relpath(__file__)} --cpu\n")
 
-    # Same dataset on every rank; the DistributedSampler gives each rank a
-    # disjoint slice of it.
+    # the same dataset on every rank; the DistributedSampler gives each rank a
+    # disjoint slice of it
     g = torch.Generator().manual_seed(0)
     x = torch.randn(N_SAMPLES, IN, generator=g)
     y = torch.randn(N_SAMPLES, OUT, generator=g)
     dataset = DictDataset(x, y)
     model = MLP()
 
+    def loss_fn(m, batch):
+        out = m(x=batch["x"], y=batch["y"])
+        return ((out - batch["y"]) ** 2).sum()
+
     with tempfile.TemporaryDirectory() as tmp:
-        args = AttributionArguments(
+        attr_args = AttributionArguments(
             output_dir=tmp,
             per_device_train_batch_size=2,
             per_device_eval_batch_size=2,
@@ -115,11 +97,28 @@ def main() -> None:
             dataloader_pin_memory=False,
             # fsdp="full_shard",     # <- uncomment (multi-GPU) to collect under FSDP
         )
-        hashes, _grads = collect_gradients(model, dataset, args)
-        print(f"[rank {rank}/{world}] collected {len(hashes)} of {N_SAMPLES} "
-              f"samples (this shard)")
 
-        # Gather the shards' hashes on rank 0 just to show they reassemble into
+        # stream one frozen pass; each yielded block is (step, Gradient, hashes)
+        # for this rank's shard
+        hashes, grads = [], []
+        streamer = GradientStreamer(
+            model, dataset, attr_args,
+            batch_size=attr_args.per_device_train_batch_size,
+            enable_update=False, loss_fn=loss_fn,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+        )
+        with streamer as s:
+            for _step, grad, batch_hashes in s:
+                hashes.extend(batch_hashes)
+                grads.append(grad)
+
+        print("-" * 50)
+        print(f"{'Rank':<10}{'Shard size':<15}{'Dataset size'}")
+        print("-" * 50)
+        print(f"{f'{rank}/{world}':<10}{len(hashes):<15}{N_SAMPLES}")
+        print("-" * 50)
+
+        # gather the shards' hashes on rank 0 just to show they reassemble into
         # the whole dataset.  In practice each rank offloads its gradients to
         # disk and an attributor reads all ranks' directories together.
         if distributed:
@@ -127,12 +126,8 @@ def main() -> None:
             dist.all_gather_object(gathered, hashes)
             if rank == 0:
                 all_hashes = [h for shard in gathered for h in shard]
-                print(f"\n[rank 0] all ranks together collected "
+                print(f"[rank 0] all ranks together collected "
                       f"{len(set(all_hashes))} unique samples "
                       f"(the full dataset of {N_SAMPLES}).")
             dist.barrier()
             dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()
