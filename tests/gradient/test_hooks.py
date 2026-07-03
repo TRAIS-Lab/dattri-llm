@@ -538,6 +538,31 @@ class TestLayerTypesConfig:
 
 
 # --------------------------------------------------------------------------- #
+# no-grad forwards are not captured                                             #
+# --------------------------------------------------------------------------- #
+
+
+class TestNoGradForwardSkipped:
+    def test_no_grad_forward_does_not_contaminate_step(self):
+        """A no_grad forward (e.g. an RL log-prob or eval pass) can never
+        produce a backward; it must leave the step buffers untouched, so the
+        following real training step assembles cleanly."""
+        model = nn.Sequential(nn.Linear(8, 4, bias=False))
+        cb = _Recording()
+        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL),
+                         callbacks=[cb])
+        with hm.collect():
+            with torch.no_grad():
+                model(torch.randn(3, 8))          # contamination candidate
+            model(torch.randn(5, 8)).sum().backward()   # the real step
+        hm.remove()
+        assert len(cb.records) == 1
+        grad = cb.records[0].gradient
+        assert grad.batch_size == 5               # only the grad-enabled pass
+        assert grad.data["0"].activation.shape[0] == 5
+
+
+# --------------------------------------------------------------------------- #
 # linear_io hooks skip frozen (non-trainable) layers — LoRA / frozen backbones  #
 # --------------------------------------------------------------------------- #
 

@@ -238,6 +238,12 @@ def register_linear_io_hooks(
 
         def _make_forward_hook(layer_name: str):
             def _fwd(_module, inp, _out):
+                # A forward under no_grad / inference_mode can never produce a
+                # backward, so capturing its activation would only contaminate
+                # the step buffers (e.g. an RL log-prob or eval pass between
+                # training steps).
+                if not torch.is_grad_enabled():
+                    return
                 a = inp[0].detach()
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
                 buf = buffers[layer_name]
