@@ -573,7 +573,7 @@ def collect_to_disk(streamer, file_manager: GradientFileManager) -> None:
     """
     with streamer:
         for step, grad, hashes in streamer:
-            file_manager.save_batch(
+            file_manager.save_bulk(
                 [GradientRecord(step=step, input_hash=hashes, gradient=grad)]
             )
 

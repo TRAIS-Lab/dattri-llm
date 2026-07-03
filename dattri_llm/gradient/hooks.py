@@ -59,7 +59,7 @@ from dattri_llm.gradient.ops import (
     extract_module_kwargs,
     is_embedding,
 )
-from dattri_llm.gradient.utils import hash_sample
+from dattri_llm.gradient.utils import hash_batch
 
 try:
     from transformers.pytorch_utils import Conv1D as HF_Conv1D
@@ -1347,7 +1347,7 @@ class HookManager:
         self._last_gradient = gradient
 
         batch_size = self._get_input_batch_size()
-        input_hash = [hash_sample(self._last_inputs, i) for i in range(batch_size)]
+        input_hash = hash_batch(self._last_inputs, batch_size)
         record = GradientRecord(step=step, input_hash=input_hash, gradient=gradient)
         for cb in self._callbacks:
             cb.on_step_end(record)

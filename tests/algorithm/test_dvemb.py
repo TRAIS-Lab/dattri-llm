@@ -85,8 +85,8 @@ def collected(tmp_path):
     TT._collect_to_disk(model, [sd0, sd1], x_tr, y_tr, train_dir)
     TT._collect_to_disk(model, [sdT], x_te, y_te, test_dir)
 
-    train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(TT.N_TRAIN)]
-    test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(TT.N_TEST)]
+    train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
+    test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
     return dict(
         model=model, train_sds=[sd0, sd1], test_sd=sdT,
         x_tr=x_tr, y_tr=y_tr, x_te=x_te, y_te=y_te,

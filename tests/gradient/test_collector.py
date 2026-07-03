@@ -20,7 +20,7 @@ from dattri_llm.gradient.hooks import (
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
-from dattri_llm.gradient.utils import hash_sample
+from dattri_llm.gradient.utils import hash_batch, hash_sample
 
 
 # --------------------------------------------------------------------------- #
@@ -58,20 +58,17 @@ def _run_one_step(model: nn.Module, input_ids: torch.Tensor, callbacks=None):
 
 class TestHashSample:
     def test_same_sample_same_hash(self):
-        inputs = {"input_ids": torch.randint(0, 10, (3, 8))}
-        h1 = hash_sample(inputs, 0)
-        h2 = hash_sample(inputs, 0)
-        assert h1 == h2
+        sample = {"input_ids": torch.randint(0, 10, (8,))}
+        assert hash_sample(sample) == hash_sample(sample)
 
     def test_different_samples_different_hash(self):
-        inputs = {"input_ids": torch.randint(0, 10, (3, 8))}
-        hashes = [hash_sample(inputs, i) for i in range(3)]
+        batch = {"input_ids": torch.randint(0, 10, (3, 8))}
+        hashes = hash_batch(batch)
         # All three samples should be distinct (with overwhelming probability for random data)
         assert len(set(hashes)) == 3
 
     def test_64_char_hex(self):
-        inputs = {"input_ids": torch.zeros(2, 4, dtype=torch.long)}
-        h = hash_sample(inputs, 0)
+        h = hash_sample({"input_ids": torch.zeros(4, dtype=torch.long)})
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
 
@@ -79,24 +76,38 @@ class TestHashSample:
         row = torch.randint(0, 100, (8,))
         batch_a = {"input_ids": torch.stack([row, torch.zeros(8, dtype=torch.long)])}
         batch_b = {"input_ids": torch.stack([torch.zeros(8, dtype=torch.long), row])}
-        # Same content row → same hash regardless of batch position
-        assert hash_sample(batch_a, 0) == hash_sample(batch_b, 1)
+        # Same content row → same hash regardless of batch position, and the
+        # single-sample hash of the raw row matches both.
+        assert hash_batch(batch_a)[0] == hash_batch(batch_b)[1]
+        assert hash_batch(batch_a)[0] == hash_sample({"input_ids": row})
 
     def test_multiple_fields_used(self):
-        ids = torch.zeros(2, 4, dtype=torch.long)
-        mask_a = {"input_ids": ids, "attention_mask": torch.ones(2, 4)}
-        mask_b = {"input_ids": ids, "attention_mask": torch.zeros(2, 4)}
+        ids = torch.zeros(4, dtype=torch.long)
+        mask_a = {"input_ids": ids, "attention_mask": torch.ones(4)}
+        mask_b = {"input_ids": ids, "attention_mask": torch.zeros(4)}
         # Same input_ids but different attention_mask → different hash
-        assert hash_sample(mask_a, 0) != hash_sample(mask_b, 0)
+        assert hash_sample(mask_a) != hash_sample(mask_b)
 
     def test_non_tensor_values_skipped(self):
-        inputs = {
-            "input_ids": torch.zeros(2, 4, dtype=torch.long),
+        sample = {
+            "input_ids": torch.zeros(4, dtype=torch.long),
             "some_flag": True,  # non-tensor, should be ignored
         }
         # Should not raise
-        h = hash_sample(inputs, 0)
+        h = hash_sample(sample)
         assert len(h) == 64
+
+    def test_hash_batch_order_matches_capture(self):
+        batch = {"x": torch.randn(3, 5), "y": torch.randn(3, 2)}
+        expected = [hash_sample({"x": batch["x"][i], "y": batch["y"][i]})
+                    for i in range(3)]
+        assert hash_batch(batch) == expected
+
+    def test_hash_batch_rejects_non_batch_first(self):
+        # A sequence-first (T, B) field disagrees with the batch dimension.
+        batch = {"x": torch.randn(3, 5), "pos": torch.randn(7, 3)}
+        with pytest.raises(NotImplementedError, match="batch-first"):
+            hash_batch(batch, batch_size=3)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,56 +364,6 @@ class TestGradientFileManager:
             manager.save(rec)
             assert (Path(tmpdir) / "index.json").exists()
 
-    def test_load_by_hash_round_trip(self, tiny_model, tiny_batch):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
-            rec = self._make_record(3, self._HASH_A, tiny_model, tiny_batch)
-            manager.save(rec)
-            loaded = manager.load_by_hash(3, self._HASH_A)
-            assert isinstance(loaded, GradientRecord)
-            assert loaded.step == 3
-            assert loaded.input_hash == self._HASH_A
-
-    def test_load_by_hash_wrong_step_raises(self, tiny_model, tiny_batch):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
-            rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
-            manager.save(rec)
-            with pytest.raises(KeyError):
-                manager.load_by_hash(99, self._HASH_A)
-
-    def test_load_by_inputs(self, tiny_model, tiny_batch):
-        """load() accepts model inputs directly and hashes them internally."""
-        inputs = {"input_ids": tiny_batch["input_ids"]}
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(offload_interval=100, file_manager=manager,
-                                      recording_type="per_sample")
-            collector = HookManager(tiny_model, callbacks=[offload])
-            with collector.collect():
-                tiny_model(**inputs).mean().backward()
-            loaded = manager.load(0, inputs, sample_idx=0)
-            assert isinstance(loaded, GradientRecord)
-            assert loaded.step == 0
-            assert loaded.gradient.batch_size == 1
-            collector.remove()
-
-    def test_load_inputs_equivalent_to_by_hash(self, tiny_model, tiny_batch):
-        """load() and load_by_hash() return the same record."""
-        inputs = {"input_ids": tiny_batch["input_ids"]}
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(offload_interval=100, file_manager=manager,
-                                      recording_type="per_sample")
-            collector = HookManager(tiny_model, callbacks=[offload])
-            with collector.collect():
-                tiny_model(**inputs).mean().backward()
-            h = hash_sample(inputs, sample_idx=0)
-            by_hash = manager.load_by_hash(0, h)
-            by_inputs = manager.load(0, inputs, sample_idx=0)
-            assert by_hash.input_hash == by_inputs.input_hash
-            collector.remove()
-
     def test_load_all_by_hash(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
@@ -418,13 +379,9 @@ class TestGradientFileManager:
             with pytest.raises(KeyError):
                 manager.load_all_by_hash(self._HASH_B)
 
-    def test_load_all_by_inputs(self, tiny_model, tiny_batch):
-        """load_all() loads all records for all samples in the batch.
-
-        Uses per_sample recording so each sample gets its own record.
-        """
+    def test_load_all_inputs_equivalent_to_by_hash(self, tiny_model, tiny_batch):
+        """The inputs/by-hash pair differ only by how the sample is identified."""
         inputs = {"input_ids": tiny_batch["input_ids"]}
-        B = tiny_batch["input_ids"].shape[0]
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
             offload = OffloadCallback(offload_interval=100, file_manager=manager,
@@ -432,26 +389,12 @@ class TestGradientFileManager:
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
-            # load_all returns all unique records for all samples in the batch
-            records = manager.load_all(inputs)
-            assert len(records) == B
-            collector.remove()
-
-    def test_load_all_covers_all_samples(self, tiny_model, tiny_batch):
-        """load_all() returns one record per unique sample in the batch (per_sample mode)."""
-        inputs = {"input_ids": tiny_batch["input_ids"]}
-        B = tiny_batch["input_ids"].shape[0]
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
-            offload = OffloadCallback(offload_interval=100, file_manager=manager,
-                                      recording_type="per_sample")
-            collector = HookManager(tiny_model, callbacks=[offload])
-            with collector.collect():
-                tiny_model(**inputs).mean().backward()
-            records = manager.load_all(inputs)
-            input_hashes = {hash_sample(inputs, i) for i in range(B)}
-            record_hashes = {r.input_hash for r in records}  # str per per_sample record
-            assert record_hashes == input_hashes
+            sample1 = {k: v[1] for k, v in inputs.items()}
+            h = hash_sample(sample1)
+            by_inputs = manager.load_all(sample1)
+            by_hash = manager.load_all_by_hash(h)
+            assert [r.input_hash for r in by_inputs] == [r.input_hash for r in by_hash]
+            assert by_inputs[0].input_hash == h
             collector.remove()
 
     def test_index_loaded_from_disk_on_construction(self, tiny_model, tiny_batch):
@@ -475,7 +418,7 @@ class TestGradientFileManager:
 
 
 class TestBatchSaving:
-    """Tests for GradientFileManager.save_batch and OffloadCallback(batch_save=True)."""
+    """Tests for GradientFileManager.save_bulk and OffloadCallback flushing."""
 
     _HASH_A = "abcdef01" * 8
     _HASH_B = "12345678" * 8
@@ -488,42 +431,42 @@ class TestBatchSaving:
         collector.remove()
         return GradientRecord(step=step, input_hash=input_hash, gradient=cb.records[0].gradient)
 
-    def test_save_batch_creates_one_file(self, tiny_model, tiny_batch):
+    def test_save_bulk_creates_one_file(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
             recs = [
                 self._make_record(0, self._HASH_A, tiny_model, tiny_batch),
                 self._make_record(0, self._HASH_B, tiny_model, tiny_batch),
             ]
-            path = manager.save_batch(recs)
+            path = manager.save_bulk(recs)
             assert path.exists()
             assert path.name.startswith("batch_")
             assert len(list(Path(tmpdir).glob("batch_*.pt"))) == 1
 
-    def test_save_batch_indexes_all_hashes(self, tiny_model, tiny_batch):
+    def test_save_bulk_indexes_all_hashes(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
             recs = [
                 self._make_record(0, self._HASH_A, tiny_model, tiny_batch),
                 self._make_record(0, self._HASH_B, tiny_model, tiny_batch),
             ]
-            manager.save_batch(recs)
+            manager.save_bulk(recs)
             assert self._HASH_A in manager.index
             assert self._HASH_B in manager.index
             # Both point to the same batch file but different idx
             assert manager.index[self._HASH_A][0]["idx"] == 0
             assert manager.index[self._HASH_B][0]["idx"] == 1
 
-    def test_save_batch_load_round_trip(self, tiny_model, tiny_batch):
+    def test_save_bulk_load_round_trip(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
             recs = [
                 self._make_record(0, self._HASH_A, tiny_model, tiny_batch),
                 self._make_record(0, self._HASH_B, tiny_model, tiny_batch),
             ]
-            manager.save_batch(recs)
-            loaded_a = manager.load_by_hash(0, self._HASH_A)
-            loaded_b = manager.load_by_hash(0, self._HASH_B)
+            manager.save_bulk(recs)
+            loaded_a = manager.load_all_by_hash(self._HASH_A)[0]
+            loaded_b = manager.load_all_by_hash(self._HASH_B)[0]
             assert isinstance(loaded_a, GradientRecord)
             assert isinstance(loaded_b, GradientRecord)
             assert loaded_a.input_hash == self._HASH_A
@@ -533,11 +476,11 @@ class TestBatchSaving:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager1 = GradientFileManager(tmpdir)
             recs = [self._make_record(0, self._HASH_A, tiny_model, tiny_batch)]
-            manager1.save_batch(recs)  # writes batch_000000.pt
+            manager1.save_bulk(recs)  # writes batch_000000.pt
 
             manager2 = GradientFileManager(tmpdir)
             recs2 = [self._make_record(1, self._HASH_B, tiny_model, tiny_batch)]
-            manager2.save_batch(recs2)  # should write batch_000001.pt
+            manager2.save_bulk(recs2)  # should write batch_000001.pt
 
             batch_files = sorted(Path(tmpdir).glob("batch_*.pt"))
             assert len(batch_files) == 2
@@ -573,8 +516,9 @@ class TestBatchSaving:
             assert len(list(Path(tmpdir).glob("step_*.pt"))) == 0
             collector.remove()
 
-    def test_offload_load_by_hash_after_batch_write(self, tiny_model, tiny_batch):
-        """Records written by OffloadCallback(per_sample) can be loaded by sample hash."""
+    def test_offload_load_all_per_sample(self, tiny_model, tiny_batch):
+        """Every sample written by OffloadCallback(per_sample) is retrievable
+        from its raw inputs, one record per step."""
         inputs = {"input_ids": tiny_batch["input_ids"]}
         B = tiny_batch["input_ids"].shape[0]
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -584,10 +528,79 @@ class TestBatchSaving:
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(**inputs).mean().backward()
-            records = manager.load_all(inputs)
-            assert len(records) == B
-            assert all(isinstance(r, GradientRecord) for r in records)
+            for i in range(B):
+                records = manager.load_all({k: v[i] for k, v in inputs.items()})
+                assert len(records) == 1
+                assert isinstance(records[0], GradientRecord)
             collector.remove()
+
+
+class TestLookupAndLoadSample:
+    """input_hash → (step, sample_idx) → file: position-indexed per-sample lookup."""
+
+    H = ["aa" * 32, "bb" * 32, "cc" * 32]   # three sample hashes
+
+    def _batch_record(self, step, hashes):
+        """A per-batch record whose rows are distinguishable: row i at step s
+        holds the constant ``100*s + i``."""
+        B = len(hashes)
+        data = torch.arange(B, dtype=torch.float).unsqueeze(1).repeat(1, 4) + 100 * step
+        g = Gradient(representation={"l": "materialized"}, data={"l": data},
+                     layer_types={"l": "nn.Linear"})
+        return GradientRecord(step=step, input_hash=hashes, gradient=g)
+
+    def _shuffled_store(self, tmpdir):
+        """Two steps with the SAME samples at different batch positions —
+        the shuffling scenario the (step, sample) index exists for."""
+        manager = GradientFileManager(tmpdir)
+        manager.save_bulk([self._batch_record(0, [self.H[0], self.H[1], self.H[2]])])
+        manager.save_bulk([self._batch_record(1, [self.H[2], self.H[0], self.H[1]])])
+        return manager
+
+    def test_lookup_returns_step_sample_pairs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._shuffled_store(tmpdir)
+            # H[2] sat at position 2 in step 0 and position 0 in step 1.
+            assert manager.lookup_by_hash(self.H[2]) == [(0, 2), (1, 0)]
+            assert manager.lookup_by_hash(self.H[0]) == [(0, 0), (1, 1)]
+
+    def test_load_sample_slices_the_indexed_position(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._shuffled_store(tmpdir)
+            for h_i, h in enumerate(self.H):
+                for step, sample_idx in manager.lookup_by_hash(h):
+                    g = manager.load_sample_by_hash(h, step, sample_idx)
+                    # row value encodes (step, position): 100*step + sample_idx.
+                    expected = float(100 * step + sample_idx)
+                    assert g.data["l"].shape[0] == 1
+                    assert torch.allclose(g.data["l"],
+                                          torch.full((1, 4), expected))
+
+    def test_load_sample_missing_pair_raises_with_pairs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._shuffled_store(tmpdir)
+            with pytest.raises(KeyError, match=r"Available \(step, sample_idx\) pairs"):
+                manager.load_sample_by_hash(self.H[0], step=7, sample_idx=0)
+
+    def test_lookup_unknown_hash_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._shuffled_store(tmpdir)
+            with pytest.raises(KeyError, match="not in index"):
+                manager.lookup_by_hash("ff" * 32)
+
+    def test_inputs_and_by_hash_pairs_agree(self):
+        """Each load-family pair differs only by how the sample is identified."""
+        x = torch.arange(12, dtype=torch.float).reshape(3, 4)
+        hashes = hash_batch({"x": x})
+        sample1 = {"x": x[1]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = GradientFileManager(tmpdir)
+            manager.save_bulk([self._batch_record(0, hashes)])
+            assert manager.lookup(sample1) == manager.lookup_by_hash(hashes[1])
+            step, sample_idx = manager.lookup(sample1)[0]
+            g_a = manager.load_sample(sample1, step, sample_idx)
+            g_b = manager.load_sample_by_hash(hashes[1], step, sample_idx)
+            assert torch.equal(g_a.data["l"], g_b.data["l"])
 
 
 class TestOffloadCallback:
@@ -635,12 +648,10 @@ class TestOffloadCallback:
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
                 tiny_model(tiny_batch["input_ids"]).mean().backward()
-            for h, entries in manager.index.items():
-                for entry in entries:
-                    s = entry["step"]
-                    rec = manager.load_by_hash(s, h)
-                    assert isinstance(rec, GradientRecord)
-                    assert rec.step == s
+            for h in manager.index:
+                for step, sample_idx in manager.lookup_by_hash(h):
+                    g = manager.load_sample_by_hash(h, step, sample_idx)
+                    assert g.batch_size == 1
             collector.remove()
 
     def test_load_all_via_manager(self, tiny_model, tiny_batch):
@@ -1027,12 +1038,12 @@ class TestGradientFileManagerDDP:
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: 0)
         m0 = GradientFileManager(str(tmp_path))
         rec0 = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
-        m0.save_batch([rec0])
+        m0.save_bulk([rec0])
 
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: 1)
         m1 = GradientFileManager(str(tmp_path))
         rec1 = self._make_record(0, self._HASH_B, tiny_model, tiny_batch)
-        m1.save_batch([rec1])
+        m1.save_bulk([rec1])
 
         assert (tmp_path / "rank_0").is_dir()
         assert (tmp_path / "rank_1").is_dir()
@@ -1047,7 +1058,7 @@ class TestGradientFileManagerDDP:
             monkeypatch.setattr(fm_module, "_dist_rank", lambda r=rank: r)
             m = GradientFileManager(str(tmp_path))
             rec = self._make_record(0, h, tiny_model, tiny_batch)
-            m.save_batch([rec])
+            m.save_bulk([rec])
 
         # Both write batch_000000.pt but in separate dirs — no data loss.
         assert (tmp_path / "rank_0" / "batch_000000.pt").exists()
@@ -1060,7 +1071,7 @@ class TestGradientFileManagerDDP:
             monkeypatch.setattr(fm_module, "_dist_rank", lambda r=rank: r)
             m = GradientFileManager(str(tmp_path))
             rec = self._make_record(0, h, tiny_model, tiny_batch)
-            m.save_batch([rec])
+            m.save_bulk([rec])
 
         idx0 = json.loads((tmp_path / "rank_0" / "index.json").read_text())
         idx1 = json.loads((tmp_path / "rank_1" / "index.json").read_text())
@@ -1074,7 +1085,7 @@ class TestGradientFileManagerDDP:
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: 0)
         m = GradientFileManager(str(tmp_path))
         rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
-        m.save_batch([rec])
+        m.save_bulk([rec])
 
         entry = m.index[self._HASH_A][0]
         assert entry["file"].startswith("rank_0/")
@@ -1087,7 +1098,7 @@ class TestGradientFileManagerDDP:
             monkeypatch.setattr(fm_module, "_dist_rank", lambda r=rank: r)
             m = GradientFileManager(str(tmp_path))
             rec = self._make_record(0, h, tiny_model, tiny_batch)
-            m.save_batch([rec])
+            m.save_bulk([rec])
 
         # Reader: no distributed context.
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: None)
@@ -1102,17 +1113,17 @@ class TestGradientFileManagerDDP:
         # Simulate training: rank 0 and rank 1 each write their own records.
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: 0)
         m0 = GradientFileManager(str(tmp_path))
-        m0.save_batch([self._make_record(0, self._HASH_A, tiny_model, tiny_batch)])
+        m0.save_bulk([self._make_record(0, self._HASH_A, tiny_model, tiny_batch)])
 
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: 1)
         m1 = GradientFileManager(str(tmp_path))
-        m1.save_batch([self._make_record(0, self._HASH_B, tiny_model, tiny_batch)])
+        m1.save_bulk([self._make_record(0, self._HASH_B, tiny_model, tiny_batch)])
 
         # Simulate post-training analysis: fresh reader with no distributed context.
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: None)
         reader = GradientFileManager(str(tmp_path))
-        loaded_a = reader.load_by_hash(0, self._HASH_A)
-        loaded_b = reader.load_by_hash(0, self._HASH_B)
+        loaded_a = reader.load_all_by_hash(self._HASH_A)[0]
+        loaded_b = reader.load_all_by_hash(self._HASH_B)[0]
         assert loaded_a.input_hash == self._HASH_A
         assert loaded_b.input_hash == self._HASH_B
 
@@ -1123,7 +1134,7 @@ class TestGradientFileManagerDDP:
         monkeypatch.setattr(fm_module, "_dist_rank", lambda: None)
         m = GradientFileManager(str(tmp_path))
         rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
-        m.save_batch([rec])
+        m.save_bulk([rec])
 
         assert not any(tmp_path.glob("rank_*"))
         assert (tmp_path / "batch_000000.pt").exists()

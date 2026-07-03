@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from dattri_llm.gradient.gradient import GradientRecord
+from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.utils import hash_sample
 
 
@@ -78,10 +78,18 @@ class GradientFileManager:
 
         {
             "<sha256_hex>": [
-                {"file": "rank_0/batch_000000.pt", "idx": 2, "step": 0},
-                {"file": "rank_0/batch_000002.pt", "idx": 0, "step": 4}
+                {"file": "rank_0/batch_000000.pt", "idx": 2, "step": 0, "sample_idx": 5},
+                {"file": "rank_0/batch_000002.pt", "idx": 0, "step": 4, "sample_idx": 1}
             ]
         }
+
+    The mapping is ``input_hash → (step, sample_idx) → file``: the content hash is
+    sample-position independent (a sample hashes the same wherever shuffling
+    put it), and each entry records **where** that sample landed — the training
+    ``step`` and its ``sample_idx`` position within the stored record's batch — so
+    a per-sample gradient is retrieved by direct slicing, never by scanning a
+    batch record.  :meth:`lookup` returns a hash's ``(step, sample_idx)`` pairs and
+    :meth:`load_sample` retrieves one pair's gradient.
 
     Paths in ``"file"`` are always relative to *save_dir* (the root), so
     load methods work regardless of which rank originally wrote the record.
@@ -128,6 +136,11 @@ class GradientFileManager:
         Returns:
             The :class:`~pathlib.Path` of the written file.
         """
+        if isinstance(record.input_hash, list):
+            raise TypeError(
+                "save() takes a single-hash record; this record carries a "
+                "per-batch hash list — use save_bulk([record]) instead."
+            )
         self._save_dir.mkdir(parents=True, exist_ok=True)
         h = record.input_hash
         s = record.step
@@ -138,15 +151,20 @@ class GradientFileManager:
         self._write_index()
         return path
 
-    def save_batch(self, records: list[GradientRecord]) -> Path:
-        """Persist multiple :class:`GradientRecord` objects to a single file.
+    def save_bulk(self, records: list[GradientRecord]) -> Path:
+        """Pack multiple :class:`GradientRecord` objects into a single file.
 
-        All sample hashes from each record (including per-batch
-        ``input_hash`` lists) are indexed so that per-sample lookup works
-        without a directory scan.
+        "Bulk" is file-level packing (amortising file I/O — e.g.
+        ``OffloadCallback`` flushes its accumulated records through here every
+        ``offload_interval`` steps); it says nothing about the records' shape.
+        Each record may be per-sample (single ``input_hash``) or per-batch
+        (``input_hash`` list), and the two may be mixed in one call.  Every
+        sample hash of every record is indexed with its ``(step, sample_idx)``
+        coordinates, so per-sample lookup works without a directory scan.
 
         Args:
-            records: The records to persist together.
+            records: The records to persist together.  Each record's hash-list
+                length must equal its gradient's batch size (checked).
 
         Returns:
             The :class:`~pathlib.Path` of the written batch file.
@@ -163,9 +181,19 @@ class GradientFileManager:
         return path
 
     def _index_entry(self, record: GradientRecord, filename: str, idx: int) -> None:
-        entry = {"file": filename, "idx": idx, "step": record.step}
         hashes = record.input_hash if isinstance(record.input_hash, list) else [record.input_hash]
-        for h in hashes:
+        if isinstance(record.input_hash, list):
+            batch = record.gradient.batch_size
+            if len(hashes) != batch:
+                raise ValueError(
+                    f"Record at step {record.step} carries {len(hashes)} sample "
+                    f"hashes but its gradient batch size is {batch}; the indexed "
+                    "sample_idx positions would not match the gradient rows."
+                )
+        for pos, h in enumerate(hashes):
+            # "sample_idx" is the sample's position within the record's batch, so
+            # a per-sample gradient is retrieved by direct slicing (see load_sample).
+            entry = {"file": filename, "idx": idx, "step": record.step, "sample_idx": pos}
             entries = self._index.setdefault(h, [])
             if entry not in entries:
                 entries.append(entry)
@@ -174,85 +202,121 @@ class GradientFileManager:
     # Loading                                                                  #
     # ---------------------------------------------------------------------- #
 
-    def load(
+    # Every load-family method comes as a pair differing only by how the
+    # sample is identified: ``F(inputs, ...)`` takes ONE sample's model-input
+    # dict and hashes it; ``F_by_hash(input_hash, ...)`` takes the precomputed
+    # content hash.  Under the ``input_hash → (step, sample_idx) → file`` index a
+    # step alone no longer identifies a gradient — only a ``(step, sample_idx)``
+    # pair does — so there is no step-only loader.
+
+    def lookup(
         self,
-        step: int,
         inputs: dict[str, torch.Tensor],
-        sample_idx: int = 0,
-    ) -> GradientRecord:
-        """Load a :class:`GradientRecord` for a sample given its inputs and step.
+    ) -> list[tuple[int, int]]:
+        """Every ``(step, sample_idx)`` occurrence of a sample, sorted by step.
 
         Args:
-            step: The batch-step index assigned by the collector.
-            inputs: The model input dict for the batch.
-            sample_idx: Index of the target sample within the batch dimension.
+            inputs: **One sample's** model-input dict (e.g. ``dataset[i]``).
 
         Returns:
-            The :class:`GradientRecord` for that sample at that step.
+            Sorted list of ``(step, sample_idx)`` pairs — see :meth:`lookup_by_hash`.
         """
-        return self.load_by_hash(step, hash_sample(inputs, sample_idx))
+        return self.lookup_by_hash(hash_sample(inputs))
 
-    def load_by_hash(self, step: int, input_hash: str) -> GradientRecord:
-        """Load a :class:`GradientRecord` by step and sample hash.
+    def lookup_by_hash(self, input_hash: str) -> list[tuple[int, int]]:
+        """Every ``(step, sample_idx)`` occurrence of a sample, sorted by step.
+
+        The content hash identifies *what* the sample is (independent of
+        shuffling); the returned pairs say *where* it was recorded — the
+        training step, and its position within that step's stored batch.
+        Feed a pair to :meth:`load_sample_by_hash` to retrieve the gradient.
 
         Args:
-            step: The batch-step index assigned by the collector.
-            input_hash: Full 64-character SHA-256 hash of the sample.
+            input_hash: Full 64-character SHA-256 hash (see
+                :func:`~dattri_llm.gradient.utils.hash_sample`).
 
         Returns:
-            The :class:`GradientRecord` for that sample at that step.
+            Sorted list of ``(step, sample_idx)`` pairs.
 
         Raises:
-            KeyError: If the hash or step is not in the index.
+            KeyError: If the hash is not found in the index.
         """
-        entries = self._index.get(input_hash)
-        if not entries:
-            raise KeyError(f"Hash {input_hash[:16]}… not in index.")
-        for entry in entries:
-            if entry["step"] == step:
-                return self._load_entry(entry)
-        known = sorted({e["step"] for e in entries})
+        if input_hash not in self._index:
+            raise KeyError(
+                f"Hash {input_hash[:16]}… not in index. "
+                "Has the collect() context closed, and is save_dir correct?"
+            )
+        return sorted(
+            (e["step"], e["sample_idx"]) for e in self._index[input_hash]
+        )
+
+    def load_sample(
+        self,
+        inputs: dict[str, torch.Tensor],
+        step: int,
+        sample_idx: int,
+    ) -> Gradient:
+        """Load one sample's gradient at one ``(step, sample_idx)`` occurrence.
+
+        Args:
+            inputs: **One sample's** model-input dict (e.g. ``dataset[i]``).
+            step: Training step, as returned by :meth:`lookup`.
+            sample_idx: The sample's position within the stored batch, as
+                returned by :meth:`lookup`.
+
+        Returns:
+            The sample's :class:`Gradient` — see :meth:`load_sample_by_hash`.
+        """
+        return self.load_sample_by_hash(hash_sample(inputs), step, sample_idx)
+
+    def load_sample_by_hash(self, input_hash: str, step: int, sample_idx: int) -> Gradient:
+        """Load one sample's gradient at one training step, by direct slicing.
+
+        Uses the indexed ``sample`` position to slice the stored record's batch
+        gradient — an O(1) retrieval, with no scan over the batch.
+
+        Args:
+            input_hash: Full 64-character SHA-256 hash of the sample.
+            step: Training step, as returned by :meth:`lookup_by_hash`.
+            sample_idx: The sample's position within the stored batch, as
+                returned by :meth:`lookup_by_hash`.
+
+        Returns:
+            The sample's :class:`Gradient` (batch dimension 1).
+
+        Raises:
+            KeyError: If no record matches ``(input_hash, step, sample_idx)``.
+        """
+        for e in self._index.get(input_hash, []):
+            if e["step"] == step and e["sample_idx"] == sample_idx:
+                record = self._load_entry(e)
+                return record.gradient.slice(dim="batch", index=sample_idx)
+        pairs = self.lookup_by_hash(input_hash) if input_hash in self._index else []
         raise KeyError(
-            f"step {step} not found for hash {input_hash[:16]}…  known steps: {known}"
+            f"No record for hash {input_hash[:16]}… at (step={step}, "
+            f"sample_idx={sample_idx}). Available (step, sample_idx) pairs: {pairs}."
         )
 
     def load_all(
         self,
         inputs: dict[str, torch.Tensor],
     ) -> list[GradientRecord]:
-        """Load every saved :class:`GradientRecord` that contains any sample in *inputs*.
-
-        Computes the SHA-256 hash for every sample in the batch, unions their
-        index entries, deduplicates (a per-batch file appears once even if
-        multiple samples in the query batch hit it), and returns all unique
-        records sorted by step.
+        """Every saved :class:`GradientRecord` containing one sample.
 
         Args:
-            inputs: The model input dict for the batch — the same dict passed
-                to the model during collection.
+            inputs: **One sample's** model-input dict (e.g. ``dataset[i]``).
 
         Returns:
-            List of unique :class:`GradientRecord` sorted by step.
+            List of :class:`GradientRecord` sorted by step — see
+            :meth:`load_all_by_hash`.
         """
-        batch_size = next(
-            (v.shape[0] for v in inputs.values()
-             if isinstance(v, torch.Tensor) and v.ndim > 0),
-            1,
-        )
-        seen: set[tuple] = set()
-        records: list[GradientRecord] = []
-        for i in range(batch_size):
-            h = hash_sample(inputs, i)
-            for entry in self._index.get(h, []):
-                key = (entry["file"], entry["idx"])
-                if key not in seen:
-                    seen.add(key)
-                    records.append(self._load_entry(entry))
-        records.sort(key=lambda r: r.step)
-        return records
+        return self.load_all_by_hash(hash_sample(inputs))
 
     def load_all_by_hash(self, input_hash: str) -> list[GradientRecord]:
         """Load every saved :class:`GradientRecord` for a given sample hash.
+
+        Returns whole records (a per-batch record includes the sample's whole
+        batch); use :meth:`load_sample_by_hash` for the sample's own gradient.
 
         Args:
             input_hash: Full 64-character SHA-256 hash.
@@ -367,7 +431,7 @@ class GradientFileManager:
         """Merged mapping from ``input_hash`` to ``{file, idx, step}`` entries.
 
         Spans all ranks.  Updated after every :meth:`save` /
-        :meth:`save_batch` call on this instance.
+        :meth:`save_bulk` call on this instance.
         """
         return self._index
 

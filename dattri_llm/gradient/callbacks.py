@@ -197,7 +197,7 @@ class OffloadCallback(HookManagerCallback):
     def _flush(self) -> None:
         if not self._staged:
             return
-        self.file_manager.save_batch(self._staged)
+        self.file_manager.save_bulk(self._staged)
         self._staged.clear()
         self._staged_steps.clear()
 

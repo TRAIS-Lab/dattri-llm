@@ -133,8 +133,8 @@ def collected(tmp_path):
     train_dir, test_dir = tmp_path / "train_g", tmp_path / "test_g"
     TT._collect_to_disk(model, checkpoints, x_tr, y_tr, train_dir)
     TT._collect_to_disk(model, checkpoints, x_te, y_te, test_dir)
-    train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(TT.N_TRAIN)]
-    test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(TT.N_TEST)]
+    train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
+    test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
     return dict(train_dir=train_dir, test_dir=test_dir,
                 train_hashes=train_hashes, test_hashes=test_hashes)
 
@@ -321,8 +321,8 @@ class TestKFACMultiToken:
         train_dir, test_dir = tmp_path / "tr", tmp_path / "te"
         collect(x_tr, train_dir)
         collect(x_te, test_dir)
-        train_hashes = [hash_sample({"x": x_tr}, i) for i in range(B)]
-        test_hashes = [hash_sample({"x": x_te}, j) for j in range(4)]
+        train_hashes = [hash_sample({"x": x_tr[i]}) for i in range(B)]
+        test_hashes = [hash_sample({"x": x_te[j]}) for j in range(4)]
 
         args = AttributionArguments(output_dir=str(tmp_path / "o"),
                                     dataloader_num_workers=0, dataloader_pin_memory=False)
@@ -356,11 +356,11 @@ def collected_step1(tmp_path):
     TT._collect_to_disk(model, checkpoints, x_te, y_te, raw_test)
 
     train_dir, test_dir = tmp_path / "tr_s1", tmp_path / "te_s1"
-    GradientFileManager(str(train_dir)).save_batch(TT._load_step_records(raw_train, 1))
-    GradientFileManager(str(test_dir)).save_batch(TT._load_step_records(raw_test, 1))
+    GradientFileManager(str(train_dir)).save_bulk(TT._load_step_records(raw_train, 1))
+    GradientFileManager(str(test_dir)).save_bulk(TT._load_step_records(raw_test, 1))
 
-    train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(TT.N_TRAIN)]
-    test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(TT.N_TEST)]
+    train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
+    test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
     return dict(train_dir=train_dir, test_dir=test_dir,
                 train_hashes=train_hashes, test_hashes=test_hashes)
 
@@ -399,10 +399,10 @@ class TestStepSelection:
         TT._collect_to_disk(model, checkpoints[:1], x_te, y_te, test_dir)
 
         curated = tmp_path / "tr_s1"
-        GradientFileManager(str(curated)).save_batch(TT._load_step_records(raw_train, 1))
+        GradientFileManager(str(curated)).save_bulk(TT._load_step_records(raw_train, 1))
 
-        train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(TT.N_TRAIN)]
-        test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(TT.N_TEST)]
+        train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
+        test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
 
         def run(train_dir, steps):
             attr = cls(
@@ -543,8 +543,8 @@ def _collect_norm_model(tmp_path, patterns):
     collect(x_te, test_dir)
     return dict(
         train_dir=train_dir, test_dir=test_dir,
-        train_hashes=[hash_sample({"x": x_tr}, i) for i in range(6)],
-        test_hashes=[hash_sample({"x": x_te}, j) for j in range(4)],
+        train_hashes=[hash_sample({"x": x_tr[i]}) for i in range(6)],
+        test_hashes=[hash_sample({"x": x_te[j]}) for j in range(4)],
     )
 
 
@@ -662,8 +662,8 @@ class TestDirectFIM:
 
         collect(x_tr, tmp_path / "tr")
         collect(x_te, tmp_path / "te")
-        train_hashes = [hash_sample({"x": x_tr}, i) for i in range(6)]
-        test_hashes = [hash_sample({"x": x_te}, j) for j in range(4)]
+        train_hashes = [hash_sample({"x": x_tr[i]}) for i in range(6)]
+        test_hashes = [hash_sample({"x": x_te[j]}) for j in range(4)]
         with pytest.warns(UserWarning, match="embedding"):
             _attr(KFACAttributor, tmp_path / "o").attribute_from_cache(
                 train_gradients_dir=str(tmp_path / "tr"),

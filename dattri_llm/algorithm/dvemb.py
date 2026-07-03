@@ -601,7 +601,7 @@ class DVEmbAttributor(BaseAttributor):
                                 n: train_g.layer_types[n] for n in shared
                             },
                         )
-                        dvemb_fm.save_batch(
+                        dvemb_fm.save_bulk(
                             [GradientRecord(
                                 step=ts, input_hash=list(train_hashes),
                                 gradient=grad,

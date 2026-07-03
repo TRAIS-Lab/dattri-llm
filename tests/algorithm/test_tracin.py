@@ -148,8 +148,8 @@ def collected(tmp_path):
     train_dir, test_dir = tmp_path / "train_g", tmp_path / "test_g"
     _collect_to_disk(model, [sd], x_tr, y_tr, train_dir)
     _collect_to_disk(model, [sd], x_te, y_te, test_dir)
-    train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
-    test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
+    train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)]
+    test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
     return dict(
         model=model, sd=sd,
         x_tr=x_tr, y_tr=y_tr, x_te=x_te, y_te=y_te,
@@ -269,7 +269,7 @@ class TestTracInOnDisk:
                 mixed.append(
                     GradientRecord(record.step, record.input_hash, mixed_gradient)
                 )
-            GradientFileManager(str(destination)).save_batch(mixed)
+            GradientFileManager(str(destination)).save_bulk(mixed)
 
         train_dir = tmp_path / "mixed_train"
         test_dir = tmp_path / "mixed_test"
@@ -303,7 +303,7 @@ class TestTracInOnDisk:
 
         mixed = tmp_path / "mixed"
         fm_out = GradientFileManager(str(mixed))
-        fm_out.save_batch(_load_step_records(raw, 0) + _load_step_records(raw, 1))
+        fm_out.save_bulk(_load_step_records(raw, 0) + _load_step_records(raw, 1))
         reader = GradientFileManager(str(mixed))
 
         calls = []
@@ -335,8 +335,8 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd0, sd1], x_tr, y_tr, train_dir)
         _collect_to_disk(model, [sd0], x_te, y_te, test_dir)  # single-step test
 
-        train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
-        test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
+        train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)]
+        test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
@@ -368,8 +368,8 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd0, sd1], x_tr, y_tr, train_dir)
         _collect_to_disk(model, [sd0], x_te, y_te, test_dir)
 
-        train_hashes = [hash_sample({"x": x_tr, "y": y_tr}, i) for i in range(N_TRAIN)]
-        test_hashes = [hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)]
+        train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)]
+        test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
@@ -411,7 +411,7 @@ class TestTracInOnDisk:
         res = _make_attr(tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
-        distinct = len({hash_sample({"x": x_te, "y": y_te}, j) for j in range(N_TEST)})
+        distinct = len({hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)})
         assert distinct == N_TEST - 1
         assert len(res.test_ids) == distinct          # collapsed, not N_TEST
         assert int((res.scores.abs().sum(0) == 0).sum()) == 0  # no spurious zero column
