@@ -358,6 +358,18 @@ class Gradient:
         other: "Gradient",
         dim: Literal["batch", "token"] = "batch",
     ) -> "Gradient":
+        """Concatenate two gradients along the batch or token axis.
+
+        A layer that is **broadcast** (batch axis 1 while the gradient's batch is
+        larger — e.g. a positional embedding added to every sample) has no
+        per-sample rows to concatenate.  When such a layer is broadcast on *both*
+        sides, batch concatenation instead produces a unified broadcast row: the
+        batch-size-weighted average ``(B_self·r_self + B_other·r_other) /
+        (B_self + B_other)`` of the two shared rows.  Factorized broadcast layers
+        stay factorized when the two activations coincide (the gradient is linear
+        in the output-gradient factor); otherwise both rows are materialized
+        before averaging and the layer becomes ``"materialized"``.
+        """
         self._check_compatible(other, require_same_batch=False)
 
         if dim == "token":
@@ -374,6 +386,9 @@ class Gradient:
                 raise ValueError("Token concatenation requires the same batch size")
 
         new_data = {}
+        new_repr = dict(self.representation)
+        new_indexing = dict(self.indexing)
+        b_self, b_other = self.batch_size, other.batch_size
 
         def cat_axis(batch_first: bool) -> int:
             # Batch axis is 0 (1) and token axis 1 (0) for batch-first (seq-first).
@@ -381,9 +396,60 @@ class Gradient:
                 return 0 if batch_first else 1
             return 1 if batch_first else 0
 
+        def layer_batch(value) -> int:
+            if isinstance(value, Factorized):
+                return value.activation.shape[0 if value.batch_first else 1]
+            return value.shape[0]
+
+        def is_broadcast(value, step_batch: int) -> bool:
+            return layer_batch(value) == 1 and step_batch > 1
+
         for name in self.layer_names:
             a = self.data[name]
             b = other.data[name]
+
+            bc_a, bc_b = is_broadcast(a, b_self), is_broadcast(b, b_other)
+            if dim == "batch" and (bc_a or bc_b):
+                if bc_a != bc_b:
+                    raise ValueError(
+                        f"{name} is a broadcast (batch-collapsed) gradient on one "
+                        "side but per-sample on the other; the two cannot be "
+                        "concatenated along the batch axis."
+                    )
+                # Unified broadcast row: weighted average by each side's batch.
+                w_a, w_b = float(b_self), float(b_other)
+                if isinstance(a, Factorized) and isinstance(b, Factorized):
+                    a_bf, b_bf = a.as_batch_first(), b.as_batch_first()
+                    if (
+                        a_bf.activation.shape == b_bf.activation.shape
+                        and torch.equal(a_bf.activation, b_bf.activation)
+                    ):
+                        # Same activation factor: the gradient is linear in the
+                        # output-gradient factor, so averaging g averages ∇W.
+                        g_avg = (
+                            w_a * a_bf.pre_activation_grad
+                            + w_b * b_bf.pre_activation_grad
+                        ) / (w_a + w_b)
+                        new_data[name] = Factorized(
+                            activation=a_bf.activation,
+                            pre_activation_grad=g_avg,
+                            module_kwargs=a_bf.module_kwargs,
+                            batch_first=True,
+                        )
+                    else:
+                        # Differing activations: average in the materialized
+                        # domain (always well-defined).
+                        layer_type = self.layer_types[name]
+                        m_a = ops.materialize(a, layer_type)
+                        m_b = ops.materialize(b, layer_type)
+                        new_data[name] = (w_a * m_a + w_b * m_b) / (w_a + w_b)
+                        new_repr[name] = "materialized"
+                        new_indexing[name] = "batch"
+                elif isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+                    new_data[name] = (w_a * a + w_b * b) / (w_a + w_b)
+                else:
+                    raise TypeError(f"{name} has mismatched data types")
+                continue
 
             if isinstance(a, Factorized) and isinstance(b, Factorized):
                 if a.batch_first != b.batch_first:
@@ -406,10 +472,10 @@ class Gradient:
                 raise TypeError(f"{name} has mismatched data types")
 
         out = Gradient(
-            representation=dict(self.representation),
+            representation=new_repr,
             data=new_data,
             layer_types=self.layer_types,
-            indexing=dict(self.indexing),
+            indexing=new_indexing,
         )
         out.validate()
         return out
@@ -481,6 +547,13 @@ class Gradient:
         dim: Literal["batch", "token"],
         index,
     ) -> "Gradient":
+        """Slice every layer along the batch or token axis.
+
+        A layer whose batch axis has size 1 while the step batch is larger (a
+        broadcast / batch-collapsed gradient, e.g. a positional embedding fed an
+        unbatched index tensor) shares its single row across the batch: batch
+        slicing copies that row over for any requested index.
+        """
         if dim == "token":
             non_bt = [
                 n for n in self.layer_names
@@ -495,11 +568,23 @@ class Gradient:
         new_data = {}
 
         def slice_tensor(x: torch.Tensor, slice_dim: int) -> torch.Tensor:
+            layer_index = index
+            if dim == "batch" and x.shape[slice_dim] == 1:
+                # Broadcast (batch-collapsed) layer — e.g. a positional embedding
+                # fed an unbatched index tensor: one shared row serves every
+                # sample, so any per-sample slice copies that row over instead of
+                # indexing past the size-1 batch axis.
+                if isinstance(index, int):
+                    layer_index = 0
+                else:
+                    n = index.numel() if torch.is_tensor(index) else len(index)
+                    layer_index = torch.zeros(n, dtype=torch.long, device=x.device)
+
             idx = [slice(None)] * x.ndim
-            idx[slice_dim] = index
+            idx[slice_dim] = layer_index
             y = x[tuple(idx)]
 
-            if isinstance(index, int):
+            if isinstance(layer_index, int):
                 y = y.unsqueeze(slice_dim)
 
             return y
@@ -578,9 +663,11 @@ class Gradient:
             single ``(B_self, B_other)`` tensor.
 
         Note:
-            ``reduce="all"`` requires every shared layer to have the same
-            ``B_self`` (and ``B_other``); summing is undefined when a layer's
-            gradient was collapsed over the batch during a forward broadcast.
+            Under ``reduce="all"``, a **broadcast** layer (batch axis 1 while the
+            gradient's batch is larger, e.g. a positional embedding) contributes
+            its shared row to *every* sample: its ``(1, ·)``/``(·, 1)`` cross
+            matrix is expanded to ``(B_self, B_other)`` before the per-layer sum
+            (matching :meth:`slice`'s copy-over semantics).
         """
         if metric not in {"dot", "cosine"}:
             raise ValueError("metric must be 'dot' or 'cosine'")
@@ -610,15 +697,28 @@ class Gradient:
         # matrices, since the whole-model gradient is the concatenation of layers).
         if not per_layer:
             raise ValueError("No shared layers to compute an overall similarity")
-        total = torch.stack(list(per_layer.values())).sum(0)
+        # A broadcast layer's shared row belongs to every sample: expand its
+        # size-1 batch axes to the full (B_self, B_other) before summing.
+        b_s, b_o = self.batch_size, other.batch_size
+
+        def _expand_matrix(m: torch.Tensor) -> torch.Tensor:
+            return m.expand(
+                b_s if m.shape[0] == 1 else m.shape[0],
+                b_o if m.shape[1] == 1 else m.shape[1],
+            )
+
+        def _expand_vec(v: torch.Tensor, b: int) -> torch.Tensor:
+            return v.expand(b) if v.shape[0] == 1 else v
+
+        total = torch.stack([_expand_matrix(m) for m in per_layer.values()]).sum(0)
         if metric == "cosine":
             # Full-model cosine: normalise by the concatenated-gradient norms,
             # i.e. sqrt(sum of per-layer squared norms).
             norm_sq_s = torch.stack(
-                [self._layer_norm_sq(n, mode) for n in per_layer]
+                [_expand_vec(self._layer_norm_sq(n, mode), b_s) for n in per_layer]
             ).sum(0).clamp_min(0)                                         # (B_self,)
             norm_sq_o = torch.stack(
-                [other._layer_norm_sq(n, mode) for n in per_layer]
+                [_expand_vec(other._layer_norm_sq(n, mode), b_o) for n in per_layer]
             ).sum(0).clamp_min(0)                                         # (B_other,)
             total = total / (norm_sq_s.sqrt()[:, None] * norm_sq_o.sqrt()[None, :] + eps)
         return total

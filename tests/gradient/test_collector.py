@@ -10,12 +10,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
     HookManager,
     HookManagerCallback,
     HookManagerConfig,
-    OffloadCallback,
 )
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord

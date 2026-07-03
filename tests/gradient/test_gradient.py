@@ -576,6 +576,27 @@ class TestSlice:
         gs = g.slice(dim="batch", index=0)
         assert gs.representation == g.representation
 
+    def test_batch_slice_copies_broadcast_layer(self):
+        # A broadcast (batch-1) layer — e.g. a positional embedding fed an
+        # unbatched index tensor — shares its single row across the batch, so
+        # slicing any sample must copy that row instead of raising IndexError.
+        Bn, Tn, Dn = 4, 3, 5
+        fc = Factorized(torch.randn(Bn, Tn, Dn), torch.randn(Bn, Tn, Dn))
+        pos = Factorized(torch.arange(Tn).unsqueeze(0), torch.randn(1, Tn, Dn))
+        g = Gradient(representation={"fc": "factorized", "pos": "factorized"},
+                     data={"fc": fc, "pos": pos},
+                     layer_types={"fc": "nn.Linear", "pos": "nn.Embedding"},
+                     indexing={"fc": "batch_token", "pos": "batch_token"})
+        for i in range(Bn):
+            s = g.slice(dim="batch", index=i)
+            assert torch.equal(s.data["fc"].activation[0], fc.activation[i])
+            assert torch.equal(s.data["pos"].pre_activation_grad[0],
+                               pos.pre_activation_grad[0])   # shared row copied
+        s = g.slice(dim="batch", index=[1, 3])
+        assert s.data["fc"].activation.shape[0] == 2
+        assert s.data["pos"].activation.shape[0] == 2
+        assert torch.equal(s.data["pos"].activation[0], s.data["pos"].activation[1])
+
     def test_batch_slice_preserves_param_grad_without_slicing(self):
         param_grad = torch.randn(7, 3)
         g = Gradient(
@@ -587,6 +608,113 @@ class TestSlice:
         sliced = g.slice(dim="batch", index=0)
         assert sliced.data["sample"].shape[0] == 1
         assert torch.equal(sliced.data["weight"], param_grad)
+
+
+# --------------------------------------------------------------------------- #
+# Broadcast (batch-collapsed) layers under batch operations                    #
+# --------------------------------------------------------------------------- #
+
+
+def _broadcast_gradient(B, T=3, D=5, seed=0):
+    """Gradient with a per-sample 'fc' layer (B, T, D) and a broadcast 'pos'
+    embedding (batch 1) whose single row is shared across the batch."""
+    g = torch.Generator().manual_seed(seed)
+    fc = Factorized(torch.randn(B, T, D, generator=g),
+                    torch.randn(B, T, D, generator=g))
+    pos = Factorized(torch.arange(T).unsqueeze(0),
+                     torch.randn(1, T, D, generator=g))
+    return Gradient(
+        representation={"fc": "factorized", "pos": "factorized"},
+        data={"fc": fc, "pos": pos},
+        layer_types={"fc": "nn.Linear", "pos": "nn.Embedding"},
+        indexing={"fc": "batch_token", "pos": "batch_token"},
+    )
+
+
+class TestBroadcastConcatenate:
+    def test_batch_concat_unifies_broadcast_row(self):
+        """Broadcast rows merge into the batch-size-weighted average; per-sample
+        layers concatenate normally."""
+        g1, g2 = _broadcast_gradient(4, seed=0), _broadcast_gradient(2, seed=1)
+        out = g1.concatenate(g2, dim="batch")
+        out.validate()
+        assert out.batch_size == 6
+        assert out.data["fc"].activation.shape[0] == 6           # plain cat
+        # pos stays factorized: same position ids, g weighted-averaged 4:2.
+        assert out.representation["pos"] == "factorized"
+        expected_g = (4 * g1.data["pos"].pre_activation_grad
+                      + 2 * g2.data["pos"].pre_activation_grad) / 6
+        assert torch.allclose(out.data["pos"].pre_activation_grad, expected_g)
+        assert torch.equal(out.data["pos"].activation, g1.data["pos"].activation)
+
+    def test_batch_concat_differing_activations_materializes(self):
+        """Broadcast rows with different activation factors are averaged in the
+        materialized domain (the layer flips to 'materialized')."""
+        g1, g2 = _broadcast_gradient(4, seed=0), _broadcast_gradient(2, seed=1)
+        # give g2's pos a different id pattern
+        pos2 = g2.data["pos"]
+        g2.data["pos"] = Factorized(
+            activation=torch.flip(pos2.activation, dims=[1]),
+            pre_activation_grad=pos2.pre_activation_grad,
+        )
+        out = g1.concatenate(g2, dim="batch")
+        out.validate()
+        assert out.representation["pos"] == "materialized"
+        m1 = ops.materialize(g1.data["pos"], "nn.Embedding")
+        m2 = ops.materialize(g2.data["pos"], "nn.Embedding")
+        assert torch.allclose(out.data["pos"], (4 * m1 + 2 * m2) / 6)
+
+    def test_batch_concat_materialized_broadcast(self):
+        """Materialized broadcast rows are weighted-averaged directly."""
+        r1, r2 = torch.randn(1, 7), torch.randn(1, 7)
+        def make(B, row):
+            return Gradient(
+                representation={"fc": "materialized", "pos": "materialized"},
+                data={"fc": torch.randn(B, 7), "pos": row},
+                layer_types={"fc": "nn.Linear", "pos": "nn.Embedding"},
+            )
+        out = make(3, r1).concatenate(make(5, r2), dim="batch")
+        assert torch.allclose(out.data["pos"], (3 * r1 + 5 * r2) / 8)
+        assert out.data["fc"].shape[0] == 8
+
+    def test_batch_concat_broadcast_on_one_side_raises(self):
+        g1 = _broadcast_gradient(4, seed=0)
+        g2 = _broadcast_gradient(2, seed=1)
+        # make g2's pos per-sample (batch 2) instead of broadcast
+        g2.data["pos"] = Factorized(
+            activation=torch.arange(3).repeat(2, 1),
+            pre_activation_grad=torch.randn(2, 3, 5),
+        )
+        with pytest.raises(ValueError, match="broadcast"):
+            g1.concatenate(g2, dim="batch")
+
+    def test_genuine_batch_one_gradients_still_cat(self):
+        """Two all-batch-1 gradients are NOT broadcast — they concatenate to
+        batch 2 exactly as before."""
+        g1, g2 = _broadcast_gradient(1, seed=0), _broadcast_gradient(1, seed=1)
+        out = g1.concatenate(g2, dim="batch")
+        assert out.batch_size == 2
+        assert out.data["pos"].activation.shape[0] == 2          # plain cat
+
+
+class TestBroadcastSimilarity:
+    def test_reduce_all_expands_broadcast_layer(self):
+        """The shared row contributes identically to every (i, j) pair, so the
+        full-model cross-gram is the fc gram plus a constant offset."""
+        g1, g2 = _broadcast_gradient(4, seed=0), _broadcast_gradient(2, seed=1)
+        total = g1.similarity(g2, metric="dot", reduce="all")
+        assert total.shape == (4, 2)
+        per_layer = g1.similarity(g2, metric="dot", reduce="none")
+        assert per_layer["pos"].shape == (1, 1)                  # raw broadcast gram
+        expected = per_layer["fc"] + per_layer["pos"].expand(4, 2)
+        assert torch.allclose(total, expected, atol=1e-5)
+
+    def test_reduce_all_cosine_no_crash(self):
+        g1, g2 = _broadcast_gradient(4, seed=0), _broadcast_gradient(2, seed=1)
+        total = g1.similarity(g2, metric="cosine", reduce="all")
+        assert total.shape == (4, 2)
+        assert bool(torch.isfinite(total).all())
+        assert float(total.abs().max()) <= 1 + 1e-5
 
 
 # --------------------------------------------------------------------------- #

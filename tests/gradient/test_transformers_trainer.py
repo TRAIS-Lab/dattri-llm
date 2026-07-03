@@ -9,7 +9,6 @@ import os
 
 import pytest
 import torch
-import torch.nn as nn
 
 try:
     from transformers import GPT2Config, GPT2LMHeadModel, TrainingArguments

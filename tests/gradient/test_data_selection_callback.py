@@ -380,7 +380,6 @@ class TestNegativeBottomFraction:
 
     def test_select_dropped_logic_directly(self):
         """Unit-test _select_dropped with synthetic scores to cover all branches."""
-        import types
         model = MinimalEmbeddingMLP()
         cb = DataSelectionCallback(
             model=model,
