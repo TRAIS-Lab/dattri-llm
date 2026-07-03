@@ -35,18 +35,39 @@ while under a **sum** loss (``ĝ = ∇ℓ``, ``c = 1``) it is used as-is — see
 Setting every ``H_k = 0`` recovers TracIn (η · ⟨g_test, g_train⟩); the Fisher
 factors are exactly the "training dynamics" correction DVEmb adds.
 
-**Computation.** Because each ``H_k`` is symmetric, the product in (1) is
-applied to the *test* side by sweeping the recorded training steps from latest
-to earliest.  For every test column we carry a running parameter-space vector
+**Computation.** The bilinear form in (1) can be evaluated by carrying the
+Fisher product on either side; the ``propagation`` argument of
+:meth:`attribute` / :meth:`attribute_from_cache` selects which.  Both sweep
+the recorded training steps from latest to earliest and produce **identical**
+scores.
 
-    w_{t_s} = [ ∏_{k=t_s+1}^{T-1}(I − η_k H_k) ]ᵀ ∇ℓ(θ_T, z_val),
+With ``propagation="test"`` (the default) the product is applied to the *test*
+side: for every test column a running parameter-space vector
 
-initialised at the final-model test gradient.  At each step ``t_s`` (descending)
-the rows for the train samples recorded there are ``η_{t_s} · ⟨g(z*), w_{t_s}⟩``,
-after which ``w`` is advanced by that step's full Fisher factor
-``w ← w − η_{t_s} Σ_{z∈B_{t_s}} g(z) ⟨g(z), w⟩``.  The recorded per-sample
-gradients of a step thus serve twice: as the vectors scored, and as the rank-1
-components of ``H_{t_s}``.
+    w_{t_s} = [ ∏_{k=t_s+1}^{T-1}(I − η_k H_k) ]ᵀ ∇ℓ(θ_T, z_val)
+
+is initialised at the final-model test gradient.  At each step ``t_s``
+(descending) the rows for the train samples recorded there are
+``η_{t_s} · ⟨g(z*), w_{t_s}⟩``, after which ``w`` is advanced by that step's
+full Fisher factor ``w ← w − η_{t_s} Σ_{z∈B_{t_s}} g(z) ⟨g(z), w⟩``.  The
+recorded per-sample gradients of a step thus serve twice: as the vectors
+scored, and as the rank-1 components of ``H_{t_s}``.  This is matrix-free —
+the product ``∏(I − η H)`` is never materialised — but ties the sweep to the
+given test set.
+
+With ``propagation="train"`` the product is applied to the *train* side,
+yielding the paper's **data value embedding** per training sample,
+
+    e_{t_s}(z*) = η_{t_s} · [ ∏_{k=t_s+1}^{T-1}(I − η_k H_k) ]ᵀ ĝ(θ_{t_s}, z*),
+
+so a row's score against any test column is simply ``⟨e, ∇ℓ(θ_T, z_val)⟩``.
+Because the propagated object now lives on the train side, the sweep carries
+the explicit accumulated operator ``M_{t_s}`` with
+``I − M_{t_s} = [ ∏_{k>t_s}(I − η_k H_k) ]ᵀ`` — a dense ``(d, d)`` matrix over
+the concatenated layer dimension — updated as
+``M ← M + η_{t_s} Σ_{z∈B_{t_s}} (ĝ(z) − M ĝ(z)) ĝ(z)ᵀ``.  This costs ``d²``
+memory (use projected gradients or ``layer_name`` to keep ``d`` small) but
+makes the embeddings test-independent.
 
 This is the **basic** DVEmb estimator — it materialises the per-layer gradients
 and propagates the exact (Fisher-approximated) product.  Influence-checkpointing
@@ -82,7 +103,7 @@ from dattri.task import AttributionTask
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManagerConfig
-from dattri_llm.gradient.gradient import Gradient
+from dattri_llm.gradient.gradient import Gradient, GradientRecord
 
 
 class DVEmbAttributor(BaseAttributor):
@@ -224,6 +245,82 @@ class DVEmbAttributor(BaseAttributor):
 
         return train_dir, test_dir
 
+    def cache_dvemb(
+        self,
+        train_gradients_dir: str,
+        dvemb_dir: Optional[str] = None,
+        *,
+        selected_training_steps: Optional[Iterable[int]] = None,
+        final_step: Optional[int] = None,
+        loss_reduction: str = "mean",
+        verbose: bool = False,
+        layer_name: Optional[Union[str, List[str]]] = None,
+        learning_rate: Union[float, Mapping[int, float]] = 1.0,
+    ) -> str:
+        """Turn a stored gradient trajectory into persisted **data value embeddings**.
+
+        One train-side sweep (``propagation="train"``) over an existing
+        per-step gradient store — written by :meth:`cache` or by any training
+        run wrapped with hooks — turning every train record into its embedding
+        ``e = η · ∏_{k>t_s}(I − η_k H_k)ᵀ ĝ`` and storing it in ``dvemb_dir``
+        as materialized per-layer :class:`Gradient` records via
+        :class:`GradientFileManager` — same hashes and steps as the source
+        records.  No test gradients are involved and nothing is scored.
+
+        Because a DVEmb score is the plain inner product ``⟨e, g_test⟩``,
+        attribution then reduces to TracIn over the stored embeddings::
+
+            train_dir, test_dir = attr.cache(train_ds, test_ds)   # or your own
+            dvemb_dir = attr.cache_dvemb(train_dir)               # hooked run
+            scores = TracInAttributor(args).attribute_from_cache(
+                train_gradients_dir=dvemb_dir, test_gradients_dir=test_dir)
+
+        and *any* later test set (its gradients collected at the final model
+        ``θ_T``) can be scored the same way without re-sweeping the trajectory.
+
+        Args:
+            train_gradients_dir: Per-step train gradient store (supplies both
+                the embedded records and each step's Fisher factor).
+            dvemb_dir: Where to store the embeddings; defaults to
+                ``<args.output_dir>/dvemb_grads``.
+            selected_training_steps: Restrict which steps' embeddings are
+                *stored* (the sweep always propagates through every step);
+                ``None`` stores all of them.
+            final_step, loss_reduction, verbose, layer_name, learning_rate: As
+                in :meth:`attribute_from_cache`.
+
+        Returns:
+            ``dvemb_dir``.
+        """
+        if dvemb_dir is None:
+            dvemb_dir = os.path.join(self.args.output_dir, "dvemb_grads")
+        if loss_reduction not in ("mean", "sum"):
+            raise ValueError(
+                f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}."
+            )
+        (
+            _train_fm, prop_steps, output_steps, _final_step, learning_rate,
+        ) = self._resolve_sweep(
+            train_gradients_dir, selected_training_steps, final_step,
+            learning_rate,
+        )
+        device = self.args.device
+        train_source = DiskGradientSource(
+            GradientFileManager(train_gradients_dir), self.args,
+            steps=prop_steps, layer_name=normalize_layer_names(layer_name),
+        )
+        # No test matrix to derive the concatenated layout from — peek it off
+        # the latest propagated step's first train block instead.
+        layers, slices = self._train_layer_slices(
+            train_source, max(prop_steps), device,
+        )
+        self._propagate_train_and_score(
+            None, layers, slices, train_source, prop_steps, output_steps,
+            device, loss_reduction, verbose, learning_rate,
+            dvemb_fm=GradientFileManager(dvemb_dir),
+        )
+        return dvemb_dir
+
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
@@ -315,7 +412,7 @@ class DVEmbAttributor(BaseAttributor):
                 stacklevel=2,
             )
 
-    def _propagate_and_score(
+    def _propagate_test_and_score(
         self,
         w: Dict[str, torch.Tensor],
         n_cols: int,
@@ -392,6 +489,204 @@ class DVEmbAttributor(BaseAttributor):
         )
         return scores, row_train_ids, row_steps
 
+    def _propagate_train_and_score(
+        self,
+        test_flat: Optional[torch.Tensor],
+        layers: List[str],
+        slices: Dict[str, Tuple[int, int]],
+        train_source: DiskGradientSource,
+        prop_steps: List[int],
+        output_steps: set,
+        device: torch.device,
+        loss_reduction: str,
+        verbose: bool,
+        learning_rate: Union[float, Dict[int, float]],
+        dvemb_fm: Optional[GradientFileManager] = None,
+    ) -> Tuple[torch.Tensor, List[str], List[int]]:
+        """One latest→earliest sweep carrying the operator on the *train* side.
+
+        The counterpart of :meth:`_propagate_and_score` for
+        ``propagation="train"``: instead of advancing per-test-column vectors,
+        it maintains the accumulated operator ``M`` (``I − M`` is the transposed
+        Fisher product of all later steps) over the **concatenated** layer
+        dimension ``d = Σ d_layer`` and turns each step's recorded gradients
+        into data value embeddings ``e = η (ĝ − M ĝ)``.  Emitted rows are
+        ``e @ test_flatᵀ``; after a step's blocks are embedded, ``M`` is
+        advanced by that step's full Fisher factor
+        ``M ← M + η · scale · Σ_b (ĝ_b − M ĝ_b) ĝ_bᵀ``.
+
+        Layers are concatenated (not block-diagonal): the Fisher rank-1 terms
+        ``ĝ ĝᵀ`` couple layers exactly as in the test-side sweep, so the two
+        propagation modes produce identical scores.
+
+        Args:
+            test_flat: ``(num_test, d)`` final-model test gradients, layer
+                blocks concatenated in ``layers`` order.  ``None`` skips scoring
+                (embedding-only sweep — requires ``dvemb_fm``).
+            layers, slices: Layer order and the ``{name: (start, end)}``
+                column ranges of each layer inside the concatenated axis.
+            dvemb_fm: When given, each emitted step's embeddings ``e`` are also
+                persisted through this :class:`GradientFileManager` as
+                **materialized** per-layer :class:`Gradient` records (η folded
+                in; same hashes and step as the source records).  A row's score
+                is then a plain inner product ``⟨e, g_test⟩``, so the stored
+                directory can be consumed directly by
+                ``TracInAttributor.attribute_from_cache`` against the test
+                gradients, reproducing this attributor's scores.
+
+        Returns ``(scores (num_rows, num_test), row_train_ids, row_steps)``;
+        ``scores`` is empty for an embedding-only sweep.
+        """
+        if test_flat is None and dvemb_fm is None:
+            raise ValueError(
+                "embedding-only sweep (test_flat=None) requires dvemb_fm."
+            )
+        d_total = slices[layers[-1]][1] if layers else 0
+        row_chunks: List[torch.Tensor] = []
+        row_train_ids: List[str] = []
+        row_steps: List[int] = []
+        M: Optional[torch.Tensor] = None  # lazy: no (d, d) alloc for the last step
+        steps = tqdm(
+            sorted(prop_steps, reverse=True),
+            desc="DVEmb: propagating (train side)",
+            unit="step",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not verbose or not self.args.should_log,
+        )
+        for ts in steps:
+            lr = self._lr(learning_rate, ts)
+            emit = ts in output_steps
+            # Accumulate this step's Fisher contribution across all its blocks
+            # before advancing M — every embedding of the step must use the
+            # pre-step operator, and the whole batch forms one (I − η H_ts).
+            delta: Optional[torch.Tensor] = None
+            n_t = 0
+            for _s, train_g, train_hashes in train_source.for_steps([ts]):
+                mat = self._materialize(train_g, device)
+                shared = [n for n in layers if n in mat]
+                if not shared:
+                    continue
+                batch = mat[shared[0]].shape[0]
+                n_t += batch
+                g_flat = torch.zeros(batch, d_total, device=device)
+                for name in shared:
+                    s, e = slices[name]
+                    g_flat[:, s:e] = mat[name]
+                # e_raw[b] = (I − M) ĝ_b; the embedding is η · e_raw.
+                e_raw = g_flat if M is None else g_flat - g_flat @ M.T
+                if emit:
+                    emb = lr * e_raw
+                    if test_flat is not None:
+                        row_chunks.append(
+                            (emb @ test_flat.T).detach().to("cpu", torch.float)
+                        )
+                        row_train_ids.extend(train_hashes)
+                        row_steps.extend([ts] * batch)
+                    if dvemb_fm is not None:
+                        # Persist as an ordinary materialized per-layer Gradient
+                        # record so downstream dot-product attributors (TracIn)
+                        # can read it like any stored gradient.  ``contiguous``
+                        # detaches the slice from the flat backing storage so
+                        # torch.save doesn't serialise the whole (B, d) tensor
+                        # per layer.
+                        grad = Gradient(
+                            representation={n: "materialized" for n in shared},
+                            data={
+                                n: emb[:, slices[n][0]:slices[n][1]]
+                                .contiguous().cpu()
+                                for n in shared
+                            },
+                            layer_types={
+                                n: train_g.layer_types[n] for n in shared
+                            },
+                        )
+                        dvemb_fm.save_batch(
+                            [GradientRecord(
+                                step=ts, input_hash=list(train_hashes),
+                                gradient=grad,
+                            )]
+                        )
+                upd = e_raw.T @ g_flat  # Σ_b (I − M) ĝ_b ĝ_bᵀ → (d, d)
+                delta = upd if delta is None else delta + upd
+            if delta is not None:
+                # H_t = (1/c) Σ ĝ ĝᵀ: ×B_t for mean-loss-recorded grads, ×1 for sum.
+                fisher_scale = float(n_t) if loss_reduction == "mean" else 1.0
+                scaled = (lr * fisher_scale) * delta
+                M = scaled if M is None else M + scaled
+
+        n_cols = test_flat.shape[0] if test_flat is not None else 0
+        scores = (
+            torch.cat(row_chunks, dim=0)
+            if row_chunks
+            else torch.zeros(0, n_cols, dtype=torch.float)
+        )
+        return scores, row_train_ids, row_steps
+
+    def _resolve_sweep(
+        self,
+        train_gradients_dir: str,
+        selected_training_steps: Optional[Iterable[int]],
+        final_step: Optional[int],
+        learning_rate: Union[float, Mapping[int, float]],
+    ) -> Tuple[GradientFileManager, List[int], set, int, Union[float, Dict[int, float]]]:
+        """Resolve the sweep parameters shared by scoring and embedding-only runs.
+
+        Opens the train store, fixes ``final_step`` (default: one past the last
+        recorded step), derives the propagated steps (< ``final_step``) and the
+        emitted subset (``selected_training_steps`` filters rows, never the
+        Fisher product), and canonicalises ``learning_rate`` — warning when it
+        disagrees with the schedule :meth:`cache` recorded.
+
+        Returns ``(train_fm, prop_steps, output_steps, final_step, learning_rate)``.
+        """
+        train_fm = GradientFileManager(train_gradients_dir)
+        available = train_fm.available_steps()
+        if final_step is None:
+            final_step = (max(available) + 1) if available else 0
+        # Steps that participate in the trajectory (rows *and* Fisher product).
+        prop_steps = [s for s in available if s < final_step]
+        if not prop_steps:
+            raise ValueError(
+                f"No training step satisfies step < final_step ({final_step}); "
+                f"available steps: {available}."
+            )
+        # If the train dir carries a schedule recorded by cache(), check the
+        # configured learning_rate against it (warn-only; configured one is used).
+        learning_rate = self._normalize_lr(learning_rate)
+        recorded_lr = self._read_lr_schedule(train_gradients_dir)
+        if recorded_lr is not None:
+            self._warn_on_lr_mismatch(learning_rate, recorded_lr, prop_steps)
+        # ``selected_training_steps`` filters only which steps are emitted as
+        # rows; the propagation always sweeps every step in ``prop_steps``.
+        if selected_training_steps is None:
+            output_steps = set(prop_steps)
+        else:
+            output_steps = set(resolve_steps(train_fm, selected_training_steps)) & set(
+                prop_steps
+            )
+        return train_fm, prop_steps, output_steps, final_step, learning_rate
+
+    def _train_layer_slices(
+        self, train_source: DiskGradientSource, step: int, device: torch.device
+    ) -> Tuple[List[str], Dict[str, Tuple[int, int]]]:
+        """Layer order and concatenated-axis slices, peeked from one train block.
+
+        Materialises the first block of *step* to learn the stored layers and
+        their materialized widths — used by the embedding-only sweep, which has
+        no test matrix to derive the layout from.
+        """
+        for _s, train_g, _hashes in train_source.for_steps([step]):
+            mat = self._materialize(train_g, device)
+            layers = list(mat.keys())
+            slices: Dict[str, Tuple[int, int]] = {}
+            offset = 0
+            for name in layers:
+                slices[name] = (offset, offset + mat[name].shape[1])
+                offset = slices[name][1]
+            return layers, slices
+        raise ValueError(f"No train gradients recorded at step {step}.")
+
     # ------------------------------------------------------------------ #
     # Main entry points                                                  #
     # ------------------------------------------------------------------ #
@@ -401,6 +696,8 @@ class DVEmbAttributor(BaseAttributor):
         train_dataset: Dataset,
         test_dataset: Dataset,
         *,
+        propagation: str = "train",
+        dvemb_dir: Optional[str] = None,
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
         loss_reduction: str = "mean",
@@ -424,8 +721,9 @@ class DVEmbAttributor(BaseAttributor):
 
         Args:
             train_dataset, test_dataset: Datasets to stream.
-            loop_over_test, selected_training_steps, loss_reduction, verbose,
-                learning_rate: As in :meth:`attribute_from_cache`.
+            propagation, dvemb_dir, loop_over_test, selected_training_steps,
+                loss_reduction, verbose, learning_rate: As in
+                :meth:`attribute_from_cache`.
             hook_config: As in :meth:`cache`.
         """
         train_dir, test_dir = self.cache(train_dataset, test_dataset,
@@ -433,6 +731,8 @@ class DVEmbAttributor(BaseAttributor):
         return self.attribute_from_cache(
             train_dir,
             test_dir,
+            propagation=propagation,
+            dvemb_dir=dvemb_dir,
             loop_over_test=loop_over_test,
             selected_training_steps=selected_training_steps,
             loss_reduction=loss_reduction,
@@ -444,6 +744,8 @@ class DVEmbAttributor(BaseAttributor):
         self,
         train_gradients_dir: str,
         test_gradients_dir: str,
+        propagation: str = "train",
+        dvemb_dir: Optional[str] = None,
         loop_over_test: bool = False,
         selected_training_steps: Optional[Iterable[int]] = None,
         final_step: Optional[int] = None,
@@ -463,15 +765,43 @@ class DVEmbAttributor(BaseAttributor):
                 gradients must have been collected at the **final** model
                 ``θ_T`` (capital ``T`` = ``final_step``), since the score dots
                 against ``∇ℓ(θ_T, z_val)``.
+            propagation: Which side of the bilinear form carries the Fisher
+                product — ``"test"`` (default) or ``"train"``.  Both produce
+                **identical** scores; they differ in cost shape and reusability
+                (see the module docstring for the two recursions).  ``"test"``
+                back-propagates one vector per test column (matrix-free; memory
+                scales with ``num_test × d``) — fastest when the test set is
+                the only one that will ever be scored.  ``"train"`` is the
+                paper's *data value embedding* formulation: it maintains the
+                explicit ``(d, d)`` propagation operator over the concatenated
+                layer dimension and turns every training record into a
+                test-independent embedding, scored against the test gradients
+                by a plain inner product.  Its ``d²`` operator makes it
+                practical only for low-dimensional gradients — project at
+                collection time (``hook_config``) and/or restrict
+                ``layer_name`` to keep ``d`` small.
+            dvemb_dir: Requires ``propagation="train"``.  When given, the data
+                value embeddings computed during the sweep are also persisted
+                to this directory (managed by :class:`GradientFileManager`) as
+                materialized per-layer :class:`Gradient` records — η folded in,
+                same hashes/steps as the train records, one record per emitted
+                step block.  Because a row's score is then the plain inner
+                product ``⟨e, g_test⟩``, the stored directory can later be
+                scored against *any* test gradient directory with
+                ``TracInAttributor.attribute_from_cache(dvemb_dir, test_dir)``
+                — no re-sweep of the trajectory.
             loop_over_test: Memory/disk trade-off for the per-test-column
                 embedding ``w`` (shape ``(num_test, d)``), which is
-                back-propagated through the steps.  Because every test column
-                propagates independently, ``False`` (default) uses the test
-                columns as the **inner** loop and the steps as the outer loop:
-                one dense embedding is held and the training gradients are
-                streamed exactly **once** (peak memory: full ``w`` + one train
-                block; fastest).  ``True`` uses the test blocks as the **outer**
-                loop to save space: each test block gets its own sweep, holding
+                back-propagated through the steps (``propagation="test"``
+                only; incompatible with ``"train"``, whose sweep is
+                test-independent and holds the test matrix just for the final
+                inner products).  Because every test column propagates
+                independently, ``False`` (default) uses the test columns as
+                the **inner** loop and the steps as the outer loop: one dense
+                embedding is held and the training gradients are streamed
+                exactly **once** (peak memory: full ``w`` + one train block;
+                fastest).  ``True`` uses the test blocks as the **outer** loop
+                to save space: each test block gets its own sweep, holding
                 only that block's embedding while **re-streaming the training
                 gradients once per block** (peak memory: one test block's ``w`` +
                 one train block).  Both produce identical scores; use ``True``
@@ -522,7 +852,9 @@ class DVEmbAttributor(BaseAttributor):
 
         Raises:
             ValueError: If a gradients dir is missing, ``loss_reduction`` is not
-                ``"mean"``/``"sum"``, ``selected_training_steps`` matches no
+                ``"mean"``/``"sum"``, ``propagation`` is not
+                ``"test"``/``"train"``, ``loop_over_test`` is combined with
+                ``propagation="train"``, ``selected_training_steps`` matches no
                 available step, or no training step satisfies
                 ``step < final_step``.
         """
@@ -530,39 +862,35 @@ class DVEmbAttributor(BaseAttributor):
             raise ValueError(
                 f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}."
             )
+        if propagation not in ("test", "train"):
+            raise ValueError(
+                f"propagation must be 'test' or 'train', got {propagation!r}."
+            )
+        if propagation == "train" and loop_over_test:
+            raise ValueError(
+                "loop_over_test applies only to propagation='test': the "
+                "train-side sweep is test-independent (its memory is the (d, d) "
+                "operator, not the test embedding), so there is nothing to "
+                "block over."
+            )
+        if dvemb_dir is not None and propagation != "train":
+            raise ValueError(
+                "dvemb_dir requires propagation='train': data value embeddings "
+                "only exist in the train-side sweep."
+            )
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
                 f"{type(self).__name__} requires both train_gradients_dir and "
                 "test_gradients_dir."
             )
 
-        train_fm = GradientFileManager(train_gradients_dir)
         test_fm = GradientFileManager(test_gradients_dir)
-
-        available = train_fm.available_steps()
-        if final_step is None:
-            final_step = (max(available) + 1) if available else 0
-        # Steps that participate in the trajectory (rows *and* Fisher product).
-        prop_steps = [s for s in available if s < final_step]
-        if not prop_steps:
-            raise ValueError(
-                f"No training step satisfies step < final_step ({final_step}); "
-                f"available steps: {available}."
-            )
-        # If the train dir carries a schedule recorded by cache(), check the
-        # configured learning_rate against it (warn-only; configured one is used).
-        learning_rate = self._normalize_lr(learning_rate)
-        recorded_lr = self._read_lr_schedule(train_gradients_dir)
-        if recorded_lr is not None:
-            self._warn_on_lr_mismatch(learning_rate, recorded_lr, prop_steps)
-        # ``selected_training_steps`` filters only which steps are emitted as
-        # rows; the propagation always sweeps every step in ``prop_steps``.
-        if selected_training_steps is None:
-            output_steps = set(prop_steps)
-        else:
-            output_steps = set(resolve_steps(train_fm, selected_training_steps)) & set(
-                prop_steps
-            )
+        (
+            train_fm, prop_steps, output_steps, final_step, learning_rate,
+        ) = self._resolve_sweep(
+            train_gradients_dir, selected_training_steps, final_step,
+            learning_rate,
+        )
 
         # The train source is restricted to the propagated steps; the sweep pulls
         # one step at a time from it (DiskGradientSource.for_steps).  The test
@@ -581,6 +909,8 @@ class DVEmbAttributor(BaseAttributor):
             prop_steps=prop_steps,
             output_steps=output_steps,
             loss_reduction=loss_reduction,
+            propagation=propagation,
+            dvemb_fm=GradientFileManager(dvemb_dir) if dvemb_dir else None,
             loop_over_test=loop_over_test,
             verbose=verbose,
             layer_name=layer_name,
@@ -591,8 +921,44 @@ class DVEmbAttributor(BaseAttributor):
                 "propagated_steps": sorted(prop_steps),
                 "learning_rate": learning_rate,
                 "loss_reduction": loss_reduction,
+                "propagation": propagation,
+                "dvemb_dir": dvemb_dir,
             },
         )
+
+    def _collect_test_matrix(
+        self, test_source: DiskGradientSource, device: torch.device
+    ) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+        """Materialise every test gradient into one dense per-layer embedding.
+
+        Returns ``(w, test_ids)`` where ``w`` maps each layer to its
+        ``(num_test, d_layer)`` final-model test gradients, rows ordered by
+        first appearance of each test hash (duplicate-hash rows collapse via
+        ``index_copy_`` — last wins).
+        """
+        test_ids: List[str] = []
+        test_index: Dict[str, int] = {}
+        pending: List[Tuple[Dict[str, torch.Tensor], List[int]]] = []
+        for _step, test_g, test_hashes in test_source:
+            mat = self._materialize(test_g, device)
+            cols: List[int] = []
+            for h in test_hashes:
+                if h not in test_index:
+                    test_index[h] = len(test_ids)
+                    test_ids.append(h)
+                cols.append(test_index[h])
+            pending.append((mat, cols))
+        num_test = len(test_ids)
+        layers = list(pending[0][0].keys()) if pending else []
+        w: Dict[str, torch.Tensor] = {
+            name: torch.zeros(num_test, pending[0][0][name].shape[1], device=device)
+            for name in layers
+        }
+        for mat, cols in pending:
+            idx = torch.as_tensor(cols, device=device)
+            for name in layers:
+                w[name].index_copy_(0, idx, mat[name])
+        return w, test_ids
 
     def _run(
         self,
@@ -602,53 +968,70 @@ class DVEmbAttributor(BaseAttributor):
         prop_steps: List[int],
         output_steps: set,
         loss_reduction: str,
+        propagation: str,
         loop_over_test: bool,
         verbose: bool,
         algorithm_meta: dict,
         layer_name: Optional[List[str]] = None,
         learning_rate: Union[float, Dict[int, float]] = 1.0,
+        dvemb_fm: Optional[GradientFileManager] = None,
     ) -> AttributionScore:
         """Score a train source against a test source — the shared DVEmb loop.
 
-        The test embedding ``w`` starts at the final-model test gradients and is
-        back-propagated through ``prop_steps`` (latest→earliest) by
-        :meth:`_propagate_and_score`, pulling each step's train blocks from
-        ``train_source``.  Because every test column propagates independently,
-        ``loop_over_test`` trades memory for disk reads without changing the
-        result.  Both sources are re-iterable (``reusable``); the train source is
-        swept once per test pass.
+        With ``propagation="test"`` the test embedding ``w`` starts at the
+        final-model test gradients and is back-propagated through ``prop_steps``
+        (latest→earliest) by :meth:`_propagate_and_score`, pulling each step's
+        train blocks from ``train_source``.  Because every test column
+        propagates independently, ``loop_over_test`` trades memory for disk
+        reads without changing the result.  With ``propagation="train"`` the
+        same sweep instead carries the explicit ``(d, d)`` operator and embeds
+        the *train* records (:meth:`_propagate_train_and_score`); the test
+        matrix is held only for the final inner products.  Both sources are
+        re-iterable (``reusable``); the train source is swept once per pass.
         """
         device = self.args.device
-        if not loop_over_test:
+        if propagation == "train":
+            # ---- train-side: embed the train records, dot against the test
+            # matrix.  Layer blocks are concatenated into one flat axis so the
+            # (d, d) operator carries the full (cross-layer) Fisher — exactly
+            # the test-side semantics.
+            w, test_ids = self._collect_test_matrix(test_source, device)
+            num_test = len(test_ids)
+            layers = list(w.keys())
+            slices: Dict[str, Tuple[int, int]] = {}
+            offset = 0
+            for name in layers:
+                slices[name] = (offset, offset + w[name].shape[1])
+                offset = slices[name][1]
+            gib = offset * offset * 4 / 2**30
+            if gib > 2.0:
+                warnings.warn(
+                    f"propagation='train' maintains a ({offset}, {offset}) "
+                    f"float32 operator (~{gib:.1f} GiB) on {device}. Project "
+                    "the gradients at collection time and/or restrict "
+                    "layer_name to shrink d, or use propagation='test'.",
+                    stacklevel=3,
+                )
+            test_flat = (
+                torch.cat([w[name] for name in layers], dim=1)
+                if layers
+                else torch.zeros(num_test, 0, device=device)
+            )
+            del w
+            scores, row_train_ids, row_steps = self._propagate_train_and_score(
+                test_flat, layers, slices, train_source, prop_steps,
+                output_steps, device, loss_reduction, verbose, learning_rate,
+                dvemb_fm=dvemb_fm,
+            )
+        elif not loop_over_test:
             # ---- step outer / test inner: one dense embedding, train read once.
             # Materialise every test gradient into one (num_test, d) embedding and
             # sweep the train gradients a single time (peak: full w + one train
             # block).  Fastest; the default.
-            test_ids: List[str] = []
-            test_index: Dict[str, int] = {}
-            pending: List[Tuple[Dict[str, torch.Tensor], List[int]]] = []
-            for _step, test_g, test_hashes in test_source:
-                mat = self._materialize(test_g, device)
-                cols: List[int] = []
-                for h in test_hashes:
-                    if h not in test_index:
-                        test_index[h] = len(test_ids)
-                        test_ids.append(h)
-                    cols.append(test_index[h])
-                pending.append((mat, cols))
+            w, test_ids = self._collect_test_matrix(test_source, device)
             num_test = len(test_ids)
-            layers = list(pending[0][0].keys()) if pending else []
-            w: Dict[str, torch.Tensor] = {
-                name: torch.zeros(num_test, pending[0][0][name].shape[1], device=device)
-                for name in layers
-            }
-            for mat, cols in pending:
-                idx = torch.as_tensor(cols, device=device)
-                for name in layers:
-                    # Duplicate-hash columns collapse via index_copy_ (last wins).
-                    w[name].index_copy_(0, idx, mat[name])
-            del pending
-            scores, row_train_ids, row_steps = self._propagate_and_score(
+            layers = list(w.keys())
+            scores, row_train_ids, row_steps = self._propagate_test_and_score(
                 w, num_test, layers, train_source, prop_steps, output_steps,
                 device, loss_reduction, verbose, learning_rate,
             )
@@ -674,7 +1057,7 @@ class DVEmbAttributor(BaseAttributor):
                 w_block = self._materialize(test_g, device)  # (B_block, d) per layer
                 layers = list(w_block.keys())
                 block_cols = [test_index[h] for h in test_hashes]
-                block_scores, rtids, rsteps = self._propagate_and_score(
+                block_scores, rtids, rsteps = self._propagate_test_and_score(
                     w_block, len(block_cols), layers, train_source, prop_steps,
                     output_steps, device, loss_reduction, verbose, learning_rate,
                 )

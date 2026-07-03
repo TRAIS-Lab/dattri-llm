@@ -114,6 +114,7 @@ class TestDVEmbOnDisk:
         res = _make_attr(tmp_path / f"o_{lr}_{loop_over_test}", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
+            propagation="test",
             loop_over_test=loop_over_test,
             final_step=2,
             loss_reduction="sum",  # fixture collects with a sum loss
@@ -137,17 +138,149 @@ class TestDVEmbOnDisk:
         a = _make_attr(tmp_path / "a", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
+            propagation="test",
             loop_over_test=False, final_step=2, loss_reduction="sum",
         )
         b = _make_attr(tmp_path / "b", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
+            propagation="test",
             loop_over_test=True, final_step=2, loss_reduction="sum",
         )
         assert a.test_ids == b.test_ids
         assert a.row_train_ids == b.row_train_ids
         assert a.row_steps == b.row_steps
         assert torch.equal(a.scores, b.scores)
+
+    @pytest.mark.parametrize("lr", [0.1, 0.5])
+    def test_train_side_propagation_matches_oracle(self, collected, tmp_path, lr):
+        """``propagation="train"`` — the explicit data-value-embedding operator
+        over the concatenated layer axis — matches the same explicit-matrix
+        oracle as the test-side sweep."""
+        res = _make_attr(tmp_path / f"tr_{lr}", lr).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            propagation="train",
+            final_step=2,
+            loss_reduction="sum",
+        )
+        oracle = _dvemb_oracle(
+            collected["model"], collected["train_sds"],
+            collected["x_tr"], collected["y_tr"],
+            collected["test_sd"], collected["x_te"], collected["y_te"],
+            lr=lr, final_step=2,
+        )
+        for step, (train_ids, matrix) in res.step_matrices().items():
+            want = oracle[step][[collected["train_hashes"].index(h) for h in train_ids]]
+            cols = [collected["test_hashes"].index(h) for h in res.test_ids]
+            assert torch.allclose(matrix, want[:, cols], atol=1e-5, rtol=1e-4), (
+                f"step {step}: max diff "
+                f"{(matrix - want[:, cols]).abs().max().item():.2e}"
+            )
+
+    def test_propagation_modes_agree(self, collected, tmp_path):
+        """Test-side and train-side propagation are two evaluation orders of the
+        same bilinear form — rows, columns, and scores must coincide."""
+        a = _make_attr(tmp_path / "pt", 0.3).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            propagation="test", final_step=2, loss_reduction="sum",
+        )
+        b = _make_attr(tmp_path / "ptr", 0.3).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            propagation="train", final_step=2, loss_reduction="sum",
+        )
+        assert a.test_ids == b.test_ids
+        assert a.row_train_ids == b.row_train_ids
+        assert a.row_steps == b.row_steps
+        assert torch.allclose(a.scores, b.scores, atol=1e-5, rtol=1e-4)
+
+    def test_dvemb_dir_storage_scored_by_tracin(self, collected, tmp_path):
+        """Embeddings persisted via ``dvemb_dir`` (η folded in), dotted against
+        the test gradients by a plain TracIn pass, reproduce the DVEmb scores —
+        the store-then-attribute workflow."""
+        from dattri_llm.algorithm.tracin import TracInAttributor
+
+        dvemb_dir = tmp_path / "dvemb"
+        res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            propagation="train", dvemb_dir=str(dvemb_dir),
+            final_step=2, loss_reduction="sum",
+        )
+        tracin = TracInAttributor(_args(tmp_path / "t")).attribute_from_cache(
+            train_gradients_dir=str(dvemb_dir),
+            test_gradients_dir=str(collected["test_dir"]),
+        )
+        # Same rows/columns up to ordering (TracIn reads steps ascending).
+        assert sorted(zip(tracin.row_train_ids, tracin.row_steps)) == sorted(
+            zip(res.row_train_ids, res.row_steps)
+        )
+        t_row = {
+            key: i
+            for i, key in enumerate(zip(tracin.row_train_ids, tracin.row_steps))
+        }
+        t_cols = [tracin.test_ids.index(h) for h in res.test_ids]
+        for i, key in enumerate(zip(res.row_train_ids, res.row_steps)):
+            want = tracin.scores[t_row[key]][t_cols]
+            assert torch.allclose(res.scores[i], want, atol=1e-5, rtol=1e-4), (
+                f"row {key}: max diff {(res.scores[i] - want).abs().max():.2e}"
+            )
+
+    def test_cache_dvemb_matches_scoring_run(self, collected, tmp_path):
+        """``cache_dvemb`` (embedding-only sweep over the gradient store, no test
+        gradients involved) stores the same embeddings as a scoring run —
+        verified through the TracIn dot products."""
+        from dattri_llm.algorithm.tracin import TracInAttributor
+
+        res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            propagation="train", final_step=2, loss_reduction="sum",
+        )
+        dvemb_dir = DVEmbAttributor(_args(tmp_path / "e")).cache_dvemb(
+            str(collected["train_dir"]), str(tmp_path / "dvemb"),
+            final_step=2, loss_reduction="sum", learning_rate=0.3,
+        )
+        tracin = TracInAttributor(_args(tmp_path / "t")).attribute_from_cache(
+            train_gradients_dir=dvemb_dir,
+            test_gradients_dir=str(collected["test_dir"]),
+        )
+        t_row = {
+            key: i
+            for i, key in enumerate(zip(tracin.row_train_ids, tracin.row_steps))
+        }
+        t_cols = [tracin.test_ids.index(h) for h in res.test_ids]
+        for i, key in enumerate(zip(res.row_train_ids, res.row_steps)):
+            want = tracin.scores[t_row[key]][t_cols]
+            assert torch.allclose(res.scores[i], want, atol=1e-5, rtol=1e-4)
+
+    def test_dvemb_dir_requires_train_propagation(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="dvemb_dir"):
+            _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                propagation="test", dvemb_dir=str(tmp_path / "d"),
+                final_step=2, loss_reduction="sum",
+            )
+
+    def test_train_side_rejects_loop_over_test(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="loop_over_test"):
+            _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                propagation="train", loop_over_test=True,
+                final_step=2, loss_reduction="sum",
+            )
+
+    def test_invalid_propagation_raises(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="propagation"):
+            _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                propagation="both", final_step=2, loss_reduction="sum",
+            )
 
     def test_loop_over_test_multiblock_scatter(self, collected, tmp_path):
         """With the test set split across two on-disk blocks, the column-blocked
@@ -179,6 +312,7 @@ class TestDVEmbOnDisk:
         common = dict(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(test_dir2), final_step=2, loss_reduction="sum",
+            propagation="test",
         )
         res_f = _make_attr(tmp_path / "f", lr).attribute_from_cache(loop_over_test=False, **common)
         res_t = _make_attr(tmp_path / "t", lr).attribute_from_cache(loop_over_test=True, **common)
