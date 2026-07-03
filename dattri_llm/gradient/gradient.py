@@ -549,8 +549,10 @@ class Gradient:
         diagonal; per-sample influence scoring against a target gradient is the
         row-sum over ``other``'s batch (``⟨∇W_i, Σ_j ∇W_target_j⟩``).
 
-        Layers absent from *other*, or stored with a different representation,
-        are skipped (so a target gradient need only overlap on some layers).
+        Layers absent from *other* are skipped (so a target gradient need only
+        overlap on some layers).  A layer stored factorized on one side and
+        materialized on the other is compared by materializing the factorized
+        side.
 
         Args:
             other: Gradient to compare against (e.g. a target/reference batch).
@@ -643,8 +645,10 @@ class Gradient:
             return ops.cross_dot(sv, ov, layer_type, mode=mode)
 
         if isinstance(sv, Factorized) or isinstance(ov, Factorized):
-            # One side factorized, the other materialized — incompatible.
-            return None
+            if isinstance(sv, Factorized):
+                sv = ops.materialize(sv, layer_type)
+            else:
+                ov = ops.materialize(ov, other.layer_types[name])
 
         # Both plain materialized tensors: flatten non-batch dims and dot.
         xf = sv.reshape(sv.shape[0], -1).float()
