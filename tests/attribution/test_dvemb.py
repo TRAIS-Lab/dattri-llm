@@ -21,7 +21,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-import tests.algorithm.test_tracin as TT
+import tests.attribution.test_tracin as TT
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.attribution.algorithm.dvemb import DVEmbAttributor
 from dattri_llm.utils.hashing import hash_sample
