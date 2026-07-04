@@ -114,7 +114,7 @@ if __name__ == "__main__":
         # the gradients live on disk, this stage can be re-run with different
         # settings (e.g. layer_name=[...] or normalized_grad=True) for free.
         attr_args = AttributionArguments(
-            output_dir=str(tmp / "scores"),
+            output_dir=str(root / "scores"),
             per_device_train_batch_size=4,
             per_device_eval_batch_size=3,
             use_cpu=True,
