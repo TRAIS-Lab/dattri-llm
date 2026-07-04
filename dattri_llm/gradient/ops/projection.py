@@ -1,4 +1,4 @@
-"""Random projection — TRAK-style (materialized) and LoGRA-style (factorized)."""
+"""Random projection -- TRAK-style (materialized) and LoGRA-style (factorized)."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _project_materialized(
 ) -> torch.Tensor:
     """TRAK-style: materialize the per-sample weight gradient, then project it.
 
-    Returns a dense ``(B, proj_dim)`` tensor — the full gradient is reduced to a
+    Returns a dense ``(B, proj_dim)`` tensor -- the full gradient is reduced to a
     single random-projected vector per sample.
     """
     mat = _materialize(a, g, layer_type, module_kwargs, include_bias)   # (B, D)
@@ -73,9 +73,9 @@ def _project_factorized(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """LoGRA-style: project the two factorized factors, keeping the structure.
 
-    Each factor is independently projected to width ``proj_dim`` — the output
+    Each factor is independently projected to width ``proj_dim`` -- the output
     factor with ``proj_seed`` and the input factor with ``proj_seed + 1`` (dattri's
-    LoGRA convention) — so the per-sample gradient stays the outer product of two
+    LoGRA convention) -- so the per-sample gradient stays the outer product of two
     ``(B, T, proj_dim)`` factors.  Returns ``(a_p, g_p)``.
 
     Only layer types whose gradient *is* an outer product of the factors (linear,
@@ -85,7 +85,7 @@ def _project_factorized(
     if is_norm(layer_type) or is_embedding(layer_type):
         raise ValueError(
             f"factorized projection is undefined for {layer_type!r}: its gradient "
-            "is not an outer product of the factors — use materialized projection"
+            "is not an outer product of the factors -- use materialized projection"
         )
     a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
     a_f = _to_3d(a.float())   # (B, T, d_in)

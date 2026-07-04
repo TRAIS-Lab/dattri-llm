@@ -22,7 +22,7 @@ class Factorized:
     # which layer produced them.
     module_kwargs: Optional[dict] = field(default=None, compare=False, repr=False, hash=False)
     # Tensor layout flag.  ``True`` (default) means the batch axis is dim 0 and
-    # the token/sequence axis is dim 1 — the layout every ``ops`` kernel assumes.
+    # the token/sequence axis is dim 1 -- the layout every ``ops`` kernel assumes.
     # ``False`` marks a *sequence-first* capture ``(T, B, ...)`` (e.g. a layer
     # internal to a sequence-first model such as MusicTransformer); call
     # :meth:`as_batch_first` to get the canonical ``(B, T, ...)`` view.
@@ -96,7 +96,7 @@ class Gradient:
                 best = max(best, x.shape[0])
         if best:
             return best
-        # Only ``param_grad`` layers present — fall back to the first tensor.
+        # Only ``param_grad`` layers present -- fall back to the first tensor.
         x = next(iter(self.data.values()))
         return x.activation.shape[0] if isinstance(x, Factorized) else x.shape[0]
 
@@ -202,7 +202,7 @@ class Gradient:
                     )
                 cur_batch = value.shape[0]
 
-            # A layer with batch size 1 is a *broadcast* / shared gradient — e.g.
+            # A layer with batch size 1 is a *broadcast* / shared gradient -- e.g.
             # a positional embedding added to every sample, whose gradient is
             # summed over the batch.  Like ``param_grad`` it has no per-sample
             # axis, so it is compatible with any real batch size and does not
@@ -262,7 +262,7 @@ class Gradient:
                 layer_type = self.layer_types[name]
                 new_data[name] = ops.materialize(value, layer_type)
                 new_repr[name] = "materialized"
-                # ops.materialize always returns (B, d) — collapse to "batch".
+                # ops.materialize always returns (B, d) -- collapse to "batch".
                 new_indexing[name] = "batch"
             else:
                 new_data[name] = value
@@ -280,16 +280,16 @@ class Gradient:
 
         Two styles, chosen per layer by ``proj_kwargs[name]["factorize"]``:
 
-        * ``factorize=True`` (LoGRA) — project the factorized factors, keeping the
+        * ``factorize=True`` (LoGRA) -- project the factorized factors, keeping the
           Kronecker structure at width ``proj_dim``; the layer stays *factorized*.
           Defined only for outer-product gradients (linear / conv); norm and
           embedding layers must use ``factorize=False``.
-        * ``factorize=False`` (TRAK) — materialize the per-sample weight gradient,
+        * ``factorize=False`` (TRAK) -- materialize the per-sample weight gradient,
           then project it, collapsing the layer to a dense ``(B, proj_dim)`` block.
 
         Args:
             projector: a projection factory following dattri's ``random_project``
-                protocol — ``projector(feature, batch_size, proj_dim=..., **kw)``
+                protocol -- ``projector(feature, batch_size, proj_dim=..., **kw)``
                 returns a callable mapping ``(N, D) -> (N, proj_dim)``.
             proj_kwargs: ``{layer_name: dict}`` per-layer config.  Each dict carries
                 ``proj_dim`` and optionally ``factorize`` (default ``True``),
@@ -309,7 +309,7 @@ class Gradient:
         for name, value in self.data.items():
             kw = proj_kwargs.get(name, proj_kwargs.get("__default__"))
             if kw is None:
-                # No config for this layer — pass it through untouched.
+                # No config for this layer -- pass it through untouched.
                 new_data[name] = value
                 new_repr[name] = self.representation[name]
                 new_types[name] = self.layer_types[name]
@@ -361,10 +361,10 @@ class Gradient:
         """Concatenate two gradients along the batch or token axis.
 
         A layer that is **broadcast** (batch axis 1 while the gradient's batch is
-        larger — e.g. a positional embedding added to every sample) has no
+        larger -- e.g. a positional embedding added to every sample) has no
         per-sample rows to concatenate.  When such a layer is broadcast on *both*
         sides, batch concatenation instead produces a unified broadcast row: the
-        batch-size-weighted average ``(B_self·r_self + B_other·r_other) /
+        batch-size-weighted average ``(B_self*r_self + B_other*r_other) /
         (B_self + B_other)`` of the two shared rows.  Factorized broadcast layers
         stay factorized when the two activations coincide (the gradient is linear
         in the output-gradient factor); otherwise both rows are materialized
@@ -425,7 +425,7 @@ class Gradient:
                         and torch.equal(a_bf.activation, b_bf.activation)
                     ):
                         # Same activation factor: the gradient is linear in the
-                        # output-gradient factor, so averaging g averages ∇W.
+                        # output-gradient factor, so averaging g averages dW.
                         g_avg = (
                             w_a * a_bf.pre_activation_grad
                             + w_b * b_bf.pre_activation_grad
@@ -491,7 +491,7 @@ class Gradient:
         a purely ``"batch"``-indexed one.
 
         Summation is the only aggregation offered because it is the chain rule:
-        ``∂L/∂W = Σ_t g_t a_tᵀ`` for **any** loss — a token-mean (or masked)
+        ``dL/dW = sum_t g_t a_t^T`` for **any** loss -- a token-mean (or masked)
         loss already carries its normalization inside the captured per-token
         gradients, so averaging here would divide by the token count a second
         time and yields the gradient of nothing.
@@ -519,7 +519,7 @@ class Gradient:
                     new_data[name] = torch.sum(value, dim=1)
                     new_repr[name] = self.representation[name]
             else:
-                # "batch" layer — pass through unchanged.
+                # "batch" layer -- pass through unchanged.
                 new_data[name] = value
                 new_repr[name] = self.representation[name]
 
@@ -558,7 +558,7 @@ class Gradient:
         def slice_tensor(x: torch.Tensor, slice_dim: int) -> torch.Tensor:
             layer_index = index
             if dim == "batch" and x.shape[slice_dim] == 1:
-                # Broadcast (batch-collapsed) layer — e.g. a positional embedding
+                # Broadcast (batch-collapsed) layer -- e.g. a positional embedding
                 # fed an unbatched index tensor: one shared row serves every
                 # sample, so any per-sample slice copies that row over instead of
                 # indexing past the size-1 batch axis.
@@ -617,10 +617,10 @@ class Gradient:
         """Per-sample gradient similarity between this gradient and ``other``.
 
         For each shared layer this forms the full ``(B_self, B_other)`` cross-gram
-        ``K[i, j] = ⟨∇W_i (self), ∇W_j (other)⟩`` — the fundamental object for
+        ``K[i, j] = <dW_i (self), dW_j (other)>`` -- the fundamental object for
         gradient-based data attribution.  The aligned ``i == j`` case is its
         diagonal; per-sample influence scoring against a target gradient is the
-        row-sum over ``other``'s batch (``⟨∇W_i, Σ_j ∇W_target_j⟩``).
+        row-sum over ``other``'s batch (``<dW_i, sum_j dW_target_j>``).
 
         Layers absent from *other* are skipped (so a target gradient need only
         overlap on some layers).  A layer stored factorized on one side and
@@ -634,14 +634,14 @@ class Gradient:
                 norms).
             reduce: ``"none"`` (default) keeps the result broken down per layer,
                 returning ``{layer: (B_self, B_other)}``.  ``"all"`` returns a
-                single ``(B_self, B_other)`` matrix — the full-model gradient
+                single ``(B_self, B_other)`` matrix -- the full-model gradient
                 cross-gram, i.e. the per-layer matrices summed over layers
-                (``⟨g_i, g_j⟩ = Σ_layer ⟨g_i^layer, g_j^layer⟩``).  Either way
+                (``<g_i, g_j> = sum_layer <g_i^layer, g_j^layer>``).  Either way
                 the per-sample pair structure is preserved.
             mode: ``"factorized"`` (ghost, no materialisation, via
                 :func:`ops.cross_dot`), ``"materialized"`` (materialize each side
                 then matrix-multiply), or ``"auto"`` (choose per layer by the cost
-                heuristic in :func:`ops.cross_gram_auto` — factorized for small
+                heuristic in :func:`ops.cross_gram_auto` -- factorized for small
                 token/patch counts, materialized once the $S^2$ factor dominates).
                 All three are numerically equivalent.
             eps: Numerical floor added to the cosine denominator.
@@ -653,7 +653,7 @@ class Gradient:
         Note:
             Under ``reduce="all"``, a **broadcast** layer (batch axis 1 while the
             gradient's batch is larger, e.g. a positional embedding) contributes
-            its shared row to *every* sample: its ``(1, ·)``/``(·, 1)`` cross
+            its shared row to *every* sample: its ``(1, *)``/``(*, 1)`` cross
             matrix is expanded to ``(B_self, B_other)`` before the per-layer sum
             (matching :meth:`slice`'s copy-over semantics).
         """
@@ -720,7 +720,7 @@ class Gradient:
         """Return the ``(B_self, B_other)`` cross-gram for one layer, or ``None``
         when the representations are incompatible.
 
-        The factorized↔materialized routing lives in :func:`ops.cross_dot` /
+        The factorized<->materialized routing lives in :func:`ops.cross_dot` /
         :func:`ops._cross_gram` (the shared kernel, also used by K-FAC), so this
         method just forwards ``mode``; ``"auto"`` picks the cheaper path per layer
         from :func:`ops.maybe_use_materialized_gram`.
@@ -750,7 +750,7 @@ class Gradient:
     ) -> torch.Tensor:
         """Per-sample squared gradient norms ``(B,)`` for one layer.
 
-        Used by :meth:`similarity` for the cosine denominator.  The factorized↔
+        Used by :meth:`similarity` for the cosine denominator.  The factorized<->
         materialized routing lives in :func:`ops.grad_norm_sq` /
         :func:`ops._grad_norm_sq`; this method just forwards ``mode`` (``"auto"``
         picks the cheaper path via :func:`ops.maybe_use_materialized_norm`).  The
@@ -866,7 +866,7 @@ class GradientRecord:
 
     def __repr__(self) -> str:
         if isinstance(self.input_hash, list):
-            h_repr = f"[{self.input_hash[0][:16]}…+{len(self.input_hash)-1}]"
+            h_repr = f"[{self.input_hash[0][:16]}...+{len(self.input_hash)-1}]"
         else:
-            h_repr = f"{self.input_hash[:16]}…"
+            h_repr = f"{self.input_hash[:16]}..."
         return f"GradientRecord(step={self.step}, input_hash={h_repr})"

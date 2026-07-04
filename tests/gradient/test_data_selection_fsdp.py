@@ -9,12 +9,12 @@ contribution requires a cross-rank reduction (see
 
 These tests launch two ``gloo`` CPU workers via ``torch.multiprocessing.spawn``
 (no ``torchrun`` needed) and check, end-to-end, that the corrected sharded
-gradients reconstruct to ``(1/world_size) · Σ_r G_r^kept`` — i.e. exactly the
-averaged gradient of the surviving samples — across three regimes:
+gradients reconstruct to ``(1/world_size) * sum_r G_r^kept`` -- i.e. exactly the
+averaged gradient of the surviving samples -- across three regimes:
 
-* ``none``  — nothing dropped (callback must be a no-op, no deadlock).
-* ``half``  — bottom 50 % of every rank dropped (symmetric).
-* ``hard0`` — drop negatively-influential samples (counts differ per rank,
+* ``none``  -- nothing dropped (callback must be a no-op, no deadlock).
+* ``half``  -- bottom 50 % of every rank dropped (symmetric).
+* ``hard0`` -- drop negatively-influential samples (counts differ per rank,
   exercising the lock-step collective when a rank drops nothing).
 """
 
@@ -45,7 +45,7 @@ RTOL = 1e-3
 
 
 class EmbeddingMLP(nn.Module):
-    """Embedding → two-layer MLP with biases.
+    """Embedding -> two-layer MLP with biases.
 
     The embedding makes every MLP input require grad (matching real LLM
     training), and the biases exercise 1-D shard mapping alongside the 2-D
@@ -147,10 +147,10 @@ def _fsdp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
             buf = torch.zeros(math.prod(spec.orig_shape), dtype=torch.float32)
             if spec.in_shard and param.grad is not None:
                 buf[spec.start : spec.end + 1] = param.grad.reshape(-1).float()
-            dist.all_reduce(buf, op=dist.ReduceOp.SUM)  # disjoint shards → full
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)  # disjoint shards -> full
             actual_full[name] = buf
 
-        # --- Expected: (1/W) · Σ_r gradient over rank r's surviving samples. ---
+        # --- Expected: (1/W) * sum_r gradient over rank r's surviving samples. ---
         keep = [i for i in range(BATCH) if i not in set(dropped)]
         ref = EmbeddingMLP()
         ref.load_state_dict(init_state)

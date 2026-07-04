@@ -3,15 +3,15 @@
 This package re-exports the full surface of its submodules so existing code
 keeps importing from ``dattri_llm.gradient.ops`` unchanged:
 
-* :mod:`~dattri_llm.gradient.ops.types` — layer-type constants and predicates.
-* :mod:`~dattri_llm.gradient.ops.norm` — normalization x̂ / bias augmentation.
-* :mod:`~dattri_llm.gradient.ops.preprocess` — raw-capture preprocessing
+* :mod:`~dattri_llm.gradient.ops.types` -- layer-type constants and predicates.
+* :mod:`~dattri_llm.gradient.ops.norm` -- normalization x_hat / bias augmentation.
+* :mod:`~dattri_llm.gradient.ops.preprocess` -- raw-capture preprocessing
   (incl. conv im2col) and module-kwargs extraction.
-* :mod:`~dattri_llm.gradient.ops.materialize` — per-sample weight gradients.
-* :mod:`~dattri_llm.gradient.ops.dot` — dot products, grams, norms, and the
+* :mod:`~dattri_llm.gradient.ops.materialize` -- per-sample weight gradients.
+* :mod:`~dattri_llm.gradient.ops.dot` -- dot products, grams, norms, and the
   factorized-vs-materialized routing heuristic.
-* :mod:`~dattri_llm.gradient.ops.projection` — TRAK/LoGRA random projection.
-* :mod:`~dattri_llm.gradient.ops.kronecker` — K-FAC / EK-FAC / Fisher kernels
+* :mod:`~dattri_llm.gradient.ops.projection` -- TRAK/LoGRA random projection.
+* :mod:`~dattri_llm.gradient.ops.kronecker` -- K-FAC / EK-FAC / Fisher kernels
   and streaming accumulators.
 """
 

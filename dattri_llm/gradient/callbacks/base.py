@@ -42,7 +42,7 @@ class HookManagerCallback:
 
         The record always contains the full-batch gradient (``input_hash`` is a
         list of B hashes).  Per-sample slicing is the callback's responsibility
-        — see :class:`OffloadCallback` for an example.
+        -- see :class:`OffloadCallback` for an example.
 
         Args:
             record: The assembled :class:`GradientRecord` for this step.

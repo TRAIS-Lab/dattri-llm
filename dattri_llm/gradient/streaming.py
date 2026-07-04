@@ -1,24 +1,24 @@
-"""Gradient sources for attribution — on-disk and live, behind one contract.
+"""Gradient sources for attribution -- on-disk and live, behind one contract.
 
 An attributor scores by iterating ``(step, Gradient, hashes)`` blocks.  Where
 those blocks come from is abstracted by :class:`GradientSource`, which has two
 concrete implementations so the same scoring loop serves both workflows:
 
-* :class:`DiskGradientSource` — *store-then-attribute*: reads pre-collected
+* :class:`DiskGradientSource` -- *store-then-attribute*: reads pre-collected
   gradients off disk via a
   :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  ``reusable=True``.
-* :class:`GradientStreamer` — *on-the-fly*: runs a forward+backward pass over a
+* :class:`GradientStreamer` -- *on-the-fly*: runs a forward+backward pass over a
   dataset and yields each per-step block on demand, never persisting it.  Its
   ``enable_update`` flag selects the two regimes:
 
-  * ``enable_update=False`` (default) — a **frozen probe** at a fixed checkpoint;
+  * ``enable_update=False`` (default) -- a **frozen probe** at a fixed checkpoint;
     ``reusable=True``.  Required by methods with a pre-pass (K-FAC/EK-FAC fit the
     Fisher, then score).
-  * ``enable_update=True`` — **advances the optimizer** as it streams, so each
+  * ``enable_update=True`` -- **advances the optimizer** as it streams, so each
     step is a real checkpoint along the training trajectory; ``reusable=False``
     (single-shot).  Suits single-pass methods (TracIn).
 
-The only axis attributors branch on is :attr:`GradientSource.reusable` — whether
+The only axis attributors branch on is :attr:`GradientSource.reusable` -- whether
 the source can be iterated more than once at the *same* parameters.  The
 method-specific logic (TracIn dot vs. K-FAC whitening) stays in the attributors;
 this module is method-agnostic.
@@ -138,7 +138,7 @@ class DiskGradientSource(GradientSource):
         return True
 
     def __len__(self) -> int:
-        # One block per (file, step) pair — matches what __iter__ yields.
+        # One block per (file, step) pair -- matches what __iter__ yields.
         return sum(len(by_step) for _, by_step in self._fm.iter_steps(self._steps))
 
     def __iter__(self) -> Iterator[StreamBatch]:
@@ -154,7 +154,7 @@ class DiskGradientSource(GradientSource):
     def for_steps(self, steps: Iterable[int]) -> "DiskGradientSource":
         """A view of this source restricted to ``steps`` (same file manager and
         layer filter).  Disk is random-access by step, so a trajectory attributor
-        (e.g. DVEmb) can pull one step's blocks at a time for its latest→earliest
+        (e.g. DVEmb) can pull one step's blocks at a time for its latest->earliest
         sweep while still going through the source abstraction.  The sub-read
         shows no progress bar (``verbose=False``) to avoid nesting under the
         sweep's own bar."""
@@ -182,7 +182,7 @@ def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
     loss = getattr(out, "loss", None)
     if loss is None:
         raise ValueError(
-            "Default loss_fn expected the model output to carry a `.loss`; "
+            "Default loss_fn expected the model output to carry a ``.loss``; "
             "none found. Pass an explicit loss_fn."
         )
     return loss
@@ -196,7 +196,7 @@ class GradientStreamer(GradientSource):
     HF Trainer**: ``args`` drives mixed precision (``bf16``/``fp16`` autocast, with
     a dynamic ``GradScaler`` for fp16), gradient clipping (``max_grad_norm``), and
     gradient checkpointing, and the per-step order is
-    forward → backward → clip → ``optimizer.step`` → ``scheduler.step`` → ``zero_grad``.
+    forward -> backward -> clip -> ``optimizer.step`` -> ``scheduler.step`` -> ``zero_grad``.
     DeepSpeed is **not** supported (the hook capture is incompatible with its
     engine); a ``deepspeed`` config is ignored with a warning.  Verified bit-exact
     against ``Trainer`` in ``scripts/verify_streamer_vs_trainer.py``.
@@ -236,7 +236,7 @@ class GradientStreamer(GradientSource):
         scheduler: Optional LR scheduler, stepped after the optimizer.
         config: :class:`HookManagerConfig` controlling which layers are hooked.
             Defaults to factorized per-sample hooks on every linear-IO-capable
-            layer (``linear_io=REGISTER_ALL``) — *without* the ``param_grad``
+            layer (``linear_io=REGISTER_ALL``) -- *without* the ``param_grad``
             fallback, since batch-collapsed parameter gradients (e.g. BatchNorm,
             which couples samples across the batch) are incompatible with
             per-sample attribution and would be silently skipped.
@@ -283,7 +283,7 @@ class GradientStreamer(GradientSource):
             if shared is None:
                 raise ValueError(
                     "A shared hook_manager must carry a CaptureCallback; pass the "
-                    "`.hook_manager` of another GradientStreamer."
+                    "``.hook_manager`` of another GradientStreamer."
                 )
             self._capture = shared
         else:
@@ -299,23 +299,23 @@ class GradientStreamer(GradientSource):
             )
             self._owns_hm = True
 
-        # ── Compute-shaping options, mirroring HF ``Trainer`` so that the same
+        # -- Compute-shaping options, mirroring HF ``Trainer`` so that the same
         # ``AttributionArguments`` yield the same forward/backward and (for the
-        # training streamer) the same optimizer trajectory. ──────────────────
+        # training streamer) the same optimizer trajectory. ------------------
         if args.deepspeed:
             raise NotImplementedError(
                 "GradientStreamer does not support DeepSpeed (the hook-based "
-                "capture is incompatible with its engine); the `deepspeed` config "
+                "capture is incompatible with its engine); the ``deepspeed`` config "
                 "is ignored. Run single-process, DDP, or FSDP instead."
             )
         # Gradient checkpointing must be enabled on the *unwrapped* model, before
-        # DDP/FSDP wrapping — exactly as Trainer does (Trainer._inner_training_loop).
+        # DDP/FSDP wrapping -- exactly as Trainer does (Trainer._inner_training_loop).
         if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs
             )
         # Mixed precision: bf16/fp16 autocast around the forward; fp16 also needs a
-        # dynamic GradScaler — but only when we actually step the optimizer (a
+        # dynamic GradScaler -- but only when we actually step the optimizer (a
         # frozen probe must capture *unscaled* gradients).  bf16 needs no scaler.
         self._amp_dtype: Optional[torch.dtype] = (
             torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else None
@@ -342,7 +342,7 @@ class GradientStreamer(GradientSource):
         self._batch_iter: Optional[Iterator] = None
         self._batch_index: int = 0
         self._consumed: bool = False
-        # Per-step LR actually applied (``enable_update``), keyed by step index —
+        # Per-step LR actually applied (``enable_update``), keyed by step index --
         # so a trajectory attributor can use/verify the true schedule.
         self._step_lrs: Dict[int, float] = {}
         # Saved-state for frozen probes (restored on __exit__).
@@ -365,7 +365,7 @@ class GradientStreamer(GradientSource):
     @property
     def hook_manager(self) -> HookManager:
         """The underlying :class:`HookManager`.  Pass it to another streamer's
-        ``hook_manager=`` (over the same model) so both share one set of hooks —
+        ``hook_manager=`` (over the same model) so both share one set of hooks --
         the cleaner alternative to two managers cross-capturing each backward."""
         return self._hm
 
@@ -388,7 +388,7 @@ class GradientStreamer(GradientSource):
             raise RuntimeError("GradientStreamer is already active.")
         self._entered = True
         # Seed at the start of the pass, exactly as Trainer does at the top of
-        # `_inner_training_loop`: enable_full_determinism (also seeds) or set_seed.
+        # ``_inner_training_loop``: enable_full_determinism (also seeds) or set_seed.
         from transformers import enable_full_determinism, set_seed
 
         if self._args.full_determinism:
@@ -397,8 +397,8 @@ class GradientStreamer(GradientSource):
             set_seed(self._args.seed)
         if not self.enable_update:
             # Freeze: snapshot grads so the probe leaves them untouched.  (The
-            # eval() that keeps repeated passes bit-identical — e.g. K-FAC's fit
-            # and score passes — is applied per-pass in __iter__.)
+            # eval() that keeps repeated passes bit-identical -- e.g. K-FAC's fit
+            # and score passes -- is applied per-pass in __iter__.)
             self._saved_grads = {
                 n: (p.grad.detach().clone() if p.grad is not None else None)
                 for n, p in self._model.named_parameters()
@@ -433,7 +433,7 @@ class GradientStreamer(GradientSource):
         if not self._entered:
             raise RuntimeError(
                 "Use the streamer as a context manager before iterating: "
-                "`with streamer as s: for ... in s: ...`."
+                "``with streamer as s: for ... in s: ...``."
             )
         if self._consumed and not self.reusable:
             raise RuntimeError(
@@ -443,7 +443,7 @@ class GradientStreamer(GradientSource):
         # Set the train/eval mode for THIS pass on the (possibly shared) model: a
         # training trajectory runs in train() to match real training (dropout/BN
         # active); a frozen probe runs in eval() for deterministic, repeatable
-        # scoring.  Per-pass — not per-context — so a frozen test probe and an
+        # scoring.  Per-pass -- not per-context -- so a frozen test probe and an
         # updating train pass over the same model each get the correct mode.
         self._fwd_model.train(self.enable_update)
         self._batch_iter = iter(self._loader)
@@ -529,10 +529,10 @@ class GradientStreamer(GradientSource):
         return loss
 
     def _optimizer_step(self) -> None:
-        """Clip → step → schedule, mirroring ``Trainer``'s inner loop.
+        """Clip -> step -> schedule, mirroring ``Trainer``'s inner loop.
 
-        Order matches ``Trainer._inner_training_loop``: unscale (fp16) →
-        ``clip_grad_norm_(max_grad_norm)`` → ``optimizer.step`` → ``scheduler.step``.
+        Order matches ``Trainer._inner_training_loop``: unscale (fp16) ->
+        ``clip_grad_norm_(max_grad_norm)`` -> ``optimizer.step`` -> ``scheduler.step``.
         ``zero_grad`` happens at the start of the next ``_forward_backward``.
         """
         # Record the LR applied at this step (the value used by ``optimizer.step``
@@ -554,7 +554,7 @@ class GradientStreamer(GradientSource):
             self._scheduler.step()
 
     def _create_optimizer_and_scheduler(self):
-        """Build the trajectory optimizer + LR scheduler from ``args`` — the
+        """Build the trajectory optimizer + LR scheduler from ``args`` -- the
         streamer analogue of ``Trainer.create_optimizer_and_scheduler``.
 
         Weight decay excludes biases and 1-D (norm) parameters, as in HF; the
@@ -597,7 +597,7 @@ class GradientStreamer(GradientSource):
         """Semantic step stamp for the current block (the attribution index).
 
         Frozen: a constant checkpoint index (all batches share one checkpoint).
-        Updating: the optimizer-step index (each batch is its own checkpoint) —
+        Updating: the optimizer-step index (each batch is its own checkpoint) --
         which equals the manager's per-pass ``record.step`` (cross-checked in
         :meth:`__next__`).  ``_batch_index`` always tracks capture order; only the
         *label* differs between the two modes.
@@ -621,7 +621,7 @@ class GradientStreamer(GradientSource):
         seed = self._args.data_seed if self._args.data_seed is not None else self._args.seed
         # Distributed: each rank streams a disjoint shard via DistributedSampler
         # (sampler and shuffle are mutually exclusive, so set only one). Content
-        # hashes stay globally unique, so per-rank rows concatenate cleanly — the
+        # hashes stay globally unique, so per-rank rows concatenate cleanly -- the
         # on-the-fly analogue of GradientFileManager's per-rank index merge.
         if self._args.world_size > 1:
             kwargs["sampler"] = DistributedSampler(

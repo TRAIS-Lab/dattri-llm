@@ -1,4 +1,4 @@
-"""Normalization-layer x̂ computation and bias-augmentation helpers."""
+"""Normalization-layer x_hat computation and bias-augmentation helpers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 def _compute_layer_norm_x_hat(
     x: torch.Tensor, normalized_shape: tuple, eps: float
 ) -> torch.Tensor:
-    """Return x̂ = (x − μ) / √(σ² + ε) for a LayerNorm-style normalisation."""
+    """Return x_hat = (x - mu) / sqrt(sigma^2 + eps) for a LayerNorm-style normalisation."""
     n_dims = len(normalized_shape)
     reduce_dims = tuple(range(-n_dims, 0))
     mean = x.mean(dim=reduce_dims, keepdim=True)
@@ -21,7 +21,7 @@ def _compute_layer_norm_x_hat(
 def _compute_rms_x_hat(
     x: torch.Tensor, normalized_shape: tuple, eps: Optional[float]
 ) -> torch.Tensor:
-    """Return x̂ = x / √(mean(x²) + ε) for an RMSNorm normalisation.
+    """Return x_hat = x / sqrt(mean(x^2) + eps) for an RMSNorm normalisation.
 
     RMSNorm omits mean subtraction.  When *eps* is ``None`` (PyTorch's
     ``nn.RMSNorm`` default) the dtype's machine epsilon is used, matching
@@ -38,7 +38,7 @@ def _compute_rms_x_hat(
 def _compute_group_norm_x_hat(
     x: torch.Tensor, num_groups: int, eps: float
 ) -> torch.Tensor:
-    """Return x̂ for a GroupNorm-style normalisation.
+    """Return x_hat for a GroupNorm-style normalisation.
 
     *x* has shape ``(N, C, *spatial)``.  Channels are split into ``num_groups``
     contiguous groups; each group is normalised jointly over its channels and
@@ -63,8 +63,8 @@ def _augment_token_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Bias-augment a LayerNorm/RMSNorm pair (affine over the last dim).
 
-    With bias, append a ones block to ``x̂`` and duplicate ``g`` so that the
-    per-position elementwise product ``a ⊙ g`` yields ``[∇γ, ∇β]``.
+    With bias, append a ones block to ``x_hat`` and duplicate ``g`` so that the
+    per-position elementwise product ``a * g`` yields ``[dgamma, dbeta]``.
     """
     if has_bias:
         return (
@@ -79,11 +79,11 @@ def _augment_channel_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lay out a GroupNorm/InstanceNorm pair as ``(N, S, C)`` and bias-augment.
 
-    The affine parameters are per-channel ``(C,)`` while ``x̂`` and ``g`` have
+    The affine parameters are per-channel ``(C,)`` while ``x_hat`` and ``g`` have
     shape ``(N, C, *spatial)``.  Spatial locations play the role of the token
     dimension, so we permute to ``(N, S, C)``.  With bias, append a ones block
-    in the channel dimension and duplicate ``g`` so ``a ⊙ g`` yields
-    ``[∇γ, ∇β]`` per position.
+    in the channel dimension and duplicate ``g`` so ``a * g`` yields
+    ``[dgamma, dbeta]`` per position.
     """
     n, c = x_hat.shape[:2]
     x_sc = x_hat.reshape(n, c, -1).permute(0, 2, 1).contiguous()  # (N, S, C)

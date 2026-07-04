@@ -3,7 +3,7 @@
 This attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
 records produced earlier by the gradient-collection pipeline and persisted to
 disk via :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  No
-forward/backward pass is performed at attribution time — only inner products
+forward/backward pass is performed at attribution time -- only inner products
 between pre-stored per-sample gradients.
 
 Every train record is scored against every test record::
@@ -11,11 +11,11 @@ Every train record is scored against every test record::
     score[i, j] = <g_train_i, g_test_j>
 
 i.e. the full ``(num_train, num_test)`` cross-gram, exactly mirroring the
-:class:`~dattri_llm.attribution.algorithm.kronecker.KFACAttributor` assembly — there is no
+:class:`~dattri_llm.attribution.algorithm.kronecker.KFACAttributor` assembly -- there is no
 train/test step alignment.  With ``normalized_grad=True`` the inner product
 becomes a cosine similarity (the GradCos / CosIn variant);
 ``GradCos`` is TracIn with ``normalized_grad=True`` passed to the attribute
-methods — there is no separate subclass.
+methods -- there is no separate subclass.
 
 The result is a :class:`~dattri_llm.attribution.score.AttributionScore`.  Rows are
 stamped with the step each train gradient was recorded at (read straight off the
@@ -59,7 +59,7 @@ class TracInAttributor(BaseAttributor):
 
     Scores every train record against every test record (the full
     ``(num_train, num_test)`` gradient cross-gram), with no train/test step
-    alignment — structurally identical to the K-FAC family, minus the Fisher
+    alignment -- structurally identical to the K-FAC family, minus the Fisher
     preconditioner.
 
     Args:
@@ -102,7 +102,7 @@ class TracInAttributor(BaseAttributor):
         Runs forward/backward over the data (from the task's model, loss, and
         optional ``target_func``) and offloads the per-sample gradients so that
         :meth:`attribute_from_cache` can score them.  Reproducing :meth:`attribute`
-        is then *cache + attribute_from_cache* — scoring **each returned pair** and
+        is then *cache + attribute_from_cache* -- scoring **each returned pair** and
         **summing** the results (one pair per checkpoint, each internally aligned)::
 
             pairs = attr.cache(train_ds, test_ds)
@@ -111,11 +111,11 @@ class TracInAttributor(BaseAttributor):
 
         * ``enable_update=False`` (default): one ``(train, test)`` pair **per
           checkpoint** the task provides, both sides collected **at that same
-          ``θ_k``** (so each pair's score is ``⟨g_train@θ_k, g_test@θ_k⟩`` — the
+          ``theta_k``** (so each pair's score is ``<g_train@theta_k, g_test@theta_k>`` -- the
           step-aligned term).  Summing the pairs is the multi-checkpoint ensemble.
-        * ``enable_update=True``: a single pair — a training **trajectory** from
+        * ``enable_update=True``: a single pair -- a training **trajectory** from
           checkpoint 0 (train per optimizer step) with the test gradients taken
-          once at ``θ_0`` (mirroring :meth:`attribute`, which reads the test side
+          once at ``theta_0`` (mirroring :meth:`attribute`, which reads the test side
           before training).
 
         Args:
@@ -128,12 +128,12 @@ class TracInAttributor(BaseAttributor):
                 the streamer default (factorized hooks on every linear-family layer).
 
         Returns:
-            A list of ``(train_gradients_dir, test_gradients_dir)`` pairs — one per
+            A list of ``(train_gradients_dir, test_gradients_dir)`` pairs -- one per
             checkpoint (frozen) or a single pair (trajectory).
         """
         if self.task is None:
             raise ValueError(
-                "cache() (live collection) requires a `task` with a model; pass "
+                "cache() (live collection) requires a ``task`` with a model; pass "
                 "pre-collected gradients to attribute_from_cache() instead."
             )
         cache_dir = cache_dir if cache_dir is not None else self.args.output_dir
@@ -158,7 +158,7 @@ class TracInAttributor(BaseAttributor):
             self.task._load_checkpoints(0)
             model = self.task.get_model()
             train_dir, test_dir = _pair(0)
-            # Test FIRST, at θ_0 — mirroring attribute(), where score_sources reads
+            # Test FIRST, at theta_0 -- mirroring attribute(), where score_sources reads
             # the test side before the training pass advances the model.
             collect_to_disk(
                 GradientStreamer(model, test_dataset, self.args, batch_size=vb,
@@ -212,10 +212,10 @@ class TracInAttributor(BaseAttributor):
         layer_name: Optional[List[str]] = None,
         normalized_grad: bool = False,
     ) -> AttributionScore:
-        """Score a train source against a test source — the shared loop.
+        """Score a train source against a test source -- the shared loop.
 
         ``train_source`` is iterated **once**, so a single-shot trajectory stream
-        (`GradientStreamer` with `enable_update=True`) works as well as a re-iterable disk
+        (``GradientStreamer`` with ``enable_update=True``) works as well as a re-iterable disk
         source.  TracIn uses the raw gradients with no preconditioner, so
         ``prepare_test`` is the identity and ``score_block`` is the cross-gram
         (``"dot"``, or ``"cosine"`` for GradCos).
@@ -272,7 +272,7 @@ class TracInAttributor(BaseAttributor):
             verbose: Show tqdm progress bars on the logging process.
             layer_name: Restrict scoring to this subset of the *stored* layers
                 (``str`` or list; unknown names raise).  ``None`` (default) scores
-                every stored layer.  This is a read-time filter — the cache itself
+                every stored layer.  This is a read-time filter -- the cache itself
                 is unchanged, so the same cache can be re-queried per layer.
             normalized_grad: ``True`` scores by cosine similarity (GradCos);
                 ``False`` (default) by the raw inner product (TracIn / GradDot).
@@ -319,14 +319,14 @@ class TracInAttributor(BaseAttributor):
         Everything but the data and these two flags comes from the
         :class:`AttributionTask` (model, loss, optional ``target_func`` for the
         test side, and the checkpoint list) and from ``args`` (batch sizes,
-        precision, and — when ``enable_update`` — the optimizer/scheduler, all
+        precision, and -- when ``enable_update`` -- the optimizer/scheduler, all
         settled inside :class:`GradientStreamer`).
 
-        * ``enable_update=False`` (default) — score at **every checkpoint** the
+        * ``enable_update=False`` (default) -- score at **every checkpoint** the
           task provides (dattri's multi-checkpoint TracIn ensemble): one frozen
           pass per checkpoint, the rows stamped with the checkpoint index, summed
           over checkpoints at query time.
-        * ``enable_update=True`` — a single training **trajectory** from the first
+        * ``enable_update=True`` -- a single training **trajectory** from the first
           checkpoint; each optimizer step is its own checkpoint row.
 
         Args:
@@ -345,7 +345,7 @@ class TracInAttributor(BaseAttributor):
         """
         if self.task is None:
             raise ValueError(
-                "attribute() (live collection) requires a `task` with a model; "
+                "attribute() (live collection) requires a ``task`` with a model; "
                 "use attribute_from_cache() for pre-collected gradients."
             )
         train_loss = task_loss_fn(self.task.original_loss_func)

@@ -1,14 +1,14 @@
 """This example shows gradient collection around the HuggingFace Trainer.
 
-The training loop is NOT modified — TDA is added by wrapping trainer.train()
+The training loop is NOT modified -- TDA is added by wrapping trainer.train()
 in a HookManager collection context.  Two equivalent integration patterns:
 
-  Pattern A — with-context: wrap trainer.train() directly (preferred).
-  Pattern B — TrainerCallback: open/close the context from on_train_begin /
+  Pattern A -- with-context: wrap trainer.train() directly (preferred).
+  Pattern B -- TrainerCallback: open/close the context from on_train_begin /
       on_train_end, for pipelines where trainer.train() is called deep inside
       a library you do not control.
 
-Note: this file must not be named ``transformers.py`` — it would shadow the
+Note: this file must not be named ``transformers.py`` -- it would shadow the
 HuggingFace package on import.
 """
 
@@ -79,7 +79,7 @@ if __name__ == "__main__":
 
     # Hook the transformer blocks.  GPT-2's positional embedding (wpe) is fed an
     # unbatched position tensor, so its gradient is broadcast over the batch and
-    # is NOT per-sample — exclude it from per-sample collection.
+    # is NOT per-sample -- exclude it from per-sample collection.
     hook_cfg = HookManagerConfig(linear_io=[r"transformer\.h\.", r"wte", r"lm_head"])
 
     results = {}
@@ -103,15 +103,15 @@ if __name__ == "__main__":
                                            recording_type="per_batch")],
             )
 
-            print(f"\nRunning trainer.train() — pattern {pattern} ...")
+            print(f"\nRunning trainer.train() -- pattern {pattern} ...")
             if pattern.startswith("A"):
-                # Pattern A — wrap trainer.train() in the collection context.
+                # Pattern A -- wrap trainer.train() in the collection context.
                 trainer = Trainer(model=model, args=training_args,
                                   train_dataset=dataset)
                 with collector.collect():
                     trainer.train()
             else:
-                # Pattern B — open/close the context via Trainer callbacks.
+                # Pattern B -- open/close the context via Trainer callbacks.
                 class CollectCallback(TrainerCallback):
                     def on_train_begin(self, args, state, control, **kwargs):
                         self._ctx = collector.collect()
@@ -127,8 +127,8 @@ if __name__ == "__main__":
             collector.remove()
 
             # Retrieval is a two-step scheme.  The content hash of ONE sample's
-            # model inputs — here simply dataset[0], since the Trainer passes
-            # {input_ids, attention_mask, labels} through unchanged — identifies
+            # model inputs -- here simply dataset[0], since the Trainer passes
+            # {input_ids, attention_mask, labels} through unchanged -- identifies
             # WHAT the sample is, independent of shuffling.  lookup() then
             # reveals WHERE it was recorded: every (step, sample_idx)
             # pair, and load_sample() retrieves each pair's gradient by a

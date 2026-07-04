@@ -13,7 +13,7 @@ It follows the same conventions as
   extra boilerplate.
 * ``__post_init__`` normalises inputs, parses JSON-string dict fields, and
   calls :meth:`_validate` for cross-field consistency checks.
-* Computed attributes (``device``, ``world_size``, …) are exposed as
+* Computed attributes (``device``, ``world_size``, ...) are exposed as
   ``@property`` / ``@cached_property`` so callers never need to compute them
   manually.
 """
@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 _DICT_FIELDS = ("gradient_checkpointing_kwargs", "fsdp_config", "deepspeed")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # AttributionArguments
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 @dataclass
 class AttributionArguments:
@@ -104,7 +104,7 @@ class AttributionArguments:
             config file.
     """
 
-    # ── Output ───────────────────────────────────────────────────────────────
+    # -- Output ---------------------------------------------------------------
 
     output_dir: str = field(
         metadata={
@@ -115,7 +115,7 @@ class AttributionArguments:
         },
     )
 
-    # ── Batch sizes ──────────────────────────────────────────────────────────
+    # -- Batch sizes ----------------------------------------------------------
 
     per_device_train_batch_size: int = field(
         default=8,
@@ -137,7 +137,7 @@ class AttributionArguments:
         },
     )
 
-    # ── Optimizer / scheduler (live trajectory collection) ───────────────────
+    # -- Optimizer / scheduler (live trajectory collection) -------------------
     # Used only by GradientStreamer when ``enable_update=True`` and no optimizer is
     # supplied: the trajectory optimizer/scheduler are built from these, mirroring
     # transformers.TrainingArguments.
@@ -162,7 +162,7 @@ class AttributionArguments:
     )
     warmup_steps: int = field(default=0, metadata={"help": "LR warmup steps."})
 
-    # ── Gradient behaviour ───────────────────────────────────────────────────
+    # -- Gradient behaviour ---------------------------------------------------
 
     max_grad_norm: Optional[float] = field(
         default=1.0,
@@ -196,7 +196,7 @@ class AttributionArguments:
         },
     )
 
-    # ── Hardware ─────────────────────────────────────────────────────────────
+    # -- Hardware -------------------------------------------------------------
 
     use_cpu: bool = field(
         default=False,
@@ -208,7 +208,7 @@ class AttributionArguments:
         },
     )
 
-    # ── Precision ────────────────────────────────────────────────────────────
+    # -- Precision ------------------------------------------------------------
 
     bf16: bool = field(
         default=False,
@@ -242,7 +242,7 @@ class AttributionArguments:
         },
     )
 
-    # ── Reproducibility ──────────────────────────────────────────────────────
+    # -- Reproducibility ------------------------------------------------------
 
     seed: int = field(
         default=42,
@@ -277,7 +277,7 @@ class AttributionArguments:
         },
     )
 
-    # ── DataLoader behaviour ─────────────────────────────────────────────────
+    # -- DataLoader behaviour -------------------------------------------------
 
     dataloader_num_workers: int = field(
         default=0,
@@ -323,7 +323,7 @@ class AttributionArguments:
         },
     )
 
-    # ── Distributed / large-model ────────────────────────────────────────────
+    # -- Distributed / large-model --------------------------------------------
 
     ddp_find_unused_parameters: Optional[bool] = field(
         default=None,
@@ -372,9 +372,9 @@ class AttributionArguments:
         },
     )
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Initialisation
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def __post_init__(self) -> None:
         # Expand ~ in output_dir so Path operations work correctly.
@@ -412,9 +412,9 @@ class AttributionArguments:
 
         self._validate()
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Validation
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _validate(self) -> None:
         """Raise ``ValueError`` for mutually exclusive or invalid field combinations."""
@@ -456,9 +456,9 @@ class AttributionArguments:
                 "for non-deterministic CUDA kernels."
             )
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Computed properties
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     @cached_property
     def _device_and_n_gpu(self) -> tuple[torch.device, int]:
@@ -546,9 +546,9 @@ class AttributionArguments:
         """``output_dir`` as a :class:`pathlib.Path` object."""
         return Path(self.output_dir)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Representation
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def __repr__(self) -> str:
         fields_str = "\n  ".join(

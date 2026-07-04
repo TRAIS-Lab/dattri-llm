@@ -3,11 +3,11 @@
 This package re-exports the full surface of its submodules so existing
 ``dattri_llm.gradient.hooks`` imports keep working unchanged:
 
-* :mod:`~dattri_llm.gradient.hooks.hooks` — low-level hook registration
+* :mod:`~dattri_llm.gradient.hooks.hooks` -- low-level hook registration
   (the ``linear_io`` and ``param_grad`` hook families).
-* :mod:`~dattri_llm.gradient.hooks.config` — :class:`HookManagerConfig`,
+* :mod:`~dattri_llm.gradient.hooks.config` -- :class:`HookManagerConfig`,
   selectors, and hook-assignment resolution.
-* :mod:`~dattri_llm.gradient.hooks.manager` — :class:`HookManager`.
+* :mod:`~dattri_llm.gradient.hooks.manager` -- :class:`HookManager`.
 """
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback

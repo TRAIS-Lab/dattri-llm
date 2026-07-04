@@ -23,7 +23,7 @@ class OffloadCallback(HookManagerCallback):
         file_manager: The :class:`GradientFileManager` to delegate saves to.
         recording_type: ``"per_batch"`` (default) stores one
             :class:`GradientRecord` per step.  ``"per_sample"`` slices the
-            full-batch record into B individual records before staging — useful
+            full-batch record into B individual records before staging -- useful
             when downstream code looks up gradients by a single-sample hash.
     """
 

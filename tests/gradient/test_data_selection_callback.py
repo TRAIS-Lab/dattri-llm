@@ -40,10 +40,10 @@ from dattri_llm.gradient.callbacks import DataSelectionCallback
 
 
 class MinimalEmbeddingMLP(nn.Module):
-    """Embedding → two-layer MLP.
+    """Embedding -> two-layer MLP.
 
     The ``nn.Embedding`` lookup ensures that MLP inputs always require grad,
-    which matches real LLM training (token IDs → embedding parameters → MLP).
+    which matches real LLM training (token IDs -> embedding parameters -> MLP).
     Without this, PyTorch's ``register_full_backward_hook`` fires before
     ``param.grad`` is accumulated for the first MLP layer, causing
     ``DataSelectionCallback`` to silently skip gradient subtraction on it.
@@ -64,8 +64,8 @@ class MinimalEmbeddingMLP(nn.Module):
             nn.Linear(hidden, out_features, bias=True),
         )
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:  # (B, T) → (B, T, out)
-        x = self.embedding(token_ids)  # (B, T, embed_dim) — requires grad
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:  # (B, T) -> (B, T, out)
+        x = self.embedding(token_ids)  # (B, T, embed_dim) -- requires grad
         return self.mlp(x)             # (B, T, out_features)
 
 
@@ -105,7 +105,7 @@ def _make_token_ids(B: int, T: int, vocab_size: int = 32) -> torch.Tensor:
 
 
 class TestDataSelectionCallbackHardThreshold:
-    """hard threshold_mode (default) — scores below a cutoff are dropped."""
+    """hard threshold_mode (default) -- scores below a cutoff are dropped."""
 
     @pytest.mark.parametrize("loss_reduction", ["mean", "sum"])
     @pytest.mark.parametrize("B,T", [(2, 5), (4, 1), (1, 10)])
@@ -231,7 +231,7 @@ class TestDataSelectionCallbackHardThreshold:
 
 
 def _mlp_grads_zero(model: MinimalEmbeddingMLP, atol: float = 1e-6) -> bool:
-    """Return True if all MLP weight and bias grads are ≈ 0."""
+    """Return True if all MLP weight and bias grads are ~ 0."""
     for m in model.mlp:
         if not isinstance(m, nn.Linear):
             continue
@@ -245,7 +245,7 @@ def _mlp_grads_zero(model: MinimalEmbeddingMLP, atol: float = 1e-6) -> bool:
 
 
 class TestBottomFraction:
-    """threshold_mode='bottom_fraction' — drop the worst k% regardless of sign."""
+    """threshold_mode='bottom_fraction' -- drop the worst k% regardless of sign."""
 
     def test_drop_all_fraction_zeroes_grad(self):
         """threshold=1.0 is invalid; threshold approaching 1.0 drops almost everyone."""
@@ -254,7 +254,7 @@ class TestBottomFraction:
         model = MinimalEmbeddingMLP()
         token_ids = _make_token_ids(B, T)
 
-        # Drop the bottom 75 % (3 of 4 samples) — not all, but check count.
+        # Drop the bottom 75 % (3 of 4 samples) -- not all, but check count.
         cb = DataSelectionCallback(
             model=model,
             threshold=0.75,
@@ -264,7 +264,7 @@ class TestBottomFraction:
         assert len(cb.last_dropped) == round(B * 0.75)
 
     def test_drop_zero_fraction_preserves_all(self):
-        """threshold=0.0 → n_drop=0 → nothing removed."""
+        """threshold=0.0 -> n_drop=0 -> nothing removed."""
         torch.manual_seed(11)
         B, T = 4, 5
         model = MinimalEmbeddingMLP()
@@ -341,27 +341,27 @@ class TestBottomFraction:
 
 
 class TestNegativeBottomFraction:
-    """threshold_mode='negative_bottom_fraction' — drop bottom k% only if score < 0."""
+    """threshold_mode='negative_bottom_fraction' -- drop bottom k% only if score < 0."""
 
     def test_all_positive_scores_drops_nothing(self):
-        """When all scores are ≥ 0, no sample is ever dropped regardless of fraction."""
+        """When all scores are >= 0, no sample is ever dropped regardless of fraction."""
         model = MinimalEmbeddingMLP()
         cb = DataSelectionCallback(
             model=model,
             threshold=0.99,
             threshold_mode="negative_bottom_fraction",
         )
-        # All-positive synthetic scores → nothing qualifies even at 99% fraction.
+        # All-positive synthetic scores -> nothing qualifies even at 99% fraction.
         scores = torch.tensor([1.0, 2.0, 0.5, 3.0])
         assert cb._select_dropped(scores) == []
 
     def test_negative_scores_eligible_only(self):
-        """Samples with score ≥ 0 must never be dropped, even if in the bottom k%."""
+        """Samples with score >= 0 must never be dropped, even if in the bottom k%."""
         torch.manual_seed(21)
         B, T = 6, 4
 
         # We need at least one positive-score sample to be in the bottom k% to
-        # confirm the filter.  Ghost scores are always ≥ 0 (PSD), so in practice
+        # confirm the filter.  Ghost scores are always >= 0 (PSD), so in practice
         # we manipulate last_scores directly to test the selection logic.
         model = MinimalEmbeddingMLP()
         token_ids = _make_token_ids(B, T)
@@ -389,13 +389,13 @@ class TestNegativeBottomFraction:
 
         # scores: [-3, -1, 2, 4, -2, 5]  (B=6)
         # Bottom 50% (3 samples) by rank: indices 0 (-3), 4 (-2), 1 (-1)
-        # After negative filter (score < 0): all three qualify → dropped=[0, 4, 1]
+        # After negative filter (score < 0): all three qualify -> dropped=[0, 4, 1]
         scores = torch.tensor([-3.0, -1.0, 2.0, 4.0, -2.0, 5.0])
         dropped = cb._select_dropped(scores)
         assert set(dropped) == {0, 1, 4}
 
         # scores: [-3, 1, 2, 4, -2, 5]
-        # Bottom 3: indices 0 (-3), 4 (-2), 1 (1 — positive!)
+        # Bottom 3: indices 0 (-3), 4 (-2), 1 (1 -- positive!)
         # After negative filter: only 0 and 4 qualify
         scores2 = torch.tensor([-3.0, 1.0, 2.0, 4.0, -2.0, 5.0])
         dropped2 = cb._select_dropped(scores2)
@@ -428,7 +428,7 @@ def _scores_for_mode(
     """Return last_scores produced by one forward+backward step."""
     cb = DataSelectionCallback(
         model=model,
-        threshold=-float("inf"),   # keep everything — only compute scores
+        threshold=-float("inf"),   # keep everything -- only compute scores
         score_mode=score_mode,
     )
     _run_step_with_callback(model, token_ids, cb)
@@ -441,14 +441,14 @@ class TestScoreModeEquivalence:
 
     Mathematical identity::
 
-        <g_i ⊗ a_i,  g_j ⊗ a_j>  =  (g_i · g_j)(a_i · a_j)
+        <g_i x a_i,  g_j x a_j>  =  (g_i * g_j)(a_i * a_j)
 
     so the ghost inner product (gram-matrix form) and the materialized inner
     product (explicit outer-product form) are numerically equivalent to
     floating-point precision.  This test suite verifies that equivalence:
 
     * for layers *without* a token dimension (e.g. a plain 2-D linear)
-    * for layers *with* a token dimension (the typical LLM case, B×T×F)
+    * for layers *with* a token dimension (the typical LLM case, BxTxF)
     * for ``nn.Embedding`` layers specifically (activation = integer token IDs)
     """
 
@@ -495,10 +495,10 @@ class TestScoreModeEquivalence:
         (B, F) tensors only.
         """
         class MeanPoolMLP(nn.Module):
-            """Embedding → mean-pool over T → two-layer MLP.
+            """Embedding -> mean-pool over T -> two-layer MLP.
 
             The mean-pool produces a (B, embed_dim) activation, so every
-            subsequent linear layer's hook captures 2-D tensors (B, F) —
+            subsequent linear layer's hook captures 2-D tensors (B, F) --
             no token dimension.  The Embedding hook still captures (B, T) ints.
             """
             def __init__(
@@ -517,7 +517,7 @@ class TestScoreModeEquivalence:
                 )
 
             def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-                x = self.embedding(token_ids).mean(1)  # (B, embed_dim) — no token dim
+                x = self.embedding(token_ids).mean(1)  # (B, embed_dim) -- no token dim
                 return self.mlp(x)                     # (B, out_features)
 
         torch.manual_seed(99)
@@ -566,12 +566,12 @@ class TestScoreModeEquivalence:
 
 
 class _NormMLP(nn.Module):
-    """Embedding → LayerNorm → two-layer MLP.
+    """Embedding -> LayerNorm -> two-layer MLP.
 
     The LayerNorm (always hooked) has a token dimension, so its parameter
-    gradient is the *elementwise* x̂ ⊙ g, not an outer product.  Earlier the
-    ghost path scored norm layers with the Linear-style gram (g·g)(a·a), which
-    disagrees with the materialized (elementwise) path — this model exercises
+    gradient is the *elementwise* x_hat * g, not an outer product.  Earlier the
+    ghost path scored norm layers with the Linear-style gram (g*g)(a*a), which
+    disagrees with the materialized (elementwise) path -- this model exercises
     that case.
     """
 
@@ -742,7 +742,7 @@ class TestTargetModes:
 
     @pytest.mark.parametrize("score_mode", ["ghost", "materialized"])
     def test_fixed_with_same_batch_matches_batch_mode(self, score_mode):
-        """fixed target == the training batch gradient → identical scores.
+        """fixed target == the training batch gradient -> identical scores.
 
         Justification: score[i] = <dW_i, dW_target>.  When dW_target is the
         sum of all training gradients, this equals sum_j <dW_i, dW_j>,
@@ -812,7 +812,7 @@ class TestTargetModes:
         )
         _run_step_with_callback(model2, train_ids, cb_fixed)
 
-        # Scores should NOT be identical (different targets → different alignment).
+        # Scores should NOT be identical (different targets -> different alignment).
         assert not torch.allclose(cb_batch.last_scores, cb_fixed.last_scores, atol=1e-4), (
             "Expected different scores for different targets, but they were equal."
         )
@@ -886,7 +886,7 @@ class TestTargetModes:
             calls.append(batch)
             return m(batch).mean()
 
-        # Loader with exactly one batch — will be cycled on the second step.
+        # Loader with exactly one batch -- will be cycled on the second step.
         val_loader = [val_ids_a]
 
         cb = DataSelectionCallback(
@@ -905,7 +905,7 @@ class TestTargetModes:
             # Step 1
             model(val_ids_a).mean().backward()
             model.zero_grad()
-            # Step 2 — loader is exhausted, should cycle
+            # Step 2 -- loader is exhausted, should cycle
             model(val_ids_b).mean().backward()
 
         # val_loss_fn was called once per training step (2 total).
@@ -917,7 +917,7 @@ class TestTargetModes:
 
         When the val loader always returns the same batch, every step's
         'val_loader' target is identical to passing that batch as a 'fixed'
-        target — so the scores must agree.
+        target -- so the scores must agree.
         """
         torch.manual_seed(52)
         B, T = 3, 5

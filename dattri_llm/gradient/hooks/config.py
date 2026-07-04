@@ -56,9 +56,9 @@ trainable parameters for ``param_grad``)::
 """
 
 # A hook-family selector is one of:
-#   * ``None``        — not provided (the family is not requested explicitly).
-#   * ``REGISTER_ALL``— register every applicable layer.
-#   * ``list[str]``   — register applicable layers whose name matches a regex.
+#   * ``None``        -- not provided (the family is not requested explicitly).
+#   * ``REGISTER_ALL``-- register every applicable layer.
+#   * ``list[str]``   -- register applicable layers whose name matches a regex.
 Selector = Optional[object]  # None | _RegisterAll | list[str]
 
 # Hook-family names and the layer_types marker used for materialized grads.
@@ -75,9 +75,9 @@ class HookManagerConfig:
     The core control is :attr:`hook_types`, an explicit **assignment** mapping
     each fully-qualified layer name to the hook family it should use:
 
-    * ``linear_io`` — per-sample factorized hooks on linear-family layers
+    * ``linear_io`` -- per-sample factorized hooks on linear-family layers
       (see :func:`register_linear_io_hooks`).
-    * ``param_grad`` — batch-level materialized parameter-gradient hooks,
+    * ``param_grad`` -- batch-level materialized parameter-gradient hooks,
       available for *any* layer with trainable parameters
       (see :func:`register_param_grad_hooks`).
 
@@ -90,9 +90,9 @@ class HookManagerConfig:
     *extends* the assignment without having to spell out every layer.  Each
     selector is one of:
 
-    * ``None`` — add nothing.
-    * :data:`REGISTER_ALL` — add every layer applicable to that family.
-    * ``list[str]`` — add applicable layers whose fully-qualified name matches
+    * ``None`` -- add nothing.
+    * :data:`REGISTER_ALL` -- add every layer applicable to that family.
+    * ``list[str]`` -- add applicable layers whose fully-qualified name matches
       at least one of the given regex patterns.
 
     .. code-block:: python
@@ -109,14 +109,14 @@ class HookManagerConfig:
     The explicit assignment and the selector add-ons are merged into one final
     ``{layer_name: hook_type}`` map.  **If a layer is assigned two different
     hook families** (e.g. listed in ``hook_types`` as ``param_grad`` but also
-    matched by the ``linear_io`` selector), a :exc:`ValueError` is raised — one
+    matched by the ``linear_io`` selector), a :exc:`ValueError` is raised -- one
     layer may only be registered with one hook family.
 
-    **Default** (no arguments) — register ``linear_io`` on every
+    **Default** (no arguments) -- register ``linear_io`` on every
     linear-IO-capable layer, and fall back to ``param_grad`` for any remaining
     layer that has trainable parameters but is not linear-IO-capable.
 
-    **Manual layer types** — :attr:`layer_types` maps a layer name to a
+    **Manual layer types** -- :attr:`layer_types` maps a layer name to a
     layer-type string that overrides the type inferred by
     :func:`canonical_class_name`.  This is for user-defined layer classes whose
     class name is not recognised by the built-in type detection (e.g. a custom
@@ -125,7 +125,7 @@ class HookManagerConfig:
         HookManagerConfig(layer_types={"mlp.0": "nn.Linear"})
 
     The mapping may be incomplete: layers it does not mention keep the
-    automatically detected type.  It is orthogonal to which layers get hooked —
+    automatically detected type.  It is orthogonal to which layers get hooked --
     a layer named here is only relabelled, not forced to be hooked.  If a named
     layer is not hooked in the end, :class:`HookManager` emits a warning.
     """
@@ -264,12 +264,12 @@ def resolve_hook_assignments(
 
     Resolution rules:
 
-    * **Default** (``config.is_default``) — every linear-IO-capable layer is
+    * **Default** (``config.is_default``) -- every linear-IO-capable layer is
       assigned ``linear_io``; every other layer that directly owns a trainable
       parameter falls back to ``param_grad``.
-    * **Explicit assignment** (``config.hook_types``) — taken verbatim, after
+    * **Explicit assignment** (``config.hook_types``) -- taken verbatim, after
       validating that each named layer exists and supports the requested family.
-    * **Selector add-ons** (``config.linear_io`` / ``config.param_grad``) —
+    * **Selector add-ons** (``config.linear_io`` / ``config.param_grad``) --
       extend the assignment with the applicable layers they match.
 
     A layer assigned two *different* hook families raises :exc:`ValueError`.  A
@@ -403,7 +403,7 @@ def default_hook_assignment(
     """Discover the default-style assignment for layers that actually fire.
 
     Some modules are registered as sub-modules but invoked *functionally*
-    rather than called as modules — e.g. :class:`nn.MultiheadAttention` applies
+    rather than called as modules -- e.g. :class:`nn.MultiheadAttention` applies
     its ``out_proj`` weight through ``F.linear`` instead of ``out_proj(...)``.
     Such a module's forward/backward hooks never fire, so a :class:`HookManager`
     that waits on them can never complete a step.

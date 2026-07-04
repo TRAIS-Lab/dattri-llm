@@ -1,15 +1,15 @@
 """Correctness tests for :class:`DVEmbAttributor` (on-disk workflow).
 
 DVEmb corrects the TracIn inner product for how a training update at step
-``t_s`` propagates through every later step up to the final model ``θ_T``:
+``t_s`` propagates through every later step up to the final model ``theta_T``:
 
-    I(z*, t_s) = η_{t_s} · g_val(θ_T)ᵀ [∏_{k=t_s+1}^{T-1}(I − η_k H_k)] g(θ_{t_s}, z*)
+    I(z*, t_s) = eta_{t_s} * g_val(theta_T)^T [prod_{k=t_s+1}^{T-1}(I - eta_k H_k)] g(theta_{t_s}, z*)
 
-with ``H_k = Σ_{z∈B_k} g(θ_k, z) g(θ_k, z)ᵀ`` (empirical Fisher of the batch).
+with ``H_k = sum_{zinB_k} g(theta_k, z) g(theta_k, z)^T`` (empirical Fisher of the batch).
 
 The oracle here builds the per-step Fisher and the explicit matrix product over
-full concatenated parameter gradients — independent of the attributor's
-per-layer, test-side back-propagation — and the two must agree.  Setting the
+full concatenated parameter gradients -- independent of the attributor's
+per-layer, test-side back-propagation -- and the two must agree.  Setting the
 learning rate so the Fisher correction vanishes (``H=0`` reached by using a
 single training step) recovers TracIn, which is checked too.
 
@@ -46,7 +46,7 @@ def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_s
                   fisher_scale=1.0):
     """Explicit DVEmb influence: (num_train_rows grouped by step, num_test).
 
-    Returns ``{step: (B, num_test) tensor}`` of η · g_valᵀ M g(z*).
+    Returns ``{step: (B, num_test) tensor}`` of eta * g_val^T M g(z*).
     ``fisher_scale`` multiplies each step's Hessian (e.g. the batch size under
     ``loss_reduction="mean"``).
     """
@@ -56,7 +56,7 @@ def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_s
     g_tr = {s: _full_grads(model, train_sds[s], x_tr, y_tr) for s in prop_steps}
     g_te = _full_grads(model, test_sd, x_te, y_te)              # (num_test, P)
     dim = g_te.shape[1]
-    H = {s: fisher_scale * (g_tr[s].T @ g_tr[s]) for s in prop_steps}   # (fs)·Σ_z g gᵀ
+    H = {s: fisher_scale * (g_tr[s].T @ g_tr[s]) for s in prop_steps}   # (fs)*sum_z g g^T
     eye = torch.eye(dim)
 
     out = {}
@@ -65,7 +65,7 @@ def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_s
         for k in prop_steps:
             if ts < k < final_step:
                 M = M @ (eye - lr * H[k])
-        # η · g_valᵀ M g(z*)  → (num_train, num_test)
+        # eta * g_val^T M g(z*)  -> (num_train, num_test)
         out[ts] = lr * (g_tr[ts] @ M @ g_te.T)
     return out
 
@@ -76,7 +76,7 @@ def collected(tmp_path):
     torch.manual_seed(TT.SEED)
     model = TT.MLP().eval()
     sd0, sd1 = TT._make_checkpoints(model)
-    # A distinct "final model" checkpoint for the test gradients (θ_T).
+    # A distinct "final model" checkpoint for the test gradients (theta_T).
     g = torch.Generator().manual_seed(TT.SEED + 7)
     sdT = {k: v + 0.05 * torch.randn(v.shape, generator=g) for k, v in sd1.items()}
     x_tr, y_tr, x_te, y_te = TT._make_data()
@@ -154,8 +154,8 @@ class TestDVEmbOnDisk:
 
     @pytest.mark.parametrize("lr", [0.1, 0.5])
     def test_train_side_propagation_matches_oracle(self, collected, tmp_path, lr):
-        """``propagation="train"`` — the explicit data-value-embedding operator
-        over the concatenated layer axis — matches the same explicit-matrix
+        """``propagation="train"`` -- the explicit data-value-embedding operator
+        over the concatenated layer axis -- matches the same explicit-matrix
         oracle as the test-side sweep."""
         res = _make_attr(tmp_path / f"tr_{lr}", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
@@ -180,7 +180,7 @@ class TestDVEmbOnDisk:
 
     def test_propagation_modes_agree(self, collected, tmp_path):
         """Test-side and train-side propagation are two evaluation orders of the
-        same bilinear form — rows, columns, and scores must coincide."""
+        same bilinear form -- rows, columns, and scores must coincide."""
         a = _make_attr(tmp_path / "pt", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
@@ -197,8 +197,8 @@ class TestDVEmbOnDisk:
         assert torch.allclose(a.scores, b.scores, atol=1e-5, rtol=1e-4)
 
     def test_dvemb_dir_storage_scored_by_tracin(self, collected, tmp_path):
-        """Embeddings persisted via ``dvemb_dir`` (η folded in), dotted against
-        the test gradients by a plain TracIn pass, reproduce the DVEmb scores —
+        """Embeddings persisted via ``dvemb_dir`` (eta folded in), dotted against
+        the test gradients by a plain TracIn pass, reproduce the DVEmb scores --
         the store-then-attribute workflow."""
         from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
@@ -230,7 +230,7 @@ class TestDVEmbOnDisk:
 
     def test_cache_dvemb_matches_scoring_run(self, collected, tmp_path):
         """``cache_dvemb`` (embedding-only sweep over the gradient store, no test
-        gradients involved) stores the same embeddings as a scoring run —
+        gradients involved) stores the same embeddings as a scoring run --
         verified through the TracIn dot products."""
         from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
@@ -289,7 +289,7 @@ class TestDVEmbOnDisk:
         model, sd = collected["model"], collected["test_sd"]
         x_te, y_te = collected["x_te"], collected["y_te"]
 
-        # Re-collect the θ_T test gradients as two separate blocks (two halves),
+        # Re-collect the theta_T test gradients as two separate blocks (two halves),
         # so iter_gradient_blocks yields two files / column groups.
         test_dir2 = tmp_path / "te2"
         fm = TT.GradientFileManager(str(test_dir2))
@@ -332,15 +332,15 @@ class TestDVEmbOnDisk:
             assert torch.allclose(matrix, want[:, cols], atol=1e-5, rtol=1e-4)
 
     def test_reduces_to_tracin_at_final_step(self, collected, tmp_path):
-        """The last step (t_s = T−1) has an empty propagation product, so its
-        DVEmb rows are exactly η · ⟨g_train, g_test⟩ — plain TracIn."""
+        """The last step (t_s = T-1) has an empty propagation product, so its
+        DVEmb rows are exactly eta * <g_train, g_test> -- plain TracIn."""
         lr = 0.4
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             final_step=2, loss_reduction="sum",
         )
-        # Oracle: η · g(θ_1) gᵀ_val (no Fisher factor for the final train step).
+        # Oracle: eta * g(theta_1) g^T_val (no Fisher factor for the final train step).
         g_tr1 = _full_grads(
             collected["model"], collected["train_sds"][1],
             collected["x_tr"], collected["y_tr"],
@@ -357,7 +357,7 @@ class TestDVEmbOnDisk:
 
     def test_selected_steps_filter_rows_but_not_propagation(self, collected, tmp_path):
         """Restricting output to step 0 still propagates through step 1: the
-        step-0 rows keep their full (I − η H_1) correction."""
+        step-0 rows keep their full (I - eta H_1) correction."""
         lr = 0.5
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
@@ -381,7 +381,7 @@ class TestDVEmbOnDisk:
     def test_loss_reduction_mean_scales_fisher_by_batch_size(self, collected, tmp_path):
         """``loss_reduction='mean'`` multiplies each step's Fisher by its batch
         size: the empirical Fisher needs the true per-sample gradients, so a
-        mean-loss-recorded ``ĝ = g/B`` must be rescaled by ``B``.
+        mean-loss-recorded ``g_hat = g/B`` must be rescaled by ``B``.
 
         The fixture records the full ``N_TRAIN`` batch at each step, so the
         step-0 rows (propagated through step 1) must match an oracle whose
@@ -419,14 +419,14 @@ class TestDVEmbOnDisk:
             )
 
     def test_per_step_learning_rate_mapping(self, collected, tmp_path):
-        """A {step: η} mapping uses each step's own rate in score and Fisher."""
+        """A {step: eta} mapping uses each step's own rate in score and Fisher."""
         lrs = {0: 0.3, 1: 0.6}
         res = DVEmbAttributor(_args(tmp_path / "o")).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             final_step=2, loss_reduction="sum", learning_rate=lrs,
         )
-        # Oracle with per-step rates: η_{t_s} scale and η_k factors.
+        # Oracle with per-step rates: eta_{t_s} scale and eta_k factors.
         model, train_sds = collected["model"], collected["train_sds"]
         g_tr = {s: _full_grads(model, train_sds[s], collected["x_tr"], collected["y_tr"])
                 for s in (0, 1)}

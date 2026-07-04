@@ -43,7 +43,7 @@ def _drop_gradient_free_rows(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Drop flattened token rows whose output-gradient is exactly zero.
 
-    Such rows contribute nothing to the true Fisher: their ``g gᵀ`` term
+    Such rows contribute nothing to the true Fisher: their ``g g^T`` term
     vanishes and their activation carries no learning signal.  Excluding them
     from both factors *and* the row count keeps ``(A, G)`` proper means over
     the gradient-carrying token distribution.  Detection is on the gradient
@@ -67,12 +67,12 @@ def _kfac(
 
     *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
     For sequence (linear) layers, gradient-free (padded / fully masked) token
-    rows are excluded from both factors — see :func:`_drop_gradient_free_rows`.
+    rows are excluded from both factors -- see :func:`_drop_gradient_free_rows`.
     """
     a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
     a_f, g_f = _flatten_for_kfac(a, g, layer_type)
     # Sequence layers only: conv zero-gradient spatial rows are architectural
-    # (max-pooling losers, dead ReLU paths), not padding — the KFC convention
+    # (max-pooling losers, dead ReLU paths), not padding -- the KFC convention
     # estimates A over all spatial positions.
     if not (is_conv(layer_type) or is_conv_transpose(layer_type)):
         a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
@@ -114,7 +114,7 @@ def _fim(
 # ---------------------------------------------------------------------------
 
 def sym_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
-    """Damped symmetric inverse ``(matrix + damping·I)^{-1}``.
+    """Damped symmetric inverse ``(matrix + damping*I)^{-1}``.
 
     Computed via eigendecomposition so the result stays symmetric and a small
     *damping* keeps a rank-deficient K-FAC covariance factor invertible.
@@ -135,7 +135,7 @@ def _kfac_cross(
 ) -> torch.Tensor:
     """K-FAC preconditioned cross-gram between two factorized gradient sets.
 
-    Returns ``K[i, j] = vec(∇W1_i)ᵀ (A⁻¹ ⊗ G⁻¹) vec(∇W2_j)`` — i.e.
+    Returns ``K[i, j] = vec(dW1_i)^T (A^-1 x G^-1) vec(dW2_j)`` -- i.e.
     :func:`_cross_dot` with the side-1 factors whitened by the inverse K-FAC
     covariances (``A_inv`` over the input dim, ``G_inv`` over the output dim).
     Both inverses are symmetric, so whitening either side gives the same value.
@@ -168,7 +168,7 @@ def _ekfac_materialize(
 ) -> torch.Tensor:
     """Per-sample weight gradient rotated into the K-FAC eigenbasis.
 
-    Returns ``(B, d_out·d_in)`` flattened ``U_Gᵀ ∇W U_A`` — the eigenbasis
+    Returns ``(B, d_out*d_in)`` flattened ``U_G^T dW U_A`` -- the eigenbasis
     coordinates whose empirical second moments are the EK-FAC corrected
     eigenvalues, and against which test/train gradients are scored.
     """
@@ -255,7 +255,7 @@ class LayerKroneckerAccumulator:
         a_f, g_f = _flatten_for_kfac(a, g, layer_type)
         # Sequence layers only: padded / fully masked positions carry
         # exactly-zero gradients and no learning signal; keep (A, G) means over
-        # gradient-carrying rows.  Conv spatial zeros are architectural — kept.
+        # gradient-carrying rows.  Conv spatial zeros are architectural -- kept.
         if not (is_conv(layer_type) or is_conv_transpose(layer_type)):
             a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
         N = a_f.shape[0]
@@ -287,7 +287,7 @@ class LayerKroneckerAccumulator:
 class LayerFisherAccumulator:
     """Streaming empirical Fisher accumulator for a *single* layer.
 
-    Accumulates ``Σ_i g_i g_iᵀ`` over the per-sample :func:`_materialize` ``g_i``.
+    Accumulates ``sum_i g_i g_i^T`` over the per-sample :func:`_materialize` ``g_i``.
     For the across-layers version see :class:`FisherAccumulator`.
     """
 
@@ -375,7 +375,7 @@ class FisherAccumulator:
     Holds one :class:`LayerFisherAccumulator` per layer, accumulating the dense
     Fisher from each layer's per-sample :func:`_materialize`.  When *max_params*
     is given, layers whose parameter count exceeds it are skipped (and recorded
-    in :attr:`skipped`) to bound the dense ``O(d²)`` Fisher::
+    in :attr:`skipped`) to bound the dense ``O(d^2)`` Fisher::
 
         acc = FisherAccumulator(max_params=4096)
         for block in blocks:

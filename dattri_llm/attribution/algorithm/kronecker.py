@@ -12,19 +12,19 @@ These are **single-checkpoint** methods: there is no per-step ensemble (no
 sample and every record in ``test_gradients_dir`` is one test sample; the score
 is the full ``(num_train, num_test)`` matrix
 
-    score[i, j] = Σ_layer  vec(∇W_te,j)ᵀ F_l⁻¹ vec(∇W_tr,i)
+    score[i, j] = sum_layer  vec(dW_te,j)^T F_l^-1 vec(dW_tr,i)
 
 where the per-layer Fisher is approximated with the Kronecker structure
-``F_l ≈ A_l ⊗ G_l`` (``A`` the input-activation covariance, ``G`` the
+``F_l ~ A_l x G_l`` (``A`` the input-activation covariance, ``G`` the
 output-gradient covariance) fit over the whole training set.
 
-* **K-FAC** uses ``F_l⁻¹ ≈ (A_l + λ)⁻¹ ⊗ (G_l + λ)⁻¹``.  Because the per-sample
-  gradient factorises as ``Σ_t g_t a_tᵀ``, this collapses to a whitened version
-  of the factorised cross-gram — no weight gradient is ever materialised.
+* **K-FAC** uses ``F_l^-1 ~ (A_l + lambda)^-1 x (G_l + lambda)^-1``.  Because the per-sample
+  gradient factorises as ``sum_t g_t a_t^T``, this collapses to a whitened version
+  of the factorised cross-gram -- no weight gradient is ever materialised.
 * **EK-FAC** rotates into the Kronecker eigenbasis ``U_A, U_G`` and replaces the
-  Kronecker eigenvalues with the *empirical* second moments ``Λ`` of the
+  Kronecker eigenvalues with the *empirical* second moments ``Lambda`` of the
   projected gradients (a second pass over the training gradients), giving
-  ``F_l⁻¹ ≈ (U_A ⊗ U_G) (Λ + λ)⁻¹ (U_A ⊗ U_G)ᵀ``.
+  ``F_l^-1 ~ (U_A x U_G) (Lambda + lambda)^-1 (U_A x U_G)^T``.
 
 Only linear and convolution layers are K-FAC-eligible; normalisation and
 embedding layers (for which K-FAC is undefined) are skipped by default.  Token/
@@ -35,10 +35,10 @@ identified by the on-disk content hash, in disk order.
 Normalisation layers are not heavily parametrised, so their per-layer Fisher can
 be estimated **directly** rather than with the Kronecker factorisation.  Passing
 ``non_kfac_strategy="direct"`` to :meth:`attribute_from_cache` adds a dense
-empirical-Fisher preconditioner ``F_l⁻¹`` for each such layer (built from the
+empirical-Fisher preconditioner ``F_l^-1`` for each such layer (built from the
 token-summed ``(B, d)`` weight gradients), whose contribution is summed into the
 K-FAC score.  Layers whose parameter count exceeds ``direct_fim_max_params`` are
-left out to bound the ``O(d²)`` Fisher; embedding layers (heavily parametrised)
+left out to bound the ``O(d^2)`` Fisher; embedding layers (heavily parametrised)
 stay ignored.
 """
 
@@ -84,9 +84,9 @@ class _KroneckerBaseAttributor(BaseAttributor):
     Subclasses implement :meth:`_fit` (estimate the per-layer preconditioner from
     the whole training set), :meth:`_prepare_test` (build a test block's scoring
     representation), and :meth:`_score` (preconditioned cross-gram for a train
-    block vs a prepared test rep).  Everything else — file-granular block
+    block vs a prepared test rep).  Everything else -- file-granular block
     iteration, ``loop_over_test`` memory control, column bookkeeping, and the
-    ``(num_train, num_test)`` assembly — is shared.
+    ``(num_train, num_test)`` assembly -- is shared.
     """
 
     algorithm: str = "Kronecker"
@@ -133,7 +133,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         """
         if self.task is None:
             raise ValueError(
-                "cache() (live collection) requires a `task` with a model; pass "
+                "cache() (live collection) requires a ``task`` with a model; pass "
                 "pre-collected gradients to attribute_from_cache() instead."
             )
         n_ckpt = len(self.task.get_checkpoints())
@@ -184,7 +184,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
     ) -> object:
         """Estimate the per-layer K-FAC preconditioner from the training gradients.
 
-        Iterates ``train_source`` (a re-iterable ``GradientSource`` — disk or a
+        Iterates ``train_source`` (a re-iterable ``GradientSource`` -- disk or a
         frozen streamer; EK-FAC iterates it twice).  Returns an opaque context
         object (possibly empty if no K-FAC-eligible layer is present) passed back
         to :meth:`_prepare_test` and :meth:`_score`.
@@ -226,7 +226,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         layer_name: Optional[List[str]] = None,
     ) -> AttributionScore:
         """Fit the K-FAC preconditioner from ``train_source``, then score it
-        against ``test_source`` — the shared loop behind :meth:`attribute_from_cache`
+        against ``test_source`` -- the shared loop behind :meth:`attribute_from_cache`
         and :meth:`attribute`.
 
         ``train_source`` must be **re-iterable**: the Fisher pre-pass re-reads the
@@ -342,7 +342,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 ``direct_fim_max_params``.
             layer_name: Restrict scoring (and the Fisher fit) to this subset of the
                 *stored* layers (``str`` or list; unknown names raise).  ``None``
-                (default) uses every stored layer.  A read-time filter — the same
+                (default) uses every stored layer.  A read-time filter -- the same
                 cache can be re-queried per layer.
         """
         if train_gradients_dir is None or test_gradients_dir is None:
@@ -392,7 +392,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         """
         if self.task is None:
             raise ValueError(
-                "attribute() (live collection) requires a `task` with a model; "
+                "attribute() (live collection) requires a ``task`` with a model; "
                 "use attribute_from_cache()."
             )
         n_ckpt = len(self.task.get_checkpoints())
@@ -452,7 +452,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
 
         Called from each subclass's :meth:`_fit` first pass.  Also records any
         embedding layers seen so :meth:`_finalize_fisher` can warn that they were
-        left ignored (heavily parametrised — not covered by the direct fallback).
+        left ignored (heavily parametrised -- not covered by the direct fallback).
         """
         fisher_acc.update(grad, self._fisher_layers(grad))
         self._fisher_saw_embedding.update(
@@ -462,7 +462,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
     def _finalize_fisher(
         self, fisher_acc: ops.FisherAccumulator, max_params: int
     ) -> Dict[str, torch.Tensor]:
-        """Turn the accumulated Fishers into ``{layer: F_l⁻¹}``, warning about the
+        """Turn the accumulated Fishers into ``{layer: F_l^-1}``, warning about the
         norm layers dropped by the ``max_params`` cap and the ignored embeddings."""
         if fisher_acc.skipped:
             warnings.warn(
@@ -506,7 +506,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
     ) -> Optional[torch.Tensor]:
         """``(B_tr, B_te)`` direct-Fisher score, or ``None`` if no layer applies.
 
-        ``F_l⁻¹`` is symmetric, so ``score = M_tr F⁻¹ M_teᵀ``.
+        ``F_l^-1`` is symmetric, so ``score = M_tr F^-1 M_te^T``.
         """
         total: Optional[torch.Tensor] = None
         for layer, F_inv in fim_ctx.items():
@@ -548,7 +548,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
 class KFACAttributor(_KroneckerBaseAttributor):
     """K-FAC influence attributor.
 
-    ``F_l⁻¹ ≈ (A_l + λ)⁻¹ ⊗ (G_l + λ)⁻¹`` per linear/conv layer, with ``λ`` the
+    ``F_l^-1 ~ (A_l + lambda)^-1 x (G_l + lambda)^-1`` per linear/conv layer, with ``lambda`` the
     ``damping`` term.  See the module docstring for the score definition.
 
     Args:
@@ -612,20 +612,20 @@ class EKFACAttributor(_KroneckerBaseAttributor):
 
     Rotates each layer's gradients into the Kronecker eigenbasis ``(U_A, U_G)``
     and replaces the Kronecker eigenvalues with the empirical second moments
-    ``Λ`` of the projected gradients (a second pass over the training
-    gradients), giving ``F_l⁻¹ ≈ (U_A ⊗ U_G)(Λ + λ)⁻¹(U_A ⊗ U_G)ᵀ``.
+    ``Lambda`` of the projected gradients (a second pass over the training
+    gradients), giving ``F_l^-1 ~ (U_A x U_G)(Lambda + lambda)^-1(U_A x U_G)^T``.
 
-    The per-sample gradient is projected as ``M = U_Gᵀ ∇W U_A`` — the faithful
-    expansion of ``(U_A ⊗ U_G)ᵀ vec(∇W)``.  This is the unique projection that
-    **reduces to K-FAC** when ``Λ`` equals the Kronecker eigenvalues, and it is
+    The per-sample gradient is projected as ``M = U_G^T dW U_A`` -- the faithful
+    expansion of ``(U_A x U_G)^T vec(dW)``.  This is the unique projection that
+    **reduces to K-FAC** when ``Lambda`` equals the Kronecker eigenvalues, and it is
     invariant to the (arbitrary) sign of each eigenvector.
 
     ``mode`` selects the implementation and is kept mainly for backward
     compatibility / cross-checking:
 
-    * ``"exact"`` *(default)* — the faithful projection above.
-    * ``"approx"`` — the code path mirroring the ``dattri`` library.  Its
-      original transposed projection ``U_G ∇W U_Aᵀ`` was wrong (does not reduce
+    * ``"exact"`` *(default)* -- the faithful projection above.
+    * ``"approx"`` -- the code path mirroring the ``dattri`` library.  Its
+      original transposed projection ``U_G dW U_A^T`` was wrong (does not reduce
       to K-FAC and is sign-sensitive; see
       ``test_transposed_projection_is_sign_sensitive``); fixed, it now uses the
       same faithful projection, so the two modes produce identical scores.
@@ -665,7 +665,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         device: torch.device,
         fisher_acc: Optional[ops.FisherAccumulator],
     ) -> dict:
-        # Pass 1 — Kronecker covariance factors and their eigenbases (and, when
+        # Pass 1 -- Kronecker covariance factors and their eigenbases (and, when
         # requested, the direct Fisher for norm layers from the same sweep).
         kron = ops.KroneckerAccumulator()
         for _step, train_g, _ in train_source:
@@ -674,7 +674,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
             if fisher_acc is not None:
                 self._accumulate_fisher(fisher_acc, train_g)
         # Eigenvectors are fed to ``ekfac_materialize`` (which does ``a @ U``),
-        # giving the faithful projection ``M = U_Gᵀ ∇W U_A``.
+        # giving the faithful projection ``M = U_G^T dW U_A``.
         eig: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         for layer, (A, G) in kron.result().items():
             _, U_A, _, U_G = ops.kfac_eigh(A, G)
@@ -685,7 +685,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
                 U_A, U_G = U_A, U_G
             eig[layer] = (U_A, U_G)
 
-        # Pass 2 — empirical second moments of the projected gradients (Λ).
+        # Pass 2 -- empirical second moments of the projected gradients (Lambda).
         # Skipped entirely when no K-FAC layer is present (norm-only + direct),
         # so the data is not streamed for nothing.
         lam_sum: Dict[str, torch.Tensor] = {}

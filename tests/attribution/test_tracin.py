@@ -5,8 +5,8 @@ These collect real per-sample gradients to disk with the repo's
 score against an independent autograd oracle.
 
 The simplified attributor computes the full ``(num_train, num_test)`` gradient
-cross-gram — every train record against every test record, with no train/test
-step alignment — structurally identical to the K-FAC family.  Rows are stamped
+cross-gram -- every train record against every test record, with no train/test
+step alignment -- structurally identical to the K-FAC family.  Rows are stamped
 with the step each train gradient was recorded at, so a sample collected at
 several checkpoints contributes one (trajectory-aware) row per checkpoint.
 
@@ -341,7 +341,7 @@ class TestTracInOnDisk:
         res = _make_attr(tmp_path / "o").attribute_from_cache(
             train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
         )
-        # Two steps per train sample → 2 * N_TRAIN rows, stamped {0, 1}.
+        # Two steps per train sample -> 2 * N_TRAIN rows, stamped {0, 1}.
         assert res.scores.shape[0] == 2 * N_TRAIN
         assert sorted(set(res.row_steps)) == [0, 1]
 

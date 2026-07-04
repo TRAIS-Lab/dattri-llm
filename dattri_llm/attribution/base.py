@@ -26,7 +26,7 @@ class BaseAttributor(ABC):
         """Initialize the attributor.
 
         Args:
-            task: The attribution task. Must be an instance of `AttributionTask`.
+            task: The attribution task. Must be an instance of ``AttributionTask``.
             args: Configuration object controlling device placement, batch sizes,
                 precision, DataLoader behaviour, and distributed settings.
                 See :class:`AttributionArguments` for the full field reference.
@@ -85,7 +85,7 @@ class BaseInnerProductAttributor(BaseAttributor):
 
         Args:
             task (AttributionTask): The attribution task. Must be an instance of
-                `AttributionTask`.
+                ``AttributionTask``.
             args (AttributionArguments): Configuration object controlling device
                 placement, batch sizes, precision, DataLoader behaviour, and
                 distributed settings. See :class:`AttributionArguments` for the
@@ -233,7 +233,7 @@ class BaseInnerProductAttributor(BaseAttributor):
 
     @abstractmethod
     def _make_dataloader(self, dataset: Dataset, *, train: bool) -> DataLoader:
-        """Construct a DataLoader from `args`.
+        """Construct a DataLoader from ``args``.
 
         Args:
             dataset (Dataset): The dataset to wrap.

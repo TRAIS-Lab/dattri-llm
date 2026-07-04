@@ -46,13 +46,13 @@ def _materialize(
     """Compute the per-sample weight gradient, returning shape (B, d).
 
     When *module_kwargs* is provided the raw hook captures are preprocessed
-    first via :func:`_preprocess_factorized` (im2col for Conv, x̂ for
+    first via :func:`_preprocess_factorized` (im2col for Conv, x_hat for
     LayerNorm, bias augmentation for Linear).  Pass ``module_kwargs=None``
     when the tensors are already in the preprocessed form.
 
     A norm layer's gradient is per-position (elementwise).  By default
     (``per_token=False``) the token axis is summed, giving the actual weight
-    gradient ``(B, d)`` — a fixed dimension independent of sequence length, the
+    gradient ``(B, d)`` -- a fixed dimension independent of sequence length, the
     granularity an empirical Fisher or influence score operates on.  Pass
     ``per_token=True`` to keep the un-summed per-position products ``(B, T*d)``.
     For every other layer type the token/spatial axis is already contracted by
@@ -71,11 +71,11 @@ def _materialize(
         return prod.flatten(1) if per_token else prod.sum(1)  # (B, T*d) or (B, d)
 
     if is_conv_transpose(layer_type):
-        # a=(B,L,C_in), g=(B,L,P): ∇W_i = Σ_l a_il g_il^T
+        # a=(B,L,C_in), g=(B,L,P): dW_i = sum_l a_il g_il^T
         result = torch.einsum("blc,blp->bcp", a_f, g_f)
         return result.flatten(1)               # (B, C_in*P)
 
-    # Linear and Conv: ∇W_i = Σ_t g_it ⊗ a_it
+    # Linear and Conv: dW_i = sum_t g_it x a_it
     result = torch.einsum("bto,bti->boi", g_f, a_f)
     return result.flatten(1)                   # (B, out*in)
 

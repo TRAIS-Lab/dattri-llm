@@ -53,7 +53,7 @@ class HookManager:
             batch size detection.  Defaults to ``"input_ids"``.
         non_batch_first_layers: Optional set/list of fully-qualified layer names
             whose captured activations are **sequence-first** (``(T, B, ...)``)
-            rather than the default batch-first (``(B, T, ...)``) — e.g. layers
+            rather than the default batch-first (``(B, T, ...)``) -- e.g. layers
             internal to a sequence-first model such as MusicTransformer.  The
             assembled :class:`~dattri_llm.gradient.gradient.Factorized` for these
             layers is tagged ``batch_first=False`` so the gradient machinery reads
@@ -95,7 +95,7 @@ class HookManager:
 
         # Step-completion uses two composite barriers:
         #
-        # ``_bwd_done`` — True once *both* sub-conditions hold:
+        # ``_bwd_done`` -- True once *both* sub-conditions hold:
         #   (a) All MLP-layer full backward hooks have fired.
         #       Ensures ``_grad_parts`` buffers are populated for every
         #       hooked layer.
@@ -105,18 +105,18 @@ class HookManager:
         #   Sub-condition (b) is tracked via ``_mlp_param_hook_count``.
         #   Registering both types covers the two possible PyTorch orderings:
         #
-        #   Case A — module input *requires grad* (normal LLM training):
-        #     param.register_hook fires first  → weight.grad set
-        #     register_full_backward_hook fires second → _grad_parts set
-        #     → (b) done before (a); step triggered by (a)
+        #   Case A -- module input *requires grad* (normal LLM training):
+        #     param.register_hook fires first  -> weight.grad set
+        #     register_full_backward_hook fires second -> _grad_parts set
+        #     -> (b) done before (a); step triggered by (a)
         #
-        #   Case B — module input does *not* require grad (e.g. raw float
+        #   Case B -- module input does *not* require grad (e.g. raw float
         #     tensor, no embedding):
         #     register_full_backward_hook fires first (PyTorch early-fire quirk)
-        #     param.register_hook fires second → weight.grad set
-        #     → (a) done before (b); step triggered by (b)
+        #     param.register_hook fires second -> weight.grad set
+        #     -> (a) done before (b); step triggered by (b)
         #
-        # ``_grad_done`` — True once all user-specified ``param_grad`` hooks
+        # ``_grad_done`` -- True once all user-specified ``param_grad`` hooks
         #   have fired (only relevant when ``param_grad`` layers are
         #   registered; starts True otherwise).
         self._bwd_done: bool = True
@@ -129,7 +129,7 @@ class HookManager:
         # through the flattened FlatParameter) and FSDP writes the (sharded)
         # ``param.grad`` back to each original parameter only *after* the whole
         # backward pass completes.  To cover this, every step queues a callback
-        # on the autograd engine that fires once backward is fully done — the
+        # on the autograd engine that fires once backward is fully done -- the
         # point at which all ``param.grad`` are guaranteed ready.  For non-FSDP
         # models the per-parameter hooks complete the step earlier (during
         # backward), so this callback is a harmless no-op.  ``_mlp_params_ready``
@@ -266,7 +266,7 @@ class HookManager:
             return
 
         with self._step_lock:
-            # We are inside the backward pass here — the only valid place to
+            # We are inside the backward pass here -- the only valid place to
             # queue an end-of-backward callback.  Queue it once per step as the
             # FSDP-safe satisfier of sub-cond (b) (see ``__init__``).
             if self._n_mlp_params > 0 and not self._backward_end_scheduled:
@@ -283,8 +283,8 @@ class HookManager:
     def _on_backward_end(self) -> None:
         """Fired once the backward pass fully completes (FSDP-safe barrier).
 
-        By this point every ``param.grad`` is written — including FSDP's
-        (sharded) write-back to the original parameters — so sub-cond (b) is
+        By this point every ``param.grad`` is written -- including FSDP's
+        (sharded) write-back to the original parameters -- so sub-cond (b) is
         satisfied and any callback that reads ``param.grad`` in ``on_step_end``
         sees ready gradients.  The ``_backward_end_scheduled`` guard ensures a
         callback that fires *after* its step already completed (the common
@@ -435,20 +435,20 @@ class HookManager:
             g = torch.cat([t for _, t in sorted(grad_parts, key=lambda x: x[0])], dim=0)
 
             # Factorized (LoGRA) projection: _act_parts/_grad_parts already hold the
-            # projected, final factors (module_kwargs=None → no re-preprocessing).
+            # projected, final factors (module_kwargs=None -> no re-preprocessing).
             if proj_kw is not None:
                 data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
                                               module_kwargs=None, batch_first=batch_first)
                 representation[layer_name] = "factorized"
                 layer_types[layer_name] = "nn.Linear"
-                tokens = a.shape[1 if batch_first else 0]   # 1 ⇒ 2-D-origin layer
+                tokens = a.shape[1 if batch_first else 0]   # 1 => 2-D-origin layer
                 indexing[layer_name] = "batch_token" if tokens > 1 else "batch"
                 continue
 
-            # Un-projected raw factorized capture (original behaviour).
-            # A positional embedding fed an *unbatched* index tensor — e.g.
+            # Un-projected raw factorized capture.
+            # A positional embedding fed an *unbatched* index tensor -- e.g.
             # nanoGPT's ``pos = arange(T)`` (shape ``(T,)``) added to every
-            # sample — is captured with no batch dim.  Add a length-1 batch axis
+            # sample -- is captured with no batch dim.  Add a length-1 batch axis
             # so it validates and materialises as a single broadcast row (its
             # gradient is already summed over the batch by the broadcast add).
             if a.ndim == 1 and is_embedding(buf["_class_name"]):
@@ -494,8 +494,8 @@ class HookManager:
     def _warn_broadcast_layers(self, data: dict, layer_types: dict) -> None:
         """Warn (once per layer) about broadcast / batch-collapsed gradients.
 
-        A factorized layer whose batch dim is 1 while the step batch is larger —
-        e.g. a positional embedding added to every sample — carries a gradient
+        A factorized layer whose batch dim is 1 while the step batch is larger --
+        e.g. a positional embedding added to every sample -- carries a gradient
         that was *summed over the batch*, so it is **not** a per-sample gradient.
         Downstream per-sample attribution treats it as a single shared row, which
         is rarely what the user wants; surface it so they can exclude the layer.
@@ -529,7 +529,7 @@ class HookManager:
                     "per-sample attribution will treat it as a single shared row. "
                     f"Consider excluding '{name}' from gradient collection (e.g. "
                     "via HookManagerConfig hook selection or the attributor's "
-                    "`layer_name`).",
+                    "``layer_name``).",
                     stacklevel=3,
                 )
 
@@ -604,7 +604,7 @@ class HookManager:
           (e.g. the first layer's activation in a mid-forward pause) is
           preserved intact for the continuing training pass.
 
-        Example — val pass triggered from ``on_layer_forward``::
+        Example -- val pass triggered from ``on_layer_forward``::
 
             def on_layer_forward(self, layer_name, activation):
                 if self._first_layer and self._need_val_target:
@@ -665,7 +665,7 @@ class HookManager:
     def add_callback(self, callback: HookManagerCallback) -> None:
         """Attach a callback after construction and run its ``on_register``.
 
-        Useful when a callback can only be built *after* the manager — most
+        Useful when a callback can only be built *after* the manager -- most
         notably :class:`~dattri_llm.gradient.callbacks.DataSelectionCallback`
         under FSDP, where the manager is created on the unwrapped model (so its
         hooks survive wrapping) but the callback needs the FSDP-wrapped module
@@ -684,7 +684,7 @@ class HookManager:
     def layer_name(self) -> list[str]:
         """The layer set an attributor scores: the hooked per-sample (linear-IO)
         layers.  Layer selection is decided here, at capture, via
-        :class:`HookManagerConfig` — attributors read it back through this
+        :class:`HookManagerConfig` -- attributors read it back through this
         property (e.g. for :class:`AttributionScore` metadata) instead of taking
         their own ``layer_name`` argument."""
         return list(self._buffers.keys())
@@ -705,7 +705,7 @@ class HookManager:
         ``_step_count`` (stamped on each :attr:`GradientRecord.step` and exposed
         via :attr:`steps_collected`) is monotonic for the manager's lifetime by
         default.  A caller that restarts collection from a fresh logical baseline
-        — e.g. the live streamer beginning a new pass — can reset it so
+        -- e.g. the live streamer beginning a new pass -- can reset it so
         ``record.step`` is pass-local and aligns with the caller's own per-pass
         index.  Only the label counter is reset; in-flight per-step buffers and
         completion flags are left untouched (callers reset between steps, never

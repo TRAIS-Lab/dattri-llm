@@ -1,6 +1,6 @@
 """Ops-level unit tests for dattri_llm.gradient.ops.
 
-These tests operate directly on synthetic factor tensors ``(a, g)`` — they do
+These tests operate directly on synthetic factor tensors ``(a, g)`` -- they do
 **not** run real modules.  End-to-end checks against ``param.grad`` (running a
 forward+backward pass through an ``nn.Module`` and comparing to the captured
 weight gradient) live in ``test_ground_truth.py``.
@@ -9,11 +9,11 @@ Two suites:
 
 1.  **Algebraic identity tests** (all supported layer types): verify that
     ``pairwise_dot``, ``grad_norm_sq``, and ``dot`` are self-consistent with
-    ``materialize`` — i.e. the "ghost-scoring" identities hold:
+    ``materialize`` -- i.e. the "ghost-scoring" identities hold:
 
-        _pairwise_dot(a, g, lt)[i, j]  ==  mat[i] · mat[j]
-        _grad_norm_sq(a, g, lt)[i]     ==  ||mat[i]||²
-        _dot(a1,g1, a2,g2, lt)[i]      ==  mat1[i] · mat2[i]
+        _pairwise_dot(a, g, lt)[i, j]  ==  mat[i] * mat[j]
+        _grad_norm_sq(a, g, lt)[i]     ==  ||mat[i]||^2
+        _dot(a1,g1, a2,g2, lt)[i]      ==  mat1[i] * mat2[i]
 
     where ``mat = _materialize(a, g, lt, per_token=True)`` (the per-position form,
     so a norm layer's diagonal cross-gram matches).  Factors are supplied already
@@ -56,7 +56,7 @@ E = 10  # embedding dim
 
 
 # ---------------------------------------------------------------------------
-# Factories — build preprocessed (a, g) tensors for each layer type
+# Factories -- build preprocessed (a, g) tensors for each layer type
 # ---------------------------------------------------------------------------
 
 def _linear_2d():
@@ -66,7 +66,7 @@ def _linear_3d():
     return torch.randn(B, T, I), torch.randn(B, T, O)
 
 def _conv():
-    # (B, L, in_patch), (B, L, C_out)  — L is the spatial dimension
+    # (B, L, in_patch), (B, L, C_out)  -- L is the spatial dimension
     return torch.randn(B, T, I), torch.randn(B, T, O)
 
 def _conv_transpose():
@@ -123,7 +123,7 @@ _PARAMS_CROSS = [pytest.param(_lt(tag), *fn(), *fn(), id=tag) for tag, fn in LAY
 # ---------------------------------------------------------------------------
 
 class TestPairwiseDotIdentity:
-    """_pairwise_dot(a, g, lt)[i, j]  ==  mat[i] · mat[j]."""
+    """_pairwise_dot(a, g, lt)[i, j]  ==  mat[i] * mat[j]."""
 
     @pytest.mark.parametrize("lt,a,g", _PARAMS)
     def test_matches_materialized_gram(self, lt, a, g):
@@ -146,7 +146,7 @@ class TestPairwiseDotIdentity:
 
 
 class TestGradNormSqIdentity:
-    """_grad_norm_sq(a, g, lt)[i]  ==  ||mat[i]||²."""
+    """_grad_norm_sq(a, g, lt)[i]  ==  ||mat[i]||^2."""
 
     @pytest.mark.parametrize("lt,a,g", _PARAMS)
     def test_matches_materialized_norm(self, lt, a, g):
@@ -165,7 +165,7 @@ class TestGradNormSqIdentity:
 
 
 class TestDotIdentity:
-    """_dot(a1,g1, a2,g2, lt)[i]  ==  mat1[i] · mat2[i]."""
+    """_dot(a1,g1, a2,g2, lt)[i]  ==  mat1[i] * mat2[i]."""
 
     @pytest.mark.parametrize("lt,a1,g1,a2,g2", _PARAMS_CROSS)
     def test_matches_materialized_dot(self, lt, a1, g1, a2, g2):
@@ -321,7 +321,7 @@ class TestStreamingAccumulators:
 
 
 # ---------------------------------------------------------------------------
-# materialize — token-collapse (default) vs per_token=True for norm layers
+# materialize -- token-collapse (default) vs per_token=True for norm layers
 # ---------------------------------------------------------------------------
 
 class TestMaterializeCollapse:
@@ -348,7 +348,7 @@ class TestMaterializeCollapse:
 
 
 # ---------------------------------------------------------------------------
-# Random projection — TRAK (materialized) and LoGRA (factorized) units
+# Random projection -- TRAK (materialized) and LoGRA (factorized) units
 # ---------------------------------------------------------------------------
 
 from dattri.func.projection import random_project  # noqa: E402
@@ -391,7 +391,7 @@ class TestProjection:
         assert out.shape == (B, 16)
 
     def test_projection_approximately_preserves_gram(self):
-        # Johnson–Lindenstrauss: random projection preserves pairwise dot products.
+        # Johnson-Lindenstrauss: random projection preserves pairwise dot products.
         torch.manual_seed(0)
         a, g = torch.randn(16, T, I), torch.randn(16, T, O)
         f = Factorized(a, g, {"has_bias": False})
@@ -403,7 +403,7 @@ class TestProjection:
 
 
 # ---------------------------------------------------------------------------
-# Multi-layer accumulators — fan a Gradient block out to per-layer estimators
+# Multi-layer accumulators -- fan a Gradient block out to per-layer estimators
 # ---------------------------------------------------------------------------
 
 import types  # noqa: E402
@@ -466,7 +466,7 @@ class TestMultiLayerAccumulators:
 
 
 # ---------------------------------------------------------------------------
-# Factorized-input wrappers (``_f``) — delegate to the raw ops, handle layout
+# Factorized-input wrappers (``_f``) -- delegate to the raw ops, handle layout
 # ---------------------------------------------------------------------------
 
 from dattri_llm.gradient import ops

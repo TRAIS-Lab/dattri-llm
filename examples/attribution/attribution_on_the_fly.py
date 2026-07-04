@@ -74,7 +74,7 @@ if __name__ == "__main__":
     task = AttributionTask(loss_func=loss_func, model=model, checkpoints=[checkpoint])
 
     with tempfile.TemporaryDirectory() as tmp:
-        # attribute — one call streams the gradients live and scores them;
+        # attribute -- one call streams the gradients live and scores them;
         # nothing is persisted.  Pass normalized_grad=True for GradCos, or a
         # hook_config=HookManagerConfig(...) to control which layers are hooked
         # (and, optionally, per-layer random projection).

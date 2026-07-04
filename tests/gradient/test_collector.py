@@ -76,7 +76,7 @@ class TestHashSample:
         row = torch.randint(0, 100, (8,))
         batch_a = {"input_ids": torch.stack([row, torch.zeros(8, dtype=torch.long)])}
         batch_b = {"input_ids": torch.stack([torch.zeros(8, dtype=torch.long), row])}
-        # Same content row → same hash regardless of batch position, and the
+        # Same content row -> same hash regardless of batch position, and the
         # single-sample hash of the raw row matches both.
         assert hash_batch(batch_a)[0] == hash_batch(batch_b)[1]
         assert hash_batch(batch_a)[0] == hash_sample({"input_ids": row})
@@ -85,7 +85,7 @@ class TestHashSample:
         ids = torch.zeros(4, dtype=torch.long)
         mask_a = {"input_ids": ids, "attention_mask": torch.ones(4)}
         mask_b = {"input_ids": ids, "attention_mask": torch.zeros(4)}
-        # Same input_ids but different attention_mask → different hash
+        # Same input_ids but different attention_mask -> different hash
         assert hash_sample(mask_a) != hash_sample(mask_b)
 
     def test_non_tensor_values_skipped(self):
@@ -140,7 +140,7 @@ class TestGradientRecord:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager — init and introspection                                   #
+# HookManager -- init and introspection                                   #
 # --------------------------------------------------------------------------- #
 
 
@@ -168,7 +168,7 @@ class TestHookManagerInit:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager — collect() context manager                                #
+# HookManager -- collect() context manager                                #
 # --------------------------------------------------------------------------- #
 
 
@@ -232,7 +232,7 @@ class TestCollectContextManager:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager — record content                                           #
+# HookManager -- record content                                           #
 # --------------------------------------------------------------------------- #
 
 
@@ -285,7 +285,7 @@ class TestRecordContent:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager — sample hashing                                           #
+# HookManager -- sample hashing                                           #
 # --------------------------------------------------------------------------- #
 
 
@@ -314,7 +314,7 @@ class TestSampleHashing:
                 tiny_model(ids).mean().backward()
         # Two records (one per step), each with 2 hashes
         assert len(cb.records) == 2
-        assert cb.records[0].input_hash == cb.records[1].input_hash  # same inputs → same hashes
+        assert cb.records[0].input_hash == cb.records[1].input_hash  # same inputs -> same hashes
         assert cb.records[0].step == 0
         assert cb.records[1].step == 1
         collector.remove()
@@ -503,7 +503,7 @@ class TestBatchSaving:
             collector.remove()
 
     def test_offload_groups_one_step_into_one_file(self, tiny_model, tiny_batch):
-        """One batch step → one batch file (offload_interval=1)."""
+        """One batch step -> one batch file (offload_interval=1)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
             offload = OffloadCallback(offload_interval=1, file_manager=manager)
@@ -536,7 +536,7 @@ class TestBatchSaving:
 
 
 class TestLookupAndLoadSample:
-    """input_hash → (step, sample_idx) → file: position-indexed per-sample lookup."""
+    """input_hash -> (step, sample_idx) -> file: position-indexed per-sample lookup."""
 
     H = ["aa" * 32, "bb" * 32, "cc" * 32]   # three sample hashes
 
@@ -550,7 +550,7 @@ class TestLookupAndLoadSample:
         return GradientRecord(step=step, input_hash=hashes, gradient=g)
 
     def _shuffled_store(self, tmpdir):
-        """Two steps with the SAME samples at different batch positions —
+        """Two steps with the SAME samples at different batch positions --
         the shuffling scenario the (step, sample) index exists for."""
         manager = GradientFileManager(tmpdir)
         manager.save_bulk([self._batch_record(0, [self.H[0], self.H[1], self.H[2]])])
@@ -667,7 +667,7 @@ class TestOffloadCallback:
             collector.remove()
 
     def test_periodic_flush(self, tiny_model, tiny_batch):
-        # offload_interval=2: flush every 2 batch steps → 4 steps / 2 = 2 batch files
+        # offload_interval=2: flush every 2 batch steps -> 4 steps / 2 = 2 batch files
         with tempfile.TemporaryDirectory() as tmpdir:
             manager, offload = self._make_offload(tmpdir, offload_interval=2)
             collector = HookManager(tiny_model, callbacks=[offload])
@@ -688,7 +688,7 @@ class TestOffloadCallback:
             collector.remove()
 
     def test_manager_accessible_for_queries(self, tiny_model, tiny_batch):
-        """file_manager is the query handle — offload only owns saving."""
+        """file_manager is the query handle -- offload only owns saving."""
         with tempfile.TemporaryDirectory() as tmpdir:
             manager, offload = self._make_offload(tmpdir)
             collector = HookManager(tiny_model, callbacks=[offload])
@@ -703,7 +703,7 @@ class TestOffloadCallback:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager — remove                                                   #
+# HookManager -- remove                                                   #
 # --------------------------------------------------------------------------- #
 
 
@@ -718,7 +718,7 @@ class TestHookManagerRemove:
         cb = RecordingCallback()
         collector = HookManager(tiny_model, callbacks=[cb])
         collector.remove()
-        # After remove, hooks are gone — no records should be emitted
+        # After remove, hooks are gone -- no records should be emitted
         # (collect() itself would raise an AttributeError since buffers cleared,
         # but running without collect() also should not emit records)
         logits = tiny_model(tiny_batch["input_ids"])
@@ -727,7 +727,7 @@ class TestHookManagerRemove:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager.get_gradient — last-step gradient cache                          #
+# HookManager.get_gradient -- last-step gradient cache                          #
 # --------------------------------------------------------------------------- #
 
 
@@ -744,7 +744,7 @@ class TestGetGradient:
         }
 
     def test_cache_is_same_object_as_record(self, tiny_model, tiny_batch):
-        # The cached gradient is exactly the object handed to on_step_end —
+        # The cached gradient is exactly the object handed to on_step_end --
         # no duplicate copy is kept in memory.
         cb = RecordingCallback()
         hm = HookManager(tiny_model, callbacks=[cb])
@@ -799,7 +799,7 @@ class TestGetGradient:
 
 
 class TestHookManagerConfig:
-    # ── default ─────────────────────────────────────────────────────────────
+    # -- default -------------------------------------------------------------
 
     def test_default_selectors(self):
         cfg = HookManagerConfig()
@@ -808,7 +808,7 @@ class TestHookManagerConfig:
         assert cfg.param_grad is None
         assert cfg.is_default
 
-    # ── hook_types assignment (the basic control) ─────────────────────────────
+    # -- hook_types assignment (the basic control) -----------------------------
 
     def test_hook_types_assignment(self):
         cfg = HookManagerConfig(
@@ -825,7 +825,7 @@ class TestHookManagerConfig:
         with pytest.raises(TypeError, match="hook_types must be a dict"):
             HookManagerConfig(hook_types=["mlp.0"])  # type: ignore[arg-type]
 
-    # ── REGISTER_ALL ──────────────────────────────────────────────────────────
+    # -- REGISTER_ALL ----------------------------------------------------------
 
     def test_register_all_is_singleton(self):
         assert HookManagerConfig(linear_io=REGISTER_ALL).linear_io is REGISTER_ALL
@@ -842,7 +842,7 @@ class TestHookManagerConfig:
         assert cfg.linear_io is None
         assert not cfg.is_default
 
-    # ── pattern lists ─────────────────────────────────────────────────────────
+    # -- pattern lists ---------------------------------------------------------
 
     def test_linear_io_pattern(self):
         cfg = HookManagerConfig(linear_io=[r"mlp\.0"])
@@ -857,7 +857,7 @@ class TestHookManagerConfig:
         assert cfg.linear_io == [r"mlp\."]
         assert cfg.param_grad == [r"lm_head"]
 
-    # ── validation ────────────────────────────────────────────────────────────
+    # -- validation ------------------------------------------------------------
 
     def test_invalid_selector_type_raises(self):
         with pytest.raises(TypeError, match="must be None, REGISTER_ALL"):
@@ -869,7 +869,7 @@ class TestHookManagerConfig:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager — param_grad hook type                                          #
+# HookManager -- param_grad hook type                                          #
 # --------------------------------------------------------------------------- #
 
 
@@ -1060,7 +1060,7 @@ class TestGradientFileManagerDDP:
             rec = self._make_record(0, h, tiny_model, tiny_batch)
             m.save_bulk([rec])
 
-        # Both write batch_000000.pt but in separate dirs — no data loss.
+        # Both write batch_000000.pt but in separate dirs -- no data loss.
         assert (tmp_path / "rank_0" / "batch_000000.pt").exists()
         assert (tmp_path / "rank_1" / "batch_000000.pt").exists()
 

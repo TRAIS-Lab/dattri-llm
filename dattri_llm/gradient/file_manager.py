@@ -25,7 +25,7 @@ class GradientFileManager:
 
     Responsible for file naming, maintaining ``index.json`` hash-to-location
     mappings, and loading records back.  It knows nothing about *when* to
-    save — that is :class:`OffloadCallback`'s job.
+    save -- that is :class:`OffloadCallback`'s job.
 
     Under ``DistributedDataParallel`` (or any context where
     ``torch.distributed`` is initialised), each rank writes to its own
@@ -55,13 +55,13 @@ class GradientFileManager:
 
     The three bugs that this layout prevents:
 
-    * **File-name collision** — each rank's ``_next_batch_id`` counter is
+    * **File-name collision** -- each rank's ``_next_batch_id`` counter is
       local to its own subdirectory, so ``batch_000000.pt`` on rank 0 and
       ``batch_000000.pt`` on rank 1 live in different directories.
-    * **``index.json`` race** — every rank writes only to its own
+    * **``index.json`` race** -- every rank writes only to its own
       ``rank_N/index.json``; there are no concurrent writes to a shared file.
-    * **Silent data loss** — in DDP each rank processes a different micro-batch,
-      so all ranks must save; restricting saves to rank 0 would discard ¾ of
+    * **Silent data loss** -- in DDP each rank processes a different micro-batch,
+      so all ranks must save; restricting saves to rank 0 would discard 3/4 of
       the gradient data.
 
     Index format (inside each ``index.json``)::
@@ -73,10 +73,10 @@ class GradientFileManager:
             ]
         }
 
-    The mapping is ``input_hash → (step, sample_idx) → file``: the content hash is
+    The mapping is ``input_hash -> (step, sample_idx) -> file``: the content hash is
     sample-position independent (a sample hashes the same wherever shuffling
-    put it), and each entry records **where** that sample landed — the training
-    ``step`` and its ``sample_idx`` position within the stored record's batch — so
+    put it), and each entry records **where** that sample landed -- the training
+    ``step`` and its ``sample_idx`` position within the stored record's batch -- so
     a per-sample gradient is retrieved by direct slicing, never by scanning a
     batch record.  :meth:`lookup` returns a hash's ``(step, sample_idx)`` pairs and
     :meth:`load_sample` retrieves one pair's gradient.
@@ -129,7 +129,7 @@ class GradientFileManager:
         if isinstance(record.input_hash, list):
             raise TypeError(
                 "save() takes a single-hash record; this record carries a "
-                "per-batch hash list — use save_bulk([record]) instead."
+                "per-batch hash list -- use save_bulk([record]) instead."
             )
         self._save_dir.mkdir(parents=True, exist_ok=True)
         h = record.input_hash
@@ -144,7 +144,7 @@ class GradientFileManager:
     def save_bulk(self, records: list[GradientRecord]) -> Path:
         """Pack multiple :class:`GradientRecord` objects into a single file.
 
-        "Bulk" is file-level packing (amortising file I/O — e.g.
+        "Bulk" is file-level packing (amortising file I/O -- e.g.
         ``OffloadCallback`` flushes its accumulated records through here every
         ``offload_interval`` steps); it says nothing about the records' shape.
         Each record may be per-sample (single ``input_hash``) or per-batch
@@ -195,9 +195,9 @@ class GradientFileManager:
     # Every load-family method comes as a pair differing only by how the
     # sample is identified: ``F(inputs, ...)`` takes ONE sample's model-input
     # dict and hashes it; ``F_by_hash(input_hash, ...)`` takes the precomputed
-    # content hash.  Under the ``input_hash → (step, sample_idx) → file`` index a
-    # step alone no longer identifies a gradient — only a ``(step, sample_idx)``
-    # pair does — so there is no step-only loader.
+    # content hash.  Under the ``input_hash -> (step, sample_idx) -> file`` index a
+    # step alone no longer identifies a gradient -- only a ``(step, sample_idx)``
+    # pair does -- so there is no step-only loader.
 
     def lookup(
         self,
@@ -209,7 +209,7 @@ class GradientFileManager:
             inputs: **One sample's** model-input dict (e.g. ``dataset[i]``).
 
         Returns:
-            Sorted list of ``(step, sample_idx)`` pairs — see :meth:`lookup_by_hash`.
+            Sorted list of ``(step, sample_idx)`` pairs -- see :meth:`lookup_by_hash`.
         """
         return self.lookup_by_hash(hash_sample(inputs))
 
@@ -217,7 +217,7 @@ class GradientFileManager:
         """Every ``(step, sample_idx)`` occurrence of a sample, sorted by step.
 
         The content hash identifies *what* the sample is (independent of
-        shuffling); the returned pairs say *where* it was recorded — the
+        shuffling); the returned pairs say *where* it was recorded -- the
         training step, and its position within that step's stored batch.
         Feed a pair to :meth:`load_sample_by_hash` to retrieve the gradient.
 
@@ -233,7 +233,7 @@ class GradientFileManager:
         """
         if input_hash not in self._index:
             raise KeyError(
-                f"Hash {input_hash[:16]}… not in index. "
+                f"Hash {input_hash[:16]}... not in index. "
                 "Has the collect() context closed, and is save_dir correct?"
             )
         return sorted(
@@ -255,7 +255,7 @@ class GradientFileManager:
                 returned by :meth:`lookup`.
 
         Returns:
-            The sample's :class:`Gradient` — see :meth:`load_sample_by_hash`.
+            The sample's :class:`Gradient` -- see :meth:`load_sample_by_hash`.
         """
         return self.load_sample_by_hash(hash_sample(inputs), step, sample_idx)
 
@@ -263,7 +263,7 @@ class GradientFileManager:
         """Load one sample's gradient at one training step, by direct slicing.
 
         Uses the indexed ``sample`` position to slice the stored record's batch
-        gradient — an O(1) retrieval, with no scan over the batch.
+        gradient -- an O(1) retrieval, with no scan over the batch.
 
         Args:
             input_hash: Full 64-character SHA-256 hash of the sample.
@@ -283,7 +283,7 @@ class GradientFileManager:
                 return record.gradient.slice(dim="batch", index=sample_idx)
         pairs = self.lookup_by_hash(input_hash) if input_hash in self._index else []
         raise KeyError(
-            f"No record for hash {input_hash[:16]}… at (step={step}, "
+            f"No record for hash {input_hash[:16]}... at (step={step}, "
             f"sample_idx={sample_idx}). Available (step, sample_idx) pairs: {pairs}."
         )
 
@@ -297,7 +297,7 @@ class GradientFileManager:
             inputs: **One sample's** model-input dict (e.g. ``dataset[i]``).
 
         Returns:
-            List of :class:`GradientRecord` sorted by step — see
+            List of :class:`GradientRecord` sorted by step -- see
             :meth:`load_all_by_hash`.
         """
         return self.load_all_by_hash(hash_sample(inputs))
@@ -319,7 +319,7 @@ class GradientFileManager:
         """
         if input_hash not in self._index:
             raise KeyError(
-                f"Hash {input_hash[:16]}… not in index. "
+                f"Hash {input_hash[:16]}... not in index. "
                 "Has the collect() context closed, and is save_dir correct?"
             )
         entries = sorted(self._index[input_hash], key=lambda e: e["step"])

@@ -13,19 +13,19 @@ For each supported layer type the test:
 
 Layer types covered
 -------------------
-* ``nn.Linear``                           — 2-D (no-bias, with-bias), 3-D token
-* ``nn.NonDynamicallyQuantizableLinear``  — same math as nn.Linear (no-bias, with-bias)
-* ``transformers.pytorch_utils.Conv1D``   — weight stored transposed (I, O); always has bias
+* ``nn.Linear``                           -- 2-D (no-bias, with-bias), 3-D token
+* ``nn.NonDynamicallyQuantizableLinear``  -- same math as nn.Linear (no-bias, with-bias)
+* ``transformers.pytorch_utils.Conv1D``   -- weight stored transposed (I, O); always has bias
 * ``nn.Embedding``
-* ``nn.EmbeddingBag``                     — mode='sum', mode='mean'
-* ``nn.LayerNorm``                        — no-bias, with-bias
-* ``nn.RMSNorm``                          — affine weight (no bias in PyTorch)
-* ``nn.GroupNorm``                        — no-bias, with-bias (spatial > 1)
-* ``nn.InstanceNorm2d``                   — no-bias, with-bias (spatial > 1)
-* ``nn.Conv1d``                           — no-bias, with-bias
-* ``nn.Conv2d``                           — no-bias, with-bias
-* ``nn.Conv3d``                           — no-bias, with-bias
-* ``nn.ConvTranspose1d/2d/3d``            — no-bias, with-bias
+* ``nn.EmbeddingBag``                     -- mode='sum', mode='mean'
+* ``nn.LayerNorm``                        -- no-bias, with-bias
+* ``nn.RMSNorm``                          -- affine weight (no bias in PyTorch)
+* ``nn.GroupNorm``                        -- no-bias, with-bias (spatial > 1)
+* ``nn.InstanceNorm2d``                   -- no-bias, with-bias (spatial > 1)
+* ``nn.Conv1d``                           -- no-bias, with-bias
+* ``nn.Conv2d``                           -- no-bias, with-bias
+* ``nn.Conv3d``                           -- no-bias, with-bias
+* ``nn.ConvTranspose1d/2d/3d``            -- no-bias, with-bias
 
 Notes on normalization-layer ground truth
 ------------------------------------------
@@ -36,7 +36,7 @@ For LayerNorm/RMSNorm tested with a single position (2-D input) this equals
 ``param.grad`` directly.  GroupNorm/InstanceNorm intrinsically have spatial
 positions, so their tests check ``materialize`` summed-over-positions against
 ``param.grad``, and check ``grad_norm_sq`` / ``pairwise_dot`` against an
-independent per-position reference (x̂ from the affine-free functional norm,
+independent per-position reference (x_hat from the affine-free functional norm,
 g controlled by an output multiplier).
 """
 
@@ -100,7 +100,7 @@ class _NonDynQuantLinearModel(nn.Module):
 
 
 class _HFConv1DModel(nn.Module):
-    """HF Conv1D wrapper — weight is (nx, nf) = (I, O), bias is always (nf,) = (O,)."""
+    """HF Conv1D wrapper -- weight is (nx, nf) = (I, O), bias is always (nf,) = (O,)."""
     def __init__(self, in_f: int, out_f: int) -> None:
         super().__init__()
         # Conv1D(nf, nx): weight shape (nx, nf) = (in_f, out_f)
@@ -304,14 +304,14 @@ def _channel_norm_diag_grad(
     """Independent per-position (diagonal) gradient for a per-channel norm.
 
     ``xhat`` and ``R`` are ``(1, C, *spatial)`` (R == the captured output grad
-    g).  Returns the flattened per-position gradient vector ``[x̂⊙g | g]`` laid
+    g).  Returns the flattened per-position gradient vector ``[x_hat*g | g]`` laid
     out position-major to match the library's ``materialize`` ordering.
     """
     c = xhat.shape[1]
     gamma = (xhat * R).reshape(c, -1).permute(1, 0)   # (S, C)
     parts = [gamma]
     if has_bias:
-        parts.append(R.reshape(c, -1).permute(1, 0))  # (S, C)  β contrib = 1·g
+        parts.append(R.reshape(c, -1).permute(1, 0))  # (S, C)  beta contrib = 1*g
     return torch.cat(parts, dim=-1).flatten()          # (S * feat,)
 
 
@@ -339,13 +339,13 @@ def _pairwise_dot(gradient, name: str, include_bias: bool = True) -> torch.Tenso
 # ---------------------------------------------------------------------------
 
 class TestLinearGroundTruth:
-    """nn.Linear — 2-D input (no-bias), 2-D with-bias, 3-D token input."""
+    """nn.Linear -- 2-D input (no-bias), 2-D with-bias, 3-D token input."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
         self.model = _LinearModel(I, O, bias=False)
 
-    # ── 2-D input: (B, I) ──────────────────────────────────────────────────
+    # -- 2-D input: (B, I) --------------------------------------------------
 
     def _inputs_2d(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
@@ -376,7 +376,7 @@ class TestLinearGroundTruth:
                 assert torch.allclose(K[i, j], expected, atol=1e-3), \
                     f"K[{i},{j}] expected {expected:.4f} got {K[i,j]:.4f}"
 
-    # ── 3-D input: (B, T, I) — token sequence; materialize sums over T ─────
+    # -- 3-D input: (B, T, I) -- token sequence; materialize sums over T -----
 
     def _inputs_3d(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
@@ -406,7 +406,7 @@ class TestLinearGroundTruth:
                 expected = (ref[i].float() * ref[j].float()).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3)
 
-    # ── 2-D with bias ───────────────────────────────────────────────────────
+    # -- 2-D with bias -------------------------------------------------------
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
@@ -453,7 +453,7 @@ class TestLinearGroundTruth:
 # ---------------------------------------------------------------------------
 
 class TestNonDynQuantLinearGroundTruth:
-    """nn.NonDynamicallyQuantizableLinear — behaves identically to nn.Linear."""
+    """nn.NonDynamicallyQuantizableLinear -- behaves identically to nn.Linear."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
@@ -530,7 +530,7 @@ class TestNonDynQuantLinearGroundTruth:
 
 @pytest.mark.skipif(not _HAS_HF, reason="transformers not installed")
 class TestHFConv1DGroundTruth:
-    """transformers.pytorch_utils.Conv1D — weight stored as (nx, nf)=(I, O), transposed
+    """transformers.pytorch_utils.Conv1D -- weight stored as (nx, nf)=(I, O), transposed
     relative to nn.Linear.  Bias is always present (fixed in the constructor).
 
     materialize produces (B, O*(I+1)) where mat[i].reshape(O, I+1)[:, :I] == weight.grad.T
@@ -583,7 +583,7 @@ class TestHFConv1DGroundTruth:
 # ---------------------------------------------------------------------------
 
 class TestEmbeddingGroundTruth:
-    """nn.Embedding — token IDs as activation, grad w.r.t. output as grad."""
+    """nn.Embedding -- token IDs as activation, grad w.r.t. output as grad."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
@@ -629,11 +629,11 @@ class TestEmbeddingGroundTruth:
 # ---------------------------------------------------------------------------
 
 class TestLayerNormGroundTruth:
-    """nn.LayerNorm — 2-D input (no-bias and with-bias).
+    """nn.LayerNorm -- 2-D input (no-bias and with-bias).
 
     The forward hook delivers the *raw* (pre-normalization) input; module_kwargs
     carries ``normalized_shape`` and ``eps`` so that ``preprocess_factorized``
-    computes x̂ = (x − μ)/√(σ²+ε) internally before ``materialize``.
+    computes x_hat = (x - mu)/sqrt(sigma^2+eps) internally before ``materialize``.
 
     For 2-D inputs the materialize output equals ``weight.grad`` directly
     (per-sample, no token summing needed).
@@ -671,7 +671,7 @@ class TestLayerNormGroundTruth:
                 expected = (ref[i].float() * ref[j].float()).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-4)
 
-    # ── with bias ──────────────────────────────────────────────────────────
+    # -- with bias ----------------------------------------------------------
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
@@ -719,7 +719,7 @@ class TestLayerNormGroundTruth:
 # ---------------------------------------------------------------------------
 
 class TestConv1dGroundTruth:
-    """nn.Conv1d — raw (N, C_in, L) hook data; im2col unfolds before materialize."""
+    """nn.Conv1d -- raw (N, C_in, L) hook data; im2col unfolds before materialize."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
@@ -753,7 +753,7 @@ class TestConv1dGroundTruth:
                 expected = (ref[i].float() * ref[j].float()).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3)
 
-    # ── with bias ──────────────────────────────────────────────────────────
+    # -- with bias ----------------------------------------------------------
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
@@ -801,7 +801,7 @@ class TestConv1dGroundTruth:
 # ---------------------------------------------------------------------------
 
 class TestConv2dGroundTruth:
-    """nn.Conv2d — raw (N, C_in, H, W) hook data; im2col unfolds before materialize."""
+    """nn.Conv2d -- raw (N, C_in, H, W) hook data; im2col unfolds before materialize."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
@@ -835,7 +835,7 @@ class TestConv2dGroundTruth:
                 expected = (ref[i].float() * ref[j].float()).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3)
 
-    # ── with bias ──────────────────────────────────────────────────────────
+    # -- with bias ----------------------------------------------------------
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
@@ -883,7 +883,7 @@ class TestConv2dGroundTruth:
 # ---------------------------------------------------------------------------
 
 class TestConv3dGroundTruth:
-    """nn.Conv3d — raw (N, C_in, D, H, W) hook data; 3-D im2col before materialize."""
+    """nn.Conv3d -- raw (N, C_in, D, H, W) hook data; 3-D im2col before materialize."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
@@ -917,7 +917,7 @@ class TestConv3dGroundTruth:
                 expected = (ref[i].float() * ref[j].float()).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3)
 
-    # ── with bias ──────────────────────────────────────────────────────────
+    # -- with bias ----------------------------------------------------------
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
@@ -966,10 +966,10 @@ class TestConv3dGroundTruth:
 
 @pytest.mark.skipif(not _HAS_RMSNORM, reason="nn.RMSNorm requires PyTorch >= 2.4")
 class TestRMSNormGroundTruth:
-    """nn.RMSNorm — 2-D input, affine weight (PyTorch RMSNorm has no bias).
+    """nn.RMSNorm -- 2-D input, affine weight (PyTorch RMSNorm has no bias).
 
     The forward hook delivers the raw input; module_kwargs carries
-    ``normalized_shape``/``eps`` so preprocess computes x̂ = x/√(mean(x²)+ε).
+    ``normalized_shape``/``eps`` so preprocess computes x_hat = x/sqrt(mean(x^2)+eps).
     With a single position the materialize output equals ``weight.grad``.
     """
 
@@ -1015,7 +1015,7 @@ class _ChannelNormChecks:
     per-channel norm wrapped in :class:`_ChannelNormModel`.
 
     Subclasses set ``self.model`` (a ``_ChannelNormModel``), ``self.C`` (number
-    of channels), ``self.xhat_fn`` (callable ``x -> x̂`` via the affine-free
+    of channels), ``self.xhat_fn`` (callable ``x -> x_hat`` via the affine-free
     functional norm), and provide ``_inputs()``.
     """
 
@@ -1026,7 +1026,7 @@ class _ChannelNormChecks:
         R = self.model.R
         return _channel_norm_diag_grad(self._xhat(x), R, has_bias)
 
-    # ── with bias (affine=True, bias folded) ────────────────────────────────
+    # -- with bias (affine=True, bias folded) --------------------------------
 
     def test_materialize_with_bias(self) -> None:
         inputs = self._inputs()
@@ -1058,7 +1058,7 @@ class _ChannelNormChecks:
                 expected = (diags[i] * diags[j]).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3)
 
-    # ── no bias (include_bias=False: only the gamma gradient is kept) ────────
+    # -- no bias (include_bias=False: only the gamma gradient is kept) --------
 
     def test_materialize_no_bias(self) -> None:
         inputs = self._inputs()
@@ -1094,7 +1094,7 @@ class _ChannelNormChecks:
 # ---------------------------------------------------------------------------
 
 class TestGroupNormGroundTruth(_ChannelNormChecks):
-    """nn.GroupNorm — input (N, C, L) with spatial L > 1; 2 groups over C=8."""
+    """nn.GroupNorm -- input (N, C, L) with spatial L > 1; 2 groups over C=8."""
 
     NUM_GROUPS = 2
     L = 5
@@ -1119,7 +1119,7 @@ class TestGroupNormGroundTruth(_ChannelNormChecks):
 # ---------------------------------------------------------------------------
 
 class TestInstanceNorm2dGroundTruth(_ChannelNormChecks):
-    """nn.InstanceNorm2d — input (N, C, H, W); per-channel normalization."""
+    """nn.InstanceNorm2d -- input (N, C, H, W); per-channel normalization."""
 
     H = 3
     W = 3
@@ -1144,7 +1144,7 @@ class TestInstanceNorm2dGroundTruth(_ChannelNormChecks):
 
 class _ConvTransposeChecks:
     """Mixin: weight (and optional bias) ground-truth checks for a transposed
-    convolution at ``self.model.mlp``.  ``self.P`` is C_out·∏kernel and
+    convolution at ``self.model.mlp``.  ``self.P`` is C_out*prodkernel and
     ``self.C_in`` the number of input channels."""
 
     def _inputs(self) -> list[torch.Tensor]:
@@ -1177,7 +1177,7 @@ class _ConvTransposeChecks:
                 expected = (ref[i].float() * ref[j].float()).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3, rtol=1e-3)
 
-    # ── with bias: augmented factors (L+1, C_in+1) x (L+1, P+C_out) ──────────
+    # -- with bias: augmented factors (L+1, C_in+1) x (L+1, P+C_out) ----------
 
     def test_materialize_with_bias(self) -> None:
         model = self.make_model(bias=True)

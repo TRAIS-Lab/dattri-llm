@@ -12,13 +12,13 @@ class TinyMLP(nn.Module):
 
     Used as a lightweight stand-in for a real LLM during tests.  Structure::
 
-        embedding → transformer_block (attn_proj, mlp.fc1, mlp.fc2) → lm_head
+        embedding -> transformer_block (attn_proj, mlp.fc1, mlp.fc2) -> lm_head
     """
 
     def __init__(self, vocab_size: int = 32, d_model: int = 16, seq_len: int = 8) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        # Simulated attention projection (NOT in mlp → should NOT be hooked)
+        # Simulated attention projection (NOT in mlp -> should NOT be hooked)
         self.attn_proj = nn.Linear(d_model, d_model, bias=False)
         # MLP block: named so that _is_mlp_linear matches it
         self.mlp = nn.Sequential(

@@ -27,16 +27,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from dattri_llm.gradient.callbacks import CaptureCallback, DataSelectionCallback
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_ALL
 
-MODEL_ID = "gpt2"   # 124M parameters — large enough for meaningful score spread
+MODEL_ID = "gpt2"   # 124M parameters -- large enough for meaningful score spread
 MAX_LEN = 32        # keep sequences short for CPU speed
 
-# validation target — NLP / ML research prose (the "goal")
+# validation target -- NLP / ML research prose (the "goal")
 VAL_TEXTS = [
     "Training data attribution identifies which examples most influence model predictions.",
     "Influence functions measure the effect of individual training points on model loss.",
 ]
 
-# training corpus — deliberately diverse domains
+# training corpus -- deliberately diverse domains
 TRAIN_ITEMS = [
     ("NLP/ML",  "Gradient-based data selection removes low-quality training examples."),
     ("NLP/ML",  "Per-sample influence scores guide curriculum learning strategies."),
@@ -75,7 +75,7 @@ if __name__ == "__main__":
     train_tags = [tag for tag, _ in TRAIN_ITEMS]
     train_texts = [text for _, text in TRAIN_ITEMS]
 
-    # step 1 — capture the validation gradient (the fixed selection target)
+    # step 1 -- capture the validation gradient (the fixed selection target)
     print("Capturing the validation-target gradient ...")
     cap = CaptureCallback()
     hm = HookManager(model, config=hook_cfg, callbacks=[cap])
@@ -89,7 +89,7 @@ if __name__ == "__main__":
     val_grad_flat = torch.cat([p.grad.detach().flatten()
                                for p in model.parameters() if p.grad is not None])
 
-    # step 2 — ground truth: per-sample cosine similarity of the full
+    # step 2 -- ground truth: per-sample cosine similarity of the full
     # param.grad against the validation gradient (one backward per sample)
     print("Computing per-sample cosine similarities (ground truth) ...")
     cos_sims = []
@@ -100,7 +100,7 @@ if __name__ == "__main__":
                           for p in model.parameters() if p.grad is not None])
         cos_sims.append(F.cosine_similarity(flat, val_grad_flat, dim=0).item())
 
-    # step 3 — one batched forward+backward scores every sample at once.
+    # step 3 -- one batched forward+backward scores every sample at once.
     # DataSelectionCallback computes <dL_i/dW, dL_val/dW> per sample from the
     # factorized ("ghost") gradients and drops the bottom fraction.
     print("Scoring the training batch ...")
@@ -134,7 +134,7 @@ if __name__ == "__main__":
               f"{cos_sims[i]:>+11.6f}  \"{short}\"")
     print("-" * 87)
 
-    # summary by domain — same-domain samples should score highest
+    # summary by domain -- same-domain samples should score highest
     domain_ghost, domain_cos = defaultdict(list), defaultdict(list)
     for tag, gs, cs in zip(train_tags, ghost_scores.tolist(), cos_sims):
         domain_ghost[tag].append(gs)

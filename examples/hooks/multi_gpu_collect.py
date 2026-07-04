@@ -2,7 +2,7 @@
 
 Launch with torchrun and each rank collects its own DistributedSampler shard;
 rows are keyed by content hash, so the shards recombine into the full dataset
-with no duplicates.  Pass the UNWRAPPED model — GradientStreamer registers the
+with no duplicates.  Pass the UNWRAPPED model -- GradientStreamer registers the
 hooks, places the model on its device, and wraps it in DDP/FSDP itself (set
 fsdp="full_shard" in AttributionArguments to collect under FSDP instead).
 

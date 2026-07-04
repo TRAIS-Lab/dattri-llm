@@ -42,7 +42,7 @@ class DataSelectionCallback(HookManagerCallback):
     **Score modes** (``score_mode`` argument):
 
     ``"ghost"`` *(default)*
-        Ghost inner product — computes ``score[i] = <dL_i/dW, dL_target/dW>``
+        Ghost inner product -- computes ``score[i] = <dL_i/dW, dL_target/dW>``
         via gram matrices on the factorised (g, a) factors without ever
         forming the (out x in) weight gradient.
         Cost O((B*T)^2 * (d_out + d_in)) per layer.
@@ -144,8 +144,8 @@ class DataSelectionCallback(HookManagerCallback):
             FSDP-wrapped module (see "Distributed (FSDP)" above).
         threshold: Interpretation depends on ``threshold_mode``:
 
-            * ``"hard"`` — score cutoff (any float, default ``0.0``).
-            * ``"bottom_fraction"`` / ``"negative_bottom_fraction"`` — fraction
+            * ``"hard"`` -- score cutoff (any float, default ``0.0``).
+            * ``"bottom_fraction"`` / ``"negative_bottom_fraction"`` -- fraction
               of the batch to drop (float in ``[0, 1)``).
 
         threshold_mode: One of ``"hard"`` (default), ``"bottom_fraction"``,
@@ -334,10 +334,10 @@ class DataSelectionCallback(HookManagerCallback):
         if self._target != "val_loader":
             return
         if self._in_val_pass:
-            return  # inside val pass — no recursive collection
+            return  # inside val pass -- no recursive collection
         if self._val_target_ready_for_step:
             return  # already collected for this step
-        # First training-layer forward of this step → collect val target.
+        # First training-layer forward of this step -> collect val target.
         self._val_target_ready_for_step = True
         self._collect_val_gradient()
 
@@ -346,14 +346,14 @@ class DataSelectionCallback(HookManagerCallback):
 
         When ``_in_val_pass`` is ``True`` the call originates from the
         val backward (triggered inside :meth:`_collect_val_gradient`) and is
-        silently ignored — the val gradient has already been captured by the
+        silently ignored -- the val gradient has already been captured by the
         dedicated val hooks.
 
         Args:
             record: The assembled :class:`GradientRecord` for this step.
         """
         if self._in_val_pass:
-            # Val pass completed — data captured by our own val hooks.
+            # Val pass completed -- data captured by our own val hooks.
             # Do not score; just return.
             return
 
@@ -510,7 +510,7 @@ class DataSelectionCallback(HookManagerCallback):
         """Return the list of batch indices to drop based on the configured mode.
 
         Args:
-            scores: Float tensor of shape ``(B,)`` — one score per sample.
+            scores: Float tensor of shape ``(B,)`` -- one score per sample.
 
         Returns:
             Sorted list of batch indices to remove from ``param.grad``.
@@ -532,7 +532,7 @@ class DataSelectionCallback(HookManagerCallback):
             # Drop all n_drop regardless of sign.
             return bottom_idx
 
-        # "negative_bottom_fraction": keep any candidate whose score ≥ 0.
+        # "negative_bottom_fraction": keep any candidate whose score >= 0.
         return [i for i in bottom_idx if scores[i] < 0]
 
     # ---------------------------------------------------------------------- #
@@ -544,21 +544,21 @@ class DataSelectionCallback(HookManagerCallback):
         record: GradientRecord,
         target: Optional[Gradient] = None,
     ) -> torch.Tensor:
-        """Compute per-sample influence scores ``score[i] = ⟨∇W_i, ∇W_target⟩``.
+        """Compute per-sample influence scores ``score[i] = <dW_i, dW_target>``.
 
-        ``∇W_target`` is the sum of the target samples' gradients (the training
+        ``dW_target`` is the sum of the target samples' gradients (the training
         batch itself when ``target`` is ``None``).  The per-layer inner products
-        are delegated to :meth:`Gradient.similarity` — the single shared
-        implementation of factorized gradient similarity — and this method only
+        are delegated to :meth:`Gradient.similarity` -- the single shared
+        implementation of factorized gradient similarity -- and this method only
         sums each layer's cross-gram over the target batch and accumulates
         across layers.
 
         ``score_mode`` selects the :meth:`~Gradient.similarity` ``mode``
-        (``"ghost"`` → ``"factorized"``); both modes are numerically identical.
+        (``"ghost"`` -> ``"factorized"``); both modes are numerically identical.
 
         Args:
             record: Full-batch GradientRecord for this step.
-            target: Optional external target Gradient.  ``None`` → batch mode.
+            target: Optional external target Gradient.  ``None`` -> batch mode.
 
         Returns:
             Float tensor of shape (B,).
@@ -573,7 +573,7 @@ class DataSelectionCallback(HookManagerCallback):
         B = gradient.batch_size
         scores = torch.zeros(B)
         for matrix in per_layer.values():
-            # Sum over target samples → ⟨∇W_i, Σ_j ∇W_target_j⟩.
+            # Sum over target samples -> <dW_i, sum_j dW_target_j>.
             layer_scores = matrix.sum(1)
             # A layer whose gradient was summed over the batch during the forward
             # broadcast (e.g. GPT-2 wpe) yields fewer rows; every sample then
@@ -645,7 +645,7 @@ class DataSelectionCallback(HookManagerCallback):
         """Subtract the dropped samples' weight-gradient contribution.
 
         Uses :func:`ops.materialize` (``include_bias=False``) for the per-sample
-        weight gradient, then maps it onto ``weight.grad``'s natural shape — a
+        weight gradient, then maps it onto ``weight.grad``'s natural shape -- a
         vocab-row slice for embeddings, a position-sum for norms, a transpose
         for HuggingFace ``Conv1D``, and a plain ``reshape_as`` otherwise.
         """
@@ -653,7 +653,7 @@ class DataSelectionCallback(HookManagerCallback):
         if weight is None or weight.grad is None:
             return
 
-        # (n, d_weight); sum over the dropped samples → (d_weight,).
+        # (n, d_weight); sum over the dropped samples -> (d_weight,).
         contrib = ops.materialize(
             Factorized(a_d, g_d, module_kwargs), layer_type, include_bias=False
         ).sum(0)
@@ -710,9 +710,9 @@ class DataSelectionCallback(HookManagerCallback):
     # ---------------------------------------------------------------------- #
     #
     # Under ``FullyShardedDataParallel`` (``use_orig_params=True``) each
-    # original ``param.grad`` is a 1-D *shard* — a contiguous slice of the
-    # flattened, unsharded parameter — holding FSDP's *averaged* gradient
-    # ``(1/world_size) · Σ_r G_r`` for that slice.  A dropped sample lives on a
+    # original ``param.grad`` is a 1-D *shard* -- a contiguous slice of the
+    # flattened, unsharded parameter -- holding FSDP's *averaged* gradient
+    # ``(1/world_size) * sum_r G_r`` for that slice.  A dropped sample lives on a
     # single rank, but the weight elements its gradient touches may be owned by
     # a *different* rank's shard, so removal cannot be done rank-locally.
     #
@@ -720,7 +720,7 @@ class DataSelectionCallback(HookManagerCallback):
     # dropped samples, the contributions are summed across ranks with a single
     # ``all_reduce`` and rescaled by ``1/world_size`` to match FSDP's averaging,
     # and every rank then subtracts the slice covering the elements it owns.
-    # The result equals ``(1/world_size) · Σ_r G_r^kept`` shard-for-shard.
+    # The result equals ``(1/world_size) * sum_r G_r^kept`` shard-for-shard.
     #
     # The collectives run on *every* step the callback is active (with zero
     # contributions when no rank dropped anything) so all ranks stay in
@@ -811,8 +811,8 @@ class DataSelectionCallback(HookManagerCallback):
 
         Each contribution is the *full*, unsharded parameter-gradient of this
         rank's dropped samples, flattened in the parameter's natural C-order
-        (zeros when this rank dropped nothing).  The entry list — params and
-        their full sizes — depends only on model structure and is therefore
+        (zeros when this rank dropped nothing).  The entry list -- params and
+        their full sizes -- depends only on model structure and is therefore
         identical across ranks, which keeps the packed ``all_reduce`` aligned.
         """
         B = record.gradient.batch_size
@@ -876,7 +876,7 @@ class DataSelectionCallback(HookManagerCallback):
         ).sum(0)
         if ops.is_embedding(layer_type):
             # materialize scatters into rows 0..max_token, flattened row-major
-            # — already aligned with the start of the flattened weight.
+            # -- already aligned with the start of the flattened weight.
             return contrib, 0
         if ops.is_norm(layer_type):
             wnum = math.prod(full_shape)

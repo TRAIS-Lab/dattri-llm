@@ -68,11 +68,11 @@ if __name__ == "__main__":
         tmp = pathlib.Path(tmp)
         train_dir, test_dir = str(tmp / "train_grads"), str(tmp / "test_grads")
 
-        # Stage 1 — collect per-sample gradients to disk.  HookManager captures
+        # Stage 1 -- collect per-sample gradients to disk.  HookManager captures
         # the factorized per-sample gradients during one full-batch backward;
         # OffloadCallback persists them via GradientFileManager.  The loss is a
         # SUM over samples so each captured gradient is that sample's own dL_i/dW.
-        print("Stage 1 — collecting per-sample gradients to disk")
+        print("Stage 1 -- collecting per-sample gradients to disk")
         print("-" * 50)
         for split, x, y, out_dir in [("train", x_tr, y_tr, train_dir),
                                      ("test", x_te, y_te, test_dir)]:
@@ -92,7 +92,7 @@ if __name__ == "__main__":
             print(f"{split:<8}{len(fm.index)} sample records, steps={fm.available_steps()}")
         print("-" * 50)
 
-        # Stage 2 — attribute from the cached gradients.  No model or backward
+        # Stage 2 -- attribute from the cached gradients.  No model or backward
         # pass is needed; the score is <g_train_i, g_test_j> per pair.  Because
         # the gradients live on disk, this stage can be re-run with different
         # settings (e.g. layer_name=[...] or normalized_grad=True) for free.
@@ -112,7 +112,7 @@ if __name__ == "__main__":
         te_hashes = hash_batch({"x": x_te, "y": y_te})
         matrix = score.query(tr_hashes, te_hashes, trajectory="agnostic")
 
-        print("\nStage 2 — TracIn score[train i, test j]")
+        print("\nStage 2 -- TracIn score[train i, test j]")
         header = f"{'':<10}" + "".join(f"{f'test{j}':>12}" for j in range(n_test))
         print("-" * len(header))
         print(header)

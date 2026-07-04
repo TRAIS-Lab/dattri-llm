@@ -1,12 +1,12 @@
 """This example shows gradient collection around the OLMo Trainer.
 
-The training loop is NOT modified — TDA is added by wrapping trainer.fit() in a
+The training loop is NOT modified -- TDA is added by wrapping trainer.fit() in a
 HookManager collection context.  A tiny OLMo model is built entirely in Python
 (no config YAML) and trained with the real OLMo Trainer on CPU; OLMo's
 feed-forward projections (ff_proj / ff_out inside transformer.blocks.<i>) are
 selected by regex.
 
-Note: this file must not be named ``olmo.py`` — it would shadow the ai2-olmo
+Note: this file must not be named ``olmo.py`` -- it would shadow the ai2-olmo
 package on import.
 
 Run (with ai2-olmo installed):
@@ -54,7 +54,7 @@ if __name__ == "__main__":
     os.environ.setdefault("MASTER_PORT", "29511")
     dist.init_process_group("gloo", rank=0, world_size=1)
 
-    # a hard-coded tiny TrainConfig: 2 layers, d_model=64 — runs on CPU in
+    # a hard-coded tiny TrainConfig: 2 layers, d_model=64 -- runs on CPU in
     # seconds; checkpointing is disabled so no persistent save_folder is needed
     cfg = TrainConfig(
         model=ModelConfig(
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     )
 
     with tempfile.TemporaryDirectory() as grad_dir:
-        # select OLMo's feed-forward projections by regex — the layers live at
+        # select OLMo's feed-forward projections by regex -- the layers live at
         # transformer.blocks.<i>.ff_proj / ff_out and are plain nn.Linear, so
         # the factorized ("ghost") linear_io hooks apply directly
         fm = GradientFileManager(grad_dir)
@@ -122,9 +122,9 @@ if __name__ == "__main__":
             trainer.fit()
         collector.remove()
 
-        # Retrieval: the content hash of ONE sample's model inputs — here
+        # Retrieval: the content hash of ONE sample's model inputs -- here
         # simply sequences[0], since OLMo's train step feeds the model
-        # input_ids — identifies the sample independently of where shuffling
+        # input_ids -- identifies the sample independently of where shuffling
         # put it; lookup() then reveals every (step, sample_idx) position it was
         # recorded at, and load_sample() retrieves each pair's gradient by
         # direct slicing.

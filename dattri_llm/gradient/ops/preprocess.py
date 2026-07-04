@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 def _conv1d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
-    """Unfold a raw Conv1d input (N, C_in, L_in) → (N, L_out, C_in*k)."""
+    """Unfold a raw Conv1d input (N, C_in, L_in) -> (N, L_out, C_in*k)."""
     N, C_in, _ = x.shape
     k, s, p, d = (kwargs["kernel_size"][0], kwargs["stride"][0],
                   kwargs["padding"][0], kwargs["dilation"][0])
@@ -45,14 +45,14 @@ def _conv1d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
 
 
 def _conv2d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
-    """Unfold a raw Conv2d input (N, C_in, H, W) → (N, L_out, C_in*kH*kW)."""
+    """Unfold a raw Conv2d input (N, C_in, H, W) -> (N, L_out, C_in*kH*kW)."""
     unf = F.unfold(x, kwargs["kernel_size"], kwargs["dilation"],
                    kwargs["padding"], kwargs["stride"])
     return unf.permute(0, 2, 1).contiguous()   # (N, L, C_in*kH*kW)
 
 
 def _conv3d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
-    """Unfold a raw Conv3d input (N, C_in, D, H, W) → (N, L_out, C_in*kD*kH*kW)."""
+    """Unfold a raw Conv3d input (N, C_in, D, H, W) -> (N, L_out, C_in*kD*kH*kW)."""
     N, C_in = x.shape[:2]
     kD, kH, kW = kwargs["kernel_size"]
     sD, sH, sW = kwargs["stride"]
@@ -81,8 +81,8 @@ def _conv3d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
     return patches.reshape(N, L_out, C_in * kD * kH * kW)
 
 
-# Spatial-rank → im2col helper.  Keyed by the trailing digit of the layer-type
-# string ("nn.Conv2d" / "nn.ConvTranspose2d" → 2).
+# Spatial-rank -> im2col helper.  Keyed by the trailing digit of the layer-type
+# string ("nn.Conv2d" / "nn.ConvTranspose2d" -> 2).
 _CONV_IM2COL = {1: _conv1d_im2col, 2: _conv2d_im2col, 3: _conv3d_im2col}
 
 
@@ -133,21 +133,21 @@ def _preprocess_conv_transpose(
     regular convolution: the *output gradient* is unfolded into kernel patches
     while the input is merely flattened over spatial locations.  This yields
 
-        a ∈ (N, L, C_in),   g ∈ (N, L, C_out·∏K),
+        a in (N, L, C_in),   g in (N, L, C_out*prod(K)),
 
-    where ``L`` is the number of input spatial locations and ``∇W = Σ_ℓ aᵀg``.
+    where ``L`` is the number of input spatial locations and ``dW = sum_l a^Tg``.
 
-    Bias cannot be folded by a single ones column because ``∇b`` has dimension
-    ``C_out`` (not ``C_out·∏K``).  Following the factorized-gradient formulation
+    Bias cannot be folded by a single ones column because ``db`` has dimension
+    ``C_out`` (not ``C_out*prod(K)``).  Following the factorized-gradient formulation
     we instead extend both factors with one extra location and feature block so
     the bias gradient is stored jointly:
 
-        ã ∈ (N, L+1, C_in+1),   g̃ ∈ (N, L+1, C_out·∏K + C_out).
+        a_tilde in (N, L+1, C_in+1),   g_tilde in (N, L+1, C_out*prod(K) + C_out).
     """
     rank = _conv_spatial_rank(layer_type)
     n, c_in = a.shape[:2]
     a_flat = a.reshape(n, c_in, -1).permute(0, 2, 1).contiguous()   # (N, L, C_in)
-    g_unf = _CONV_IM2COL[rank](g, module_kwargs)                    # (N, L, C_out*∏K)
+    g_unf = _CONV_IM2COL[rank](g, module_kwargs)                    # (N, L, C_out*prod(K))
     if not has_bias:
         return a_flat, g_unf
 
@@ -178,7 +178,7 @@ def _preprocess_conv_transpose(
 def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
     """Extract the minimal hyperparameters from *module* needed by :func:`_preprocess_factorized`.
 
-    Returns a plain serialisable dict — no reference to the module object is
+    Returns a plain serialisable dict -- no reference to the module object is
     retained, so the result can be pickled cheaply alongside gradient tensors.
 
     Args:
@@ -228,14 +228,14 @@ def _preprocess_factorized(
     ``grad_output[0]``).  Before the factorised data can be passed to the ops
     functions in this module, layer-specific transforms are applied:
 
-    * **LayerNorm / RMSNorm**: normalise ``a`` → ``x̂`` (RMSNorm omits the mean
+    * **LayerNorm / RMSNorm**: normalise ``a`` -> ``x_hat`` (RMSNorm omits the mean
       subtraction).  With bias, append a ones block to ``a`` and duplicate ``g``
-      so ``a ⊙ g = [∇γ, ∇β]`` per position.
-    * **GroupNorm / InstanceNorm**: normalise per group/channel → ``x̂``, then
+      so ``a * g = [dgamma, dbeta]`` per position.
+    * **GroupNorm / InstanceNorm**: normalise per group/channel -> ``x_hat``, then
       lay out spatial locations as the token dimension ``(N, S, C)``.  Bias is
       folded as for LayerNorm but in the channel dimension.
     * **Linear types with bias**: append a ones column to ``a`` so the last
-      column of ``∇W̃ = g ãᵀ`` recovers ``∇b``.
+      column of ``dW_tilde = g a_tilde^T`` recovers ``db``.
     * **Conv1d / Conv2d / Conv3d**: run im2col on ``a`` to get the unfolded
       ``(N, L, patch_size)`` form; reshape ``g`` to ``(N, L, C_out)``; append a
       ones column to ``a`` if the layer has a bias.
@@ -267,7 +267,7 @@ def _preprocess_factorized(
 
     has_bias = module_kwargs.get("has_bias", False) and include_bias
 
-    # ── Normalisation layers ────────────────────────────────────────────────
+    # -- Normalisation layers ------------------------------------------------
     if layer_type == "nn.LayerNorm":
         x_hat = _compute_layer_norm_x_hat(
             a,
@@ -297,14 +297,14 @@ def _preprocess_factorized(
         )
         return _augment_channel_norm(x_hat, g, has_bias)
 
-    # ── Embedding bag ───────────────────────────────────────────────────────
+    # -- Embedding bag -------------------------------------------------------
     if layer_type == "nn.EmbeddingBag":
         return _preprocess_embedding_bag(a, g, module_kwargs.get("mode", "mean"))
 
-    # ── Convolution ─────────────────────────────────────────────────────────
+    # -- Convolution ---------------------------------------------------------
     if layer_type in CONV_TYPES:
         rank = _conv_spatial_rank(layer_type)
-        a_unf = _CONV_IM2COL[rank](a, module_kwargs)            # (N, L, C_in*∏K)
+        a_unf = _CONV_IM2COL[rank](a, module_kwargs)            # (N, L, C_in*prod(K))
         n, c_out = g.shape[0], g.shape[1]
         g_out = g.reshape(n, c_out, -1).permute(0, 2, 1).contiguous()  # (N, L, C_out)
         if has_bias:
@@ -314,7 +314,7 @@ def _preprocess_factorized(
     if layer_type in CONV_TRANSPOSE_TYPES:
         return _preprocess_conv_transpose(a, g, layer_type, module_kwargs, has_bias)
 
-    # ── Linear with bias ────────────────────────────────────────────────────
+    # -- Linear with bias ----------------------------------------------------
     if is_linear(layer_type) and has_bias:
         return torch.cat([a, torch.ones_like(a[..., :1])], dim=-1), g
 
@@ -344,7 +344,7 @@ def _to_3d(x: torch.Tensor) -> torch.Tensor:
 # :class:`~dattri_llm.gradient.gradient.Factorized` container instead: they call
 # :meth:`Factorized.as_batch_first` to normalise a sequence-first capture, unpack
 # ``module_kwargs``, and delegate to the private version.  These are the entry
-# points to prefer — the call is both shorter and automatically correct for
+# points to prefer -- the call is both shorter and automatically correct for
 # non-batch-first layers, so nothing downstream needs to reason about tensor
 # layout.  Reach for the raw ``_``-prefixed kernels only when you already hold
 # bare, batch-first factor tensors (e.g. inside another kernel).

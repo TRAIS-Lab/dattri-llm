@@ -2,25 +2,25 @@
 
 Two low-level hook families are provided:
 
-Linear-IO factorized hooks — ``register_linear_io_hooks``
+Linear-IO factorized hooks -- ``register_linear_io_hooks``
 ---------------------------------------------------------
 Registers forward and backward hooks on linear-family layers (``nn.Linear``,
-``nn.Conv*``, ``nn.Embedding``, norm layers, …) to capture the input
+``nn.Conv*``, ``nn.Embedding``, norm layers, ...) to capture the input
 activations and output gradients needed for the outer-product identity:
 
-    dL/dW ≈ g^T ⊗ a    (per sample)
+    dL/dW ~ g^T x a    (per sample)
 
 DataParallel support: each replica fires its hooks in a separate thread.
 The hooks accumulate all replica calls in ``_act_parts`` / ``_grad_parts``
 (thread-safe, tagged by source device index) rather than overwriting a single
-slot.  Single-GPU and DDP usage is unaffected — the lists always hold one
+slot.  Single-GPU and DDP usage is unaffected -- the lists always hold one
 element in those cases.
 
-Parameter gradient hooks — ``register_param_grad_hooks``
+Parameter gradient hooks -- ``register_param_grad_hooks``
 ---------------------------------------------------------
 Registers ``Tensor.register_hook`` on the *parameters* of general modules.
 The hook fires during the backward pass immediately after each parameter's
-gradient is freshly computed — not a post-backward ``.grad`` read, which can
+gradient is freshly computed -- not a post-backward ``.grad`` read, which can
 be ``None`` on the first call or hold a stale accumulated value from the
 previous step.
 
@@ -64,7 +64,7 @@ def _queue_backward_end_callback(fn: Callable[[], None]) -> bool:
     """Schedule ``fn`` to run once the in-flight backward pass fully completes.
 
     Must be called from *within* a backward pass (e.g. a module full-backward
-    hook).  The callback fires after the autograd engine has finished — the
+    hook).  The callback fires after the autograd engine has finished -- the
     point at which FSDP has written every (sharded) ``param.grad`` back to its
     original parameter, so reading ``param.grad`` inside ``fn`` is safe.
 
@@ -78,14 +78,14 @@ def _queue_backward_end_callback(fn: Callable[[], None]) -> bool:
     except Exception:  # pragma: no cover - unexpected autograd internals
         return False
 
-# ── Linear-IO-capable types ─────────────────────────────────────────────────
+# -- Linear-IO-capable types -------------------------------------------------
 # Layers whose per-sample gradient factorises as an outer product of the input
-# activation and the output gradient (``dL/dW ≈ g^T ⊗ a``).  These are the
+# activation and the output gradient (``dL/dW ~ g^T x a``).  These are the
 # layers that can be hooked with the ``linear_io`` family.  Any layer (whether
 # or not it appears here) can instead be hooked with the ``param_grad`` family,
 # which materialises the batch-level parameter gradient directly.
 #
-# Membership is decided purely by type — never by the module's name in the
+# Membership is decided purely by type -- never by the module's name in the
 # graph, which is arbitrary.
 _LINEAR_IO_TYPES: tuple[type, ...] = (
     nn.Embedding,
@@ -104,7 +104,7 @@ _LINEAR_IO_TYPES: tuple[type, ...] = (
     nn.ConvTranspose2d,
     nn.ConvTranspose3d,
 ) + ((HF_Conv1D,) if HF_Conv1D is not None else ())
-# RMSNorm was added in PyTorch 2.4 — guard for older versions.
+# RMSNorm was added in PyTorch 2.4 -- guard for older versions.
 if hasattr(nn, "RMSNorm"):
     _LINEAR_IO_TYPES = _LINEAR_IO_TYPES + (nn.RMSNorm,)  # type: ignore[assignment]
 
@@ -144,10 +144,10 @@ def _make_layer_buffer() -> LayerBuffer:
         # Projected per-sample gradient parts for a materialized (TRAK) layer;
         # for factorized (LoGRA) layers the projected factors live in
         # _act_parts/_grad_parts (already projected).  ``_proj_kw`` is the layer's
-        # resolved proj_kwargs (or None to capture raw factors as before).
+        # resolved proj_kwargs (or None to capture raw factors).
         # ``_device_id`` maps each replica's device id to a stack of on-device
         # forward activations, so the backward hook can pair (a, g) *per device*
-        # (LIFO) before projecting — a single shared slot would race across DDP
+        # (LIFO) before projecting -- a single shared slot would race across DDP
         # replica threads and drop calls for layers invoked more than once.
         "_proj_parts": [],
         "_proj_kw": None,
@@ -177,7 +177,7 @@ def register_linear_io_hooks(
     Optionally, user-supplied ``on_layer_forward`` and ``on_layer_backward``
     callables fire inside each hook with ``(layer_name, cpu_tensor)``
     immediately after capture.  Because these callables execute inside a
-    PyTorch hook they are trainer-agnostic — no trainer callback system is
+    PyTorch hook they are trainer-agnostic -- no trainer callback system is
     required.
 
     Args:
@@ -250,7 +250,7 @@ def register_linear_io_hooks(
                     # backward hook projects (a, g) together; the full factor is
                     # never buffered.  A per-device *stack* pairs each call's a
                     # with its g even when a layer is invoked multiple times per
-                    # forward (weight tying / RNN unroll) — backward pops in the
+                    # forward (weight tying / RNN unroll) -- backward pops in the
                     # reverse (LIFO) order the forwards ran.
                     with buf["_lock"]:
                         buf["_device_id"].setdefault(dev_idx, []).append(a)
@@ -289,14 +289,14 @@ def _capture_projected(
     matching per-replica forward activation.  For a **factorized** (LoGRA) layer
     the projected factors are appended to ``_act_parts``/``_grad_parts``; for a
     **materialized** (TRAK) layer the projected per-sample gradient is appended to
-    ``_proj_parts``.  Only the small projected result is retained on CPU — the raw
+    ``_proj_parts``.  Only the small projected result is retained on CPU -- the raw
     factors are discarded here, so the buffer never holds the full gradient.
     """
     with buf["_lock"]:
         stack = buf["_device_id"].get(dev_idx)
         a = stack.pop() if stack else None
     if a is None:
-        return   # backward without a matching forward capture — nothing to project
+        return   # backward without a matching forward capture -- nothing to project
 
     kw = dict(buf["_proj_kw"])
     factorize = kw.pop("factorize", True)
@@ -429,9 +429,9 @@ def register_linear_param_hooks(
     Unlike :func:`register_param_grad_hooks`, which uses
     ``Tensor.register_hook`` (fires *before* ``param.grad`` is accumulated),
     this function uses ``Tensor.register_post_accumulate_grad_hook``
-    (PyTorch ≥ 2.0) which fires *after* ``param.grad`` is written.
+    (PyTorch >= 2.0) which fires *after* ``param.grad`` is written.
 
-    This guarantees that when the callback runs, ``param.grad`` is non-None —
+    This guarantees that when the callback runs, ``param.grad`` is non-None --
     a precondition for any callback that needs to read or modify weight
     gradients in-place (e.g. :class:`~dattri_llm.gradient.callbacks.DataSelectionCallback`).
 

@@ -8,7 +8,7 @@ import torch
 def hash_sample(inputs: dict[str, torch.Tensor]) -> str:
     """SHA-256 content hash identifying **one sample** by its model inputs.
 
-    *inputs* holds a single sample's tensors — e.g. what ``dataset[i]`` yields,
+    *inputs* holds a single sample's tensors -- e.g. what ``dataset[i]`` yields,
     or one row sliced out of a batch.  All tensor fields are digested, sorted
     by key for determinism; non-tensor values are skipped.  The digest is over
     raw bytes, so the same sample hashes identically wherever shuffling put

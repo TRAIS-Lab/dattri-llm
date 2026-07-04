@@ -490,7 +490,7 @@ class TestAggregate:
             assert v.shape == (B, O * I)
 
     def test_aggregate_is_token_sum(self):
-        # Aggregation is the chain rule: the token axis is summed out —
+        # Aggregation is the chain rule: the token axis is summed out --
         # normalization (mean/masked losses) lives in the captured gradients.
         g = make_gradient(indexing="batch_token")
         ga = g.aggregate(dim="token")
@@ -581,8 +581,8 @@ class TestSlice:
         assert gs.representation == g.representation
 
     def test_batch_slice_copies_broadcast_layer(self):
-        # A broadcast (batch-1) layer — e.g. a positional embedding fed an
-        # unbatched index tensor — shares its single row across the batch, so
+        # A broadcast (batch-1) layer -- e.g. a positional embedding fed an
+        # unbatched index tensor -- shares its single row across the batch, so
         # slicing any sample must copy that row instead of raising IndexError.
         Bn, Tn, Dn = 4, 3, 5
         fc = Factorized(torch.randn(Bn, Tn, Dn), torch.randn(Bn, Tn, Dn))
@@ -693,8 +693,8 @@ class TestBroadcastConcatenate:
             g1.concatenate(g2, dim="batch")
 
     def test_genuine_batch_one_gradients_still_cat(self):
-        """Two all-batch-1 gradients are NOT broadcast — they concatenate to
-        batch 2 exactly as before."""
+        """Two all-batch-1 gradients are NOT broadcast -- they concatenate to
+        batch 2."""
         g1, g2 = _broadcast_gradient(1, seed=0), _broadcast_gradient(1, seed=1)
         out = g1.concatenate(g2, dim="batch")
         assert out.batch_size == 2
@@ -727,7 +727,7 @@ class TestBroadcastSimilarity:
 
 
 class TestSimilarity:
-    """Gradient.similarity — the cross-gram gradient-similarity primitive."""
+    """Gradient.similarity -- the cross-gram gradient-similarity primitive."""
 
     def test_diagonal_equals_aligned_dot(self):
         """The diagonal of the self cross-gram equals the aligned per-sample dot."""
@@ -784,7 +784,7 @@ class TestSimilarity:
         cross = g.similarity(other)
         assert set(cross.keys()) == {"l1"}
 
-    # ── metric ──────────────────────────────────────────────────────────────
+    # -- metric --------------------------------------------------------------
 
     def test_cosine_self_diagonal_is_one(self):
         """Cosine similarity of each sample with itself is 1."""
@@ -810,7 +810,7 @@ class TestSimilarity:
         for name in fac:
             assert torch.allclose(fac[name], mat[name], atol=1e-4, rtol=1e-4)
 
-    # ── reduce ──────────────────────────────────────────────────────────────
+    # -- reduce --------------------------------------------------------------
 
     def test_reduce_none_returns_per_layer_matrices(self):
         g = make_gradient(repr_type="factorized")
@@ -820,7 +820,7 @@ class TestSimilarity:
             assert matrix.shape == (B, B)
 
     def test_reduce_all_returns_single_matrix(self):
-        """`reduce="all"` returns one (B_self, B_other) matrix, not a dict."""
+        """``reduce="all"`` returns one (B_self, B_other) matrix, not a dict."""
         g = make_gradient(repr_type="factorized")
         out = g.similarity(g, reduce="all")
         assert isinstance(out, torch.Tensor)
@@ -841,7 +841,7 @@ class TestSimilarity:
         with pytest.raises(ValueError, match="No shared layers"):
             g.similarity(other, reduce="all")
 
-    # ── validation ──────────────────────────────────────────────────────────
+    # -- validation ----------------------------------------------------------
 
     def test_invalid_arguments_raise(self):
         g = make_gradient(repr_type="factorized")
@@ -854,13 +854,13 @@ class TestSimilarity:
 
 
 # --------------------------------------------------------------------------- #
-# batch_first — sequence-first ``(T, B, ...)`` captures                         #
+# batch_first -- sequence-first ``(T, B, ...)`` captures                         #
 # --------------------------------------------------------------------------- #
 
 
 def _seq_first_pair():
     """Return (batch_first_grad, seq_first_grad) holding the *same* underlying
-    per-sample gradient for one ``batch_token`` linear layer — the seq-first one
+    per-sample gradient for one ``batch_token`` linear layer -- the seq-first one
     is the batch-first factors with the leading two axes swapped."""
     torch.manual_seed(0)
     a = torch.randn(B, T, I)

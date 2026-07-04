@@ -18,9 +18,9 @@ Three built-in callbacks are provided:
 
     Two scoring modes are available via ``score_mode``:
 
-    * ``"ghost"`` (default) — gram-matrix form, no weight-gradient
+    * ``"ghost"`` (default) -- gram-matrix form, no weight-gradient
       materialisation. Cost O((B*T)^2 * (out + in)) per layer.
-    * ``"materialized"`` — builds the explicit per-sample weight gradient
+    * ``"materialized"`` -- builds the explicit per-sample weight gradient
       and dots it against the batch gradient. Easier to verify but uses
       more memory.
 

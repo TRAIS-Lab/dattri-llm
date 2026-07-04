@@ -24,7 +24,7 @@ from dattri_llm.gradient.hooks import (
 
 
 # --------------------------------------------------------------------------- #
-# _is_linear_io_capable — purely type-based, never name-based                  #
+# _is_linear_io_capable -- purely type-based, never name-based                  #
 # --------------------------------------------------------------------------- #
 
 
@@ -132,7 +132,7 @@ class TestResolveHookAssignments:
             )
 
     def test_explicit_incapable_layer_raises(self, tiny_model):
-        # mlp.1 is a ReLU — cannot support linear_io.
+        # mlp.1 is a ReLU -- cannot support linear_io.
         with pytest.raises(ValueError, match="does not support"):
             resolve_hook_assignments(
                 tiny_model, HookManagerConfig(hook_types={"mlp.1": "linear_io"})
@@ -164,7 +164,7 @@ class TestRegisterLinearIoHooks:
     def test_hooks_registered_on_all_linear_layers(self, tiny_model):
         buffers, handles = register_linear_io_hooks(tiny_model)
         # TinyMLP linear-family layers: embedding, attn_proj, mlp.0, mlp.2,
-        # lm_head.  mlp.1 is ReLU → skipped.
+        # lm_head.  mlp.1 is ReLU -> skipped.
         assert set(buffers) == {
             "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
         }
@@ -189,7 +189,7 @@ class TestRegisterLinearIoHooks:
         B, T = tiny_batch["input_ids"].shape
         tiny_model(tiny_batch["input_ids"]).mean().backward()
 
-        # mlp.0: Linear(16, 32) → activation shape (B, T, 16)
+        # mlp.0: Linear(16, 32) -> activation shape (B, T, 16)
         act = buffers["mlp.0"]["activation"]
         assert act.shape == (B, T, 16)
         remove_hooks(handles)
@@ -199,7 +199,7 @@ class TestRegisterLinearIoHooks:
         B, T = tiny_batch["input_ids"].shape
         tiny_model(tiny_batch["input_ids"]).mean().backward()
 
-        # mlp.0: output dim 32 → grad_output shape (B, T, 32)
+        # mlp.0: output dim 32 -> grad_output shape (B, T, 32)
         go = buffers["mlp.0"]["grad_output"]
         assert go.shape == (B, T, 32)
         remove_hooks(handles)
@@ -320,7 +320,7 @@ class TestRegisterParamGradHooks:
         # Freeze mlp.0 and verify it produces no buffer entry.
         tiny_model.mlp[0].weight.requires_grad_(False)
         buffers, handles = register_param_grad_hooks(tiny_model, layer_names={"mlp.0"})
-        # mlp.0 has no trainable params → no buffer created for it.
+        # mlp.0 has no trainable params -> no buffer created for it.
         assert "mlp.0" not in buffers
         tiny_model.mlp[0].weight.requires_grad_(True)  # restore
         remove_hooks(handles)
@@ -341,7 +341,7 @@ class TestRegisterParamGradHooks:
     def test_remove_hooks_stops_updates(self, tiny_model, tiny_batch):
         buffers, handles = register_param_grad_hooks(tiny_model, layer_names={"mlp.0"})
         remove_hooks(handles)
-        # Run backward after removal — buffer should stay None.
+        # Run backward after removal -- buffer should stay None.
         tiny_model(tiny_batch["input_ids"]).mean().backward()
         assert buffers["mlp.0"]["weight"] is None
 
@@ -360,7 +360,7 @@ class TestRegisterParamGradHooks:
 class _GhostLinearModel(nn.Module):
     """A model whose ``ghost`` Linear is applied functionally, not as a module.
 
-    ``ghost``'s forward/backward hooks therefore never fire — the situation that
+    ``ghost``'s forward/backward hooks therefore never fire -- the situation that
     stalls HookManager step completion (cf. ``MultiheadAttention.out_proj``).
     """
 
@@ -371,7 +371,7 @@ class _GhostLinearModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.used(x)
-        # Apply ghost's weight functionally — its module hooks do not fire.
+        # Apply ghost's weight functionally -- its module hooks do not fire.
         return F.linear(x, self.ghost.weight, self.ghost.bias)
 
 
@@ -381,7 +381,7 @@ class TestDefaultHookAssignment:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             assignment = default_hook_assignment(model, torch.randn(2, 4))
-        # 'used' is a real module call → kept; 'ghost' never fires → skipped.
+        # 'used' is a real module call -> kept; 'ghost' never fires -> skipped.
         assert assignment == {"used": "linear_io"}
         assert any("ghost" in str(w.message) for w in caught)
 
@@ -436,14 +436,14 @@ class TestDefaultHookAssignment:
 
         model = _CustomParam()
         assignment = default_hook_assignment(model, torch.randn(2, 4))
-        # The container owns 'scale' directly (not linear-IO-capable) → param_grad;
-        # the Linear is a real module call → linear_io.
+        # The container owns 'scale' directly (not linear-IO-capable) -> param_grad;
+        # the Linear is a real module call -> linear_io.
         assert assignment[""] == "param_grad"
         assert assignment["lin"] == "linear_io"
 
 
 # --------------------------------------------------------------------------- #
-# HookManagerConfig.layer_types — manual layer-type overrides                  #
+# HookManagerConfig.layer_types -- manual layer-type overrides                  #
 # --------------------------------------------------------------------------- #
 
 
@@ -454,7 +454,7 @@ class _CustomLinear(nn.Linear):
 
 
 class _CustomLinearModel(nn.Module):
-    """``embedding → custom (CustomLinear) → lm_head``."""
+    """``embedding -> custom (CustomLinear) -> lm_head``."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -563,7 +563,7 @@ class TestNoGradForwardSkipped:
 
 
 # --------------------------------------------------------------------------- #
-# linear_io hooks skip frozen (non-trainable) layers — LoRA / frozen backbones  #
+# linear_io hooks skip frozen (non-trainable) layers -- LoRA / frozen backbones  #
 # --------------------------------------------------------------------------- #
 
 
@@ -571,7 +571,7 @@ class TestTrainabilityFilter:
     def test_frozen_leading_layer_skipped_and_completes(self):
         # A frozen layer fed a leaf input never fires its backward (its output
         # needs no grad), which would stall completion if it were hooked.  It must
-        # be skipped, leaving only the trainable layer — mirrors a LoRA base_layer.
+        # be skipped, leaving only the trainable layer -- mirrors a LoRA base_layer.
         model = nn.Sequential()
         model.add_module("frozen", nn.Linear(8, 8, bias=False))
         model.add_module("trainable", nn.Linear(8, 4, bias=False))
@@ -631,7 +631,7 @@ class TestTrainabilityFilter:
 
 
 # --------------------------------------------------------------------------- #
-# HookManagerConfig(projection=...) — per-layer random projection on capture    #
+# HookManagerConfig(projection=...) -- per-layer random projection on capture    #
 # --------------------------------------------------------------------------- #
 
 
@@ -706,7 +706,7 @@ class TestProjectionConfig:
     @pytest.mark.parametrize("factorize", [True, False])
     def test_capture_time_equals_assembly_time_projection(self, factorize):
         # Projecting at capture (per micro-batch) must be bit-identical to
-        # projecting the fully-assembled gradient — project(cat) == cat(project).
+        # projecting the fully-assembled gradient -- project(cat) == cat(project).
         from dattri.func.projection import random_project
         from dattri_llm.gradient import ops
         from dattri_llm.gradient.gradient import Factorized
@@ -740,7 +740,7 @@ class TestProjectionConfig:
 
 
 # --------------------------------------------------------------------------- #
-# HookManager(non_batch_first_layers=...) — sequence-first captures            #
+# HookManager(non_batch_first_layers=...) -- sequence-first captures            #
 # --------------------------------------------------------------------------- #
 
 
@@ -754,7 +754,7 @@ class _SeqFirstModel(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embedding(input_ids)        # (B, T, d)
-        x = x.transpose(0, 1)                # (T, B, d) — sequence-first
+        x = x.transpose(0, 1)                # (T, B, d) -- sequence-first
         x = self.proj(x)
         return x.transpose(0, 1)
 
@@ -807,7 +807,7 @@ class _NanoGPT(nn.Module):
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         _B, T = idx.shape
-        pos = torch.arange(0, T, dtype=torch.long)        # (T,) — no batch dim
+        pos = torch.arange(0, T, dtype=torch.long)        # (T,) -- no batch dim
         return self.head(self.wte(idx) + self.wpe(pos))   # broadcast add
 
 

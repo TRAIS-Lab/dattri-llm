@@ -1,4 +1,4 @@
-"""On-disk Gradient datasets — file-level reading of stored gradient records.
+"""On-disk Gradient datasets -- file-level reading of stored gradient records.
 
 Shared building blocks for consumers of pre-collected on-disk gradients (the
 :class:`~dattri_llm.gradient.streaming.DiskGradientSource`, and through it the
@@ -38,8 +38,8 @@ def identity_collate(batch: list) -> object:
 class GradientFileDataset(Dataset):
     """Yields ``(Gradient_block, hashes)`` for each on-disk file at one step.
 
-    Exposes one *file* per item — a single :func:`torch.load` yields a whole
-    batch block — so a standard :class:`~torch.utils.data.DataLoader` with
+    Exposes one *file* per item -- a single :func:`torch.load` yields a whole
+    batch block -- so a standard :class:`~torch.utils.data.DataLoader` with
     ``num_workers > 0`` can prefetch files in parallel and an attributor can
     stream blocks without stacking a full train/test side into one tensor.
 
@@ -194,7 +194,7 @@ def resolve_steps(
     requested steps are intersected with what is available, so an over-specified
     range (e.g. ``range(0, 1000)`` against checkpoints saved every 50 steps) is
     accepted and simply keeps the steps that exist.  An empty intersection is an
-    error — it almost always means a typo'd or wrong step set.
+    error -- it almost always means a typo'd or wrong step set.
 
     Args:
         file_manager: Manager opened on the gradient directory.

@@ -29,8 +29,8 @@ def normalize_layer_names(
 
 
 def task_loss_fn(func: Callable) -> Callable:
-    """Adapt a dattri ``AttributionTask`` loss/target — ``(params, data) -> loss``
-    (functorch style) — to the streamer's ``(model, batch) -> loss``.
+    """Adapt a dattri ``AttributionTask`` loss/target -- ``(params, data) -> loss``
+    (functorch style) -- to the streamer's ``(model, batch) -> loss``.
 
     The streamer drives a live model, so we call *func* with that model's current
     parameters; *func* runs the same ``functional_call`` forward the task defines,
@@ -47,7 +47,7 @@ def collect_to_disk(streamer, file_manager: GradientFileManager) -> None:
 
     Iterates ``streamer`` (entering/exiting its context here, so pass a freshly
     built one), saving each ``(step, Gradient, hashes)`` block as a
-    :class:`GradientRecord` stamped with the streamer's *semantic* step label —
+    :class:`GradientRecord` stamped with the streamer's *semantic* step label --
     the checkpoint index for a frozen probe, or the optimizer-step index for a
     training trajectory.  This is the shared engine of every attributor's
     on-the-fly :meth:`cache`: collect live here, then score with
@@ -77,7 +77,7 @@ def score_sources(
     ``(step, Gradient, hashes)`` blocks.  The skeleton fixes the test column order
     from the first test pass, scores every train block against every (prepared)
     test block, and returns the pieces an
-    :class:`~dattri_llm.attribution.score.AttributionScore` is assembled from — the
+    :class:`~dattri_llm.attribution.score.AttributionScore` is assembled from -- the
     per-method preparation/scoring lives in the two callables:
 
     * ``prepare_test(test_g) -> rep`` turns a device-resident test block into the
@@ -98,7 +98,7 @@ def score_sources(
             (low memory) instead of caching them once (default).
 
     Returns:
-        ``(scores, row_train_ids, row_steps, test_ids)`` — ``scores`` is
+        ``(scores, row_train_ids, row_steps, test_ids)`` -- ``scores`` is
         ``(num_train_rows, num_test)`` on CPU, ``row_steps`` stamps each row with
         the step its train gradient came from, ``test_ids`` is the column order.
     """

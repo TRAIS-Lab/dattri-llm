@@ -2,8 +2,8 @@
 
 Covers two parallelism settings:
 
-* **Single-process** — plain ``OLMo`` on CPU, no distributed setup required.
-* **FSDP** — ``FullyShardedDataParallel``-wrapped ``OLMo`` launched via
+* **Single-process** -- plain ``OLMo`` on CPU, no distributed setup required.
+* **FSDP** -- ``FullyShardedDataParallel``-wrapped ``OLMo`` launched via
   ``torch.multiprocessing.spawn`` (2 workers using the ``gloo`` backend so the
   tests pass on CPU without any extra configuration).
 
@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# Optional OLMo import — skip the whole file if not installed
+# Optional OLMo import -- skip the whole file if not installed
 # ---------------------------------------------------------------------------
 
 try:
@@ -116,7 +116,7 @@ def tiny_olmo() -> OLMo:
 
 @pytest.fixture()
 def sample_ids() -> torch.Tensor:
-    """A fixed batch of token IDs — deterministic across all test runs."""
+    """A fixed batch of token IDs -- deterministic across all test runs."""
     return _make_sample_ids()
 
 
@@ -292,7 +292,7 @@ class TestOLMoCollectorSingle:
             for l in rec1.gradient.data
             if l in rec2.gradient.data
         )
-        assert any_differ, "Activations are identical across different inputs — buffers not reset"
+        assert any_differ, "Activations are identical across different inputs -- buffers not reset"
         collector.remove()
 
     def test_numeric_agreement_with_reference(self, tiny_olmo, sample_ids):
@@ -302,7 +302,7 @@ class TestOLMoCollectorSingle:
         _run_forward_backward(tiny_olmo, sample_ids, collector_a, capture_a)
         collector_a.remove()
 
-        # Model B — fresh instance, same seed
+        # Model B -- fresh instance, same seed
         torch.manual_seed(SEED)
         cfg = ModelConfig(
             d_model=D_MODEL, n_layers=N_LAYERS, n_heads=N_HEADS,
@@ -473,7 +473,7 @@ class TestOLMoCollectorFSDP:
     """HookManager on an FSDP-wrapped OLMo model.
 
     Uses ``torch.multiprocessing.spawn`` (gloo, CPU) so no ``torchrun`` or
-    special launcher is needed — plain ``pytest`` is sufficient.
+    special launcher is needed -- plain ``pytest`` is sufficient.
     """
 
     def test_fsdp_collector_populates_and_agrees(self):

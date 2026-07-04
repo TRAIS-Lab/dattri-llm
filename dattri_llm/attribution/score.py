@@ -1,7 +1,7 @@
 """Structured attribution scores for the on-disk gradient workflow.
 
 * **Trajectory-aware rows.**  TracIn-style scores are a sum of per-step
-  ensemble terms ``Σ_k weight_k · ⟨g_train^k, g_test^k⟩``.  We keep those
+  ensemble terms ``sum_k weight_k * <g_train^k, g_test^k>``.  We keep those
   terms *un-summed*: every row of :attr:`scores` is a single
   ``(train_hash, step)`` pair.  Summing a training sample's rows over steps
   recovers the trajectory-*agnostic* score, so the
@@ -18,8 +18,8 @@
 Two lookup maps, rebuilt from the stored lists on :meth:`load`, make this
 queryable:
 
-* :attr:`train_index` — ``train_hash -> [(step, row_idx), ...]``
-* :attr:`test_index`  — ``test_hash -> col_idx``
+* :attr:`train_index` -- ``train_hash -> [(step, row_idx), ...]``
+* :attr:`test_index`  -- ``test_hash -> col_idx``
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class AttributionScore:
 
     Args:
         scores: Float tensor of shape ``(num_rows, num_test)``.  Row ``r``
-            holds ``⟨g_train^step, g_test⟩`` for training sample
+            holds ``<g_train^step, g_test>`` for training sample
             ``row_train_ids[r]`` at step ``row_steps[r]``, against every test
             sample.
         row_train_ids: Length-``num_rows`` list giving the training-sample
@@ -48,7 +48,7 @@ class AttributionScore:
         test_ids: Length-``num_test`` list giving the test-sample hash for each
             column.
         algorithm: The specific attribution algorithm used.
-        algorithm_meta: Algorithm-specific metadata — e.g. ``"damping"`` for
+        algorithm_meta: Algorithm-specific metadata -- e.g. ``"damping"`` for
             the K-FAC family, ``"normalized_grad"`` for TracIn/GradCos,
             ``"learning_rate"`` for DVEmb.
         layer_name: Layers the inner product was restricted to, or ``None``.
@@ -148,7 +148,7 @@ class AttributionScore:
             train_hash: The training sample's input hash.
 
         Returns:
-            Tensor of shape ``(num_test,)`` — the classic TracIn score for this
+            Tensor of shape ``(num_test,)`` -- the classic TracIn score for this
             sample, summed over all of its steps.
         """
         _, rows = self.trajectory_aware(train_hash)
@@ -176,21 +176,21 @@ class AttributionScore:
             test_hash: The test sample's input hash.
 
         Returns:
-            Tensor of shape ``(num_rows,)`` — the test sample's column over
+            Tensor of shape ``(num_rows,)`` -- the test sample's column over
             every ``(train_hash, step)`` row.
 
         Raises:
             KeyError: If ``test_hash`` is not present.
         """
         if test_hash not in self.test_index:
-            raise KeyError(f"test hash {test_hash[:16]}… not in scores.")
+            raise KeyError(f"test hash {test_hash[:16]}... not in scores.")
         return self.scores[:, self.test_index[test_hash]]
 
     def step_matrix(self, step: int) -> Tuple[List[str], torch.Tensor]:
         """The ``(num_train, num_test)`` score matrix for a single step.
 
         This is the per-step view of the attribution: the ensemble term
-        ``weight_step · ⟨g_train^step, g_test^step⟩`` for every train/test pair
+        ``weight_step * <g_train^step, g_test^step>`` for every train/test pair
         present at ``step``.  Summing :meth:`step_matrix` over all recorded
         steps reproduces :meth:`agnostic_matrix`.
 
@@ -215,7 +215,7 @@ class AttributionScore:
         """Every step's score matrix, keyed by step.
 
         Convenience wrapper over :meth:`step_matrix` that returns the per-step
-        view for *all* steps at once — the natural way to present per-step
+        view for *all* steps at once -- the natural way to present per-step
         attribution scores to a user.
 
         Returns:
@@ -235,7 +235,7 @@ class AttributionScore:
             test_hash: The test sample's input hash.
 
         Returns:
-            A 0-dim tensor: ``weight_step · ⟨g_train^step, g_test^step⟩`` (or its
+            A 0-dim tensor: ``weight_step * <g_train^step, g_test^step>`` (or its
             cosine for GradCos).
 
         Raises:
@@ -248,7 +248,7 @@ class AttributionScore:
                 return self.scores[row_idx, col]
         known = sorted(s for s, _ in self.train_index[train_hash])
         raise KeyError(
-            f"train sample {train_hash[:16]}… has no row at step {step}; "
+            f"train sample {train_hash[:16]}... has no row at step {step}; "
             f"known steps: {known}"
         )
 
@@ -300,12 +300,12 @@ class AttributionScore:
 
     def _require_train(self, train_hash: str) -> List[Tuple[int, int]]:
         if train_hash not in self.train_index:
-            raise KeyError(f"train hash {train_hash[:16]}… not in scores.")
+            raise KeyError(f"train hash {train_hash[:16]}... not in scores.")
         return self.train_index[train_hash]
 
     def _require_test(self, test_hash: str) -> int:
         if test_hash not in self.test_index:
-            raise KeyError(f"test hash {test_hash[:16]}… not in scores.")
+            raise KeyError(f"test hash {test_hash[:16]}... not in scores.")
         return self.test_index[test_hash]
 
     # ------------------------------------------------------------------ #

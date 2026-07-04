@@ -1,6 +1,6 @@
 """Unit tests for HookManager around the HuggingFace Transformers Trainer.
 
-The training loop is NOT modified — gradient collection is added by wrapping
+The training loop is NOT modified -- gradient collection is added by wrapping
 ``trainer.train()`` in a :meth:`HookManager.collect` context (the integration
 shown in ``examples/trainers/transformers_trainer.py``).  These tests use a
 tiny GPT-2-config model so they run entirely on CPU in CI.

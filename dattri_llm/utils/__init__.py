@@ -1,9 +1,9 @@
 """Common utilities shared across the library.
 
-* :mod:`~dattri_llm.utils.hashing` — content hashing of model inputs
+* :mod:`~dattri_llm.utils.hashing` -- content hashing of model inputs
   (``hash_sample`` / ``hash_batch``), the sample identity used by capture
   and retrieval.
-* :mod:`~dattri_llm.utils.distributed` — guarded ``torch.distributed``
+* :mod:`~dattri_llm.utils.distributed` -- guarded ``torch.distributed``
   helpers, safe to call outside a distributed context.
 """
 
