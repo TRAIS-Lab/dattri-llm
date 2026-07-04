@@ -1,31 +1,4 @@
-"""Gradient collection callbacks.
-
-Three built-in callbacks are provided:
-
-``HookManagerCallback``
-    Base class.  All methods are no-ops; subclass and override only what you
-    need.
-
-``OffloadCallback``
-    Periodically flushes :class:`GradientRecord` objects to disk via
-    :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.
-    Supports both per-batch and per-sample recording granularity.
-
-``DataSelectionCallback``
-    Online data selection: computes per-sample influence scores at the end of
-    each step, then removes low-influence samples' contributions from
-    ``param.grad`` before ``optimizer.step()``.
-
-    Two scoring modes are available via ``score_mode``:
-
-    * ``"ghost"`` (default) — gram-matrix form, no weight-gradient
-      materialisation. Cost O((B*T)^2 * (out + in)) per layer.
-    * ``"materialized"`` — builds the explicit per-sample weight gradient
-      and dots it against the batch gradient. Easier to verify but uses
-      more memory.
-
-    Both modes produce identical scores.
-"""
+"""Online data-selection callback (per-sample influence scoring + gradient removal)."""
 
 from __future__ import annotations
 
@@ -36,9 +9,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient import ops
+from dattri_llm.gradient.callbacks.base import HookManagerCallback
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 
 
 # Per-parameter slice of an FSDP ``FlatParameter`` shard.  ``start``/``end`` are
@@ -46,170 +19,6 @@ from dattri_llm.gradient import ops
 # owns (i.e. ``param.grad`` equals ``full.reshape(-1)[start : end + 1]``);
 # ``in_shard`` is False when this rank holds none of the parameter.
 _ShardSpec = namedtuple("_ShardSpec", "orig_shape in_shard start end")
-
-
-# --------------------------------------------------------------------------- #
-# Base callback                                                                #
-# --------------------------------------------------------------------------- #
-
-
-class HookManagerCallback:
-    """Base class for :class:`~dattri_llm.gradient.hooks.HookManager` callbacks.
-
-    All methods are no-ops by default; subclasses override only what they need.
-    ``on_layer_forward`` and ``on_layer_backward`` are wired directly into
-    PyTorch's hook system and fire regardless of trainer callback support.
-    """
-
-    def on_layer_forward(self, layer_name: str, activation: torch.Tensor) -> None:
-        """Called after each layer's forward hook captures the activation.
-
-        Fires once per layer per forward pass.  ``activation`` is on CPU.
-
-        Args:
-            layer_name: Fully-qualified name of the hooked layer.
-            activation: Captured input activation, shape ``(B, *, in_features)``.
-        """
-
-    def on_layer_backward(self, layer_name: str, grad_output: torch.Tensor) -> None:
-        """Called after each layer's backward hook captures the gradient.
-
-        ``grad_output`` is on CPU.  Fires once per layer per backward pass
-        (once per replica under DataParallel).
-
-        Args:
-            layer_name: Fully-qualified name of the hooked layer.
-            grad_output: Captured output gradient, shape ``(B, *, out_features)``.
-        """
-
-    def on_step_end(self, record: GradientRecord) -> None:
-        """Called exactly once per batch step after the :class:`GradientRecord`
-        is assembled.
-
-        The record always contains the full-batch gradient (``input_hash`` is a
-        list of B hashes).  Per-sample slicing is the callback's responsibility
-        — see :class:`OffloadCallback` for an example.
-
-        Args:
-            record: The assembled :class:`GradientRecord` for this step.
-        """
-
-    def on_context_end(self) -> None:
-        """Called when the :meth:`~dattri_llm.gradient.hooks.HookManager.collect`
-        context closes.
-
-        Use this to flush any remaining staged records to disk.
-        """
-
-
-# --------------------------------------------------------------------------- #
-# CaptureCallback                                                              #
-# --------------------------------------------------------------------------- #
-
-
-class CaptureCallback(HookManagerCallback):
-    """Holds the most recent per-step :class:`GradientRecord` in memory.
-
-    The minimal callback: it persists nothing and simply stashes the latest
-    step's record on :attr:`record`, so a caller can read it back immediately
-    after the step (used by the live :class:`~dattri_llm.algorithm.streaming.\
-GradientStreamer` to yield one block at a time).  Reset to ``None`` before each
-    step by the consumer if a missed capture should be detectable.
-    """
-
-    def __init__(self) -> None:
-        self.record: Optional[GradientRecord] = None
-
-    def on_step_end(self, record: GradientRecord) -> None:
-        self.record = record
-
-
-# --------------------------------------------------------------------------- #
-# OffloadCallback                                                              #
-# --------------------------------------------------------------------------- #
-
-
-class OffloadCallback(HookManagerCallback):
-    """Periodically saves :class:`GradientRecord` objects to disk.
-
-    Accumulates records in memory and writes them to a single batch file every
-    ``offload_interval`` *batch steps*.  Any remaining staged records are written
-    when the :meth:`~dattri_llm.gradient.hooks.HookManager.collect` context
-    closes.
-
-    Args:
-        offload_interval: Number of batch steps to accumulate before writing a
-            batch file.  Set to ``1`` for one file per step.
-        file_manager: The :class:`GradientFileManager` to delegate saves to.
-        recording_type: ``"per_batch"`` (default) stores one
-            :class:`GradientRecord` per step.  ``"per_sample"`` slices the
-            full-batch record into B individual records before staging — useful
-            when downstream code looks up gradients by a single-sample hash.
-    """
-
-    def __init__(
-        self,
-        offload_interval: int,
-        file_manager: GradientFileManager,
-        recording_type: str = "per_batch",
-    ) -> None:
-        if recording_type not in ("per_sample", "per_batch"):
-            raise ValueError(
-                f"recording_type must be 'per_sample' or 'per_batch', "
-                f"got {recording_type!r}."
-            )
-        self._offload_interval = offload_interval
-        self.file_manager = file_manager
-        self._recording_type = recording_type
-        self._staged: List[GradientRecord] = []
-        self._staged_steps: set = set()
-
-    def on_step_end(self, record: GradientRecord) -> None:
-        records = self._expand(record)
-        if record.step not in self._staged_steps:
-            if len(self._staged_steps) >= self._offload_interval:
-                self._flush()
-        self._staged.extend(records)
-        self._staged_steps.add(record.step)
-
-    def _expand(self, record: GradientRecord) -> List[GradientRecord]:
-        """Slice into per-sample records when ``recording_type='per_sample'``."""
-        if self._recording_type != "per_sample":
-            return [record]
-        hashes = (
-            record.input_hash
-            if isinstance(record.input_hash, list)
-            else [record.input_hash]
-        )
-        batch_size = record.gradient.batch_size
-        return [
-            GradientRecord(
-                step=record.step,
-                input_hash=hashes[i],
-                gradient=record.gradient.slice(dim="batch", index=i),
-            )
-            for i in range(batch_size)
-        ]
-
-    def on_context_end(self) -> None:
-        self._flush()
-
-    def _flush(self) -> None:
-        if not self._staged:
-            return
-        self.file_manager.save_bulk(self._staged)
-        self._staged.clear()
-        self._staged_steps.clear()
-
-    @property
-    def staged(self) -> List[GradientRecord]:
-        """Records staged but not yet written to disk."""
-        return list(self._staged)
-
-
-# --------------------------------------------------------------------------- #
-# DataSelectionCallback                                                        #
-# --------------------------------------------------------------------------- #
 
 
 _THRESHOLD_MODES = frozenset({"hard", "bottom_fraction", "negative_bottom_fraction"})
