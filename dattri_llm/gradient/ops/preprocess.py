@@ -6,11 +6,11 @@ per-layer-type dispatch, and hyperparameter extraction from hooked modules.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from dattri_llm.gradient.ops.norm import (
     _augment_channel_norm,
@@ -32,23 +32,32 @@ if TYPE_CHECKING:
 def _conv1d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
     """Unfold a raw Conv1d input (N, C_in, L_in) -> (N, L_out, C_in*k)."""
     N, C_in, _ = x.shape
-    k, s, p, d = (kwargs["kernel_size"][0], kwargs["stride"][0],
-                  kwargs["padding"][0], kwargs["dilation"][0])
+    k, s, p, d = (
+        kwargs["kernel_size"][0],
+        kwargs["stride"][0],
+        kwargs["padding"][0],
+        kwargs["dilation"][0],
+    )
     if p > 0:
         x = F.pad(x, (p, p))
     L_out = (x.shape[-1] - d * (k - 1) - 1) // s + 1
     l_idx = torch.arange(L_out, device=x.device) * s
     k_idx = torch.arange(k, device=x.device) * d
-    idx = l_idx.unsqueeze(-1) + k_idx.unsqueeze(0)   # (L_out, k)
-    patches = x[:, :, idx]                             # (N, C_in, L_out, k)
+    idx = l_idx.unsqueeze(-1) + k_idx.unsqueeze(0)  # (L_out, k)
+    patches = x[:, :, idx]  # (N, C_in, L_out, k)
     return patches.permute(0, 2, 1, 3).contiguous().reshape(N, L_out, C_in * k)
 
 
 def _conv2d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
     """Unfold a raw Conv2d input (N, C_in, H, W) -> (N, L_out, C_in*kH*kW)."""
-    unf = F.unfold(x, kwargs["kernel_size"], kwargs["dilation"],
-                   kwargs["padding"], kwargs["stride"])
-    return unf.permute(0, 2, 1).contiguous()   # (N, L, C_in*kH*kW)
+    unf = F.unfold(
+        x,
+        kwargs["kernel_size"],
+        kwargs["dilation"],
+        kwargs["padding"],
+        kwargs["stride"],
+    )
+    return unf.permute(0, 2, 1).contiguous()  # (N, L, C_in*kH*kW)
 
 
 def _conv3d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
@@ -65,14 +74,21 @@ def _conv3d_im2col(x: torch.Tensor, kwargs: dict) -> torch.Tensor:
     H_out = (H_pad - dH * (kH - 1) - 1) // sH + 1
     W_out = (W_pad - dW * (kW - 1) - 1) // sW + 1
     L_out = D_out * H_out * W_out
-    d_idx = (torch.arange(D_out, device=x.device).unsqueeze(-1) * sD
-             + torch.arange(kD, device=x.device).unsqueeze(0) * dD)
-    h_idx = (torch.arange(H_out, device=x.device).unsqueeze(-1) * sH
-             + torch.arange(kH, device=x.device).unsqueeze(0) * dH)
-    w_idx = (torch.arange(W_out, device=x.device).unsqueeze(-1) * sW
-             + torch.arange(kW, device=x.device).unsqueeze(0) * dW)
+    d_idx = (
+        torch.arange(D_out, device=x.device).unsqueeze(-1) * sD
+        + torch.arange(kD, device=x.device).unsqueeze(0) * dD
+    )
+    h_idx = (
+        torch.arange(H_out, device=x.device).unsqueeze(-1) * sH
+        + torch.arange(kH, device=x.device).unsqueeze(0) * dH
+    )
+    w_idx = (
+        torch.arange(W_out, device=x.device).unsqueeze(-1) * sW
+        + torch.arange(kW, device=x.device).unsqueeze(0) * dW
+    )
     patches = x[
-        :, :,
+        :,
+        :,
         d_idx.view(D_out, kD, 1, 1, 1, 1),
         h_idx.view(1, 1, H_out, kH, 1, 1),
         w_idx.view(1, 1, 1, 1, W_out, kW),
@@ -92,7 +108,9 @@ def _conv_spatial_rank(layer_type: str) -> int:
 
 
 def _preprocess_embedding_bag(
-    a: torch.Tensor, g: torch.Tensor, mode: str
+    a: torch.Tensor,
+    g: torch.Tensor,
+    mode: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Expand per-bag EmbeddingBag gradients to the per-token Embedding form.
 
@@ -106,18 +124,18 @@ def _preprocess_embedding_bag(
     """
     if mode == "max":
         raise NotImplementedError(
-            "EmbeddingBag mode='max' is not supported for factorized gradients."
+            "EmbeddingBag mode='max' is not supported for factorized gradients.",
         )
     if a.ndim != 2:
         raise NotImplementedError(
             "EmbeddingBag factorization supports only 2-D inputs (N, T) without "
-            "offsets."
+            "offsets.",
         )
     t = a.shape[1]
-    g_exp = g.unsqueeze(1).expand(-1, t, -1)   # (N, T, E)
+    g_exp = g.unsqueeze(1).expand(-1, t, -1).contiguous()  # (N, T, E)
     if mode == "mean":
-        g_exp = g_exp / t
-    return a, g_exp.contiguous()
+        g_exp /= t
+    return a, g_exp
 
 
 def _preprocess_conv_transpose(
@@ -146,22 +164,21 @@ def _preprocess_conv_transpose(
     """
     rank = _conv_spatial_rank(layer_type)
     n, c_in = a.shape[:2]
-    a_flat = a.reshape(n, c_in, -1).permute(0, 2, 1).contiguous()   # (N, L, C_in)
-    g_unf = _CONV_IM2COL[rank](g, module_kwargs)                    # (N, L, C_out*prod(K))
+    a_flat = a.reshape(n, c_in, -1).permute(0, 2, 1).contiguous()  # (N, L, C_in)
+    g_unf = _CONV_IM2COL[rank](g, module_kwargs)  # (N, L, C_out*prod(K))
     if not has_bias:
         return a_flat, g_unf
 
     c_out = g.shape[1]
     L = a_flat.shape[1]
-    spatial_dims = tuple(range(2, g.ndim))
-    bias_grad = g.reshape(n, c_out, -1).sum(dim=2)                  # (N, C_out)
+    bias_grad = g.reshape(n, c_out, -1).sum(dim=2)  # (N, C_out)
 
     # Activation: zero-pad the feature dim, then append a bias location whose
     # only non-zero feature is the appended one.
     a_pad = torch.cat([a_flat, torch.zeros_like(a_flat[..., :1])], dim=-1)
     a_bias = torch.zeros(n, 1, a_pad.shape[-1], dtype=a_pad.dtype, device=a_pad.device)
     a_bias[..., -1] = 1.0
-    a_aug = torch.cat([a_pad, a_bias], dim=1)                       # (N, L+1, C_in+1)
+    a_aug = torch.cat([a_pad, a_bias], dim=1)  # (N, L+1, C_in+1)
 
     # Gradient: zero-pad the feature dim with C_out columns, then append a bias
     # location carrying the bias gradient in those columns.
@@ -171,12 +188,13 @@ def _preprocess_conv_transpose(
     )
     g_bias = torch.zeros(n, 1, g_pad.shape[-1], dtype=g_pad.dtype, device=g_pad.device)
     g_bias[..., -c_out:] = bias_grad.unsqueeze(1)
-    g_aug = torch.cat([g_pad, g_bias], dim=1)                       # (N, L+1, P+C_out)
+    g_aug = torch.cat([g_pad, g_bias], dim=1)  # (N, L+1, P+C_out)
     return a_aug, g_aug
 
 
 def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
-    """Extract the minimal hyperparameters from *module* needed by :func:`_preprocess_factorized`.
+    """Extract the minimal hyperparameters from *module* needed by
+    :func:`_preprocess_factorized`.
 
     Returns a plain serialisable dict -- no reference to the module object is
     retained, so the result can be pickled cheaply alongside gradient tensors.
@@ -186,7 +204,7 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
         layer_type: Canonical class name (e.g. ``"nn.Conv2d"``).
 
     Returns:
-        A dict with at least ``"has_bias": bool``.  Conv and ConvTranspose
+        dict: A dict with at least ``"has_bias": bool``.  Conv and ConvTranspose
         layers additionally include ``"kernel_size"``, ``"stride"``,
         ``"padding"``, and ``"dilation"``.  LayerNorm and RMSNorm include
         ``"normalized_shape"`` and ``"eps"``.  GroupNorm includes
@@ -219,7 +237,7 @@ def _preprocess_factorized(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
-    module_kwargs: Optional[dict] = None,
+    module_kwargs: dict | None = None,
     include_bias: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Transform raw hook captures into the (a, g) form expected by ops.
@@ -286,14 +304,18 @@ def _preprocess_factorized(
 
     if layer_type == "nn.GroupNorm":
         x_hat = _compute_group_norm_x_hat(
-            a, module_kwargs["num_groups"], module_kwargs.get("eps", 1e-5)
+            a,
+            module_kwargs["num_groups"],
+            module_kwargs.get("eps", 1e-5),
         )
         return _augment_channel_norm(x_hat, g, has_bias)
 
     if layer_type in ("nn.InstanceNorm1d", "nn.InstanceNorm2d", "nn.InstanceNorm3d"):
         # InstanceNorm = GroupNorm with one group per channel.
         x_hat = _compute_group_norm_x_hat(
-            a, module_kwargs["num_features"], module_kwargs.get("eps", 1e-5)
+            a,
+            module_kwargs["num_features"],
+            module_kwargs.get("eps", 1e-5),
         )
         return _augment_channel_norm(x_hat, g, has_bias)
 
@@ -304,7 +326,7 @@ def _preprocess_factorized(
     # -- Convolution ---------------------------------------------------------
     if layer_type in CONV_TYPES:
         rank = _conv_spatial_rank(layer_type)
-        a_unf = _CONV_IM2COL[rank](a, module_kwargs)            # (N, L, C_in*prod(K))
+        a_unf = _CONV_IM2COL[rank](a, module_kwargs)  # (N, L, C_in*prod(K))
         n, c_out = g.shape[0], g.shape[1]
         g_out = g.reshape(n, c_out, -1).permute(0, 2, 1).contiguous()  # (N, L, C_out)
         if has_bias:
@@ -324,6 +346,7 @@ def _preprocess_factorized(
 # ---------------------------------------------------------------------------
 # Shape helper
 # ---------------------------------------------------------------------------
+
 
 def _to_3d(x: torch.Tensor) -> torch.Tensor:
     """Expand a (B, D) tensor to (B, 1, D); leave (B, T, D) unchanged.
@@ -351,10 +374,16 @@ def _to_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 def preprocess_factorized(
-    f: "Factorized", layer_type: str, include_bias: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    f: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """:func:`_preprocess_factorized` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
     return _preprocess_factorized(
-        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        bf.module_kwargs,
+        include_bias,
     )

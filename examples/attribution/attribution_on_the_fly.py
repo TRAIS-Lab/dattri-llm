@@ -11,13 +11,12 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
+from dattri.task import AttributionTask
 from torch import nn
 from torch.utils.data import Dataset
 
-from dattri.task import AttributionTask
-
-from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
 
 IN, HID, OUT = 8, 16, 4
 
@@ -36,7 +35,8 @@ class MLP(nn.Module):
 
 class DictDataset(Dataset):
     """Yields ``{"x", "y"}``.  The task's loss runs the model on this batch, so
-    the hooks capture each sample's gradient (and its content hash)."""
+    the hooks capture each sample's gradient (and its content hash).
+    """
 
     def __init__(self, x: torch.Tensor, y: torch.Tensor) -> None:
         self.x, self.y = x, y
@@ -59,8 +59,14 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     model = MLP().eval()
     g = torch.Generator().manual_seed(0)
-    x_tr, y_tr = torch.randn(n_train, IN, generator=g), torch.randn(n_train, OUT, generator=g)
-    x_te, y_te = torch.randn(n_test, IN, generator=g), torch.randn(n_test, OUT, generator=g)
+    x_tr, y_tr = (
+        torch.randn(n_train, IN, generator=g),
+        torch.randn(n_train, OUT, generator=g),
+    )
+    x_te, y_te = (
+        torch.randn(n_test, IN, generator=g),
+        torch.randn(n_test, OUT, generator=g),
+    )
     train_ds, test_ds = DictDataset(x_tr, y_tr), DictDataset(x_te, y_te)
 
     # describe the attribution target with a dattri AttributionTask: the loss is
@@ -94,7 +100,9 @@ if __name__ == "__main__":
         train_ids, matrix = score.agnostic_matrix()
 
         print("TracIn score[train i, test j]")
-        header = f"{'':<10}" + "".join(f"{f'test{j}':>12}" for j in range(matrix.shape[1]))
+        header = f"{'':<10}" + "".join(
+            f"{f'test{j}':>12}" for j in range(matrix.shape[1])
+        )
         print("-" * len(header))
         print(header)
         print("-" * len(header))

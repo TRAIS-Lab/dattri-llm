@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import operator
 import threading
 import warnings
 from contextlib import contextmanager
-from typing import Generator, Iterable, Optional
+from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
+from torch import nn
 
-from dattri_llm.gradient.callbacks import HookManagerCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks.config import (
     LINEAR_IO,
@@ -29,6 +29,10 @@ from dattri_llm.gradient.hooks.hooks import (
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, is_embedding
 from dattri_llm.utils.hashing import hash_batch
 
+if TYPE_CHECKING:
+    from collections.abc import Generator, Iterable
+
+    from dattri_llm.gradient.callbacks import HookManagerCallback
 
 # --------------------------------------------------------------------------- #
 # Hook manager                                                                 #
@@ -63,10 +67,10 @@ class HookManager:
     def __init__(
         self,
         model: nn.Module,
-        config: Optional[HookManagerConfig] = None,
-        callbacks: Optional[list[HookManagerCallback]] = None,
+        config: HookManagerConfig | None = None,
+        callbacks: list[HookManagerCallback] | None = None,
         sample_id_key: str = "input_ids",
-        non_batch_first_layers: Optional[Iterable[str]] = None,
+        non_batch_first_layers: Iterable[str] | None = None,
     ) -> None:
         self._model = model
         self._callbacks: list[HookManagerCallback] = callbacks or []
@@ -87,7 +91,7 @@ class HookManager:
         # *completed* step.  The per-layer buffers are cleared as soon as a step
         # completes, so this is what :meth:`get_gradient` returns afterwards.
         # Only ever holds one step's gradient at a time (see _on_step_complete).
-        self._last_gradient: Optional[Gradient] = None
+        self._last_gradient: Gradient | None = None
 
         self._seen_bwd: set[str] = set()
         self._bwd_replica_counts: dict[str, int] = {}
@@ -120,8 +124,8 @@ class HookManager:
         #   have fired (only relevant when ``param_grad`` layers are
         #   registered; starts True otherwise).
         self._bwd_done: bool = True
-        self._mlp_param_hook_count: int = 0   # fires toward sub-cond (b)
-        self._n_mlp_params: int = 0            # target for sub-cond (b)
+        self._mlp_param_hook_count: int = 0  # fires toward sub-cond (b)
+        self._n_mlp_params: int = 0  # target for sub-cond (b)
         self._grad_done: bool = True
 
         # End-of-backward barrier for sub-cond (b).  Under FSDP the
@@ -141,14 +145,13 @@ class HookManager:
 
         root = getattr(model, "module", model)
         self._n_replicas: int = (
-            len(model.device_ids)
-            if isinstance(model, nn.DataParallel)
-            else 1
+            len(model.device_ids) if isinstance(model, nn.DataParallel) else 1
         )
 
         self._last_inputs: dict[str, torch.Tensor] = {}
         self._model_fwd_handle = root.register_forward_pre_hook(
-            self._capture_model_input, with_kwargs=True
+            self._capture_model_input,
+            with_kwargs=True,
         )
 
         # Resolve which hook family each layer is assigned to (one family per
@@ -161,7 +164,7 @@ class HookManager:
 
         self._buffers: dict = {}
         self._handles: list = []
-        self._mlp_weight_handles: list = []   # post-accumulate hooks for sub-cond (b)
+        self._mlp_weight_handles: list = []  # post-accumulate hooks for sub-cond (b)
         self._n_layers: int = 0
         if self._has_linear_io:
             self._bwd_done = False
@@ -174,7 +177,8 @@ class HookManager:
                 projection=self._config.projection,
                 projector=(
                     _resolve_projector(self._config.projector)
-                    if self._config.projection is not None else None
+                    if self._config.projection is not None
+                    else None
                 ),
             )
             self._n_layers = len(self._buffers)
@@ -233,7 +237,12 @@ class HookManager:
     # Model-level pre-forward hook                                            #
     # ---------------------------------------------------------------------- #
 
-    def _capture_model_input(self, _module, args: tuple, kwargs: dict) -> None:
+    def _capture_model_input(
+        self,
+        _module: nn.Module,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
         if not self._collecting:
             return
         captured: dict[str, torch.Tensor] = {
@@ -249,11 +258,19 @@ class HookManager:
     # Per-layer hook dispatchers                                              #
     # ---------------------------------------------------------------------- #
 
-    def _dispatch_layer_forward(self, layer_name: str, activation: torch.Tensor) -> None:
+    def _dispatch_layer_forward(
+        self,
+        layer_name: str,
+        activation: torch.Tensor,
+    ) -> None:
         for cb in self._callbacks:
             cb.on_layer_forward(layer_name, activation)
 
-    def _check_step_bwd_complete(self, layer_name: str, grad_output: torch.Tensor) -> None:
+    def _check_step_bwd_complete(
+        self,
+        layer_name: str,
+        grad_output: torch.Tensor,
+    ) -> None:
         """Fired by each MLP layer's full backward hook.
 
         Dispatches per-layer callbacks and, once all layers have reported,
@@ -269,9 +286,12 @@ class HookManager:
             # We are inside the backward pass here -- the only valid place to
             # queue an end-of-backward callback.  Queue it once per step as the
             # FSDP-safe satisfier of sub-cond (b) (see ``__init__``).
-            if self._n_mlp_params > 0 and not self._backward_end_scheduled:
-                if _queue_backward_end_callback(self._on_backward_end):
-                    self._backward_end_scheduled = True
+            if (
+                self._n_mlp_params > 0
+                and not self._backward_end_scheduled
+                and _queue_backward_end_callback(self._on_backward_end)
+            ):
+                self._backward_end_scheduled = True
             self._bwd_replica_counts[layer_name] = (
                 self._bwd_replica_counts.get(layer_name, 0) + 1
             )
@@ -307,7 +327,8 @@ class HookManager:
     ) -> None:
         """Fired by :func:`register_linear_param_hooks` after each linear param's
         grad is accumulated.  Once all MLP param hooks have reported, checks
-        whether the composite ``_bwd_done`` condition is met."""
+        whether the composite ``_bwd_done`` condition is met.
+        """
         if not self._collecting:
             return
         with self._step_lock:
@@ -326,9 +347,11 @@ class HookManager:
         # MLP params exist, when every per-parameter post-accumulate hook has
         # fired (non-FSDP), or when the FSDP end-of-backward callback has fired
         # (``_mlp_params_ready``).
-        mlp_params_done = (self._n_mlp_params == 0
-                           or self._mlp_params_ready
-                           or self._mlp_param_hook_count >= self._n_mlp_params)
+        mlp_params_done = (
+            self._n_mlp_params == 0
+            or self._mlp_params_ready
+            or self._mlp_param_hook_count >= self._n_mlp_params
+        )
         if bwd_hooks_done and mlp_params_done:
             self._bwd_done = True
             self._check_step_complete()
@@ -340,7 +363,8 @@ class HookManager:
         _grad: torch.Tensor,
     ) -> None:
         """Fired by each param's grad hook; marks grad done once all param
-        hooks have reported."""
+        hooks have reported.
+        """
         if not self._collecting:
             return
         with self._step_lock:
@@ -414,10 +438,11 @@ class HookManager:
                 if not parts:
                     raise RuntimeError(
                         f"Layer '{layer_name}' has no buffered data. "
-                        "Ensure backward() was called inside the collect() context."
+                        "Ensure backward() was called inside the collect() context.",
                     )
                 data[layer_name] = torch.cat(
-                    [t for _, t in sorted(parts, key=lambda x: x[0])], dim=0
+                    [t for _, t in sorted(parts, key=operator.itemgetter(0))],
+                    dim=0,
                 )
                 representation[layer_name] = "materialized"
                 layer_types[layer_name] = buf["_class_name"]
@@ -429,19 +454,29 @@ class HookManager:
             if not act_parts or not grad_parts:
                 raise RuntimeError(
                     f"Layer '{layer_name}' has no buffered data. "
-                    "Ensure backward() was called inside the collect() context."
+                    "Ensure backward() was called inside the collect() context.",
                 )
-            a = torch.cat([t for _, t in sorted(act_parts,  key=lambda x: x[0])], dim=0)
-            g = torch.cat([t for _, t in sorted(grad_parts, key=lambda x: x[0])], dim=0)
+            a = torch.cat(
+                [t for _, t in sorted(act_parts, key=operator.itemgetter(0))],
+                dim=0,
+            )
+            g = torch.cat(
+                [t for _, t in sorted(grad_parts, key=operator.itemgetter(0))],
+                dim=0,
+            )
 
             # Factorized (LoGRA) projection: _act_parts/_grad_parts already hold the
             # projected, final factors (module_kwargs=None -> no re-preprocessing).
             if proj_kw is not None:
-                data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
-                                              module_kwargs=None, batch_first=batch_first)
+                data[layer_name] = Factorized(
+                    activation=a,
+                    pre_activation_grad=g,
+                    module_kwargs=None,
+                    batch_first=batch_first,
+                )
                 representation[layer_name] = "factorized"
                 layer_types[layer_name] = "nn.Linear"
-                tokens = a.shape[1 if batch_first else 0]   # 1 => 2-D-origin layer
+                tokens = a.shape[1 if batch_first else 0]  # 1 => 2-D-origin layer
                 indexing[layer_name] = "batch_token" if tokens > 1 else "batch"
                 continue
 
@@ -454,15 +489,16 @@ class HookManager:
             if a.ndim == 1 and is_embedding(buf["_class_name"]):
                 a = a.unsqueeze(0)
                 g = g.unsqueeze(0)
-            data[layer_name] = Factorized(activation=a, pre_activation_grad=g,
-                                          module_kwargs=buf["_module_kwargs"],
-                                          batch_first=batch_first)
+            data[layer_name] = Factorized(
+                activation=a,
+                pre_activation_grad=g,
+                module_kwargs=buf["_module_kwargs"],
+                batch_first=batch_first,
+            )
             representation[layer_name] = "factorized"
             layer_types[layer_name] = buf["_class_name"]
             indexing[layer_name] = (
-                "batch_token"
-                if a.ndim >= 3 or not a.is_floating_point()
-                else "batch"
+                "batch_token" if a.ndim >= 3 or not a.is_floating_point() else "batch"
             )
 
         for layer_name, buf in self._param_buffers.items():
@@ -473,12 +509,12 @@ class HookManager:
                 data[key] = grad
                 representation[key] = "materialized"
                 layer_types[key] = PARAM_GRAD_TYPES
-                indexing[key] = "batch"   # param_grad tensors have no token dim
+                indexing[key] = "batch"  # param_grad tensors have no token dim
 
         if not data:
             raise RuntimeError(
                 "No gradient data assembled. "
-                "Ensure backward() was called inside the collect() context."
+                "Ensure backward() was called inside the collect() context.",
             )
 
         # Broadcast warning runs on the assembled (projected or raw) factors.
@@ -552,7 +588,7 @@ class HookManager:
     # ---------------------------------------------------------------------- #
 
     @contextmanager
-    def collect(self) -> Generator["HookManager", None, None]:
+    def collect(self) -> Generator[HookManager, None, None]:
         """Enable gradient collection for the duration of the context.
 
         Works with any training loop::
@@ -585,7 +621,7 @@ class HookManager:
                 cb.on_context_end()
 
     @contextmanager
-    def pause(self) -> Generator["HookManager", None, None]:
+    def pause(self) -> Generator[HookManager, None, None]:
         """Temporarily suspend step-completion tracking within ``collect()``.
 
         Use this when running a secondary forward+backward pass (e.g. a val
@@ -686,7 +722,8 @@ class HookManager:
         layers.  Layer selection is decided here, at capture, via
         :class:`HookManagerConfig` -- attributors read it back through this
         property (e.g. for :class:`AttributionScore` metadata) instead of taking
-        their own ``layer_name`` argument."""
+        their own ``layer_name`` argument.
+        """
         return list(self._buffers.keys())
 
     @property
@@ -729,8 +766,8 @@ class HookManager:
         (the *last-step gradient*), which is what this method returns.
 
         Returns:
-            A :class:`~dattri_llm.gradient.Gradient` with ``layer_types``
-            populated from the hooked module class names.
+            Gradient: The assembled gradient, with ``layer_types`` populated
+            from the hooked module class names.
 
         Raises:
             RuntimeError: If no step has completed yet (no backward has run
@@ -740,6 +777,6 @@ class HookManager:
             raise RuntimeError(
                 "No gradient available: no step has completed yet. "
                 "Ensure backward() was called inside the collect() context "
-                "before calling get_gradient()."
+                "before calling get_gradient().",
             )
         return self._last_gradient

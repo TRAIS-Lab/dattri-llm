@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING
 
-from dattri_llm.gradient.gradient import GradientRecord
+if TYPE_CHECKING:
+    import torch
+
+    from dattri_llm.gradient.gradient import GradientRecord
 
 
 class HookManagerCallback:

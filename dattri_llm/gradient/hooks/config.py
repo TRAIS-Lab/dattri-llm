@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 import warnings
-from typing import Callable, Optional
+from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from dattri_llm.gradient.hooks.hooks import (
     _has_trainable_params,
@@ -16,10 +16,15 @@ from dattri_llm.gradient.hooks.hooks import (
 )
 from dattri_llm.gradient.ops import canonical_class_name
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from typing_extensions import Self
 
 # --------------------------------------------------------------------------- #
 # Hook manager configuration                                                   #
 # --------------------------------------------------------------------------- #
+
 
 class _RegisterAll:
     """Sentinel type for :data:`REGISTER_ALL`.
@@ -28,9 +33,9 @@ class _RegisterAll:
     applicable to a given hook family be registered, regardless of name.
     """
 
-    _instance: Optional["_RegisterAll"] = None
+    _instance: _RegisterAll | None = None
 
-    def __new__(cls) -> "_RegisterAll":
+    def __new__(cls) -> Self:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
@@ -59,7 +64,7 @@ trainable parameters for ``param_grad``)::
 #   * ``None``        -- not provided (the family is not requested explicitly).
 #   * ``REGISTER_ALL``-- register every applicable layer.
 #   * ``list[str]``   -- register applicable layers whose name matches a regex.
-Selector = Optional[object]  # None | _RegisterAll | list[str]
+Selector = object | None  # None | _RegisterAll | list[str]
 
 # Hook-family names and the layer_types marker used for materialized grads.
 LINEAR_IO = "linear_io"
@@ -70,7 +75,7 @@ _VALID_HOOK_TYPES = frozenset({LINEAR_IO, PARAM_GRAD})
 
 
 class HookManagerConfig:
-    """Configuration for :class:`HookManager`.
+    r"""Configuration for :class:`HookManager`.
 
     The core control is :attr:`hook_types`, an explicit **assignment** mapping
     each fully-qualified layer name to the hook family it should use:
@@ -132,12 +137,12 @@ class HookManagerConfig:
 
     def __init__(
         self,
-        hook_types: Optional[dict[str, str]] = None,
+        hook_types: dict[str, str] | None = None,
         linear_io: Selector = None,
         param_grad: Selector = None,
-        layer_types: Optional[dict[str, str]] = None,
-        projection: Optional[dict[str, dict]] = None,
-        projector: Optional[Callable] = None,
+        layer_types: dict[str, str] | None = None,
+        projection: dict[str, dict] | None = None,
+        projector: Callable | None = None,
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
@@ -153,7 +158,7 @@ class HookManagerConfig:
 
     @staticmethod
     def _validate_assignment(
-        hook_types: Optional[dict[str, str]],
+        hook_types: dict[str, str] | None,
     ) -> dict[str, str]:
         if hook_types is None:
             return {}
@@ -161,20 +166,20 @@ class HookManagerConfig:
             raise TypeError(
                 "hook_types must be a dict mapping layer name to hook type "
                 f"({sorted(_VALID_HOOK_TYPES)}), got "
-                f"{type(hook_types).__name__}."
+                f"{type(hook_types).__name__}.",
             )
         for layer_name, hook_type in hook_types.items():
             if hook_type not in _VALID_HOOK_TYPES:
                 raise ValueError(
                     f"hook_types['{layer_name}'] = '{hook_type}' is not a valid "
-                    f"hook type. Valid types: {sorted(_VALID_HOOK_TYPES)}."
+                    f"hook type. Valid types: {sorted(_VALID_HOOK_TYPES)}.",
                 )
         return dict(hook_types)
 
     @staticmethod
     def _validate_projection(
-        projection: Optional[dict[str, dict]],
-    ) -> Optional[dict[str, dict]]:
+        projection: dict[str, dict] | None,
+    ) -> dict[str, dict] | None:
         if projection is None:
             return None
         if not isinstance(projection, dict) or not all(
@@ -183,26 +188,26 @@ class HookManagerConfig:
             raise TypeError(
                 "projection must be a dict mapping layer name (or '__default__') "
                 "to a proj_kwargs dict, e.g. "
-                "{'__default__': {'factorize': True, 'proj_dim': 512}}."
+                "{'__default__': {'factorize': True, 'proj_dim': 512}}.",
             )
         return {k: dict(v) for k, v in projection.items()}
 
     @staticmethod
     def _validate_layer_types(
-        layer_types: Optional[dict[str, str]],
+        layer_types: dict[str, str] | None,
     ) -> dict[str, str]:
         if layer_types is None:
             return {}
         if not isinstance(layer_types, dict):
             raise TypeError(
                 "layer_types must be a dict mapping layer name to a layer-type "
-                f"string, got {type(layer_types).__name__}."
+                f"string, got {type(layer_types).__name__}.",
             )
         for layer_name, layer_type in layer_types.items():
             if not isinstance(layer_name, str) or not isinstance(layer_type, str):
                 raise TypeError(
                     "layer_types must map str layer names to str type names, got "
-                    f"{layer_name!r}: {layer_type!r}."
+                    f"{layer_name!r}: {layer_type!r}.",
                 )
         return dict(layer_types)
 
@@ -213,25 +218,23 @@ class HookManagerConfig:
         if isinstance(selector, (list, tuple)):
             if not all(isinstance(p, str) for p in selector):
                 raise TypeError(
-                    f"{name} pattern list must contain only regex strings."
+                    f"{name} pattern list must contain only regex strings.",
                 )
             return list(selector)
         raise TypeError(
             f"{name} must be None, REGISTER_ALL, or a list of regex strings, "
-            f"got {type(selector).__name__}."
+            f"got {type(selector).__name__}.",
         )
 
     @property
     def is_default(self) -> bool:
         """True when nothing was requested (the auto fallback applies)."""
         return (
-            not self.hook_types
-            and self.linear_io is None
-            and self.param_grad is None
+            not self.hook_types and self.linear_io is None and self.param_grad is None
         )
 
 
-def _resolve_projector(projector: Optional[Callable]) -> Callable:
+def _resolve_projector(projector: Callable | None) -> Callable:
     """Return *projector*, or lazily fall back to dattri's ``random_project``.
 
     The import is deferred so configuring projection is the only thing that pulls
@@ -240,6 +243,7 @@ def _resolve_projector(projector: Optional[Callable]) -> Callable:
     if projector is not None:
         return projector
     from dattri.func.projection import random_project
+
     return random_project
 
 
@@ -284,7 +288,7 @@ def resolve_hook_assignments(
             raise ValueError(
                 f"Layer '{layer_name}' is assigned conflicting hook types: "
                 f"'{existing}' and '{hook_type}'. A layer may only be "
-                "registered with one hook family."
+                "registered with one hook family.",
             )
         assignment[layer_name] = hook_type
 
@@ -306,29 +310,31 @@ def resolve_hook_assignments(
         if module is None:
             raise ValueError(
                 f"hook_types names layer '{layer_name}', which does not exist "
-                "in the model."
+                "in the model.",
             )
         if hook_type == LINEAR_IO and not _is_linear_io_capable(module):
             raise ValueError(
                 f"Layer '{layer_name}' was assigned 'linear_io' but its type "
                 f"({canonical_class_name(module)}) does not support factorized "
-                "linear-IO hooks."
+                "linear-IO hooks.",
             )
         if hook_type == PARAM_GRAD and not _has_trainable_params(module):
             raise ValueError(
                 f"Layer '{layer_name}' was assigned 'param_grad' but has no "
-                "trainable parameters."
+                "trainable parameters.",
             )
         assign(layer_name, hook_type)
 
     # 2. Selector add-ons extend the assignment with applicable layers only.
     for name, module in modules.items():
         if _is_linear_io_capable(module) and _selector_matches(
-            config.linear_io, name
+            config.linear_io,
+            name,
         ):
             assign(name, LINEAR_IO)
         if _has_trainable_params(module) and _selector_matches(
-            config.param_grad, name
+            config.param_grad,
+            name,
         ):
             assign(name, PARAM_GRAD)
 
@@ -360,7 +366,7 @@ def _invoke_model(model: nn.Module, sample_input: object) -> object:
     return model(sample_input)
 
 
-def _derive_scalar_loss(output: object) -> Optional[torch.Tensor]:
+def _derive_scalar_loss(output: object) -> torch.Tensor | None:
     """Best-effort reduction of a model output to a scalar for ``backward()``.
 
     Prefers ``output.loss``; otherwise sums a floating-point output tensor
@@ -372,7 +378,7 @@ def _derive_scalar_loss(output: object) -> Optional[torch.Tensor]:
         return loss
 
     if isinstance(output, torch.Tensor):
-        candidate: Optional[torch.Tensor] = output
+        candidate: torch.Tensor | None = output
     else:
         candidate = getattr(output, "logits", None)
         if candidate is None:
@@ -398,7 +404,7 @@ def _derive_scalar_loss(output: object) -> Optional[torch.Tensor]:
 def default_hook_assignment(
     model: nn.Module,
     sample_input: object,
-    loss_fn: Optional[Callable[[object], torch.Tensor]] = None,
+    loss_fn: Callable[[object], torch.Tensor] | None = None,
 ) -> dict[str, str]:
     """Discover the default-style assignment for layers that actually fire.
 
@@ -454,13 +460,15 @@ def default_hook_assignment(
     handles: list[torch.utils.hooks.RemovableHook] = []
 
     def _make_forward_monitor(layer_name: str) -> Callable:
-        def _hook(_module, _inp, _out) -> None:
+        def _hook(_module: nn.Module, _inp: object, _out: object) -> None:
             fired.add(layer_name)
+
         return _hook
 
     def _make_grad_monitor(layer_name: str) -> Callable:
         def _hook(_grad: torch.Tensor) -> None:
             fired.add(layer_name)
+
         return _hook
 
     for name, module in modules.items():
@@ -481,7 +489,7 @@ def default_hook_assignment(
                     if loss_fn is not None
                     else _derive_scalar_loss(output)
                 )
-            except Exception as exc:  # noqa: BLE001 - user loss_fn may fail
+            except Exception as exc:  # noqa: BLE001 - user loss_fn may raise anything
                 loss = None
                 warnings.warn(
                     f"default_hook_assignment could not compute a loss "

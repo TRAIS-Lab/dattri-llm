@@ -5,13 +5,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-import torch
-from torch.utils.data import DataLoader, Dataset
-
-from dattri_llm.attribution.arguments import AttributionArguments
-
 if TYPE_CHECKING:
+    import torch
     from dattri.task import AttributionTask
+    from torch.utils.data import DataLoader, Dataset
+
+    from dattri_llm.attribution.arguments import AttributionArguments
+    from dattri_llm.gradient.gradient import Gradient
 
 
 class BaseAttributor(ABC):
@@ -79,7 +79,7 @@ class BaseInnerProductAttributor(BaseAttributor):
         self,
         task: AttributionTask,
         args: AttributionArguments,
-        layer_name: Optional[Union[str, List[str]]] = None,
+        layer_name: str | list[str] | None = None,
     ) -> None:
         """Initialize the attributor.
 
@@ -124,12 +124,10 @@ class BaseInnerProductAttributor(BaseAttributor):
         """Calculate the influence of the training set on the test set.
 
         Args:
-            train_gradients_dir (Optional[str]): The directory where the cached training gradients are stored.
-                If not None, the attributor will try to load the cached training gradients from
-                this directory to compute the influence.
-            test_gradients_dir (Optional[str]): The directory where the cached test gradients are stored.
-                If not None, the attributor will try to load the cached test gradients from
-                this directory to compute the influence.
+            train_gradients_dir (str): The directory where the cached
+                training gradients are stored.
+            test_gradients_dir (str): The directory where the cached
+                test gradients are stored.
             verbose: Show progress bars while attributing.
 
         Returns:
@@ -149,7 +147,8 @@ class BaseInnerProductAttributor(BaseAttributor):
         train representations and test representations. This function generates the
         initial train representations.
 
-        The default implementation calculates the gradient of the train loss with respect
+        The default implementation calculates the gradient of the train loss with
+        respect
         to the parameter. Subclasses may override this function to calculate something
         else.
 

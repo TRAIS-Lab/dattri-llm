@@ -19,13 +19,20 @@ Running
 from __future__ import annotations
 
 import os
+import pathlib
 import socket
 import tempfile
-from typing import List
 
 import pytest
 import torch
 import torch.nn.functional as F
+
+from dattri_llm.gradient.gradient import Factorized, GradientRecord
+from dattri_llm.gradient.hooks import (
+    HookManager,
+    HookManagerCallback,
+    HookManagerConfig,
+)
 
 # ---------------------------------------------------------------------------
 # Optional OLMo import -- skip the whole file if not installed
@@ -43,9 +50,6 @@ pytestmark = pytest.mark.skipif(
     not OLMO_AVAILABLE,
     reason="ai2-olmo is not installed",
 )
-
-from dattri_llm.gradient.gradient import Factorized, GradientRecord  # noqa: E402
-from dattri_llm.gradient.hooks import HookManager, HookManagerCallback, HookManagerConfig  # noqa: E402
 
 # OLMo names its block-level MLP linears ``ff_proj`` / ``ff_out`` under
 # ``transformer.blocks.<i>``.  Anchoring to ``blocks.\d+`` excludes the
@@ -81,7 +85,7 @@ class _Capture(HookManagerCallback):
     """Accumulates every GradientRecord emitted by HookManager."""
 
     def __init__(self) -> None:
-        self.records: List[GradientRecord] = []
+        self.records: list[GradientRecord] = []
 
     def on_step_end(self, record: GradientRecord) -> None:
         self.records.append(record)
@@ -92,7 +96,7 @@ class _Capture(HookManagerCallback):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture
 def tiny_olmo() -> OLMo:
     """A minimal 2-layer OLMo that runs entirely on CPU."""
     torch.manual_seed(SEED)
@@ -114,7 +118,7 @@ def tiny_olmo() -> OLMo:
     return model
 
 
-@pytest.fixture()
+@pytest.fixture
 def sample_ids() -> torch.Tensor:
     """A fixed batch of token IDs -- deterministic across all test runs."""
     return _make_sample_ids()
@@ -205,7 +209,9 @@ class TestOLMoCollectorSingle:
         collector.remove()
 
     def test_buffers_populated_after_pass(self, tiny_olmo, sample_ids):
-        """Both activation and pre_activation_grad are non-None after forward+backward."""
+        """Both activation and pre_activation_grad are non-None after
+        forward+backward.
+        """
         capture = _Capture()
         collector = HookManager(tiny_olmo, config=_make_hook_cfg(), callbacks=[capture])
         _run_forward_backward(tiny_olmo, sample_ids, collector, capture)
@@ -258,7 +264,8 @@ class TestOLMoCollectorSingle:
                 )
                 assert go.shape == (BATCH_SIZE, SEQ_LEN, MLP_RATIO * D_MODEL), (
                     f"{layer_name} ff_proj pre_activation_grad: expected "
-                    f"{(BATCH_SIZE, SEQ_LEN, MLP_RATIO * D_MODEL)}, got {tuple(go.shape)}"
+                    f"{(BATCH_SIZE, SEQ_LEN, MLP_RATIO * D_MODEL)}, "
+                    f"got {tuple(go.shape)}"
                 )
             elif "ff_out" in layer_name:
                 assert act.shape == (BATCH_SIZE, SEQ_LEN, hidden), (
@@ -274,7 +281,11 @@ class TestOLMoCollectorSingle:
     def test_buffers_reset_between_passes(self, tiny_olmo, sample_ids):
         """A second context block on a different batch gives different activations."""
         capture1 = _Capture()
-        collector = HookManager(tiny_olmo, config=_make_hook_cfg(), callbacks=[capture1])
+        collector = HookManager(
+            tiny_olmo,
+            config=_make_hook_cfg(),
+            callbacks=[capture1],
+        )
         _run_forward_backward(tiny_olmo, sample_ids, collector, capture1)
 
         torch.manual_seed(SEED + 1)
@@ -286,35 +297,53 @@ class TestOLMoCollectorSingle:
         rec1, rec2 = capture1.records[0], capture2.records[0]
         any_differ = any(
             not torch.allclose(
-                rec1.gradient.data[l].activation,
-                rec2.gradient.data[l].activation,
+                rec1.gradient.data[layer].activation,
+                rec2.gradient.data[layer].activation,
             )
-            for l in rec1.gradient.data
-            if l in rec2.gradient.data
+            for layer in rec1.gradient.data
+            if layer in rec2.gradient.data
         )
-        assert any_differ, "Activations are identical across different inputs -- buffers not reset"
+        assert any_differ, (
+            "Activations are identical across different inputs -- buffers not reset"
+        )
         collector.remove()
 
     def test_numeric_agreement_with_reference(self, tiny_olmo, sample_ids):
-        """Two independent models built from the same seed must produce identical a/g."""
+        """Two independent models built from the same seed must produce
+        identical a/g.
+        """
         capture_a = _Capture()
-        collector_a = HookManager(tiny_olmo, config=_make_hook_cfg(), callbacks=[capture_a])
+        collector_a = HookManager(
+            tiny_olmo,
+            config=_make_hook_cfg(),
+            callbacks=[capture_a],
+        )
         _run_forward_backward(tiny_olmo, sample_ids, collector_a, capture_a)
         collector_a.remove()
 
         # Model B -- fresh instance, same seed
         torch.manual_seed(SEED)
         cfg = ModelConfig(
-            d_model=D_MODEL, n_layers=N_LAYERS, n_heads=N_HEADS,
-            vocab_size=VOCAB_SIZE, max_sequence_length=SEQ_LEN,
-            mlp_ratio=MLP_RATIO, activation_type=ActivationType.swiglu,
-            rope=True, flash_attention=False, include_bias=False,
+            d_model=D_MODEL,
+            n_layers=N_LAYERS,
+            n_heads=N_HEADS,
+            vocab_size=VOCAB_SIZE,
+            max_sequence_length=SEQ_LEN,
+            mlp_ratio=MLP_RATIO,
+            activation_type=ActivationType.swiglu,
+            rope=True,
+            flash_attention=False,
+            include_bias=False,
             weight_tying=True,
         )
         model_b = OLMo(cfg)
         model_b.train()
         capture_b = _Capture()
-        collector_b = HookManager(model_b, config=_make_hook_cfg(), callbacks=[capture_b])
+        collector_b = HookManager(
+            model_b,
+            config=_make_hook_cfg(),
+            callbacks=[capture_b],
+        )
         _run_forward_backward(model_b, sample_ids.clone(), collector_b, capture_b)
         collector_b.remove()
 
@@ -323,19 +352,26 @@ class TestOLMoCollectorSingle:
         for layer in rec_a.gradient.data:
             val_a = rec_a.gradient.data[layer]
             val_b = rec_b.gradient.data[layer]
-            assert isinstance(val_a, Factorized) and isinstance(val_b, Factorized)
-            assert torch.allclose(val_a.activation.float(), val_b.activation.float(),
-                                  atol=ATOL, rtol=RTOL), (
+            assert isinstance(val_a, Factorized)
+            assert isinstance(val_b, Factorized)
+            assert torch.allclose(
+                val_a.activation.float(),
+                val_b.activation.float(),
+                atol=ATOL,
+                rtol=RTOL,
+            ), (
                 f"{layer} activation: runs with same seed diverged  "
                 f"max_diff={(val_a.activation - val_b.activation).abs().max():.2e}"
             )
+            g_diff = (val_a.pre_activation_grad - val_b.pre_activation_grad).abs().max()
             assert torch.allclose(
                 val_a.pre_activation_grad.float(),
                 val_b.pre_activation_grad.float(),
-                atol=ATOL, rtol=RTOL,
+                atol=ATOL,
+                rtol=RTOL,
             ), (
                 f"{layer} pre_activation_grad: runs with same seed diverged  "
-                f"max_diff={(val_a.pre_activation_grad - val_b.pre_activation_grad).abs().max():.2e}"
+                f"max_diff={g_diff:.2e}"
             )
 
     def test_remove_clears_layer_names(self, tiny_olmo):
@@ -373,10 +409,16 @@ def _fsdp_worker(
         ids = _make_sample_ids()
         torch.manual_seed(SEED)
         cfg = ModelConfig(
-            d_model=D_MODEL, n_layers=N_LAYERS, n_heads=N_HEADS,
-            vocab_size=VOCAB_SIZE, max_sequence_length=SEQ_LEN,
-            mlp_ratio=MLP_RATIO, activation_type=ActivationType.swiglu,
-            rope=True, flash_attention=False, include_bias=False,
+            d_model=D_MODEL,
+            n_layers=N_LAYERS,
+            n_heads=N_HEADS,
+            vocab_size=VOCAB_SIZE,
+            max_sequence_length=SEQ_LEN,
+            mlp_ratio=MLP_RATIO,
+            activation_type=ActivationType.swiglu,
+            rope=True,
+            flash_attention=False,
+            include_bias=False,
             weight_tying=True,
         )
         model = OLMo(cfg)
@@ -422,14 +464,23 @@ def _fsdp_worker(
                 for val in rec.gradient.data.values():
                     if isinstance(val, Factorized):
                         passed = passed and torch.isfinite(val.activation).all().item()
-                        passed = passed and torch.isfinite(val.pre_activation_grad).all().item()
+                        passed = (
+                            passed
+                            and torch.isfinite(val.pre_activation_grad).all().item()
+                        )
 
                 # Numeric agreement with single-GPU reference
                 ref_cfg = ModelConfig(
-                    d_model=D_MODEL, n_layers=N_LAYERS, n_heads=N_HEADS,
-                    vocab_size=VOCAB_SIZE, max_sequence_length=SEQ_LEN,
-                    mlp_ratio=MLP_RATIO, activation_type=ActivationType.swiglu,
-                    rope=True, flash_attention=False, include_bias=False,
+                    d_model=D_MODEL,
+                    n_layers=N_LAYERS,
+                    n_heads=N_HEADS,
+                    vocab_size=VOCAB_SIZE,
+                    max_sequence_length=SEQ_LEN,
+                    mlp_ratio=MLP_RATIO,
+                    activation_type=ActivationType.swiglu,
+                    rope=True,
+                    flash_attention=False,
+                    include_bias=False,
                     weight_tying=True,
                 )
                 torch.manual_seed(SEED)
@@ -441,7 +492,12 @@ def _fsdp_worker(
                     config=HookManagerConfig(linear_io=OLMO_MLP_PATTERNS),
                     callbacks=[ref_capture],
                 )
-                _run_forward_backward(ref_model, ids.clone(), ref_collector, ref_capture)
+                _run_forward_backward(
+                    ref_model,
+                    ids.clone(),
+                    ref_collector,
+                    ref_capture,
+                )
                 ref_collector.remove()
 
                 ref_rec = ref_capture.records[0]
@@ -452,13 +508,18 @@ def _fsdp_worker(
                     val = rec.gradient.data[layer]
                     ref_val = ref_rec.gradient.data[layer]
                     if isinstance(val, Factorized) and isinstance(ref_val, Factorized):
-                        if not torch.allclose(ref_val.activation.float(), val.activation.float(),
-                                              atol=ATOL, rtol=RTOL):
+                        if not torch.allclose(
+                            ref_val.activation.float(),
+                            val.activation.float(),
+                            atol=ATOL,
+                            rtol=RTOL,
+                        ):
                             passed = False
                         if not torch.allclose(
                             ref_val.pre_activation_grad.float(),
                             val.pre_activation_grad.float(),
-                            atol=ATOL, rtol=RTOL,
+                            atol=ATOL,
+                            rtol=RTOL,
                         ):
                             passed = False
 
@@ -495,8 +556,8 @@ class TestOLMoCollectorFSDP:
                 join=True,
             )
         finally:
-            if os.path.exists(rendezvous_path):
-                os.unlink(rendezvous_path)
+            if pathlib.Path(rendezvous_path).exists():
+                pathlib.Path(rendezvous_path).unlink()
 
         assert not result_queue.empty(), "rank-0 worker did not report a result"
         passed = result_queue.get()

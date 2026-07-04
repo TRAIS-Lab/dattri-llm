@@ -15,7 +15,8 @@ Layer types covered
 -------------------
 * ``nn.Linear``                           -- 2-D (no-bias, with-bias), 3-D token
 * ``nn.NonDynamicallyQuantizableLinear``  -- same math as nn.Linear (no-bias, with-bias)
-* ``transformers.pytorch_utils.Conv1D``   -- weight stored transposed (I, O); always has bias
+* ``transformers.pytorch_utils.Conv1D``   -- weight stored transposed (I, O);
+  always has bias
 * ``nn.Embedding``
 * ``nn.EmbeddingBag``                     -- mode='sum', mode='mean'
 * ``nn.LayerNorm``                        -- no-bias, with-bias
@@ -44,8 +45,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
 
 from dattri_llm.gradient import ops
@@ -57,6 +58,7 @@ from dattri_llm.gradient.hooks import (
 
 try:
     from transformers.pytorch_utils import Conv1D as _HF_Conv1D
+
     _HAS_HF = True
 except ImportError:
     _HF_Conv1D = None
@@ -69,17 +71,18 @@ _HAS_RMSNORM = hasattr(nn, "RMSNorm")
 # Shared dimensions
 # ---------------------------------------------------------------------------
 
-B = 4       # batch size for the batch pass
-T = 5       # token / sequence length
-I = 8       # in-features / C_in
-O = 6       # out-features / C_out
+B = 4  # batch size for the batch pass
+T = 5  # token / sequence length
+D_IN = 8  # in-features / C_in
+D_OUT = 6  # out-features / C_out
 VOCAB = 32
-E = 10      # embedding dimension
+E = 10  # embedding dimension
 
 
 # ---------------------------------------------------------------------------
 # Tiny wrapper models (layer inside MLP-named submodule or always-hooked type)
 # ---------------------------------------------------------------------------
+
 
 class _LinearModel(nn.Module):
     def __init__(self, in_f: int, out_f: int, bias: bool = False) -> None:
@@ -101,6 +104,7 @@ class _NonDynQuantLinearModel(nn.Module):
 
 class _HFConv1DModel(nn.Module):
     """HF Conv1D wrapper -- weight is (nx, nf) = (I, O), bias is always (nf,) = (O,)."""
+
     def __init__(self, in_f: int, out_f: int) -> None:
         super().__init__()
         # Conv1D(nf, nx): weight shape (nx, nf) = (in_f, out_f)
@@ -167,7 +171,8 @@ class _RMSNormModel(nn.Module):
 class _ChannelNormModel(nn.Module):
     """Wraps a per-channel norm (GroupNorm/InstanceNorm) and scales the output
     by a fixed buffer ``R`` so the captured output gradient is non-trivial and
-    identical across the per-sample reference and batch passes (g == R)."""
+    identical across the per-sample reference and batch passes (g == R).
+    """
 
     def __init__(self, norm: nn.Module, r_shape: tuple[int, ...]) -> None:
         super().__init__()
@@ -218,6 +223,7 @@ class _EmbeddingBagModel(nn.Module):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 class _CaptureCB(HookManagerCallback):
     def __init__(self) -> None:
@@ -288,7 +294,9 @@ def _per_sample_hf_weight_grads(
     layer_attr: str,
     inputs: list[torch.Tensor],
 ) -> list[torch.Tensor]:
-    """For HF Conv1D: weight is (I, O); return weight.grad.T.flatten() = (O*I) to match materialize."""
+    """For HF Conv1D: weight is (I, O); return weight.grad.T.flatten() = (O*I)
+    to match materialize.
+    """
     layer = getattr(model, layer_attr)
     grads: list[torch.Tensor] = []
     for x in inputs:
@@ -299,7 +307,9 @@ def _per_sample_hf_weight_grads(
 
 
 def _channel_norm_diag_grad(
-    xhat: torch.Tensor, R: torch.Tensor, has_bias: bool
+    xhat: torch.Tensor,
+    R: torch.Tensor,
+    has_bias: bool,
 ) -> torch.Tensor:
     """Independent per-position (diagonal) gradient for a per-channel norm.
 
@@ -308,20 +318,26 @@ def _channel_norm_diag_grad(
     out position-major to match the library's ``materialize`` ordering.
     """
     c = xhat.shape[1]
-    gamma = (xhat * R).reshape(c, -1).permute(1, 0)   # (S, C)
+    gamma = (xhat * R).reshape(c, -1).permute(1, 0)  # (S, C)
     parts = [gamma]
     if has_bias:
         parts.append(R.reshape(c, -1).permute(1, 0))  # (S, C)  beta contrib = 1*g
-    return torch.cat(parts, dim=-1).flatten()          # (S * feat,)
+    return torch.cat(parts, dim=-1).flatten()  # (S * feat,)
 
 
 # Thin wrappers that call ops on a Gradient layer, passing module_kwargs through.
+
 
 def _materialize(gradient, name: str, include_bias: bool = True) -> torch.Tensor:
     lt = gradient.layer_types[name]
     # per_token=True keeps norm layers' un-summed per-position products, which the
     # norm ground-truth tests sum over positions to recover param.grad.
-    return ops.materialize(gradient.data[name], lt, include_bias, per_token=True).float()
+    return ops.materialize(
+        gradient.data[name],
+        lt,
+        include_bias,
+        per_token=True,
+    ).float()
 
 
 def _grad_norm_sq(gradient, name: str, include_bias: bool = True) -> torch.Tensor:
@@ -338,69 +354,91 @@ def _pairwise_dot(gradient, name: str, include_bias: bool = True) -> torch.Tenso
 # nn.Linear
 # ---------------------------------------------------------------------------
 
+
 class TestLinearGroundTruth:
     """nn.Linear -- 2-D input (no-bias), 2-D with-bias, 3-D token input."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _LinearModel(I, O, bias=False)
+        self.model = _LinearModel(D_IN, D_OUT, bias=False)
 
     # -- 2-D input: (B, I) --------------------------------------------------
 
     def _inputs_2d(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I) for _ in range(B)]
+        return [torch.randn(1, D_IN) for _ in range(B)]
 
     def test_materialize_2d(self) -> None:
         inputs = self._inputs_2d()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq_2d(self) -> None:
         inputs = self._inputs_2d()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
 
     def test_pairwise_dot_2d(self) -> None:
         inputs = self._inputs_2d()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
-                assert torch.allclose(K[i, j], expected, atol=1e-3), \
-                    f"K[{i},{j}] expected {expected:.4f} got {K[i,j]:.4f}"
+                assert torch.allclose(K[i, j], expected, atol=1e-3), (
+                    f"K[{i},{j}] expected {expected:.4f} got {K[i, j]:.4f}"
+                )
 
     # -- 3-D input: (B, T, I) -- token sequence; materialize sums over T -----
 
     def _inputs_3d(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, T, I) for _ in range(B)]
+        return [torch.randn(1, T, D_IN) for _ in range(B)]
 
     def test_materialize_3d(self) -> None:
         inputs = self._inputs_3d()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq_3d(self) -> None:
         inputs = self._inputs_3d()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
 
     def test_pairwise_dot_3d(self) -> None:
         inputs = self._inputs_3d()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
@@ -410,28 +448,35 @@ class TestLinearGroundTruth:
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
-        model = _LinearModel(I, O, bias=True)
+        model = _LinearModel(D_IN, D_OUT, bias=True)
         torch.manual_seed(1)
-        inputs = [torch.randn(1, I) for _ in range(B)]
+        inputs = [torch.randn(1, D_IN) for _ in range(B)]
         return model, inputs
 
     def test_materialize_with_bias(self) -> None:
         """Bias augmentation: mat[i].reshape(O, I+1)[:, :I] == weight.grad
-        and mat[i].reshape(O, I+1)[:, I] == bias.grad."""
+        and mat[i].reshape(O, I+1)[:, I] == bias.grad.
+        """
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        mat = _materialize(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            m = mat[i].reshape(O, I + 1)
-            assert torch.allclose(m[:, :I].flatten(), w_ref[i].float(), atol=1e-4)
-            assert torch.allclose(m[:, I], b_ref[i].float(), atol=1e-4)
+            m = mat[i].reshape(D_OUT, D_IN + 1)
+            assert torch.allclose(m[:, :D_IN].flatten(), w_ref[i].float(), atol=1e-4)
+            assert torch.allclose(m[:, D_IN], b_ref[i].float(), atol=1e-4)
 
     def test_grad_norm_sq_with_bias(self) -> None:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             ref_norm = w_ref[i].float().pow(2).sum() + b_ref[i].float().pow(2).sum()
             assert torch.allclose(norms[i], ref_norm, atol=1e-4)
@@ -440,8 +485,13 @@ class TestLinearGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        K = _pairwise_dot(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -452,35 +502,45 @@ class TestLinearGroundTruth:
 # nn.NonDynamicallyQuantizableLinear
 # ---------------------------------------------------------------------------
 
+
 class TestNonDynQuantLinearGroundTruth:
     """nn.NonDynamicallyQuantizableLinear -- behaves identically to nn.Linear."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _NonDynQuantLinearModel(I, O, bias=False)
+        self.model = _NonDynQuantLinearModel(D_IN, D_OUT, bias=False)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I) for _ in range(B)]
+        return [torch.randn(1, D_IN) for _ in range(B)]
 
     def test_materialize(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(mat[i], ref[i].float(), atol=1e-4)
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
 
     def test_pairwise_dot(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
@@ -488,26 +548,32 @@ class TestNonDynQuantLinearGroundTruth:
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
-        model = _NonDynQuantLinearModel(I, O, bias=True)
+        model = _NonDynQuantLinearModel(D_IN, D_OUT, bias=True)
         torch.manual_seed(1)
-        inputs = [torch.randn(1, I) for _ in range(B)]
+        inputs = [torch.randn(1, D_IN) for _ in range(B)]
         return model, inputs
 
     def test_materialize_with_bias(self) -> None:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        mat = _materialize(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            m = mat[i].reshape(O, I + 1)
-            assert torch.allclose(m[:, :I].flatten(), w_ref[i].float(), atol=1e-4)
-            assert torch.allclose(m[:, I], b_ref[i].float(), atol=1e-4)
+            m = mat[i].reshape(D_OUT, D_IN + 1)
+            assert torch.allclose(m[:, :D_IN].flatten(), w_ref[i].float(), atol=1e-4)
+            assert torch.allclose(m[:, D_IN], b_ref[i].float(), atol=1e-4)
 
     def test_grad_norm_sq_with_bias(self) -> None:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             ref_norm = w_ref[i].float().pow(2).sum() + b_ref[i].float().pow(2).sum()
             assert torch.allclose(norms[i], ref_norm, atol=1e-4)
@@ -516,8 +582,13 @@ class TestNonDynQuantLinearGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        K = _pairwise_dot(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -528,40 +599,50 @@ class TestNonDynQuantLinearGroundTruth:
 # transformers.pytorch_utils.Conv1D
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not _HAS_HF, reason="transformers not installed")
 class TestHFConv1DGroundTruth:
     """transformers.pytorch_utils.Conv1D -- weight stored as (nx, nf)=(I, O), transposed
     relative to nn.Linear.  Bias is always present (fixed in the constructor).
 
-    materialize produces (B, O*(I+1)) where mat[i].reshape(O, I+1)[:, :I] == weight.grad.T
+    materialize produces (B, O*(I+1)) where
+    mat[i].reshape(O, I+1)[:, :I] == weight.grad.T
     and mat[i].reshape(O, I+1)[:, I] == bias.grad.
     """
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _HFConv1DModel(I, O)
+        self.model = _HFConv1DModel(D_IN, D_OUT)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I) for _ in range(B)]
+        return [torch.randn(1, D_IN) for _ in range(B)]
 
     def test_materialize(self) -> None:
         inputs = self._inputs()
         w_ref = _per_sample_hf_weight_grads(self.model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(self.model, "mlp", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            m = mat[i].reshape(O, I + 1)
-            assert torch.allclose(m[:, :I].flatten(), w_ref[i].float(), atol=1e-4), \
+            m = mat[i].reshape(D_OUT, D_IN + 1)
+            assert torch.allclose(m[:, :D_IN].flatten(), w_ref[i].float(), atol=1e-4), (
                 f"weight part mismatch at sample {i}"
-            assert torch.allclose(m[:, I], b_ref[i].float(), atol=1e-4), \
+            )
+            assert torch.allclose(m[:, D_IN], b_ref[i].float(), atol=1e-4), (
                 f"bias part mismatch at sample {i}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
         w_ref = _per_sample_hf_weight_grads(self.model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(self.model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             ref_norm = w_ref[i].float().pow(2).sum() + b_ref[i].float().pow(2).sum()
             assert torch.allclose(norms[i], ref_norm, atol=1e-4)
@@ -570,8 +651,13 @@ class TestHFConv1DGroundTruth:
         inputs = self._inputs()
         w_ref = _per_sample_hf_weight_grads(self.model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(self.model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -581,6 +667,7 @@ class TestHFConv1DGroundTruth:
 # ---------------------------------------------------------------------------
 # nn.Embedding
 # ---------------------------------------------------------------------------
+
 
 class TestEmbeddingGroundTruth:
     """nn.Embedding -- token IDs as activation, grad w.r.t. output as grad."""
@@ -604,8 +691,9 @@ class TestEmbeddingGroundTruth:
         ref = _per_sample_weight_grads(self.model, "emb", inputs)
         mat = _materialize(_run_batch(self.model, torch.cat(inputs)), "emb")
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-5), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-5), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
@@ -628,6 +716,7 @@ class TestEmbeddingGroundTruth:
 # nn.LayerNorm
 # ---------------------------------------------------------------------------
 
+
 class TestLayerNormGroundTruth:
     """nn.LayerNorm -- 2-D input (no-bias and with-bias).
 
@@ -641,19 +730,20 @@ class TestLayerNormGroundTruth:
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _LayerNormModel(I, bias=False)
+        self.model = _LayerNormModel(D_IN, bias=False)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I) for _ in range(B)]
+        return [torch.randn(1, D_IN) for _ in range(B)]
 
     def test_materialize(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "ln", inputs)
         mat = _materialize(_run_batch(self.model, torch.cat(inputs)), "ln")
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
@@ -675,23 +765,27 @@ class TestLayerNormGroundTruth:
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
-        model = _LayerNormModel(I, bias=True)
+        model = _LayerNormModel(D_IN, bias=True)
         torch.manual_seed(1)
-        inputs = [torch.randn(1, I) for _ in range(B)]
+        inputs = [torch.randn(1, D_IN) for _ in range(B)]
         return model, inputs
 
     def test_materialize_with_bias(self) -> None:
         """With bias, preprocess_factorized returns a_aug=(B,2I), g_aug=(B,2I).
-        mat[i][:I] == weight.grad  and  mat[i][I:] == bias.grad."""
+
+        mat[i][:I] == weight.grad  and  mat[i][I:] == bias.grad.
+        """
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "ln", inputs)
         b_ref = _per_sample_bias_grads(model, "ln", inputs)
         mat = _materialize(_run_batch(model, torch.cat(inputs)), "ln")  # (B, 2*I)
         for i in range(B):
-            assert torch.allclose(mat[i][:I], w_ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i][:D_IN], w_ref[i].float(), atol=1e-4), (
                 f"weight grad mismatch sample {i}"
-            assert torch.allclose(mat[i][I:], b_ref[i].float(), atol=1e-4), \
+            )
+            assert torch.allclose(mat[i][D_IN:], b_ref[i].float(), atol=1e-4), (
                 f"bias grad mismatch sample {i}"
+            )
 
     def test_grad_norm_sq_with_bias(self) -> None:
         model, inputs = self._bias_model_and_inputs()
@@ -707,7 +801,9 @@ class TestLayerNormGroundTruth:
         w_ref = _per_sample_weight_grads(model, "ln", inputs)
         b_ref = _per_sample_bias_grads(model, "ln", inputs)
         K = _pairwise_dot(_run_batch(model, torch.cat(inputs)), "ln")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -718,36 +814,47 @@ class TestLayerNormGroundTruth:
 # nn.Conv1d
 # ---------------------------------------------------------------------------
 
+
 class TestConv1dGroundTruth:
     """nn.Conv1d -- raw (N, C_in, L) hook data; im2col unfolds before materialize."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _Conv1dModel(I, O, k=3, bias=False)
+        self.model = _Conv1dModel(D_IN, D_OUT, k=3, bias=False)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I, 10) for _ in range(B)]
+        return [torch.randn(1, D_IN, 10) for _ in range(B)]
 
     def test_materialize(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
 
     def test_pairwise_dot(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
@@ -757,21 +864,25 @@ class TestConv1dGroundTruth:
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
-        model = _Conv1dModel(I, O, k=3, bias=True)
+        model = _Conv1dModel(D_IN, D_OUT, k=3, bias=True)
         torch.manual_seed(1)
-        inputs = [torch.randn(1, I, 10) for _ in range(B)]
+        inputs = [torch.randn(1, D_IN, 10) for _ in range(B)]
         return model, inputs
 
     def test_materialize_with_bias(self) -> None:
         """mat[i].reshape(C_out, patch+1)[:, :patch] == weight.grad,
-        mat[i].reshape(C_out, patch+1)[:, patch] == bias.grad."""
+        mat[i].reshape(C_out, patch+1)[:, patch] == bias.grad.
+        """
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        mat = _materialize(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        patch = I * 3  # C_in * k
+        mat = _materialize(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        patch = D_IN * 3  # C_in * k
         for i in range(B):
-            m = mat[i].reshape(O, patch + 1)
+            m = mat[i].reshape(D_OUT, patch + 1)
             assert torch.allclose(m[:, :patch].flatten(), w_ref[i].float(), atol=1e-4)
             assert torch.allclose(m[:, patch], b_ref[i].float(), atol=1e-4)
 
@@ -779,7 +890,10 @@ class TestConv1dGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             ref_norm = w_ref[i].float().pow(2).sum() + b_ref[i].float().pow(2).sum()
             assert torch.allclose(norms[i], ref_norm, atol=1e-4)
@@ -788,8 +902,13 @@ class TestConv1dGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        K = _pairwise_dot(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -800,36 +919,47 @@ class TestConv1dGroundTruth:
 # nn.Conv2d
 # ---------------------------------------------------------------------------
 
+
 class TestConv2dGroundTruth:
     """nn.Conv2d -- raw (N, C_in, H, W) hook data; im2col unfolds before materialize."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _Conv2dModel(I, O, k=2, bias=False)
+        self.model = _Conv2dModel(D_IN, D_OUT, k=2, bias=False)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I, 6, 6) for _ in range(B)]
+        return [torch.randn(1, D_IN, 6, 6) for _ in range(B)]
 
     def test_materialize(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
 
     def test_pairwise_dot(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
@@ -839,21 +969,25 @@ class TestConv2dGroundTruth:
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
-        model = _Conv2dModel(I, O, k=2, bias=True)
+        model = _Conv2dModel(D_IN, D_OUT, k=2, bias=True)
         torch.manual_seed(1)
-        inputs = [torch.randn(1, I, 6, 6) for _ in range(B)]
+        inputs = [torch.randn(1, D_IN, 6, 6) for _ in range(B)]
         return model, inputs
 
     def test_materialize_with_bias(self) -> None:
         """mat[i].reshape(C_out, patch+1)[:, :patch] == weight.grad,
-        mat[i].reshape(C_out, patch+1)[:, patch] == bias.grad."""
+        mat[i].reshape(C_out, patch+1)[:, patch] == bias.grad.
+        """
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        mat = _materialize(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        patch = I * 2 * 2   # C_in * kH * kW
+        mat = _materialize(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        patch = D_IN * 2 * 2  # C_in * kH * kW
         for i in range(B):
-            m = mat[i].reshape(O, patch + 1)
+            m = mat[i].reshape(D_OUT, patch + 1)
             assert torch.allclose(m[:, :patch].flatten(), w_ref[i].float(), atol=1e-4)
             assert torch.allclose(m[:, patch], b_ref[i].float(), atol=1e-4)
 
@@ -861,7 +995,10 @@ class TestConv2dGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             ref_norm = w_ref[i].float().pow(2).sum() + b_ref[i].float().pow(2).sum()
             assert torch.allclose(norms[i], ref_norm, atol=1e-4)
@@ -870,8 +1007,13 @@ class TestConv2dGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        K = _pairwise_dot(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -882,36 +1024,47 @@ class TestConv2dGroundTruth:
 # nn.Conv3d
 # ---------------------------------------------------------------------------
 
+
 class TestConv3dGroundTruth:
     """nn.Conv3d -- raw (N, C_in, D, H, W) hook data; 3-D im2col before materialize."""
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _Conv3dModel(I, O, k=2, bias=False)
+        self.model = _Conv3dModel(D_IN, D_OUT, k=2, bias=False)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I, 4, 4, 4) for _ in range(B)]
+        return [torch.randn(1, D_IN, 4, 4, 4) for _ in range(B)]
 
     def test_materialize(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
 
     def test_pairwise_dot(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
@@ -921,21 +1074,25 @@ class TestConv3dGroundTruth:
 
     def _bias_model_and_inputs(self):
         torch.manual_seed(0)
-        model = _Conv3dModel(I, O, k=2, bias=True)
+        model = _Conv3dModel(D_IN, D_OUT, k=2, bias=True)
         torch.manual_seed(1)
-        inputs = [torch.randn(1, I, 4, 4, 4) for _ in range(B)]
+        inputs = [torch.randn(1, D_IN, 4, 4, 4) for _ in range(B)]
         return model, inputs
 
     def test_materialize_with_bias(self) -> None:
         """mat[i].reshape(C_out, patch+1)[:, :patch] == weight.grad,
-        mat[i].reshape(C_out, patch+1)[:, patch] == bias.grad."""
+        mat[i].reshape(C_out, patch+1)[:, patch] == bias.grad.
+        """
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        mat = _materialize(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        patch = I * 2 * 2 * 2  # C_in * kD * kH * kW
+        mat = _materialize(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        patch = D_IN * 2 * 2 * 2  # C_in * kD * kH * kW
         for i in range(B):
-            m = mat[i].reshape(O, patch + 1)
+            m = mat[i].reshape(D_OUT, patch + 1)
             assert torch.allclose(m[:, :patch].flatten(), w_ref[i].float(), atol=1e-4)
             assert torch.allclose(m[:, patch], b_ref[i].float(), atol=1e-4)
 
@@ -943,7 +1100,10 @@ class TestConv3dGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             ref_norm = w_ref[i].float().pow(2).sum() + b_ref[i].float().pow(2).sum()
             assert torch.allclose(norms[i], ref_norm, atol=1e-4)
@@ -952,8 +1112,13 @@ class TestConv3dGroundTruth:
         model, inputs = self._bias_model_and_inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        K = _pairwise_dot(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -963,6 +1128,7 @@ class TestConv3dGroundTruth:
 # ---------------------------------------------------------------------------
 # nn.RMSNorm
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not _HAS_RMSNORM, reason="nn.RMSNorm requires PyTorch >= 2.4")
 class TestRMSNormGroundTruth:
@@ -975,19 +1141,20 @@ class TestRMSNormGroundTruth:
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.model = _RMSNormModel(I)
+        self.model = _RMSNormModel(D_IN)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I) for _ in range(B)]
+        return [torch.randn(1, D_IN) for _ in range(B)]
 
     def test_materialize(self) -> None:
         inputs = self._inputs()
         ref = _per_sample_weight_grads(self.model, "ln", inputs)
         mat = _materialize(_run_batch(self.model, torch.cat(inputs)), "ln")
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()
@@ -1009,6 +1176,7 @@ class TestRMSNormGroundTruth:
 # ---------------------------------------------------------------------------
 # Shared driver for per-channel norms (GroupNorm / InstanceNorm)
 # ---------------------------------------------------------------------------
+
 
 class _ChannelNormChecks:
     """Mixin providing materialize / grad_norm_sq / pairwise_dot checks for a
@@ -1035,19 +1203,22 @@ class _ChannelNormChecks:
         mat = _materialize(_run_batch(self.model, torch.cat(inputs)), "norm")
         C = self.C
         for i in range(B):
-            summed = mat[i].reshape(-1, 2 * C).sum(0)   # sum over positions
-            assert torch.allclose(summed[:C], w_ref[i].float(), atol=1e-4), \
+            summed = mat[i].reshape(-1, 2 * C).sum(0)  # sum over positions
+            assert torch.allclose(summed[:C], w_ref[i].float(), atol=1e-4), (
                 f"gamma mismatch sample {i}"
-            assert torch.allclose(summed[C:], b_ref[i].float(), atol=1e-4), \
+            )
+            assert torch.allclose(summed[C:], b_ref[i].float(), atol=1e-4), (
                 f"beta mismatch sample {i}"
+            )
 
     def test_grad_norm_sq_with_bias(self) -> None:
         inputs = self._inputs()
         norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs)), "norm")
         for i in range(B):
             ref = self._diag(inputs[i], has_bias=True).pow(2).sum()
-            assert torch.allclose(norms[i], ref, atol=1e-4), \
+            assert torch.allclose(norms[i], ref, atol=1e-4), (
                 f"sample {i}: {norms[i]:.4f} vs {ref:.4f}"
+            )
 
     def test_pairwise_dot_with_bias(self) -> None:
         inputs = self._inputs()
@@ -1063,8 +1234,11 @@ class _ChannelNormChecks:
     def test_materialize_no_bias(self) -> None:
         inputs = self._inputs()
         w_ref = _per_sample_weight_grads(self.model, "norm", inputs)
-        mat = _materialize(_run_batch(self.model, torch.cat(inputs)), "norm",
-                           include_bias=False)
+        mat = _materialize(
+            _run_batch(self.model, torch.cat(inputs)),
+            "norm",
+            include_bias=False,
+        )
         C = self.C
         for i in range(B):
             summed = mat[i].reshape(-1, C).sum(0)
@@ -1072,16 +1246,22 @@ class _ChannelNormChecks:
 
     def test_grad_norm_sq_no_bias(self) -> None:
         inputs = self._inputs()
-        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs)), "norm",
-                              include_bias=False)
+        norms = _grad_norm_sq(
+            _run_batch(self.model, torch.cat(inputs)),
+            "norm",
+            include_bias=False,
+        )
         for i in range(B):
             ref = self._diag(inputs[i], has_bias=False).pow(2).sum()
             assert torch.allclose(norms[i], ref, atol=1e-4)
 
     def test_pairwise_dot_no_bias(self) -> None:
         inputs = self._inputs()
-        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs)), "norm",
-                          include_bias=False)
+        K = _pairwise_dot(
+            _run_batch(self.model, torch.cat(inputs)),
+            "norm",
+            include_bias=False,
+        )
         diags = [self._diag(x, has_bias=False) for x in inputs]
         for i in range(B):
             for j in range(B):
@@ -1093,6 +1273,7 @@ class _ChannelNormChecks:
 # nn.GroupNorm
 # ---------------------------------------------------------------------------
 
+
 class TestGroupNormGroundTruth(_ChannelNormChecks):
     """nn.GroupNorm -- input (N, C, L) with spatial L > 1; 2 groups over C=8."""
 
@@ -1101,7 +1282,7 @@ class TestGroupNormGroundTruth(_ChannelNormChecks):
 
     def setup_method(self) -> None:
         torch.manual_seed(0)
-        self.C = I
+        self.C = D_IN
         norm = nn.GroupNorm(self.NUM_GROUPS, self.C, affine=True)
         self.model = _ChannelNormModel(norm, (self.C, self.L))
 
@@ -1110,13 +1291,19 @@ class TestGroupNormGroundTruth(_ChannelNormChecks):
         return [torch.randn(1, self.C, self.L) for _ in range(B)]
 
     def _xhat(self, x: torch.Tensor) -> torch.Tensor:
-        return F.group_norm(x, self.NUM_GROUPS, weight=None, bias=None,
-                            eps=self.model.norm.eps)
+        return F.group_norm(
+            x,
+            self.NUM_GROUPS,
+            weight=None,
+            bias=None,
+            eps=self.model.norm.eps,
+        )
 
 
 # ---------------------------------------------------------------------------
 # nn.InstanceNorm2d
 # ---------------------------------------------------------------------------
+
 
 class TestInstanceNorm2dGroundTruth(_ChannelNormChecks):
     """nn.InstanceNorm2d -- input (N, C, H, W); per-channel normalization."""
@@ -1142,10 +1329,12 @@ class TestInstanceNorm2dGroundTruth(_ChannelNormChecks):
 # nn.ConvTranspose1d / 2d / 3d
 # ---------------------------------------------------------------------------
 
+
 class _ConvTransposeChecks:
     """Mixin: weight (and optional bias) ground-truth checks for a transposed
     convolution at ``self.model.mlp``.  ``self.P`` is C_out*prodkernel and
-    ``self.C_in`` the number of input channels."""
+    ``self.C_in`` the number of input channels.
+    """
 
     def _inputs(self) -> list[torch.Tensor]:
         raise NotImplementedError
@@ -1154,16 +1343,23 @@ class _ConvTransposeChecks:
         model = self.make_model(bias=False)
         inputs = self._inputs()
         ref = _per_sample_weight_grads(model, "mlp", inputs)
-        mat = _materialize(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         model = self.make_model(bias=False)
         inputs = self._inputs()
         ref = _per_sample_weight_grads(model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
 
@@ -1171,7 +1367,10 @@ class _ConvTransposeChecks:
         model = self.make_model(bias=False)
         inputs = self._inputs()
         ref = _per_sample_weight_grads(model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        K = _pairwise_dot(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
@@ -1184,21 +1383,31 @@ class _ConvTransposeChecks:
         inputs = self._inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        mat = _materialize(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        mat = _materialize(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         C_in, P, C_out = self.C_in, self.P, self.C_out
         for i in range(B):
             m = mat[i].reshape(C_in + 1, P + C_out)
-            assert torch.allclose(m[:C_in, :P].flatten(), w_ref[i].float(), atol=1e-4), \
-                f"weight mismatch sample {i}"
-            assert torch.allclose(m[C_in, P:], b_ref[i].float(), atol=1e-4), \
+            assert torch.allclose(
+                m[:C_in, :P].flatten(),
+                w_ref[i].float(),
+                atol=1e-4,
+            ), f"weight mismatch sample {i}"
+            assert torch.allclose(m[C_in, P:], b_ref[i].float(), atol=1e-4), (
                 f"bias mismatch sample {i}"
+            )
 
     def test_grad_norm_sq_with_bias(self) -> None:
         model = self.make_model(bias=True)
         inputs = self._inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        norms = _grad_norm_sq(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
+        norms = _grad_norm_sq(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
         for i in range(B):
             ref_norm = w_ref[i].float().pow(2).sum() + b_ref[i].float().pow(2).sum()
             assert torch.allclose(norms[i], ref_norm, atol=1e-4)
@@ -1208,8 +1417,13 @@ class _ConvTransposeChecks:
         inputs = self._inputs()
         w_ref = _per_sample_weight_grads(model, "mlp", inputs)
         b_ref = _per_sample_bias_grads(model, "mlp", inputs)
-        K = _pairwise_dot(_run_batch(model, torch.cat(inputs), name_patterns=["mlp"]), "mlp")
-        full_ref = [torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref)]
+        K = _pairwise_dot(
+            _run_batch(model, torch.cat(inputs), name_patterns=["mlp"]),
+            "mlp",
+        )
+        full_ref = [
+            torch.cat([w.float(), b.float()]) for w, b in zip(w_ref, b_ref, strict=True)
+        ]
         for i in range(B):
             for j in range(B):
                 expected = (full_ref[i] * full_ref[j]).sum()
@@ -1220,53 +1434,54 @@ class TestConvTranspose1dGroundTruth(_ConvTransposeChecks):
     K = 3
 
     def setup_method(self) -> None:
-        self.C_in, self.C_out = I, O
-        self.P = O * self.K
+        self.C_in, self.C_out = D_IN, D_OUT
+        self.P = D_OUT * self.K
 
     def make_model(self, bias: bool) -> nn.Module:
         torch.manual_seed(0)
-        return _ConvTranspose1dModel(I, O, k=self.K, bias=bias)
+        return _ConvTranspose1dModel(D_IN, D_OUT, k=self.K, bias=bias)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I, 6) for _ in range(B)]
+        return [torch.randn(1, D_IN, 6) for _ in range(B)]
 
 
 class TestConvTranspose2dGroundTruth(_ConvTransposeChecks):
     K = 2
 
     def setup_method(self) -> None:
-        self.C_in, self.C_out = I, O
-        self.P = O * self.K * self.K
+        self.C_in, self.C_out = D_IN, D_OUT
+        self.P = D_OUT * self.K * self.K
 
     def make_model(self, bias: bool) -> nn.Module:
         torch.manual_seed(0)
-        return _ConvTranspose2dModel(I, O, k=self.K, bias=bias)
+        return _ConvTranspose2dModel(D_IN, D_OUT, k=self.K, bias=bias)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I, 4, 4) for _ in range(B)]
+        return [torch.randn(1, D_IN, 4, 4) for _ in range(B)]
 
 
 class TestConvTranspose3dGroundTruth(_ConvTransposeChecks):
     K = 2
 
     def setup_method(self) -> None:
-        self.C_in, self.C_out = I, O
-        self.P = O * self.K * self.K * self.K
+        self.C_in, self.C_out = D_IN, D_OUT
+        self.P = D_OUT * self.K * self.K * self.K
 
     def make_model(self, bias: bool) -> nn.Module:
         torch.manual_seed(0)
-        return _ConvTranspose3dModel(I, O, k=self.K, bias=bias)
+        return _ConvTranspose3dModel(D_IN, D_OUT, k=self.K, bias=bias)
 
     def _inputs(self) -> list[torch.Tensor]:
         torch.manual_seed(1)
-        return [torch.randn(1, I, 3, 3, 3) for _ in range(B)]
+        return [torch.randn(1, D_IN, 3, 3, 3) for _ in range(B)]
 
 
 # ---------------------------------------------------------------------------
 # nn.EmbeddingBag
 # ---------------------------------------------------------------------------
+
 
 class _EmbeddingBagChecks:
     """Mixin: EmbeddingBag ground-truth checks for a given reduction mode.
@@ -1294,8 +1509,9 @@ class _EmbeddingBagChecks:
         ref = _per_sample_weight_grads(self.model, "emb", inputs)
         mat = _materialize(_run_batch(self.model, torch.cat(inputs)), "emb")
         for i in range(B):
-            assert torch.allclose(mat[i], ref[i].float(), atol=1e-5), \
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-5), (
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
     def test_grad_norm_sq(self) -> None:
         inputs = self._inputs()

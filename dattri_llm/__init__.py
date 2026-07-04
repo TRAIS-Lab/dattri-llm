@@ -48,24 +48,32 @@ _LAZY_EXPORTS = {
 
 __all__ = [
     "REGISTER_ALL",
+    # lazily resolved (see _LAZY_EXPORTS):
+    "AttributionArguments",
+    "AttributionScore",
     "CaptureCallback",
+    "DVEmbAttributor",
     "DataSelectionCallback",
+    "DiskGradientSource",
+    "EKFACAttributor",
     "Factorized",
     "Gradient",
     "GradientFileManager",
     "GradientRecord",
+    "GradientStreamer",
     "HookManager",
     "HookManagerCallback",
     "HookManagerConfig",
+    "KFACAttributor",
     "OffloadCallback",
+    "TracInAttributor",
     "default_hook_assignment",
     "hash_batch",
     "hash_sample",
-    *sorted(_LAZY_EXPORTS),
 ]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> object:
     module = _LAZY_EXPORTS.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

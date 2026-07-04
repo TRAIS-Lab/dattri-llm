@@ -1,12 +1,16 @@
+"""Gradient data model: ``Factorized`` factors and ``Gradient`` blocks."""
+
 from __future__ import annotations
 
 from dataclasses import InitVar, dataclass, field
-from typing import Callable, Dict, Iterable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from dattri_llm.gradient import ops
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Sequence
 
 GradientRepresentation = Literal["materialized", "factorized"]
 Indexing = Literal["batch", "batch_token"]
@@ -14,13 +18,22 @@ Indexing = Literal["batch", "batch_token"]
 
 @dataclass(frozen=True)
 class Factorized:
+    """A per-layer factorized ("ghost") gradient: an (activation,
+    output-gradient) factor pair.
+    """
+
     activation: torch.Tensor
     pre_activation_grad: torch.Tensor
     # Minimal serialisable hyperparameters extracted at hook-registration time
     # via ops.extract_module_kwargs.  Excluded from equality and hashing so
     # two Factorized tensors with identical data compare equal regardless of
     # which layer produced them.
-    module_kwargs: Optional[dict] = field(default=None, compare=False, repr=False, hash=False)
+    module_kwargs: dict | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+        hash=False,
+    )
     # Tensor layout flag.  ``True`` (default) means the batch axis is dim 0 and
     # the token/sequence axis is dim 1 -- the layout every ``ops`` kernel assumes.
     # ``False`` marks a *sequence-first* capture ``(T, B, ...)`` (e.g. a layer
@@ -28,7 +41,12 @@ class Factorized:
     # :meth:`as_batch_first` to get the canonical ``(B, T, ...)`` view.
     batch_first: bool = field(default=True, compare=False)
 
-    def to(self, device=None, dtype=None) -> "Factorized":
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Factorized:
+        """Return a copy with both factors moved to *device* / cast to *dtype*."""
         return Factorized(
             activation=self.activation.to(device=device, dtype=dtype),
             pre_activation_grad=self.pre_activation_grad.to(device=device, dtype=dtype),
@@ -36,7 +54,7 @@ class Factorized:
             batch_first=self.batch_first,
         )
 
-    def as_batch_first(self) -> "Factorized":
+    def as_batch_first(self) -> Factorized:
         """Return a batch-first view of these factors.
 
         For a sequence-first capture this swaps the leading two axes
@@ -54,15 +72,18 @@ class Factorized:
             batch_first=True,
         )
 
-GradientData = Union[torch.Tensor, Factorized]
+
+GradientData = torch.Tensor | Factorized
 
 
 @dataclass(frozen=True)
 class Gradient:
-    representation: Dict[str, GradientRepresentation]
-    data: Dict[str, GradientData]
-    layer_types: Dict[str, str]
-    indexing: Dict[str, Indexing] = field(default_factory=dict)
+    """A per-step, multi-layer container of per-sample gradients with metadata."""
+
+    representation: dict[str, GradientRepresentation]
+    data: dict[str, GradientData]
+    layer_types: dict[str, str]
+    indexing: dict[str, Indexing] = field(default_factory=dict)
     validate_on_init: InitVar[bool] = True
 
     def __post_init__(self, validate_on_init: bool) -> None:
@@ -77,10 +98,12 @@ class Gradient:
 
     @property
     def layer_names(self) -> set[str]:
+        """Names of the layers this gradient block covers."""
         return set(self.data.keys())
 
     @property
     def batch_size(self) -> int:
+        """The step batch size (largest per-layer sample count)."""
         # The real batch size is the largest per-layer batch dim: a broadcast
         # layer (e.g. a positional embedding) carries batch 1 and must not be
         # mistaken for the whole batch when it happens to come first.
@@ -101,9 +124,9 @@ class Gradient:
         return x.activation.shape[0] if isinstance(x, Factorized) else x.shape[0]
 
     @property
-    def token_dim(self) -> Dict[str, "int | None"]:
+    def token_dim(self) -> dict[str, int | None]:
         """Per-layer token dimension; ``None`` for layers with ``"batch"`` indexing."""
-        result: Dict[str, "int | None"] = {}
+        result: dict[str, int | None] = {}
         for name, value in self.data.items():
             if self._layer_indexing(name) == "batch_token":
                 if isinstance(value, Factorized):
@@ -117,15 +140,18 @@ class Gradient:
 
     @property
     def device(self) -> torch.device:
+        """Device of the stored payloads."""
         x = next(iter(self.data.values()))
         return x.activation.device if isinstance(x, Factorized) else x.device
 
     @property
     def dtype(self) -> torch.dtype:
+        """Dtype of the stored payloads."""
         x = next(iter(self.data.values()))
         return x.activation.dtype if isinstance(x, Factorized) else x.dtype
 
     def validate(self) -> None:
+        """Check internal consistency; raise ``ValueError`` on any violation."""
         if not self.data:
             raise ValueError("data cannot be empty")
 
@@ -154,35 +180,35 @@ class Gradient:
                     # grad is the per-bag output gradient (B, embed_dim).
                     if act.ndim != 2 or gout.ndim != 2:
                         raise ValueError(
-                            f"{name} has invalid embedding-bag factor dimensions"
+                            f"{name} has invalid embedding-bag factor dimensions",
                         )
                     if act.shape[0] != gout.shape[0]:
                         raise ValueError(
-                            f"{name} embedding-bag batch dimension mismatch"
+                            f"{name} embedding-bag batch dimension mismatch",
                         )
                 elif ops.is_embedding(layer_type):
                     # Embedding: activation is (B, T) int, grad is (B, T, embed_dim).
                     if act.ndim != 2 or gout.ndim != 3:
                         raise ValueError(
-                            f"{name} has invalid embedding factor dimensions"
+                            f"{name} has invalid embedding factor dimensions",
                         )
                     if act.shape != gout.shape[:2]:
                         raise ValueError(
-                            f"{name} embedding batch/token dimensions mismatch"
+                            f"{name} embedding batch/token dimensions mismatch",
                         )
                 elif ops.is_conv(layer_type) or ops.is_conv_transpose(layer_type):
-                    # Raw conv data: a=(N, C_in, *spatial_in), g=(N, C_out, *spatial_out).
+                    # Raw conv data: a=(N, C_in, *spatial_in), g=(N, C_out,
+                    # *spatial_out).
                     # Spatial and channel dims differ; only batch size must match.
                     if act.shape[0] != gout.shape[0]:
                         raise ValueError(
                             f"{name} conv factor batch size mismatch: "
-                            f"{act.shape[0]} != {gout.shape[0]}"
+                            f"{act.shape[0]} != {gout.shape[0]}",
                         )
-                else:
-                    if act.shape[:-1] != gout.shape[:-1]:
-                        raise ValueError(
-                            f"{name} factor batch/token dimensions mismatch"
-                        )
+                elif act.shape[:-1] != gout.shape[:-1]:
+                    raise ValueError(
+                        f"{name} factor batch/token dimensions mismatch",
+                    )
 
                 cur_batch = act.shape[0]
 
@@ -198,7 +224,8 @@ class Gradient:
                     and value.ndim != 3
                 ):
                     raise ValueError(
-                        f"{name} declared as batch_token but tensor is {value.ndim}D, expected 3D"
+                        f"{name} declared as batch_token but tensor is "
+                        f"{value.ndim}D, expected 3D",
                     )
                 cur_batch = value.shape[0]
 
@@ -214,7 +241,8 @@ class Gradient:
                 elif batch_size != cur_batch:
                     raise ValueError("All layers must have the same batch size")
 
-    def clone(self) -> "Gradient":
+    def clone(self) -> Gradient:
+        """Return a deep copy with every tensor payload cloned."""
         new_data = {}
 
         for name, value in self.data.items():
@@ -235,7 +263,12 @@ class Gradient:
             indexing=dict(self.indexing),
         )
 
-    def to(self, device=None, dtype=None) -> "Gradient":
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Gradient:
+        """Return a copy with every payload moved to *device* / cast to *dtype*."""
         new_data = {}
 
         for name, value in self.data.items():
@@ -248,7 +281,10 @@ class Gradient:
             indexing=dict(self.indexing),
         )
 
-    def materialize(self) -> "Gradient":
+    def materialize(self) -> Gradient:
+        """Return a copy with every factorized layer turned into its explicit
+        gradient.
+        """
         if all(r == "materialized" for r in self.representation.values()):
             return self
 
@@ -275,7 +311,7 @@ class Gradient:
             indexing=new_indexing,
         )
 
-    def project(self, projector: Callable, proj_kwargs: Dict[str, dict]) -> "Gradient":
+    def project(self, projector: Callable, proj_kwargs: dict[str, dict]) -> Gradient:
         """Random-project each layer's per-sample gradient to a smaller dimension.
 
         Two styles, chosen per layer by ``proj_kwargs[name]["factorize"]``:
@@ -301,10 +337,10 @@ class Gradient:
         Returns:
             A new :class:`Gradient` holding each layer's projection.
         """
-        new_data: Dict[str, GradientData] = {}
-        new_repr: Dict[str, GradientRepresentation] = {}
-        new_types: Dict[str, str] = {}
-        new_indexing: Dict[str, Indexing] = {}
+        new_data: dict[str, GradientData] = {}
+        new_repr: dict[str, GradientRepresentation] = {}
+        new_types: dict[str, str] = {}
+        new_indexing: dict[str, Indexing] = {}
 
         for name, value in self.data.items():
             kw = proj_kwargs.get(name, proj_kwargs.get("__default__"))
@@ -318,7 +354,11 @@ class Gradient:
             kw = dict(kw)
             factorize = kw.pop("factorize", True)
             payload, is_factorized = ops.project_layer(
-                value, self.layer_types[name], projector, factorize=factorize, **kw
+                value,
+                self.layer_types[name],
+                projector,
+                factorize=factorize,
+                **kw,
             )
             if is_factorized:
                 # module_kwargs=None: the projected factors are final; projected
@@ -340,7 +380,8 @@ class Gradient:
             indexing=new_indexing,
         )
 
-    def select_layers(self, layer_names: Iterable[str]) -> "Gradient":
+    def select_layers(self, layer_names: Iterable[str]) -> Gradient:
+        """Return a copy restricted to *layer_names* (all must exist)."""
         names = set(layer_names)
         missing = names - self.layer_names
         if missing:
@@ -350,14 +391,16 @@ class Gradient:
             representation={name: self.representation[name] for name in names},
             data={name: self.data[name] for name in names},
             layer_types={k: v for k, v in self.layer_types.items() if k in names},
-            indexing={name: idx for name, idx in self.indexing.items() if name in names},
+            indexing={
+                name: idx for name, idx in self.indexing.items() if name in names
+            },
         )
 
     def concatenate(
         self,
-        other: "Gradient",
+        other: Gradient,
         dim: Literal["batch", "token"] = "batch",
-    ) -> "Gradient":
+    ) -> Gradient:
         """Concatenate two gradients along the batch or token axis.
 
         A layer that is **broadcast** (batch axis 1 while the gradient's batch is
@@ -374,13 +417,12 @@ class Gradient:
 
         if dim == "token":
             non_bt = [
-                n for n in self.layer_names
-                if self._layer_indexing(n) != "batch_token"
+                n for n in self.layer_names if self._layer_indexing(n) != "batch_token"
             ]
             if non_bt:
                 raise ValueError(
                     f"Token concatenation requires all layers to have "
-                    f"indexing='batch_token'. Non-conforming: {sorted(non_bt)}"
+                    f"indexing='batch_token'. Non-conforming: {sorted(non_bt)}",
                 )
             if self.batch_size != other.batch_size:
                 raise ValueError("Token concatenation requires the same batch size")
@@ -396,12 +438,12 @@ class Gradient:
                 return 0 if batch_first else 1
             return 1 if batch_first else 0
 
-        def layer_batch(value) -> int:
+        def layer_batch(value: GradientData) -> int:
             if isinstance(value, Factorized):
                 return value.activation.shape[0 if value.batch_first else 1]
             return value.shape[0]
 
-        def is_broadcast(value, step_batch: int) -> bool:
+        def is_broadcast(value: GradientData, step_batch: int) -> bool:
             return layer_batch(value) == 1 and step_batch > 1
 
         for name in self.layer_names:
@@ -414,15 +456,15 @@ class Gradient:
                     raise ValueError(
                         f"{name} is a broadcast (batch-collapsed) gradient on one "
                         "side but per-sample on the other; the two cannot be "
-                        "concatenated along the batch axis."
+                        "concatenated along the batch axis.",
                     )
                 # Unified broadcast row: weighted average by each side's batch.
                 w_a, w_b = float(b_self), float(b_other)
                 if isinstance(a, Factorized) and isinstance(b, Factorized):
                     a_bf, b_bf = a.as_batch_first(), b.as_batch_first()
-                    if (
-                        a_bf.activation.shape == b_bf.activation.shape
-                        and torch.equal(a_bf.activation, b_bf.activation)
+                    if a_bf.activation.shape == b_bf.activation.shape and torch.equal(
+                        a_bf.activation,
+                        b_bf.activation,
                     ):
                         # Same activation factor: the gradient is linear in the
                         # output-gradient factor, so averaging g averages dW.
@@ -454,7 +496,7 @@ class Gradient:
             if isinstance(a, Factorized) and isinstance(b, Factorized):
                 if a.batch_first != b.batch_first:
                     raise ValueError(
-                        f"{name} has mismatched batch_first layout between gradients"
+                        f"{name} has mismatched batch_first layout between gradients",
                     )
                 cat_dim = cat_axis(a.batch_first)
                 new_data[name] = Factorized(
@@ -467,7 +509,7 @@ class Gradient:
                     batch_first=a.batch_first,
                 )
             elif isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-                new_data[name] = torch.cat([a, b], dim=cat_axis(True))
+                new_data[name] = torch.cat([a, b], dim=cat_axis(batch_first=True))
             else:
                 raise TypeError(f"{name} has mismatched data types")
 
@@ -483,7 +525,7 @@ class Gradient:
     def aggregate(
         self,
         dim: Literal["token"] = "token",
-    ) -> "Gradient":
+    ) -> Gradient:
         """Sum out the token dimension of ``"batch_token"`` layers.
 
         Layers with ``"batch"`` indexing are passed through unchanged.
@@ -533,8 +575,8 @@ class Gradient:
     def slice(
         self,
         dim: Literal["batch", "token"],
-        index,
-    ) -> "Gradient":
+        index: int | Sequence[int] | torch.Tensor,
+    ) -> Gradient:
         """Slice every layer along the batch or token axis.
 
         A layer whose batch axis has size 1 while the step batch is larger (a
@@ -544,13 +586,12 @@ class Gradient:
         """
         if dim == "token":
             non_bt = [
-                n for n in self.layer_names
-                if self._layer_indexing(n) != "batch_token"
+                n for n in self.layer_names if self._layer_indexing(n) != "batch_token"
             ]
             if non_bt:
                 raise ValueError(
                     f"Token slicing requires all layers to have "
-                    f"indexing='batch_token'. Non-conforming: {sorted(non_bt)}"
+                    f"indexing='batch_token'. Non-conforming: {sorted(non_bt)}",
                 )
 
         new_data = {}
@@ -597,7 +638,7 @@ class Gradient:
                     batch_first=value.batch_first,
                 )
             else:
-                new_data[name] = slice_tensor(value, axis(True))
+                new_data[name] = slice_tensor(value, axis(batch_first=True))
 
         return Gradient(
             representation=dict(self.representation),
@@ -608,12 +649,12 @@ class Gradient:
 
     def similarity(
         self,
-        other: "Gradient",
+        other: Gradient,
         metric: Literal["dot", "cosine"] = "dot",
         reduce: Literal["none", "all"] = "none",
         mode: Literal["factorized", "materialized", "auto"] = "auto",
         eps: float = 1e-8,
-    ) -> Dict[str, torch.Tensor] | torch.Tensor:
+    ) -> dict[str, torch.Tensor] | torch.Tensor:
         """Per-sample gradient similarity between this gradient and ``other``.
 
         For each shared layer this forms the full ``(B_self, B_other)`` cross-gram
@@ -664,7 +705,7 @@ class Gradient:
         if mode not in {"factorized", "materialized", "auto"}:
             raise ValueError("mode must be 'factorized', 'materialized', or 'auto'")
 
-        per_layer: Dict[str, torch.Tensor] = {}
+        per_layer: dict[str, torch.Tensor] = {}
         for name in self.layer_names:
             if name not in other.data:
                 continue
@@ -673,9 +714,9 @@ class Gradient:
                 continue
             if metric == "cosine" and reduce == "none":
                 # Per-layer cosine: normalise each layer independently.
-                n_s = self._layer_norm_sq(name, mode).clamp_min(0).sqrt()   # (B_self,)
+                n_s = self._layer_norm_sq(name, mode).clamp_min(0).sqrt()  # (B_self,)
                 n_o = other._layer_norm_sq(name, mode).clamp_min(0).sqrt()  # (B_other,)
-                matrix = matrix / (n_s[:, None] * n_o[None, :] + eps)
+                matrix /= n_s[:, None] * n_o[None, :] + eps
 
             per_layer[name] = matrix
 
@@ -702,21 +743,32 @@ class Gradient:
         if metric == "cosine":
             # Full-model cosine: normalise by the concatenated-gradient norms,
             # i.e. sqrt(sum of per-layer squared norms).
-            norm_sq_s = torch.stack(
-                [_expand_vec(self._layer_norm_sq(n, mode), b_s) for n in per_layer]
-            ).sum(0).clamp_min(0)                                         # (B_self,)
-            norm_sq_o = torch.stack(
-                [_expand_vec(other._layer_norm_sq(n, mode), b_o) for n in per_layer]
-            ).sum(0).clamp_min(0)                                         # (B_other,)
-            total = total / (norm_sq_s.sqrt()[:, None] * norm_sq_o.sqrt()[None, :] + eps)
+            norm_sq_s = (
+                torch.stack(
+                    [_expand_vec(self._layer_norm_sq(n, mode), b_s) for n in per_layer],
+                )
+                .sum(0)
+                .clamp_min(0)
+            )  # (B_self,)
+            norm_sq_o = (
+                torch.stack(
+                    [
+                        _expand_vec(other._layer_norm_sq(n, mode), b_o)
+                        for n in per_layer
+                    ],
+                )
+                .sum(0)
+                .clamp_min(0)
+            )  # (B_other,)
+            total /= norm_sq_s.sqrt()[:, None] * norm_sq_o.sqrt()[None, :] + eps
         return total
 
     def _layer_cross_matrix(
         self,
-        other: "Gradient",
+        other: Gradient,
         name: str,
         mode: Literal["factorized", "materialized", "auto"],
-    ):
+    ) -> torch.Tensor:
         """Return the ``(B_self, B_other)`` cross-gram for one layer, or ``None``
         when the representations are incompatible.
 
@@ -764,8 +816,10 @@ class Gradient:
 
     @staticmethod
     def _align_embedding_width(
-        mat_s: torch.Tensor, mat_t: torch.Tensor, embed_dim: int
-    ):
+        mat_s: torch.Tensor,
+        mat_t: torch.Tensor,
+        embed_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Zero-pad two flattened embedding gradients to a common vocab width.
 
         Embedding ``materialize`` uses ``vocab = max(token) + 1`` per batch, so
@@ -776,17 +830,19 @@ class Gradient:
         v = max(v_s, v_t)
         if v_s < v:
             mat_s = torch.cat(
-                [mat_s, mat_s.new_zeros(mat_s.shape[0], (v - v_s) * embed_dim)], dim=1
+                [mat_s, mat_s.new_zeros(mat_s.shape[0], (v - v_s) * embed_dim)],
+                dim=1,
             )
         if v_t < v:
             mat_t = torch.cat(
-                [mat_t, mat_t.new_zeros(mat_t.shape[0], (v - v_t) * embed_dim)], dim=1
+                [mat_t, mat_t.new_zeros(mat_t.shape[0], (v - v_t) * embed_dim)],
+                dim=1,
             )
         return mat_s, mat_t
 
     def _check_compatible(
         self,
-        other: "Gradient",
+        other: Gradient,
         require_same_batch: bool,
     ) -> None:
         if self.layer_names != other.layer_names:
@@ -799,7 +855,7 @@ class Gradient:
         }
         if mismatched:
             raise ValueError(
-                f"Layers have differing representations: {sorted(mismatched)}"
+                f"Layers have differing representations: {sorted(mismatched)}",
             )
 
         indexing_mismatch = {
@@ -809,12 +865,12 @@ class Gradient:
         }
         if indexing_mismatch:
             raise ValueError(
-                f"Layers have differing indexing: {sorted(indexing_mismatch)}"
+                f"Layers have differing indexing: {sorted(indexing_mismatch)}",
             )
 
         if self.layer_types != other.layer_types:
             raise ValueError(
-                f"Layer types differ: {self.layer_types} vs {other.layer_types}"
+                f"Layer types differ: {self.layer_types} vs {other.layer_types}",
             )
 
         if require_same_batch and self.batch_size != other.batch_size:
@@ -824,13 +880,11 @@ class Gradient:
             self_td = self.token_dim
             other_td = other.token_dim
             mismatched_td = {
-                name
-                for name in self.layer_names
-                if self_td[name] != other_td[name]
+                name for name in self.layer_names if self_td[name] != other_td[name]
             }
             if mismatched_td:
                 raise ValueError(
-                    f"Token dimensions differ for layers: {sorted(mismatched_td)}"
+                    f"Token dimensions differ for layers: {sorted(mismatched_td)}",
                 )
 
 
@@ -866,7 +920,7 @@ class GradientRecord:
 
     def __repr__(self) -> str:
         if isinstance(self.input_hash, list):
-            h_repr = f"[{self.input_hash[0][:16]}...+{len(self.input_hash)-1}]"
+            h_repr = f"[{self.input_hash[0][:16]}...+{len(self.input_hash) - 1}]"
         else:
             h_repr = f"{self.input_hash[:16]}..."
         return f"GradientRecord(step={self.step}, input_hash={h_repr})"

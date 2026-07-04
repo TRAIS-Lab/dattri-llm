@@ -1,3 +1,5 @@
+"""Content hashing of model inputs (the sample identity for capture/retrieval)."""
+
 from __future__ import annotations
 
 import hashlib
@@ -56,20 +58,19 @@ def hash_batch(
             ``(T, B)`` inputs.
     """
     tensors = {
-        k: v for k, v in inputs.items()
-        if isinstance(v, torch.Tensor) and v.ndim > 0
+        k: v for k, v in inputs.items() if isinstance(v, torch.Tensor) and v.ndim > 0
     }
     if batch_size is None:
         batch_size = next((v.shape[0] for v in tensors.values()), 1)
-    mismatched = {k: tuple(v.shape) for k, v in tensors.items()
-                  if v.shape[0] != batch_size}
+    mismatched = {
+        k: tuple(v.shape) for k, v in tensors.items() if v.shape[0] != batch_size
+    }
     if mismatched:
         raise NotImplementedError(
             f"hash_batch assumes every tensor field is batch-first with batch "
             f"size {batch_size}; non-conforming fields: {mismatched}. "
-            "Sequence-first or broadcast model inputs are not supported yet."
+            "Sequence-first or broadcast model inputs are not supported yet.",
         )
     return [
-        hash_sample({k: v[i] for k, v in tensors.items()})
-        for i in range(batch_size)
+        hash_sample({k: v[i] for k, v in tensors.items()}) for i in range(batch_size)
     ]

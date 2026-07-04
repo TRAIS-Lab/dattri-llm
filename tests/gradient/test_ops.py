@@ -27,9 +27,14 @@ Two suites:
 
 from __future__ import annotations
 
+import types
+
 import pytest
 import torch
+from dattri.func.projection import random_project
 
+from dattri_llm.gradient import ops
+from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.ops import (
     FisherAccumulator,
     KroneckerAccumulator,
@@ -47,10 +52,10 @@ from dattri_llm.gradient.ops import (
 # Shared dimensions
 # ---------------------------------------------------------------------------
 
-B = 4   # batch size
-T = 6   # token / spatial positions
-I = 8   # in-features / C_in
-O = 12  # out-features / C_out
+B = 4  # batch size
+T = 6  # token / spatial positions
+D_IN = 8  # in-features / C_in
+D_OUT = 12  # out-features / C_out
 VOCAB = 32
 E = 10  # embedding dim
 
@@ -59,25 +64,32 @@ E = 10  # embedding dim
 # Factories -- build preprocessed (a, g) tensors for each layer type
 # ---------------------------------------------------------------------------
 
+
 def _linear_2d():
-    return torch.randn(B, I), torch.randn(B, O)
+    return torch.randn(B, D_IN), torch.randn(B, D_OUT)
+
 
 def _linear_3d():
-    return torch.randn(B, T, I), torch.randn(B, T, O)
+    return torch.randn(B, T, D_IN), torch.randn(B, T, D_OUT)
+
 
 def _conv():
     # (B, L, in_patch), (B, L, C_out)  -- L is the spatial dimension
-    return torch.randn(B, T, I), torch.randn(B, T, O)
+    return torch.randn(B, T, D_IN), torch.randn(B, T, D_OUT)
+
 
 def _conv_transpose():
     # (B, L, C_in), (B, L, out_patch)
-    return torch.randn(B, T, I), torch.randn(B, T, O)
+    return torch.randn(B, T, D_IN), torch.randn(B, T, D_OUT)
+
 
 def _norm_2d():
-    return torch.randn(B, I), torch.randn(B, I)
+    return torch.randn(B, D_IN), torch.randn(B, D_IN)
+
 
 def _norm_3d():
-    return torch.randn(B, T, I), torch.randn(B, T, I)
+    return torch.randn(B, T, D_IN), torch.randn(B, T, D_IN)
+
 
 def _embedding():
     # Ensure token VOCAB-1 always appears so materialize output size == VOCAB*E,
@@ -90,22 +102,22 @@ def _embedding():
 # (test-id tag, factory).  The "-3d" suffix only disambiguates test ids that
 # reuse the same layer_type string; _lt() strips it before calling ops.
 LAYER_CASES = [
-    ("nn.Linear",              _linear_2d),
-    ("nn.Linear-3d",           _linear_3d),
-    ("nn.Bilinear",            _linear_2d),
-    ("nn.Conv1d",              _conv),
-    ("nn.Conv2d",              _conv),
-    ("nn.Conv3d",              _conv),
-    ("nn.ConvTranspose1d",     _conv_transpose),
-    ("nn.ConvTranspose2d",     _conv_transpose),
-    ("nn.ConvTranspose3d",     _conv_transpose),
-    ("nn.LayerNorm",           _norm_2d),
-    ("nn.LayerNorm-3d",        _norm_3d),
-    ("nn.RMSNorm",             _norm_2d),
-    ("nn.GroupNorm",           _norm_2d),
-    ("nn.InstanceNorm1d",      _norm_2d),
-    ("nn.Embedding",           _embedding),
-    ("nn.EmbeddingBag",        _embedding),
+    ("nn.Linear", _linear_2d),
+    ("nn.Linear-3d", _linear_3d),
+    ("nn.Bilinear", _linear_2d),
+    ("nn.Conv1d", _conv),
+    ("nn.Conv2d", _conv),
+    ("nn.Conv3d", _conv),
+    ("nn.ConvTranspose1d", _conv_transpose),
+    ("nn.ConvTranspose2d", _conv_transpose),
+    ("nn.ConvTranspose3d", _conv_transpose),
+    ("nn.LayerNorm", _norm_2d),
+    ("nn.LayerNorm-3d", _norm_3d),
+    ("nn.RMSNorm", _norm_2d),
+    ("nn.GroupNorm", _norm_2d),
+    ("nn.InstanceNorm1d", _norm_2d),
+    ("nn.Embedding", _embedding),
+    ("nn.EmbeddingBag", _embedding),
 ]
 
 
@@ -115,31 +127,35 @@ def _lt(tag: str) -> str:
 
 
 _PARAMS = [pytest.param(_lt(tag), *fn(), id=tag) for tag, fn in LAYER_CASES]
-_PARAMS_CROSS = [pytest.param(_lt(tag), *fn(), *fn(), id=tag) for tag, fn in LAYER_CASES]
+_PARAMS_CROSS = [
+    pytest.param(_lt(tag), *fn(), *fn(), id=tag) for tag, fn in LAYER_CASES
+]
 
 
 # ---------------------------------------------------------------------------
 # Algebraic identity tests
 # ---------------------------------------------------------------------------
 
+
 class TestPairwiseDotIdentity:
     """_pairwise_dot(a, g, lt)[i, j]  ==  mat[i] * mat[j]."""
 
-    @pytest.mark.parametrize("lt,a,g", _PARAMS)
+    @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_matches_materialized_gram(self, lt, a, g):
-        mat = _materialize(a, g, lt, per_token=True).float()   # norm: per-position
-        expected = mat @ mat.T                        # (B, B)
+        mat = _materialize(a, g, lt, per_token=True).float()  # norm: per-position
+        expected = mat @ mat.T  # (B, B)
         actual = _pairwise_dot(a, g, lt).float()
         assert actual.shape == (B, B)
-        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), \
+        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), (
             f"[{lt}] max diff {(expected - actual).abs().max():.2e}"
+        )
 
-    @pytest.mark.parametrize("lt,a,g", _PARAMS)
+    @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_symmetric(self, lt, a, g):
         K = _pairwise_dot(a, g, lt).float()
         assert torch.allclose(K, K.T, atol=1e-5)
 
-    @pytest.mark.parametrize("lt,a,g", _PARAMS)
+    @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_positive_semidefinite_diagonal(self, lt, a, g):
         K = _pairwise_dot(a, g, lt).float()
         assert (K.diagonal() >= -1e-6).all()
@@ -148,16 +164,17 @@ class TestPairwiseDotIdentity:
 class TestGradNormSqIdentity:
     """_grad_norm_sq(a, g, lt)[i]  ==  ||mat[i]||^2."""
 
-    @pytest.mark.parametrize("lt,a,g", _PARAMS)
+    @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_matches_materialized_norm(self, lt, a, g):
-        mat = _materialize(a, g, lt, per_token=True).float()   # norm: per-position
-        expected = mat.pow(2).sum(-1)                 # (B,)
+        mat = _materialize(a, g, lt, per_token=True).float()  # norm: per-position
+        expected = mat.pow(2).sum(-1)  # (B,)
         actual = _grad_norm_sq(a, g, lt).float()
         assert actual.shape == (B,)
-        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), \
+        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), (
             f"[{lt}] max diff {(expected - actual).abs().max():.2e}"
+        )
 
-    @pytest.mark.parametrize("lt,a,g", _PARAMS)
+    @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_equals_pairwise_diagonal(self, lt, a, g):
         diag = _pairwise_dot(a, g, lt).float().diagonal()
         norms = _grad_norm_sq(a, g, lt).float()
@@ -167,17 +184,18 @@ class TestGradNormSqIdentity:
 class TestDotIdentity:
     """_dot(a1,g1, a2,g2, lt)[i]  ==  mat1[i] * mat2[i]."""
 
-    @pytest.mark.parametrize("lt,a1,g1,a2,g2", _PARAMS_CROSS)
+    @pytest.mark.parametrize(("lt", "a1", "g1", "a2", "g2"), _PARAMS_CROSS)
     def test_matches_materialized_dot(self, lt, a1, g1, a2, g2):
         mat1 = _materialize(a1, g1, lt, per_token=True).float()  # norm: per-position
         mat2 = _materialize(a2, g2, lt, per_token=True).float()
-        expected = (mat1 * mat2).sum(-1)              # (B,)
+        expected = (mat1 * mat2).sum(-1)  # (B,)
         actual = _dot(a1, g1, a2, g2, lt).float()
         assert actual.shape == (B,)
-        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), \
+        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), (
             f"[{lt}] max diff {(expected - actual).abs().max():.2e}"
+        )
 
-    @pytest.mark.parametrize("lt,a,g", _PARAMS)
+    @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_self_dot_equals_grad_norm_sq(self, lt, a, g):
         """_dot(a,g, a,g, lt) == _grad_norm_sq(a, g, lt)."""
         self_dot = _dot(a, g, a, g, lt).float()
@@ -189,17 +207,21 @@ class TestDotIdentity:
 # K-FAC / FIM tests
 # ---------------------------------------------------------------------------
 
+
 class TestKFACShapes:
-    @pytest.mark.parametrize("lt,a,g", [
-        pytest.param("nn.Linear", *_linear_2d(), id="linear-2d"),
-        pytest.param("nn.Linear", *_linear_3d(), id="linear-3d"),
-        pytest.param("nn.Conv1d", *_conv(), id="conv1d"),
-        pytest.param("nn.ConvTranspose1d", *_conv_transpose(), id="convT1d"),
-    ])
+    @pytest.mark.parametrize(
+        ("lt", "a", "g"),
+        [
+            pytest.param("nn.Linear", *_linear_2d(), id="linear-2d"),
+            pytest.param("nn.Linear", *_linear_3d(), id="linear-3d"),
+            pytest.param("nn.Conv1d", *_conv(), id="conv1d"),
+            pytest.param("nn.ConvTranspose1d", *_conv_transpose(), id="convT1d"),
+        ],
+    )
     def test_kfac_shapes(self, lt, a, g):
         A, G = _kfac(a, g, lt)
-        assert A.shape == (I, I)
-        assert G.shape == (O, O)
+        assert A.shape == (D_IN, D_IN)
+        assert G.shape == (D_OUT, D_OUT)
 
     @pytest.mark.parametrize("lt", ["nn.LayerNorm", "nn.Embedding"])
     def test_kfac_not_implemented(self, lt):
@@ -207,26 +229,32 @@ class TestKFACShapes:
         with pytest.raises(NotImplementedError):
             _kfac(a, g, lt)
 
-    @pytest.mark.parametrize("lt,a,g", [
-        pytest.param("nn.Linear", *_linear_2d(), id="linear-2d"),
-        pytest.param("nn.Linear", *_linear_3d(), id="linear-3d"),
-        pytest.param("nn.Conv1d", *_conv(), id="conv1d"),
-    ])
+    @pytest.mark.parametrize(
+        ("lt", "a", "g"),
+        [
+            pytest.param("nn.Linear", *_linear_2d(), id="linear-2d"),
+            pytest.param("nn.Linear", *_linear_3d(), id="linear-3d"),
+            pytest.param("nn.Conv1d", *_conv(), id="conv1d"),
+        ],
+    )
     def test_fim_shape(self, lt, a, g):
         F = _fim(a, g, lt)
-        assert F.shape[0] == F.shape[1]    # square
+        assert F.shape[0] == F.shape[1]  # square
 
 
 class TestKfacGradientFreeRows:
     """Padded / fully masked token rows (g exactly 0) are excluded from the
-    K-FAC covariance factors and from the normalizing row count."""
+    K-FAC covariance factors and from the normalizing row count.
+    """
 
     def _padded(self):
         """(B, T, d) factors where the last 2 of 5 positions are 'padded':
-        nonzero activations (as real pads have) but exactly-zero gradients."""
+
+        nonzero activations (as real pads have) but exactly-zero gradients.
+        """
         torch.manual_seed(0)
-        a = torch.randn(B, 5, I)
-        g = torch.randn(B, 5, O)
+        a = torch.randn(B, 5, D_IN)
+        g = torch.randn(B, 5, D_OUT)
         g[:, 3:] = 0.0
         return a, g
 
@@ -250,16 +278,16 @@ class TestKfacGradientFreeRows:
     def test_padding_invariance(self):
         # Padding the same sequences to a longer length must not change (A, G).
         a, g = self._padded()
-        a_long = torch.cat([a, torch.randn(B, 4, I)], dim=1)   # pads: a != 0
-        g_long = torch.cat([g, torch.zeros(B, 4, O)], dim=1)   #        g == 0
+        a_long = torch.cat([a, torch.randn(B, 4, D_IN)], dim=1)  # pads: a != 0
+        g_long = torch.cat([g, torch.zeros(B, 4, D_OUT)], dim=1)  # g == 0
         A1, G1 = _kfac(a, g, "nn.Linear")
         A2, G2 = _kfac(a_long, g_long, "nn.Linear")
         assert torch.allclose(A1, A2, atol=1e-6)
         assert torch.allclose(G1, G2, atol=1e-6)
 
     def test_all_rows_gradient_free_raises(self):
-        a = torch.randn(B, 3, I)
-        g = torch.zeros(B, 3, O)
+        a = torch.randn(B, 3, D_IN)
+        g = torch.zeros(B, 3, D_OUT)
         with pytest.raises(ValueError, match="zero"):
             _kfac(a, g, "nn.Linear")
         acc = LayerKroneckerAccumulator()
@@ -324,26 +352,33 @@ class TestStreamingAccumulators:
 # materialize -- token-collapse (default) vs per_token=True for norm layers
 # ---------------------------------------------------------------------------
 
+
 class TestMaterializeCollapse:
     def test_norm_sums_tokens(self):
-        a, g = _norm_3d()                                            # (B, T, I)
+        a, g = _norm_3d()  # (B, T, I)
         per_token = _materialize(a, g, "nn.LayerNorm", per_token=True)  # (B, T*I)
-        wg = _materialize(a, g, "nn.LayerNorm")                       # (B, I), default collapse
-        assert wg.shape == (B, I)
-        assert torch.allclose(wg, per_token.reshape(B, T, I).sum(1), atol=1e-5)
+        wg = _materialize(a, g, "nn.LayerNorm")  # (B, I), default collapse
+        assert wg.shape == (B, D_IN)
+        assert torch.allclose(wg, per_token.reshape(B, T, D_IN).sum(1), atol=1e-5)
 
     def test_norm_dim_independent_of_seq_len(self):
-        m1 = _materialize(*[torch.randn(B, 3, I) for _ in range(2)], "nn.LayerNorm")
-        m2 = _materialize(*[torch.randn(B, 7, I) for _ in range(2)], "nn.LayerNorm")
-        assert m1.shape == m2.shape == (B, I)
+        m1 = _materialize(*[torch.randn(B, 3, D_IN) for _ in range(2)], "nn.LayerNorm")
+        m2 = _materialize(*[torch.randn(B, 7, D_IN) for _ in range(2)], "nn.LayerNorm")
+        assert m1.shape == m2.shape == (B, D_IN)
 
-    @pytest.mark.parametrize("lt,factory", [
-        ("nn.Linear", _linear_3d), ("nn.Embedding", _embedding),
-    ])
+    @pytest.mark.parametrize(
+        ("lt", "factory"),
+        [
+            ("nn.Linear", _linear_3d),
+            ("nn.Embedding", _embedding),
+        ],
+    )
     def test_per_token_noop_for_token_contracting_types(self, lt, factory):
         a, g = factory()
         assert torch.allclose(
-            _materialize(a, g, lt, per_token=True), _materialize(a, g, lt), atol=1e-6
+            _materialize(a, g, lt, per_token=True),
+            _materialize(a, g, lt),
+            atol=1e-6,
         )
 
 
@@ -351,29 +386,44 @@ class TestMaterializeCollapse:
 # Random projection -- TRAK (materialized) and LoGRA (factorized) units
 # ---------------------------------------------------------------------------
 
-from dattri.func.projection import random_project  # noqa: E402
+_PROJ = {"proj_max_batch_size": 8, "proj_type": "rademacher", "proj_seed": 0}
 
-_PROJ = dict(proj_max_batch_size=8, proj_type="rademacher", proj_seed=0)
 
 class TestProjection:
     def test_materialized_collapses_to_proj_dim(self):
         a, g = _linear_3d()
         f = Factorized(a, g, {"has_bias": False})
-        out = ops.project_materialized(f, "nn.Linear", random_project, proj_dim=64, **_PROJ)
+        out = ops.project_materialized(
+            f,
+            "nn.Linear",
+            random_project,
+            proj_dim=64,
+            **_PROJ,
+        )
         assert out.shape == (B, 64)
 
     def test_factorized_keeps_structure(self):
         a, g = _linear_3d()
         f = Factorized(a, g, {"has_bias": False})
-        a_p, g_p = ops.project_factorized(f, "nn.Linear", random_project, proj_dim=32, **_PROJ)
-        assert a_p.shape == (B, T, 32) and g_p.shape == (B, T, 32)
+        a_p, g_p = ops.project_factorized(
+            f,
+            "nn.Linear",
+            random_project,
+            proj_dim=32,
+            **_PROJ,
+        )
+        assert a_p.shape == (B, T, 32)
+        assert g_p.shape == (B, T, 32)
 
     def test_factorized_factors_use_independent_seeds(self):
         # Same proj_dim & base seed, but a uses seed+1, so the two projectors differ.
-        a, g = torch.randn(B, T, I), torch.randn(B, T, I)  # square: d_in == d_out
+        a, g = torch.randn(B, T, D_IN), torch.randn(B, T, D_IN)  # square: d_in == d_out
         a_p, g_p = ops.project_factorized(
-            Factorized(a, g, {"has_bias": False}), "nn.Linear", random_project,
-            proj_dim=32, **_PROJ,
+            Factorized(a, g, {"has_bias": False}),
+            "nn.Linear",
+            random_project,
+            proj_dim=32,
+            **_PROJ,
         )
         # Project an identical input through both factor slots; outputs must differ.
         assert not torch.allclose(a_p, g_p)
@@ -382,33 +432,49 @@ class TestProjection:
     def test_factorized_rejects_non_outer_product(self, lt):
         a, g = _norm_3d()
         with pytest.raises(ValueError, match="factorized projection is undefined"):
-            ops.project_factorized(Factorized(a, g, {"has_bias": False}), lt,
-                                   random_project, proj_dim=16, **_PROJ)
+            ops.project_factorized(
+                Factorized(a, g, {"has_bias": False}),
+                lt,
+                random_project,
+                proj_dim=16,
+                **_PROJ,
+            )
 
     def test_materialized_accepts_dense_tensor(self):
         dense = torch.randn(B, 100)
-        out = ops.project_materialized(dense, "nn.Linear", random_project, proj_dim=16, **_PROJ)
+        out = ops.project_materialized(
+            dense,
+            "nn.Linear",
+            random_project,
+            proj_dim=16,
+            **_PROJ,
+        )
         assert out.shape == (B, 16)
 
     def test_projection_approximately_preserves_gram(self):
         # Johnson-Lindenstrauss: random projection preserves pairwise dot products.
         torch.manual_seed(0)
-        a, g = torch.randn(16, T, I), torch.randn(16, T, O)
+        a, g = torch.randn(16, T, D_IN), torch.randn(16, T, D_OUT)
         f = Factorized(a, g, {"has_bias": False})
         full = _materialize(a, g, "nn.Linear").float()
         gram = full @ full.T
-        proj = ops.project_materialized(f, "nn.Linear", random_project, proj_dim=2048, **_PROJ)
-        corr = torch.corrcoef(torch.stack([(proj @ proj.T).flatten(), gram.flatten()]))[0, 1]
+        proj = ops.project_materialized(
+            f,
+            "nn.Linear",
+            random_project,
+            proj_dim=2048,
+            **_PROJ,
+        )
+        corr = torch.corrcoef(torch.stack([(proj @ proj.T).flatten(), gram.flatten()]))[
+            0,
+            1,
+        ]
         assert corr > 0.9
 
 
 # ---------------------------------------------------------------------------
 # Multi-layer accumulators -- fan a Gradient block out to per-layer estimators
 # ---------------------------------------------------------------------------
-
-import types  # noqa: E402
-
-from dattri_llm.gradient.gradient import Factorized  # noqa: E402
 
 
 def _fake_gradient(layers):
@@ -423,7 +489,9 @@ class TestMultiLayerAccumulators:
     def test_kronecker_matches_per_layer(self):
         a1, g1 = _linear_2d()
         a2, g2 = _linear_2d()
-        block = _fake_gradient({"fc": ("nn.Linear", a1, g1), "out": ("nn.Linear", a2, g2)})
+        block = _fake_gradient(
+            {"fc": ("nn.Linear", a1, g1), "out": ("nn.Linear", a2, g2)},
+        )
 
         multi = KroneckerAccumulator()
         multi.update(block, ["fc", "out"])
@@ -448,18 +516,18 @@ class TestMultiLayerAccumulators:
         assert torch.allclose(multi.result()["ln"], ref.result(), atol=1e-6)
 
     def test_fisher_skips_layers_over_cap(self):
-        a, g = _norm_3d()                                # norm param dim = I
+        a, g = _norm_3d()  # norm param dim = I
         block = _fake_gradient({"ln": ("nn.LayerNorm", a, g)})
 
-        multi = FisherAccumulator(max_params=I - 1)
+        multi = FisherAccumulator(max_params=D_IN - 1)
         multi.update(block, ["ln"])
         assert "ln" not in multi.result()
-        assert multi.skipped == {"ln": I}
+        assert multi.skipped == {"ln": D_IN}
 
     def test_fisher_within_cap_kept(self):
         a, g = _norm_3d()
         block = _fake_gradient({"ln": ("nn.LayerNorm", a, g)})
-        multi = FisherAccumulator(max_params=I)
+        multi = FisherAccumulator(max_params=D_IN)
         multi.update(block, ["ln"])
         assert "ln" in multi.result()
         assert multi.skipped == {}
@@ -468,8 +536,6 @@ class TestMultiLayerAccumulators:
 # ---------------------------------------------------------------------------
 # Factorized-input wrappers (``_f``) -- delegate to the raw ops, handle layout
 # ---------------------------------------------------------------------------
-
-from dattri_llm.gradient import ops
 
 
 def _seq_first(f: Factorized) -> Factorized:
@@ -485,31 +551,40 @@ def _seq_first(f: Factorized) -> Factorized:
 class TestFactorizedWrappers:
     """Each ``_f`` wrapper equals its raw counterpart on batch-first input, and
     produces the same result for a sequence-first capture (handled internally
-    via ``as_batch_first``)."""
+    via ``as_batch_first``).
+    """
 
     def test_materialize_f_matches_raw(self):
         a, g = _linear_3d()
         f = Factorized(a, g)
-        assert torch.allclose(ops.materialize(f, "nn.Linear"), _materialize(a, g, "nn.Linear"))
+        assert torch.allclose(
+            ops.materialize(f, "nn.Linear"),
+            _materialize(a, g, "nn.Linear"),
+        )
 
     def test_materialize_norm_f_matches_raw(self):
         a, g = _norm_3d()
         f = Factorized(a, g)
         assert torch.allclose(
-            ops.materialize(f, "nn.LayerNorm"), _materialize(a, g, "nn.LayerNorm")
+            ops.materialize(f, "nn.LayerNorm"),
+            _materialize(a, g, "nn.LayerNorm"),
         )
 
     def test_grad_norm_sq_f_matches_raw(self):
         a, g = _linear_3d()
         f = Factorized(a, g)
-        assert torch.allclose(ops.grad_norm_sq(f, "nn.Linear"), _grad_norm_sq(a, g, "nn.Linear"))
+        assert torch.allclose(
+            ops.grad_norm_sq(f, "nn.Linear"),
+            _grad_norm_sq(a, g, "nn.Linear"),
+        )
 
     def test_kfac_f_matches_raw(self):
         a, g = _linear_3d()
         f = Factorized(a, g)
         A1, G1 = ops.kfac(f, "nn.Linear")
         A2, G2 = _kfac(a, g, "nn.Linear")
-        assert torch.allclose(A1, A2) and torch.allclose(G1, G2)
+        assert torch.allclose(A1, A2)
+        assert torch.allclose(G1, G2)
 
     def test_cross_dot_f_matches_raw(self):
         a1, g1 = _linear_3d()
@@ -520,21 +595,30 @@ class TestFactorizedWrappers:
             ops._cross_dot(a1, g1, a2, g2, "nn.Linear"),
         )
 
-    @pytest.mark.parametrize("lt,factory", [
-        ("nn.Linear", _linear_3d), ("nn.LayerNorm", _norm_3d),
-    ])
+    @pytest.mark.parametrize(
+        ("lt", "factory"),
+        [
+            ("nn.Linear", _linear_3d),
+            ("nn.LayerNorm", _norm_3d),
+        ],
+    )
     def test_materialize_f_seq_first_equals_batch_first(self, lt, factory):
         a, g = factory()
         bf = Factorized(a, g)
         sf = _seq_first(bf)
-        assert torch.allclose(ops.materialize(bf, lt), ops.materialize(sf, lt), atol=1e-5)
+        assert torch.allclose(
+            ops.materialize(bf, lt),
+            ops.materialize(sf, lt),
+            atol=1e-5,
+        )
 
     def test_materialize_norm_seq_first_equals_batch_first(self):
         bf = Factorized(*_norm_3d())
         sf = _seq_first(bf)
         assert torch.allclose(
             ops.materialize(bf, "nn.LayerNorm"),
-            ops.materialize(sf, "nn.LayerNorm"), atol=1e-5,
+            ops.materialize(sf, "nn.LayerNorm"),
+            atol=1e-5,
         )
 
     def test_kfac_cross_f_seq_first_equals_batch_first(self):
@@ -545,7 +629,8 @@ class TestFactorizedWrappers:
         sf1, sf2 = _seq_first(bf1), _seq_first(bf2)
         assert torch.allclose(
             ops.kfac_cross(bf1, bf2, "nn.Linear", A_inv, G_inv),
-            ops.kfac_cross(sf1, sf2, "nn.Linear", A_inv, G_inv), atol=1e-4,
+            ops.kfac_cross(sf1, sf2, "nn.Linear", A_inv, G_inv),
+            atol=1e-4,
         )
 
     def test_ekfac_materialize_f_seq_first_equals_batch_first(self):
@@ -555,5 +640,6 @@ class TestFactorizedWrappers:
         sf = _seq_first(bf)
         assert torch.allclose(
             ops.ekfac_materialize(bf, "nn.Linear", U_A, U_G),
-            ops.ekfac_materialize(sf, "nn.Linear", U_A, U_G), atol=1e-4,
+            ops.ekfac_materialize(sf, "nn.Linear", U_A, U_G),
+            atol=1e-4,
         )

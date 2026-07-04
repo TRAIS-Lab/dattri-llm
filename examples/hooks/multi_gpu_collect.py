@@ -8,7 +8,7 @@ fsdp="full_shard" in AttributionArguments to collect under FSDP instead).
 
 Run:
     torchrun --nproc_per_node=2 examples/hooks/multi_gpu_collect.py          # GPUs
-    torchrun --nproc_per_node=2 examples/hooks/multi_gpu_collect.py --cpu    # CPU (gloo)
+    torchrun --nproc_per_node=2 examples/hooks/multi_gpu_collect.py --cpu  # gloo
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.gradient.hooks import REGISTER_ALL, HookManagerConfig
 from dattri_llm.gradient.streaming import GradientStreamer
-from dattri_llm.gradient.hooks import HookManagerConfig, REGISTER_ALL
 
 IN, HID, OUT = 8, 16, 4
 N_SAMPLES = 8
@@ -60,21 +60,26 @@ class DictDataset(Dataset):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cpu", action="store_true",
-                        help="Use the gloo backend on CPU (no GPU required).")
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Use the gloo backend on CPU (no GPU required).",
+    )
     args_cli = parser.parse_args()
 
     # initialize the process group when launched under torchrun
-    distributed = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1
+    distributed = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
     use_cpu = args_cli.cpu or not torch.cuda.is_available()
     if distributed:
         dist.init_process_group("gloo" if use_cpu else "nccl")
         rank, world = dist.get_rank(), dist.get_world_size()
     else:
         rank, world = 0, 1
-        print("Not launched under torchrun (world_size=1); collecting one "
-              "unsharded pass.  For the multi-process version, run:\n"
-              f"    torchrun --nproc_per_node=2 {os.path.relpath(__file__)} --cpu\n")
+        print(
+            "Not launched under torchrun (world_size=1); collecting one "
+            "unsharded pass.  For the multi-process version, run:\n"
+            f"    torchrun --nproc_per_node=2 {os.path.relpath(__file__)} --cpu\n",
+        )
 
     # the same dataset on every rank; the DistributedSampler gives each rank a
     # disjoint slice of it
@@ -102,9 +107,12 @@ if __name__ == "__main__":
         # for this rank's shard
         hashes, grads = [], []
         streamer = GradientStreamer(
-            model, dataset, attr_args,
+            model,
+            dataset,
+            attr_args,
             batch_size=attr_args.per_device_train_batch_size,
-            enable_update=False, loss_fn=loss_fn,
+            enable_update=False,
+            loss_fn=loss_fn,
             config=HookManagerConfig(linear_io=REGISTER_ALL),
         )
         with streamer as s:
@@ -126,8 +134,10 @@ if __name__ == "__main__":
             dist.all_gather_object(gathered, hashes)
             if rank == 0:
                 all_hashes = [h for shard in gathered for h in shard]
-                print(f"[rank 0] all ranks together collected "
-                      f"{len(set(all_hashes))} unique samples "
-                      f"(the full dataset of {N_SAMPLES}).")
+                print(
+                    f"[rank 0] all ranks together collected "
+                    f"{len(set(all_hashes))} unique samples "
+                    f"(the full dataset of {N_SAMPLES}).",
+                )
             dist.barrier()
             dist.destroy_process_group()

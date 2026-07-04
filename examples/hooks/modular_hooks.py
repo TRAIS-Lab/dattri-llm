@@ -11,7 +11,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 import torch
 from torch import nn
 
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_ALL
+from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 
 
 class TinyNet(nn.Module):
@@ -36,8 +36,11 @@ class TinyNet(nn.Module):
 
 if __name__ == "__main__":
     # every layer of TinyNet that owns a trainable parameter
-    trainable = [n for n, m in TinyNet().named_modules()
-                 if any(p.requires_grad for p in m.parameters(recurse=False))]
+    trainable = [
+        n
+        for n, m in TinyNet().named_modules()
+        if any(p.requires_grad for p in m.parameters(recurse=False))
+    ]
     print(f"{'Layers with trainable parameters':<40}{trainable}")
 
     # Two hook families exist.  ``linear_io`` registers factorized ("ghost")
@@ -47,21 +50,32 @@ if __name__ == "__main__":
     # param_grad), REGISTER_ALL, or the zero-argument default (linear_io
     # everywhere it applies, param_grad for the rest).
     configs = [
-        ("1. explicit assignment (fc1/fc2 ghost, head param_grad)",
-         HookManagerConfig(hook_types={
-             "mlp.fc1": "linear_io",
-             "mlp.fc2": "linear_io",
-             "head": "param_grad",
-         })),
-        ("2. regex selector (linear_io on mlp.* only)",
-         HookManagerConfig(linear_io=[r"mlp\."])),
-        ("3. REGISTER_ALL (every linear-IO-capable layer)",
-         HookManagerConfig(linear_io=REGISTER_ALL)),
-        ("4. default config (ghost where possible, param_grad fallback)",
-         HookManagerConfig()),
-        ("5. mixed (head param_grad + regex linear_io on mlp.*)",
-         HookManagerConfig(hook_types={"head": "param_grad"},
-                           linear_io=[r"mlp\."])),
+        (
+            "1. explicit assignment (fc1/fc2 ghost, head param_grad)",
+            HookManagerConfig(
+                hook_types={
+                    "mlp.fc1": "linear_io",
+                    "mlp.fc2": "linear_io",
+                    "head": "param_grad",
+                },
+            ),
+        ),
+        (
+            "2. regex selector (linear_io on mlp.* only)",
+            HookManagerConfig(linear_io=[r"mlp\."]),
+        ),
+        (
+            "3. REGISTER_ALL (every linear-IO-capable layer)",
+            HookManagerConfig(linear_io=REGISTER_ALL),
+        ),
+        (
+            "4. default config (ghost where possible, param_grad fallback)",
+            HookManagerConfig(),
+        ),
+        (
+            "5. mixed (head param_grad + regex linear_io on mlp.*)",
+            HookManagerConfig(hook_types={"head": "param_grad"}, linear_io=[r"mlp\."]),
+        ),
     ]
 
     print()
@@ -69,6 +83,6 @@ if __name__ == "__main__":
     print("-" * 124)
     for title, config in configs:
         hm = HookManager(TinyNet(), config=config)
-        print(f"{title:<62}{str(hm.layer_names):<50}{hm.param_layer_names}")
+        print(f"{title:<62}{hm.layer_names!s:<50}{hm.param_layer_names}")
         hm.remove()
     print("-" * 124)

@@ -6,8 +6,8 @@ import warnings
 
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from dattri_llm.gradient.callbacks import HookManagerCallback
 from dattri_llm.gradient.hooks import (
@@ -21,7 +21,6 @@ from dattri_llm.gradient.hooks import (
     remove_hooks,
     resolve_hook_assignments,
 )
-
 
 # --------------------------------------------------------------------------- #
 # _is_linear_io_capable -- purely type-based, never name-based                  #
@@ -79,26 +78,33 @@ class TestResolveHookAssignments:
         assignment = resolve_hook_assignments(tiny_model, HookManagerConfig())
         # Every linear-family layer is hooked, regardless of name.
         assert set(assignment) == {
-            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+            "embedding",
+            "attn_proj",
+            "mlp.0",
+            "mlp.2",
+            "lm_head",
         }
         assert all(t == "linear_io" for t in assignment.values())
 
     def test_register_all_linear_io(self, tiny_model):
         assignment = resolve_hook_assignments(
-            tiny_model, HookManagerConfig(linear_io=REGISTER_ALL)
+            tiny_model,
+            HookManagerConfig(linear_io=REGISTER_ALL),
         )
         assert all(t == "linear_io" for t in assignment.values())
         assert "lm_head" in assignment
 
     def test_register_all_param_grad(self, tiny_model):
         assignment = resolve_hook_assignments(
-            tiny_model, HookManagerConfig(param_grad=REGISTER_ALL)
+            tiny_model,
+            HookManagerConfig(param_grad=REGISTER_ALL),
         )
         assert all(t == "param_grad" for t in assignment.values())
 
     def test_pattern_selects_subset(self, tiny_model):
         assignment = resolve_hook_assignments(
-            tiny_model, HookManagerConfig(linear_io=[r"mlp\."])
+            tiny_model,
+            HookManagerConfig(linear_io=[r"mlp\."]),
         )
         assert set(assignment) == {"mlp.0", "mlp.2"}
 
@@ -106,7 +112,7 @@ class TestResolveHookAssignments:
         assignment = resolve_hook_assignments(
             tiny_model,
             HookManagerConfig(
-                hook_types={"mlp.0": "linear_io", "lm_head": "param_grad"}
+                hook_types={"mlp.0": "linear_io", "lm_head": "param_grad"},
             ),
         )
         assert assignment == {"mlp.0": "linear_io", "lm_head": "param_grad"}
@@ -115,11 +121,14 @@ class TestResolveHookAssignments:
         assignment = resolve_hook_assignments(
             tiny_model,
             HookManagerConfig(
-                hook_types={"lm_head": "param_grad"}, linear_io=[r"mlp\."]
+                hook_types={"lm_head": "param_grad"},
+                linear_io=[r"mlp\."],
             ),
         )
         assert assignment == {
-            "lm_head": "param_grad", "mlp.0": "linear_io", "mlp.2": "linear_io",
+            "lm_head": "param_grad",
+            "mlp.0": "linear_io",
+            "mlp.2": "linear_io",
         }
 
     def test_conflicting_assignment_raises(self, tiny_model):
@@ -127,7 +136,8 @@ class TestResolveHookAssignments:
             resolve_hook_assignments(
                 tiny_model,
                 HookManagerConfig(
-                    hook_types={"mlp.0": "param_grad"}, linear_io=[r"mlp\."]
+                    hook_types={"mlp.0": "param_grad"},
+                    linear_io=[r"mlp\."],
                 ),
             )
 
@@ -135,13 +145,15 @@ class TestResolveHookAssignments:
         # mlp.1 is a ReLU -- cannot support linear_io.
         with pytest.raises(ValueError, match="does not support"):
             resolve_hook_assignments(
-                tiny_model, HookManagerConfig(hook_types={"mlp.1": "linear_io"})
+                tiny_model,
+                HookManagerConfig(hook_types={"mlp.1": "linear_io"}),
             )
 
     def test_explicit_missing_layer_raises(self, tiny_model):
         with pytest.raises(ValueError, match="does not exist"):
             resolve_hook_assignments(
-                tiny_model, HookManagerConfig(hook_types={"nope": "linear_io"})
+                tiny_model,
+                HookManagerConfig(hook_types={"nope": "linear_io"}),
             )
 
     def test_zero_layers_warns(self):
@@ -149,7 +161,8 @@ class TestResolveHookAssignments:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             assignment = resolve_hook_assignments(
-                model, HookManagerConfig(linear_io=[r"no_such_layer"])
+                model,
+                HookManagerConfig(linear_io=[r"no_such_layer"]),
             )
         assert assignment == {}
         assert any("zero layers" in str(w.message) for w in caught)
@@ -166,7 +179,11 @@ class TestRegisterLinearIoHooks:
         # TinyMLP linear-family layers: embedding, attn_proj, mlp.0, mlp.2,
         # lm_head.  mlp.1 is ReLU -> skipped.
         assert set(buffers) == {
-            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+            "embedding",
+            "attn_proj",
+            "mlp.0",
+            "mlp.2",
+            "lm_head",
         }
         # Each layer has 2 handles (forward + backward).
         assert len(handles) == 10
@@ -205,7 +222,7 @@ class TestRegisterLinearIoHooks:
         remove_hooks(handles)
 
     def test_remove_hooks_clears_handles(self, tiny_model):
-        buffers, handles = register_linear_io_hooks(tiny_model)
+        _buffers, handles = register_linear_io_hooks(tiny_model)
         assert len(handles) > 0
         remove_hooks(handles)
         assert len(handles) == 0
@@ -221,7 +238,8 @@ class TestRegisterLinearIoHooks:
     def test_custom_layer_names(self, tiny_model, tiny_batch):
         # Hook only mlp.0 via an explicit layer-name set.
         buffers, handles = register_linear_io_hooks(
-            tiny_model, layer_names={"mlp.0"}
+            tiny_model,
+            layer_names={"mlp.0"},
         )
         assert list(buffers.keys()) == ["mlp.0"]
         remove_hooks(handles)
@@ -229,7 +247,8 @@ class TestRegisterLinearIoHooks:
     def test_layer_names_filters_to_capable_only(self, tiny_model):
         # Requesting a non-existent / non-capable name yields nothing.
         buffers, handles = register_linear_io_hooks(
-            tiny_model, layer_names={"mlp.1"}  # ReLU, not capable
+            tiny_model,
+            layer_names={"mlp.1"},  # ReLU, not capable
         )
         assert buffers == {}
         remove_hooks(handles)
@@ -238,14 +257,19 @@ class TestRegisterLinearIoHooks:
         dp_model = nn.DataParallel(tiny_model)
         buffers, handles = register_linear_io_hooks(dp_model)
         assert set(buffers) == {
-            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+            "embedding",
+            "attn_proj",
+            "mlp.0",
+            "mlp.2",
+            "lm_head",
         }
         remove_hooks(handles)
 
     def test_type_overrides_relabels_class_name(self, tiny_model):
         # Override mlp.0's detected type; others keep canonical_class_name.
         buffers, handles = register_linear_io_hooks(
-            tiny_model, type_overrides={"mlp.0": "nn.Bilinear"}
+            tiny_model,
+            type_overrides={"mlp.0": "nn.Bilinear"},
         )
         assert buffers["mlp.0"]["_class_name"] == "nn.Bilinear"
         assert buffers["mlp.2"]["_class_name"] == "nn.Linear"
@@ -279,7 +303,9 @@ class TestRegisterParamGradHooks:
         tiny_model(tiny_batch["input_ids"]).mean().backward()
         for layer_name, buf in buffers.items():
             for pname, grad in buf.items():
-                assert grad is not None, f"{layer_name}.{pname}: grad is None after backward"
+                assert grad is not None, (
+                    f"{layer_name}.{pname}: grad is None after backward"
+                )
                 assert isinstance(grad, torch.Tensor)
         remove_hooks(handles)
 
@@ -311,18 +337,19 @@ class TestRegisterParamGradHooks:
 
     def test_custom_layer_names(self, tiny_model, tiny_batch):
         buffers, handles = register_param_grad_hooks(
-            tiny_model, layer_names={"mlp.0", "mlp.2"}
+            tiny_model,
+            layer_names={"mlp.0", "mlp.2"},
         )
         assert set(buffers.keys()) == {"mlp.0", "mlp.2"}
         remove_hooks(handles)
 
     def test_frozen_params_not_hooked(self, tiny_model):
         # Freeze mlp.0 and verify it produces no buffer entry.
-        tiny_model.mlp[0].weight.requires_grad_(False)
+        tiny_model.mlp[0].weight.requires_grad_(requires_grad=False)
         buffers, handles = register_param_grad_hooks(tiny_model, layer_names={"mlp.0"})
         # mlp.0 has no trainable params -> no buffer created for it.
         assert "mlp.0" not in buffers
-        tiny_model.mlp[0].weight.requires_grad_(True)  # restore
+        tiny_model.mlp[0].weight.requires_grad_(requires_grad=True)  # restore
         remove_hooks(handles)
 
     def test_on_param_grad_callback(self, tiny_model, tiny_batch):
@@ -331,8 +358,10 @@ class TestRegisterParamGradHooks:
         def cb(layer_name, param_name, grad):
             fired.append((layer_name, param_name))
 
-        buffers, handles = register_param_grad_hooks(
-            tiny_model, layer_names={"mlp.0"}, on_param_grad=cb
+        _buffers, handles = register_param_grad_hooks(
+            tiny_model,
+            layer_names={"mlp.0"},
+            on_param_grad=cb,
         )
         tiny_model(tiny_batch["input_ids"]).mean().backward()
         assert ("mlp.0", "weight") in fired
@@ -387,10 +416,15 @@ class TestDefaultHookAssignment:
 
     def test_default_model_keeps_all_layers(self, tiny_model, tiny_batch):
         assignment = default_hook_assignment(
-            tiny_model, tiny_batch["input_ids"]
+            tiny_model,
+            tiny_batch["input_ids"],
         )
         assert set(assignment) == {
-            "embedding", "attn_proj", "mlp.0", "mlp.2", "lm_head",
+            "embedding",
+            "attn_proj",
+            "mlp.0",
+            "mlp.2",
+            "lm_head",
         }
         assert all(t == "linear_io" for t in assignment.values())
 
@@ -399,13 +433,15 @@ class TestDefaultHookAssignment:
         assignment = default_hook_assignment(model, torch.randn(2, 4))
         # The discovered assignment resolves cleanly (ghost excluded).
         resolved = resolve_hook_assignments(
-            model, HookManagerConfig(hook_types=assignment)
+            model,
+            HookManagerConfig(hook_types=assignment),
         )
         assert resolved == {"used": "linear_io"}
 
     def test_dict_input_unpacked(self, tiny_model, tiny_batch):
         assignment = default_hook_assignment(
-            tiny_model, {"input_ids": tiny_batch["input_ids"]}
+            tiny_model,
+            {"input_ids": tiny_batch["input_ids"]},
         )
         assert "mlp.0" in assignment
 
@@ -450,7 +486,8 @@ class TestDefaultHookAssignment:
 class _CustomLinear(nn.Linear):
     """A user-defined linear layer whose class name is not recognised by
     ``canonical_class_name`` but which is still linear-IO-capable (it subclasses
-    ``nn.Linear``)."""
+    ``nn.Linear``).
+    """
 
 
 class _CustomLinearModel(nn.Module):
@@ -546,19 +583,23 @@ class TestNoGradForwardSkipped:
     def test_no_grad_forward_does_not_contaminate_step(self):
         """A no_grad forward (e.g. an RL log-prob or eval pass) can never
         produce a backward; it must leave the step buffers untouched, so the
-        following real training step assembles cleanly."""
+        following real training step assembles cleanly.
+        """
         model = nn.Sequential(nn.Linear(8, 4, bias=False))
         cb = _Recording()
-        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL),
-                         callbacks=[cb])
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[cb],
+        )
         with hm.collect():
             with torch.no_grad():
-                model(torch.randn(3, 8))          # contamination candidate
-            model(torch.randn(5, 8)).sum().backward()   # the real step
+                model(torch.randn(3, 8))  # contamination candidate
+            model(torch.randn(5, 8)).sum().backward()  # the real step
         hm.remove()
         assert len(cb.records) == 1
         grad = cb.records[0].gradient
-        assert grad.batch_size == 5               # only the grad-enabled pass
+        assert grad.batch_size == 5  # only the grad-enabled pass
         assert grad.data["0"].activation.shape[0] == 5
 
 
@@ -576,14 +617,17 @@ class TestTrainabilityFilter:
         model.add_module("frozen", nn.Linear(8, 8, bias=False))
         model.add_module("trainable", nn.Linear(8, 4, bias=False))
         for p in model.frozen.parameters():
-            p.requires_grad_(False)
+            p.requires_grad_(requires_grad=False)
         cb = _Recording()
-        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL),
-                         callbacks=[cb])
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[cb],
+        )
         with hm.collect():
             model(torch.randn(4, 8)).sum().backward()
         hm.remove()
-        assert len(cb.records) == 1                          # step completed
+        assert len(cb.records) == 1  # step completed
         assert set(cb.records[-1].gradient.layer_names) == {"trainable"}
 
     def test_lora_adapters_captured_exactly(self):
@@ -600,23 +644,33 @@ class TestTrainabilityFilter:
 
         torch.manual_seed(0)
         model = peft.get_peft_model(
-            Wrap(), peft.LoraConfig(r=4, target_modules=["fc"], lora_alpha=8,
-                                    bias="none", lora_dropout=0.0)
+            Wrap(),
+            peft.LoraConfig(
+                r=4,
+                target_modules=["fc"],
+                lora_alpha=8,
+                bias="none",
+                lora_dropout=0.0,
+            ),
         ).eval()
         x = torch.randn(4, 8)
 
         cb = _Recording()
         # REGISTER_ALL now works out of the box: the frozen base_layer is skipped,
         # only the trainable lora_A / lora_B adapters are captured.
-        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL),
-                         callbacks=[cb])
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[cb],
+        )
         with hm.collect():
             model(x).sum().backward()
         hm.remove()
         grad = cb.records[-1].gradient
         names = set(grad.layer_names)
         assert all("base_layer" not in n for n in names)
-        assert any("lora_A" in n for n in names) and any("lora_B" in n for n in names)
+        assert any("lora_A" in n for n in names)
+        assert any("lora_B" in n for n in names)
 
         # The captured factorized adapter gradient equals the true per-sample one.
         a_name = next(n for n in names if "lora_A" in n)
@@ -651,13 +705,16 @@ class TestProjectionConfig:
         assert HookManagerConfig(projection={"__default__": {"proj_dim": 8}}).is_default
 
     def _run(self, projection, projector=None):
-        torch.manual_seed(0)   # identical weights + input across calls, for comparisons
+        torch.manual_seed(0)  # identical weights + input across calls, for comparisons
         model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8))
         cb = _Recording()
         hm = HookManager(
             model,
-            config=HookManagerConfig(linear_io=REGISTER_ALL,
-                                     projection=projection, projector=projector),
+            config=HookManagerConfig(
+                linear_io=REGISTER_ALL,
+                projection=projection,
+                projector=projector,
+            ),
             callbacks=[cb],
         )
         with hm.collect():
@@ -665,15 +722,31 @@ class TestProjectionConfig:
         return cb.records[-1].gradient
 
     def test_trak_projection_materializes(self):
-        g = self._run({"__default__": {"factorize": False, "proj_dim": 64,
-                       "proj_max_batch_size": 8, "proj_type": "rademacher"}})
+        g = self._run(
+            {
+                "__default__": {
+                    "factorize": False,
+                    "proj_dim": 64,
+                    "proj_max_batch_size": 8,
+                    "proj_type": "rademacher",
+                },
+            },
+        )
         for n in g.layer_names:
             assert g.representation[n] == "materialized"
             assert g.data[n].shape == (4, 64)
 
     def test_logra_projection_stays_factorized(self):
-        g = self._run({"__default__": {"factorize": True, "proj_dim": 16,
-                       "proj_max_batch_size": 8, "proj_type": "rademacher"}})
+        g = self._run(
+            {
+                "__default__": {
+                    "factorize": True,
+                    "proj_dim": 16,
+                    "proj_max_batch_size": 8,
+                    "proj_type": "rademacher",
+                },
+            },
+        )
         for n in g.layer_names:
             assert g.representation[n] == "factorized"
             assert g.data[n].activation.shape[-1] == 16
@@ -684,9 +757,18 @@ class TestProjectionConfig:
 
     def test_only_configured_layers_projected(self):
         # Project just layer "0"; layer "2" has no entry and no __default__.
-        g = self._run({"0": {"factorize": False, "proj_dim": 64,
-                             "proj_max_batch_size": 8, "proj_type": "rademacher"}})
-        assert g.representation["0"] == "materialized" and g.data["0"].shape == (4, 64)
+        g = self._run(
+            {
+                "0": {
+                    "factorize": False,
+                    "proj_dim": 64,
+                    "proj_max_batch_size": 8,
+                    "proj_type": "rademacher",
+                },
+            },
+        )
+        assert g.representation["0"] == "materialized"
+        assert g.data["0"].shape == (4, 64)
         assert g.representation["2"] == "factorized"
 
     def test_custom_projector_is_used(self):
@@ -697,8 +779,10 @@ class TestProjectionConfig:
             called["n"] += 1
             return lambda x, ensemble_id=0: x[:, :proj_dim]
 
-        g = self._run({"__default__": {"factorize": False, "proj_dim": 4}},
-                      projector=fake_projector)
+        g = self._run(
+            {"__default__": {"factorize": False, "proj_dim": 4}},
+            projector=fake_projector,
+        )
         assert called["n"] > 0
         for n in g.layer_names:
             assert g.data[n].shape == (4, 4)
@@ -708,35 +792,58 @@ class TestProjectionConfig:
         # Projecting at capture (per micro-batch) must be bit-identical to
         # projecting the fully-assembled gradient -- project(cat) == cat(project).
         from dattri.func.projection import random_project
+
         from dattri_llm.gradient import ops
         from dattri_llm.gradient.gradient import Factorized
-        cfg = {"factorize": factorize, "proj_dim": 12, "proj_max_batch_size": 8,
-               "proj_type": "rademacher", "proj_seed": 7}
-        raw = self._run(None)                                   # un-projected capture
+
+        cfg = {
+            "factorize": factorize,
+            "proj_dim": 12,
+            "proj_max_batch_size": 8,
+            "proj_type": "rademacher",
+            "proj_seed": 7,
+        }
+        raw = self._run(None)  # un-projected capture
         ref = raw.project(random_project, {"__default__": dict(cfg)})
-        cap = self._run({"__default__": dict(cfg)})             # capture-time projection
+        cap = self._run({"__default__": dict(cfg)})  # capture-time projection
         for n in cap.layer_names:
             a, b = cap.data[n], ref.data[n]
             if isinstance(a, Factorized):
-                a = ops.materialize(a, "nn.Linear"); b = ops.materialize(b, "nn.Linear")
+                a = ops.materialize(a, "nn.Linear")
+                b = ops.materialize(b, "nn.Linear")
             assert torch.allclose(a, b, atol=1e-5), n
 
     def test_shared_layer_pairs_each_call(self):
         # A layer invoked twice per forward must project each call's (a, g) pair
         # (LIFO per-device stack), producing 2*B rows with no dropped call.
         class Shared(nn.Module):
-            def __init__(self): super().__init__(); self.lin = nn.Linear(10, 6)
-            def forward(self, x1, x2): return self.lin(x1) + self.lin(x2)
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(10, 6)
+
+            def forward(self, x1, x2):
+                return self.lin(x1) + self.lin(x2)
+
         m = Shared()
         cb = _Recording()
-        hm = HookManager(m, config=HookManagerConfig(
-            linear_io=REGISTER_ALL,
-            projection={"__default__": {"factorize": False, "proj_dim": 12,
-                        "proj_max_batch_size": 8, "proj_type": "rademacher"}}),
-            callbacks=[cb])
+        hm = HookManager(
+            m,
+            config=HookManagerConfig(
+                linear_io=REGISTER_ALL,
+                projection={
+                    "__default__": {
+                        "factorize": False,
+                        "proj_dim": 12,
+                        "proj_max_batch_size": 8,
+                        "proj_type": "rademacher",
+                    },
+                },
+            ),
+            callbacks=[cb],
+        )
         with hm.collect():
             m(torch.randn(4, 10), torch.randn(4, 10)).sum().backward()
-        assert cb.records[-1].gradient.data["lin"].shape == (8, 12)   # 2*B rows
+        assert cb.records[-1].gradient.data["lin"].shape == (8, 12)  # 2*B rows
 
 
 # --------------------------------------------------------------------------- #
@@ -753,8 +860,8 @@ class _SeqFirstModel(nn.Module):
         self.proj = nn.Linear(d, d, bias=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(input_ids)        # (B, T, d)
-        x = x.transpose(0, 1)                # (T, B, d) -- sequence-first
+        x = self.embedding(input_ids)  # (B, T, d)
+        x = x.transpose(0, 1)  # (T, B, d) -- sequence-first
         x = self.proj(x)
         return x.transpose(0, 1)
 
@@ -778,9 +885,8 @@ class TestNonBatchFirstLayers:
         model = _SeqFirstModel()
         cb = _Recording()
         hm = HookManager(model, callbacks=[cb])  # proj NOT flagged
-        with pytest.raises(ValueError, match="same batch size"):
-            with hm.collect():
-                model(torch.randint(0, 16, (3, 5))).sum().backward()
+        with pytest.raises(ValueError, match="same batch size"), hm.collect():
+            model(torch.randint(0, 16, (3, 5))).sum().backward()
 
     def test_warns_when_named_layer_not_hooked(self):
         model = _SeqFirstModel()
@@ -797,7 +903,8 @@ class TestNonBatchFirstLayers:
 
 class _NanoGPT(nn.Module):
     """Token + positional embeddings where ``wpe`` is fed an unbatched
-    ``pos = arange(T)`` (shape ``(T,)``), as in nanoGPT."""
+    ``pos = arange(T)`` (shape ``(T,)``), as in nanoGPT.
+    """
 
     def __init__(self, vocab: int = 16, d: int = 8, block: int = 5) -> None:
         super().__init__()
@@ -807,8 +914,8 @@ class _NanoGPT(nn.Module):
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         _B, T = idx.shape
-        pos = torch.arange(0, T, dtype=torch.long)        # (T,) -- no batch dim
-        return self.head(self.wte(idx) + self.wpe(pos))   # broadcast add
+        pos = torch.arange(0, T, dtype=torch.long)  # (T,) -- no batch dim
+        return self.head(self.wte(idx) + self.wpe(pos))  # broadcast add
 
 
 class TestUnbatchedPositionalEmbedding:

@@ -14,18 +14,20 @@ def is_dist_initialized() -> bool:
         import torch.distributed as dist
 
         return dist.is_available() and dist.is_initialized()
-    except Exception:
+    except Exception:  # noqa: BLE001 - guarded probe; backend may raise anything
         return False
 
 
 def dist_rank() -> int | None:
-    """Return the current distributed rank, or ``None`` outside a distributed context."""
+    """Return the current distributed rank, or ``None`` outside a distributed
+    context.
+    """
     try:
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
             return dist.get_rank()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - guarded probe; backend may raise anything
         pass
     return None
 
@@ -37,6 +39,6 @@ def dist_world_size() -> int:
 
         if dist.is_available() and dist.is_initialized():
             return dist.get_world_size()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - guarded probe; backend may raise anything
         pass
     return 1

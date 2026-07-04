@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -18,6 +18,8 @@ from dattri_llm.gradient.ops.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from dattri_llm.gradient.gradient import Factorized, Gradient
 
 
@@ -25,9 +27,12 @@ if TYPE_CHECKING:
 # kfac
 # ---------------------------------------------------------------------------
 
+
 def _flatten_for_kfac(
-    a: torch.Tensor, g: torch.Tensor, layer_type: str
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    a: torch.Tensor,
+    g: torch.Tensor,
+    layer_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Flatten spatial/token dims for K-FAC; raise for norm/embedding types."""
     if is_norm(layer_type):
         raise NotImplementedError("K-FAC is not defined for normalization layers")
@@ -39,8 +44,9 @@ def _flatten_for_kfac(
 
 
 def _drop_gradient_free_rows(
-    a_f: torch.Tensor, g_f: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    a_f: torch.Tensor,
+    g_f: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Drop flattened token rows whose output-gradient is exactly zero.
 
     Such rows contribute nothing to the true Fisher: their ``g g^T`` term
@@ -60,9 +66,9 @@ def _kfac(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
-    module_kwargs: Optional[dict] = None,
+    module_kwargs: dict | None = None,
     include_bias: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (A, G) K-FAC covariance factor matrices.
 
     *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
@@ -80,7 +86,7 @@ def _kfac(
     if N == 0:
         raise ValueError(
             "K-FAC factors are undefined: every token row carries a zero "
-            "gradient (fully padded / masked input)."
+            "gradient (fully padded / masked input).",
         )
     A = a_f.T @ a_f / N
     G = g_f.T @ g_f / N
@@ -91,11 +97,12 @@ def _kfac(
 # fim
 # ---------------------------------------------------------------------------
 
+
 def _fim(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
-    module_kwargs: Optional[dict] = None,
+    module_kwargs: dict | None = None,
     include_bias: bool = True,
 ) -> torch.Tensor:
     """Return (d, d) empirical Fisher information matrix.
@@ -104,7 +111,7 @@ def _fim(
     so the Fisher is over the layer's actual parameters).  *module_kwargs* is
     passed to :func:`_preprocess_factorized` when provided.
     """
-    grad = _materialize(a, g, layer_type, module_kwargs, include_bias)   # (B, d)
+    grad = _materialize(a, g, layer_type, module_kwargs, include_bias)  # (B, d)
     B = grad.shape[0]
     return grad.T @ grad / B
 
@@ -112,6 +119,7 @@ def _fim(
 # ---------------------------------------------------------------------------
 # K-FAC / EK-FAC attribution kernels
 # ---------------------------------------------------------------------------
+
 
 def sym_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
     """Damped symmetric inverse ``(matrix + damping*I)^{-1}``.
@@ -124,13 +132,15 @@ def sym_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
 
 
 def _kfac_cross(
-    a1: torch.Tensor, g1: torch.Tensor,
-    a2: torch.Tensor, g2: torch.Tensor,
+    a1: torch.Tensor,
+    g1: torch.Tensor,
+    a2: torch.Tensor,
+    g2: torch.Tensor,
     layer_type: str,
     A_inv: torch.Tensor,
     G_inv: torch.Tensor,
-    module_kwargs1: Optional[dict] = None,
-    module_kwargs2: Optional[dict] = None,
+    module_kwargs1: dict | None = None,
+    module_kwargs2: dict | None = None,
     include_bias: bool = True,
 ) -> torch.Tensor:
     """K-FAC preconditioned cross-gram between two factorized gradient sets.
@@ -149,8 +159,9 @@ def _kfac_cross(
 
 
 def kfac_eigh(
-    A: torch.Tensor, G: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    A: torch.Tensor,
+    G: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Eigendecompose both K-FAC factors: returns ``(s_A, U_A, s_G, U_G)``."""
     s_A, U_A = torch.linalg.eigh(A.float())
     s_G, U_G = torch.linalg.eigh(G.float())
@@ -163,7 +174,7 @@ def _ekfac_materialize(
     layer_type: str,
     U_A: torch.Tensor,
     U_G: torch.Tensor,
-    module_kwargs: Optional[dict] = None,
+    module_kwargs: dict | None = None,
     include_bias: bool = True,
 ) -> torch.Tensor:
     """Per-sample weight gradient rotated into the K-FAC eigenbasis.
@@ -179,52 +190,85 @@ def _ekfac_materialize(
 
 
 def kfac(
-    f: "Factorized", layer_type: str, include_bias: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    f: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """:func:`_kfac` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
     return _kfac(
-        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        bf.module_kwargs,
+        include_bias,
     )
 
 
 def fim(
-    f: "Factorized", layer_type: str, include_bias: bool = True
+    f: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
 ) -> torch.Tensor:
     """:func:`_fim` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
     return _fim(
-        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs, include_bias
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        bf.module_kwargs,
+        include_bias,
     )
 
 
 def kfac_cross(
-    f1: "Factorized", f2: "Factorized", layer_type: str,
-    A_inv: torch.Tensor, G_inv: torch.Tensor, include_bias: bool = True,
+    f1: Factorized,
+    f2: Factorized,
+    layer_type: str,
+    A_inv: torch.Tensor,
+    G_inv: torch.Tensor,
+    include_bias: bool = True,
 ) -> torch.Tensor:
     """:func:`_kfac_cross` on two :class:`Factorized` (batch-first-safe)."""
     b1, b2 = f1.as_batch_first(), f2.as_batch_first()
     return _kfac_cross(
-        b1.activation, b1.pre_activation_grad, b2.activation, b2.pre_activation_grad,
-        layer_type, A_inv, G_inv, b1.module_kwargs, b2.module_kwargs, include_bias,
+        b1.activation,
+        b1.pre_activation_grad,
+        b2.activation,
+        b2.pre_activation_grad,
+        layer_type,
+        A_inv,
+        G_inv,
+        b1.module_kwargs,
+        b2.module_kwargs,
+        include_bias,
     )
 
 
 def ekfac_materialize(
-    f: "Factorized", layer_type: str,
-    U_A: torch.Tensor, U_G: torch.Tensor, include_bias: bool = True,
+    f: Factorized,
+    layer_type: str,
+    U_A: torch.Tensor,
+    U_G: torch.Tensor,
+    include_bias: bool = True,
 ) -> torch.Tensor:
     """:func:`_ekfac_materialize` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
     return _ekfac_materialize(
-        bf.activation, bf.pre_activation_grad, layer_type, U_A, U_G,
-        bf.module_kwargs, include_bias,
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        U_A,
+        U_G,
+        bf.module_kwargs,
+        include_bias,
     )
 
 
 # ---------------------------------------------------------------------------
 # Per-layer streaming accumulators
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LayerKroneckerAccumulator:
@@ -235,8 +279,8 @@ class LayerKroneckerAccumulator:
     :class:`KroneckerAccumulator`.
     """
 
-    _A: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
-    _G: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
+    _A: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _G: torch.Tensor | None = field(default=None, init=False, repr=False)
     _n: int = field(default=0, init=False, repr=False)
 
     def update(
@@ -244,7 +288,7 @@ class LayerKroneckerAccumulator:
         a: torch.Tensor,
         g: torch.Tensor,
         layer_type: str,
-        module_kwargs: Optional[dict] = None,
+        module_kwargs: dict | None = None,
         include_bias: bool = True,
     ) -> None:
         """Accumulate one batch of factorized gradient data.
@@ -261,16 +305,22 @@ class LayerKroneckerAccumulator:
         N = a_f.shape[0]
         if self._A is None:
             self._A = torch.zeros(
-                a_f.shape[-1], a_f.shape[-1], dtype=a_f.dtype, device=a_f.device
+                a_f.shape[-1],
+                a_f.shape[-1],
+                dtype=a_f.dtype,
+                device=a_f.device,
             )
             self._G = torch.zeros(
-                g_f.shape[-1], g_f.shape[-1], dtype=g_f.dtype, device=g_f.device
+                g_f.shape[-1],
+                g_f.shape[-1],
+                dtype=g_f.dtype,
+                device=g_f.device,
             )
         self._A += a_f.T @ a_f
         self._G += g_f.T @ g_f
         self._n += N
 
-    def result(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def result(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (A, G) normalized covariance matrices."""
         if self._A is None or self._n == 0:
             raise RuntimeError("No gradient-carrying data has been accumulated")
@@ -291,7 +341,7 @@ class LayerFisherAccumulator:
     For the across-layers version see :class:`FisherAccumulator`.
     """
 
-    _F: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
+    _F: torch.Tensor | None = field(default=None, init=False, repr=False)
     _n: int = field(default=0, init=False, repr=False)
 
     def update(
@@ -299,14 +349,16 @@ class LayerFisherAccumulator:
         a: torch.Tensor,
         g: torch.Tensor,
         layer_type: str,
-        module_kwargs: Optional[dict] = None,
+        module_kwargs: dict | None = None,
         include_bias: bool = True,
     ) -> None:
         """Accumulate one batch from its factorized factors.
 
         *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
         """
-        self.update_from_grad(_materialize(a, g, layer_type, module_kwargs, include_bias))
+        self.update_from_grad(
+            _materialize(a, g, layer_type, module_kwargs, include_bias),
+        )
 
     def update_from_grad(self, grad: torch.Tensor) -> None:
         """Accumulate one batch from already-materialized per-sample gradients.
@@ -318,7 +370,10 @@ class LayerFisherAccumulator:
         B = grad.shape[0]
         if self._F is None:
             self._F = torch.zeros(
-                grad.shape[-1], grad.shape[-1], dtype=grad.dtype, device=grad.device
+                grad.shape[-1],
+                grad.shape[-1],
+                dtype=grad.dtype,
+                device=grad.device,
             )
         self._F += grad.T @ grad
         self._n += B
@@ -339,6 +394,7 @@ class LayerFisherAccumulator:
 # Multi-layer streaming accumulators
 # ---------------------------------------------------------------------------
 
+
 class KroneckerAccumulator:
     """Streaming K-FAC covariance accumulator across a model's layers.
 
@@ -353,18 +409,20 @@ class KroneckerAccumulator:
     """
 
     def __init__(self) -> None:
-        self._layers: Dict[str, LayerKroneckerAccumulator] = {}
+        self._layers: dict[str, LayerKroneckerAccumulator] = {}
 
-    def update(self, gradient: "Gradient", layers: Iterable[str]) -> None:
+    def update(self, gradient: Gradient, layers: Iterable[str]) -> None:
         """Accumulate the factors for *layers* from one gradient block."""
         for name in layers:
             bf = gradient.data[name].as_batch_first()
             self._layers.setdefault(name, LayerKroneckerAccumulator()).update(
-                bf.activation, bf.pre_activation_grad,
-                gradient.layer_types[name], bf.module_kwargs,
+                bf.activation,
+                bf.pre_activation_grad,
+                gradient.layer_types[name],
+                bf.module_kwargs,
             )
 
-    def result(self) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    def result(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Return ``{layer: (A, G)}`` for every accumulated layer."""
         return {name: acc.result() for name, acc in self._layers.items()}
 
@@ -384,12 +442,12 @@ class FisherAccumulator:
         dropped = acc.skipped           # {layer: param_count}
     """
 
-    def __init__(self, max_params: Optional[int] = None) -> None:
+    def __init__(self, max_params: int | None = None) -> None:
         self._max_params = max_params
-        self._layers: Dict[str, LayerFisherAccumulator] = {}
-        self._skipped: Dict[str, int] = {}
+        self._layers: dict[str, LayerFisherAccumulator] = {}
+        self._skipped: dict[str, int] = {}
 
-    def update(self, gradient: "Gradient", layers: Iterable[str]) -> None:
+    def update(self, gradient: Gradient, layers: Iterable[str]) -> None:
         """Accumulate the Fisher for *layers* from one gradient block."""
         for name in layers:
             if name in self._skipped:
@@ -401,11 +459,11 @@ class FisherAccumulator:
                 continue
             self._layers.setdefault(name, LayerFisherAccumulator()).update_from_grad(g)
 
-    def result(self) -> Dict[str, torch.Tensor]:
+    def result(self) -> dict[str, torch.Tensor]:
         """Return ``{layer: F}`` for every accumulated (non-skipped) layer."""
         return {name: acc.result() for name, acc in self._layers.items()}
 
     @property
-    def skipped(self) -> Dict[str, int]:
+    def skipped(self) -> dict[str, int]:
         """``{layer: param_count}`` for layers dropped by the ``max_params`` cap."""
         return dict(self._skipped)

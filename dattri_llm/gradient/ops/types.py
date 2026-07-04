@@ -2,37 +2,55 @@
 
 from __future__ import annotations
 
-import torch.nn as nn
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import nn
 
 # ---------------------------------------------------------------------------
 # Layer type constants
 # ---------------------------------------------------------------------------
 
-LINEAR_TYPES = frozenset({
-    "nn.Linear",
-    "nn.Bilinear",
-    "nn.NonDynamicallyQuantizableLinear",
-    "transformers.pytorch_utils.Conv1D",
-})
+LINEAR_TYPES = frozenset(
+    {
+        "nn.Linear",
+        "nn.Bilinear",
+        "nn.NonDynamicallyQuantizableLinear",
+        "transformers.pytorch_utils.Conv1D",
+    },
+)
 CONV_TYPES = frozenset({"nn.Conv1d", "nn.Conv2d", "nn.Conv3d"})
-CONV_TRANSPOSE_TYPES = frozenset({
-    "nn.ConvTranspose1d", "nn.ConvTranspose2d", "nn.ConvTranspose3d"
-})
-NORM_TYPES = frozenset({
-    "nn.LayerNorm", "nn.RMSNorm", "nn.GroupNorm",
-    "nn.InstanceNorm1d", "nn.InstanceNorm2d", "nn.InstanceNorm3d",
-})
+CONV_TRANSPOSE_TYPES = frozenset(
+    {
+        "nn.ConvTranspose1d",
+        "nn.ConvTranspose2d",
+        "nn.ConvTranspose3d",
+    },
+)
+NORM_TYPES = frozenset(
+    {
+        "nn.LayerNorm",
+        "nn.RMSNorm",
+        "nn.GroupNorm",
+        "nn.InstanceNorm1d",
+        "nn.InstanceNorm2d",
+        "nn.InstanceNorm3d",
+    },
+)
 EMBEDDING_TYPES = frozenset({"nn.Embedding", "nn.EmbeddingBag"})
 
 # Special marker for aggregated param-level gradients (no batch dim).
 PARAM_GRAD_TYPES = "param_grad_layers"
 
-ALL_LAYER_TYPES = LINEAR_TYPES | CONV_TYPES | CONV_TRANSPOSE_TYPES | NORM_TYPES | EMBEDDING_TYPES
+ALL_LAYER_TYPES = (
+    LINEAR_TYPES | CONV_TYPES | CONV_TRANSPOSE_TYPES | NORM_TYPES | EMBEDDING_TYPES
+)
 
 
 # ---------------------------------------------------------------------------
 # Predicate helpers
 # ---------------------------------------------------------------------------
+
 
 def is_linear(layer_type: str) -> bool:
     """Return True if layer_type is a linear layer type."""
@@ -62,6 +80,7 @@ def is_embedding(layer_type: str) -> bool:
 # ---------------------------------------------------------------------------
 # Canonical class name
 # ---------------------------------------------------------------------------
+
 
 def canonical_class_name(module: nn.Module) -> str:
     """Return canonical string for a module class, e.g. 'nn.Linear'."""

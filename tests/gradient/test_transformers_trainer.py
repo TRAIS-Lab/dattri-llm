@@ -8,26 +8,33 @@ tiny GPT-2-config model so they run entirely on CPU in CI.
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 import torch
 
+from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
+from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.gradient import Factorized, GradientRecord
+from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+
 try:
-    from transformers import GPT2Config, GPT2LMHeadModel, Trainer, TrainingArguments
-    from transformers import set_seed
-    import accelerate  # noqa: F401
-    _HAS_TRANSFORMERS_STACK = True
-except (ImportError, Exception):
+    from transformers import (
+        GPT2Config,
+        GPT2LMHeadModel,
+        Trainer,
+        TrainingArguments,
+        set_seed,
+    )
+
+    _HAS_TRANSFORMERS_STACK = importlib.util.find_spec("accelerate") is not None
+except Exception:  # noqa: BLE001 - transformers import can fail in many ways
     _HAS_TRANSFORMERS_STACK = False
 
 pytestmark = pytest.mark.skipif(
     not _HAS_TRANSFORMERS_STACK,
     reason="transformers[torch] / accelerate not installed",
 )
-
-from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback  # noqa: E402
-from dattri_llm.gradient.file_manager import GradientFileManager  # noqa: E402
-from dattri_llm.gradient.gradient import Factorized, GradientRecord  # noqa: E402
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig  # noqa: E402
 
 # Hook the decoder blocks only: wte/wpe see broadcast position ids (not
 # per-sample) and lm_head shares wte's weight under GPT-2 weight tying.
@@ -53,7 +60,7 @@ class _Capture(HookManagerCallback):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture()
+@pytest.fixture
 def tiny_gpt2():
     """A minimal 2-layer GPT-2 that fits on CPU in seconds."""
     set_seed(42)
@@ -67,7 +74,7 @@ def tiny_gpt2():
     return GPT2LMHeadModel(cfg)
 
 
-@pytest.fixture()
+@pytest.fixture
 def tiny_dataset():
     """An iterable of 4 tiny token sequences (2 steps x 2 samples)."""
     from torch.utils.data import Dataset
@@ -87,7 +94,7 @@ def tiny_dataset():
     return TinyTokenDataset()
 
 
-@pytest.fixture()
+@pytest.fixture
 def training_args(tmp_path):
     return TrainingArguments(
         output_dir=str(tmp_path / "output"),
@@ -129,7 +136,10 @@ class TestTrainerCapture:
     def test_one_record_per_step(self, tiny_gpt2, tiny_dataset, training_args):
         capture = _Capture()
         layer_names = _train_with_callbacks(
-            tiny_gpt2, training_args, tiny_dataset, [capture]
+            tiny_gpt2,
+            training_args,
+            tiny_dataset,
+            [capture],
         )
         assert len(capture.records) == N_STEPS, (
             f"Expected {N_STEPS} records, got {len(capture.records)}"
@@ -165,7 +175,11 @@ class TestTrainerOffload:
     """Disk offload during training, then reload through a fresh manager."""
 
     def test_gradients_offloaded_and_reloadable(
-        self, tiny_gpt2, tiny_dataset, training_args, tmp_path
+        self,
+        tiny_gpt2,
+        tiny_dataset,
+        training_args,
+        tmp_path,
     ):
         grad_dir = str(tmp_path / "gradients")
         offload = OffloadCallback(

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 
 def _compute_layer_norm_x_hat(
-    x: torch.Tensor, normalized_shape: tuple, eps: float
+    x: torch.Tensor,
+    normalized_shape: tuple,
+    eps: float,
 ) -> torch.Tensor:
-    """Return x_hat = (x - mu) / sqrt(sigma^2 + eps) for a LayerNorm-style normalisation."""
+    """Return x_hat = (x - mu) / sqrt(sigma^2 + eps) for a LayerNorm-style
+    normalisation.
+    """
     n_dims = len(normalized_shape)
     reduce_dims = tuple(range(-n_dims, 0))
     mean = x.mean(dim=reduce_dims, keepdim=True)
@@ -19,7 +21,9 @@ def _compute_layer_norm_x_hat(
 
 
 def _compute_rms_x_hat(
-    x: torch.Tensor, normalized_shape: tuple, eps: Optional[float]
+    x: torch.Tensor,
+    normalized_shape: tuple,
+    eps: float | None,
 ) -> torch.Tensor:
     """Return x_hat = x / sqrt(mean(x^2) + eps) for an RMSNorm normalisation.
 
@@ -36,7 +40,9 @@ def _compute_rms_x_hat(
 
 
 def _compute_group_norm_x_hat(
-    x: torch.Tensor, num_groups: int, eps: float
+    x: torch.Tensor,
+    num_groups: int,
+    eps: float,
 ) -> torch.Tensor:
     """Return x_hat for a GroupNorm-style normalisation.
 
@@ -58,8 +64,11 @@ def _compute_group_norm_x_hat(
 # Augmentation helpers (bias folding per the factorized-gradient formulation)
 # ---------------------------------------------------------------------------
 
+
 def _augment_token_norm(
-    x_hat: torch.Tensor, g: torch.Tensor, has_bias: bool
+    x_hat: torch.Tensor,
+    g: torch.Tensor,
+    has_bias: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Bias-augment a LayerNorm/RMSNorm pair (affine over the last dim).
 
@@ -75,7 +84,9 @@ def _augment_token_norm(
 
 
 def _augment_channel_norm(
-    x_hat: torch.Tensor, g: torch.Tensor, has_bias: bool
+    x_hat: torch.Tensor,
+    g: torch.Tensor,
+    has_bias: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lay out a GroupNorm/InstanceNorm pair as ``(N, S, C)`` and bias-augment.
 
@@ -87,7 +98,7 @@ def _augment_channel_norm(
     """
     n, c = x_hat.shape[:2]
     x_sc = x_hat.reshape(n, c, -1).permute(0, 2, 1).contiguous()  # (N, S, C)
-    g_sc = g.reshape(n, c, -1).permute(0, 2, 1).contiguous()      # (N, S, C)
+    g_sc = g.reshape(n, c, -1).permute(0, 2, 1).contiguous()  # (N, S, C)
     if has_bias:
         return (
             torch.cat([x_sc, torch.ones_like(x_sc)], dim=-1),

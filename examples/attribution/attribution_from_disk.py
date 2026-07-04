@@ -14,11 +14,11 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_ALL
+from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 from dattri_llm.utils.hashing import hash_batch
 
 IN, HID, OUT = 8, 16, 4
@@ -26,7 +26,8 @@ IN, HID, OUT = 8, 16, 4
 
 class MLP(nn.Module):
     """Bias-free 2-layer MLP; ``forward`` accepts (and ignores) ``y`` so the
-    recorded input hash covers the same ``{x, y}`` pair the dataset yields."""
+    recorded input hash covers the same ``{x, y}`` pair the dataset yields.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -61,12 +62,18 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     model = MLP().eval()
     g = torch.Generator().manual_seed(0)
-    x_tr, y_tr = torch.randn(n_train, IN, generator=g), torch.randn(n_train, OUT, generator=g)
-    x_te, y_te = torch.randn(n_test, IN, generator=g), torch.randn(n_test, OUT, generator=g)
+    x_tr, y_tr = (
+        torch.randn(n_train, IN, generator=g),
+        torch.randn(n_train, OUT, generator=g),
+    )
+    x_te, y_te = (
+        torch.randn(n_test, IN, generator=g),
+        torch.randn(n_test, OUT, generator=g),
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
-        tmp = pathlib.Path(tmp)
-        train_dir, test_dir = str(tmp / "train_grads"), str(tmp / "test_grads")
+        root = pathlib.Path(tmp)
+        train_dir, test_dir = str(root / "train_grads"), str(root / "test_grads")
 
         # Stage 1 -- collect per-sample gradients to disk.  HookManager captures
         # the factorized per-sample gradients during one full-batch backward;
@@ -74,14 +81,21 @@ if __name__ == "__main__":
         # SUM over samples so each captured gradient is that sample's own dL_i/dW.
         print("Stage 1 -- collecting per-sample gradients to disk")
         print("-" * 50)
-        for split, x, y, out_dir in [("train", x_tr, y_tr, train_dir),
-                                     ("test", x_te, y_te, test_dir)]:
+        for split, x, y, out_dir in [
+            ("train", x_tr, y_tr, train_dir),
+            ("test", x_te, y_te, test_dir),
+        ]:
             fm = GradientFileManager(out_dir)
             hm = HookManager(
                 model,
                 config=HookManagerConfig(linear_io=REGISTER_ALL),
-                callbacks=[OffloadCallback(offload_interval=1, file_manager=fm,
-                                           recording_type="per_sample")],
+                callbacks=[
+                    OffloadCallback(
+                        offload_interval=1,
+                        file_manager=fm,
+                        recording_type="per_sample",
+                    ),
+                ],
             )
             with hm.collect():
                 model.zero_grad(set_to_none=True)
@@ -89,7 +103,10 @@ if __name__ == "__main__":
                 (((out - y) ** 2).sum()).backward()
             hm.remove()
             model.zero_grad(set_to_none=True)
-            print(f"{split:<8}{len(fm.index)} sample records, steps={fm.available_steps()}")
+            print(
+                f"{split:<8}{len(fm.index)} sample records, "
+                f"steps={fm.available_steps()}",
+            )
         print("-" * 50)
 
         # Stage 2 -- attribute from the cached gradients.  No model or backward

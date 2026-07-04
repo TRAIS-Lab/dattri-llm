@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING
 
 import torch
 
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 
 if TYPE_CHECKING:
-    import torch.nn as nn
+    from collections.abc import Callable, Iterable
+
+    from torch import nn
+
+    from dattri_llm.gradient.file_manager import GradientFileManager
+    from dattri_llm.gradient.streaming import GradientStreamer
 
 
 def normalize_layer_names(
-    layer_name: Optional[Union[str, List[str]]],
-) -> Optional[List[str]]:
+    layer_name: str | list[str] | None,
+) -> list[str] | None:
     """Normalize an ``attribute_from_cache`` ``layer_name`` argument.
 
     A single string becomes a one-element list; ``None`` (score every stored
@@ -36,13 +40,17 @@ def task_loss_fn(func: Callable) -> Callable:
     parameters; *func* runs the same ``functional_call`` forward the task defines,
     and ``batch`` is the loader's batch in the task's ``data`` format.
     """
-    def loss_fn(model: "nn.Module", batch: object) -> torch.Tensor:
-        return func({n: p for n, p in model.named_parameters()}, batch)
+
+    def loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
+        return func(dict(model.named_parameters()), batch)
 
     return loss_fn
 
 
-def collect_to_disk(streamer, file_manager: GradientFileManager) -> None:
+def collect_to_disk(
+    streamer: GradientStreamer,
+    file_manager: GradientFileManager,
+) -> None:
     """Run a gradient streamer to completion, persisting every block to disk.
 
     Iterates ``streamer`` (entering/exiting its context here, so pass a freshly
@@ -56,7 +64,7 @@ def collect_to_disk(streamer, file_manager: GradientFileManager) -> None:
     with streamer:
         for step, grad, hashes in streamer:
             file_manager.save_bulk(
-                [GradientRecord(step=step, input_hash=hashes, gradient=grad)]
+                [GradientRecord(step=step, input_hash=hashes, gradient=grad)],
             )
 
 
@@ -68,7 +76,7 @@ def score_sources(
     prepare_test: Callable[[Gradient], object],
     score_block: Callable[[Gradient, object, int], torch.Tensor],
     loop_over_test: bool = False,
-) -> Tuple[torch.Tensor, List[str], List[int], List[str]]:
+) -> tuple[torch.Tensor, list[str], list[int], list[str]]:
     """Shared scoring skeleton for the trajectory-agnostic attributors.
 
     Both train and test arrive as ``GradientSource`` objects (on-disk
@@ -93,7 +101,8 @@ def score_sources(
         test_source: Source of test blocks; iterated once to cache, or repeatedly
             when ``loop_over_test`` (which then requires ``test_source.reusable``).
         device: Device the blocks are moved to before scoring.
-        prepare_test, score_block: The per-method hooks described above.
+        prepare_test: The per-method preparation hook described above.
+        score_block: The per-method scoring hook described above.
         loop_over_test: Re-stream + re-prepare the test blocks per train block
             (low memory) instead of caching them once (default).
 
@@ -101,18 +110,22 @@ def score_sources(
         ``(scores, row_train_ids, row_steps, test_ids)`` -- ``scores`` is
         ``(num_train_rows, num_test)`` on CPU, ``row_steps`` stamps each row with
         the step its train gradient came from, ``test_ids`` is the column order.
+
+    Raises:
+        ValueError: If ``loop_over_test`` is requested with a single-shot
+            test source.
     """
     if loop_over_test and not getattr(test_source, "reusable", False):
         raise ValueError(
             "loop_over_test=True requires a re-iterable test source "
-            "(reusable=True); got a single-shot source."
+            "(reusable=True); got a single-shot source.",
         )
 
     # One pass over the test blocks fixes the column order (hash order as yielded)
     # and, unless looping, caches each block's prepared representation.
-    test_ids: List[str] = []
+    test_ids: list[str] = []
     test_index: dict = {}
-    cached_test: List[Tuple[object, List[str]]] = []
+    cached_test: list[tuple[object, list[str]]] = []
     for _step, test_g, test_hashes in test_source:
         for h in test_hashes:
             if h not in test_index:
@@ -123,11 +136,11 @@ def score_sources(
     num_test = len(test_ids)
 
     # Score every train block against every test block.
-    row_chunks: List[torch.Tensor] = []
-    row_train_ids: List[str] = []
-    row_steps: List[int] = []
-    for train_step, train_g, train_hashes in train_source:
-        train_g = train_g.to(device)
+    row_chunks: list[torch.Tensor] = []
+    row_train_ids: list[str] = []
+    row_steps: list[int] = []
+    for train_step, train_block, train_hashes in train_source:
+        train_g = train_block.to(device)
         row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
         test_blocks = (
             ((prepare_test(g.to(device)), h) for _s, g, h in test_source)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class TinyMLP(nn.Module):
@@ -15,7 +15,12 @@ class TinyMLP(nn.Module):
         embedding -> transformer_block (attn_proj, mlp.fc1, mlp.fc2) -> lm_head
     """
 
-    def __init__(self, vocab_size: int = 32, d_model: int = 16, seq_len: int = 8) -> None:
+    def __init__(
+        self,
+        vocab_size: int = 32,
+        d_model: int = 16,
+        seq_len: int = 8,
+    ) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         # Simulated attention projection (NOT in mlp -> should NOT be hooked)
@@ -31,21 +36,20 @@ class TinyMLP(nn.Module):
         self.seq_len = seq_len
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(input_ids)            # (B, T, d_model)
+        x = self.embedding(input_ids)  # (B, T, d_model)
         x = self.attn_proj(x)
         x = self.mlp(x)
-        logits = self.lm_head(x)                 # (B, T, vocab_size)
-        return logits
+        return self.lm_head(x)  # (B, T, vocab_size)
 
 
-@pytest.fixture()
+@pytest.fixture
 def tiny_model() -> TinyMLP:
     """Return a fresh TinyMLP on CPU with fixed seed."""
     torch.manual_seed(42)
     return TinyMLP()
 
 
-@pytest.fixture()
+@pytest.fixture
 def tiny_batch(tiny_model: TinyMLP) -> dict[str, torch.Tensor]:
     """Return a small random input batch (B=2, T=8)."""
     B, T = 2, tiny_model.seq_len

@@ -34,11 +34,10 @@ try:
     from olmo.model import OLMo
     from olmo.optim import build_optimizer, build_scheduler
     from olmo.train import Trainer
-except ImportError:
+except ImportError as exc:
     raise SystemExit(
-        "ai2-olmo is required for this example.\n"
-        "Install with:  pip install ai2-olmo"
-    )
+        "ai2-olmo is required for this example.\nInstall with:  pip install ai2-olmo",
+    ) from exc
 
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
@@ -65,7 +64,7 @@ if __name__ == "__main__":
             max_sequence_length=SEQ,
         ),
         save_folder=tempfile.mkdtemp(prefix="olmo_ckpt_"),
-        max_duration=4,                    # 4 steps = 2 epochs over 4 samples
+        max_duration=4,  # 4 steps = 2 epochs over 4 samples
         device_train_batch_size=BATCH,
         global_train_batch_size=BATCH,
         precision="fp32",
@@ -87,8 +86,12 @@ if __name__ == "__main__":
 
     torch.manual_seed(0)
     sequences = [{"input_ids": torch.randint(0, VOCAB, (SEQ,))} for _ in range(4)]
-    ds = OLMoIterableDataset(sequences, global_batch_size=BATCH,
-                             shuffle=False, drop_last=True)
+    ds = OLMoIterableDataset(
+        sequences,
+        global_batch_size=BATCH,
+        shuffle=False,
+        drop_last=True,
+    )
     loader = DataLoader(ds, batch_size=BATCH)
 
     trainer = Trainer(
@@ -110,8 +113,13 @@ if __name__ == "__main__":
         collector = HookManager(
             model,
             config=HookManagerConfig(linear_io=[r"ff_proj", r"ff_out"]),
-            callbacks=[OffloadCallback(offload_interval=1, file_manager=fm,
-                                       recording_type="per_batch")],
+            callbacks=[
+                OffloadCallback(
+                    offload_interval=1,
+                    file_manager=fm,
+                    recording_type="per_batch",
+                ),
+            ],
         )
         print(f"{'Hooked FFN layers':<25}{collector.layer_names}")
 
@@ -129,7 +137,7 @@ if __name__ == "__main__":
         # recorded at, and load_sample() retrieves each pair's gradient by
         # direct slicing.
         h0 = hash_sample(sequences[0])
-        pairs = fm.lookup_by_hash(h0)                          # [(step, sample_idx), ...]
+        pairs = fm.lookup_by_hash(h0)  # [(step, sample_idx), ...]
         g_first = fm.load_sample_by_hash(h0, *pairs[0])
         g_last = fm.load_sample_by_hash(h0, *pairs[-1])
         drift = g_first.similarity(g_last, metric="cosine", reduce="all").item()

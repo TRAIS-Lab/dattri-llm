@@ -27,9 +27,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 @dataclass
@@ -55,17 +58,17 @@ class AttributionScore:
     """
 
     scores: torch.Tensor
-    row_train_ids: List[str]
-    row_steps: List[int]
-    test_ids: List[str]
+    row_train_ids: list[str]
+    row_steps: list[int]
+    test_ids: list[str]
 
     algorithm: str
-    algorithm_meta: Dict[str, Any]
-    layer_name: Optional[List[str]]
+    algorithm_meta: dict[str, Any]
+    layer_name: list[str] | None
 
     # Rebuilt from the lists above; never persisted directly.
-    train_index: Dict[str, List[Tuple[int, int]]] = field(init=False, repr=False)
-    test_index: Dict[str, int] = field(init=False, repr=False)
+    train_index: dict[str, list[tuple[int, int]]] = field(init=False, repr=False)
+    test_index: dict[str, int] = field(init=False, repr=False)
 
     _SCORES_FILE = "scores.pt"
     _META_FILE = "metadata.json"
@@ -75,18 +78,20 @@ class AttributionScore:
         if not (len(self.row_train_ids) == len(self.row_steps) == n_rows):
             raise ValueError(
                 f"row_train_ids ({len(self.row_train_ids)}) and row_steps "
-                f"({len(self.row_steps)}) must both equal num_rows ({n_rows})."
+                f"({len(self.row_steps)}) must both equal num_rows ({n_rows}).",
             )
         if len(self.test_ids) != self.scores.shape[1]:
             raise ValueError(
                 f"test_ids ({len(self.test_ids)}) must equal num_test "
-                f"({self.scores.shape[1]})."
+                f"({self.scores.shape[1]}).",
             )
         self._build_indices()
 
     def _build_indices(self) -> None:
-        train_index: Dict[str, List[Tuple[int, int]]] = {}
-        for row_idx, (h, step) in enumerate(zip(self.row_train_ids, self.row_steps)):
+        train_index: dict[str, list[tuple[int, int]]] = {}
+        for row_idx, (h, step) in enumerate(
+            zip(self.row_train_ids, self.row_steps, strict=True),
+        ):
             train_index.setdefault(h, []).append((step, row_idx))
         for entries in train_index.values():
             entries.sort()  # by (step, row_idx)
@@ -98,15 +103,16 @@ class AttributionScore:
     # ------------------------------------------------------------------ #
 
     @property
-    def train_ids(self) -> List[str]:
+    def train_ids(self) -> list[str]:
         """Distinct training hashes, in first-occurrence (disk) order."""
-        seen: Dict[str, None] = {}
+        seen: dict[str, None] = {}
         for h in self.row_train_ids:
             seen.setdefault(h, None)
         return list(seen)
 
     @property
     def num_rows(self) -> int:
+        """Number of (train sample, step) rows in the score matrix."""
         return self.scores.shape[0]
 
     @property
@@ -116,13 +122,14 @@ class AttributionScore:
 
     @property
     def num_test(self) -> int:
+        """Number of test-sample columns in the score matrix."""
         return self.scores.shape[1]
 
     # ------------------------------------------------------------------ #
     # Retrieval                                                           #
     # ------------------------------------------------------------------ #
 
-    def trajectory_aware(self, train_hash: str) -> Tuple[List[int], torch.Tensor]:
+    def trajectory_aware(self, train_hash: str) -> tuple[list[int], torch.Tensor]:
         """Per-step scores for one training sample against every test sample.
 
         Args:
@@ -134,7 +141,7 @@ class AttributionScore:
             ``(len(steps), num_test)``.
 
         Raises:
-            KeyError: If ``train_hash`` is not present.
+            KeyError: If ``train_hash`` is not present.  # noqa: DAR402
         """
         entries = self._require_train(train_hash)
         steps = [step for step, _ in entries]
@@ -154,7 +161,7 @@ class AttributionScore:
         _, rows = self.trajectory_aware(train_hash)
         return rows.sum(dim=0)
 
-    def agnostic_matrix(self) -> Tuple[List[str], torch.Tensor]:
+    def agnostic_matrix(self) -> tuple[list[str], torch.Tensor]:
         """The accumulated ``(num_train, num_test)`` matrix.
 
         Returns:
@@ -186,7 +193,7 @@ class AttributionScore:
             raise KeyError(f"test hash {test_hash[:16]}... not in scores.")
         return self.scores[:, self.test_index[test_hash]]
 
-    def step_matrix(self, step: int) -> Tuple[List[str], torch.Tensor]:
+    def step_matrix(self, step: int) -> tuple[list[str], torch.Tensor]:
         """The ``(num_train, num_test)`` score matrix for a single step.
 
         This is the per-step view of the attribution: the ensemble term
@@ -211,7 +218,7 @@ class AttributionScore:
         train_ids = [self.row_train_ids[i] for i in rows]
         return train_ids, self.scores[rows]
 
-    def step_matrices(self) -> "Dict[int, Tuple[List[str], torch.Tensor]]":
+    def step_matrices(self) -> dict[int, tuple[list[str], torch.Tensor]]:
         """Every step's score matrix, keyed by step.
 
         Convenience wrapper over :meth:`step_matrix` that returns the per-step
@@ -249,13 +256,13 @@ class AttributionScore:
         known = sorted(s for s, _ in self.train_index[train_hash])
         raise KeyError(
             f"train sample {train_hash[:16]}... has no row at step {step}; "
-            f"known steps: {known}"
+            f"known steps: {known}",
         )
 
     def query(
         self,
-        train_hashes: Optional[Sequence[str]] = None,
-        test_hashes: Optional[Sequence[str]] = None,
+        train_hashes: Sequence[str] | None = None,
+        test_hashes: Sequence[str] | None = None,
         trajectory: str = "agnostic",
     ) -> torch.Tensor:
         """Recover the submatrix for arbitrary train/test queries.
@@ -275,13 +282,15 @@ class AttributionScore:
 
         Raises:
             ValueError: If ``trajectory`` is not ``"aware"`` or ``"agnostic"``.
-            KeyError: If any requested hash is absent.
+            KeyError: If any requested hash is absent.  # noqa: DAR402
         """
         if trajectory not in ("aware", "agnostic"):
             raise ValueError(
-                f"trajectory must be 'aware' or 'agnostic', got {trajectory!r}."
+                f"trajectory must be 'aware' or 'agnostic', got {trajectory!r}.",
             )
-        train_hashes = list(train_hashes) if train_hashes is not None else self.train_ids
+        train_hashes = (
+            list(train_hashes) if train_hashes is not None else self.train_ids
+        )
         if test_hashes is None:
             cols = list(range(self.num_test))
         else:
@@ -289,16 +298,17 @@ class AttributionScore:
 
         if trajectory == "agnostic":
             rows = torch.stack(
-                [self.trajectory_agnostic(h) for h in train_hashes], dim=0
+                [self.trajectory_agnostic(h) for h in train_hashes],
+                dim=0,
             )
             return rows[:, cols]
 
-        row_idxs: List[int] = []
+        row_idxs: list[int] = []
         for h in train_hashes:
             row_idxs.extend(row_idx for _, row_idx in self._require_train(h))
         return self.scores[row_idxs][:, cols]
 
-    def _require_train(self, train_hash: str) -> List[Tuple[int, int]]:
+    def _require_train(self, train_hash: str) -> list[tuple[int, int]]:
         if train_hash not in self.train_index:
             raise KeyError(f"train hash {train_hash[:16]}... not in scores.")
         return self.train_index[train_hash]
@@ -312,7 +322,7 @@ class AttributionScore:
     # Persistence                                                         #
     # ------------------------------------------------------------------ #
 
-    def save(self, out_dir: Union[str, Path]) -> Path:
+    def save(self, out_dir: str | Path) -> Path:
         """Persist to ``out_dir`` as ``scores.pt`` + ``metadata.json``.
 
         Args:
@@ -335,23 +345,23 @@ class AttributionScore:
             "num_test": self.num_test,
             "num_rows": self.num_rows,
         }
-        with open(out / self._META_FILE, "w") as f:
+        with Path(out / self._META_FILE).open("w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
         return out
 
     @classmethod
-    def load(cls, out_dir: Union[str, Path]) -> "AttributionScore":
+    def load(cls, out_dir: str | Path) -> AttributionScore:
         """Reload an :class:`AttributionScore` previously written by :meth:`save`.
 
         Args:
             out_dir: Directory containing ``scores.pt`` and ``metadata.json``.
 
         Returns:
-            The reconstructed :class:`AttributionScore` (index maps rebuilt).
+            AttributionScore: The reconstructed score (index maps rebuilt).
         """
         out = Path(out_dir)
         scores = torch.load(out / cls._SCORES_FILE, weights_only=True)
-        with open(out / cls._META_FILE) as f:
+        with Path(out / cls._META_FILE).open(encoding="utf-8") as f:
             meta = json.load(f)
         algorithm_meta = meta.get("algorithm_meta", {})
         # Older saves carried normalized_grad as a top-level field; fold it in.

@@ -4,24 +4,24 @@ from __future__ import annotations
 
 import pytest
 import torch
+from dattri.func.projection import random_project
 
-from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient import ops
-
+from dattri_llm.gradient.gradient import Factorized, Gradient
 
 # --------------------------------------------------------------------------- #
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
 
-B, T, I, O = 2, 4, 8, 16  # batch, token, in_features, out_features
+B, T, D_IN, D_OUT = 2, 4, 8, 16  # batch, token, in_features, out_features
 
 
-def mat_tensor(b=B, feat=O * I) -> torch.Tensor:
+def mat_tensor(b=B, feat=D_OUT * D_IN) -> torch.Tensor:
     """Materialized gradient tensor [B, feat]."""
     return torch.randn(b, feat)
 
 
-def mat_tensor_bt(b=B, t=T, feat=O * I) -> torch.Tensor:
+def mat_tensor_bt(b=B, t=T, feat=D_OUT * D_IN) -> torch.Tensor:
     """Materialized gradient tensor [B, T, feat]."""
     return torch.randn(b, t, feat)
 
@@ -29,16 +29,16 @@ def mat_tensor_bt(b=B, t=T, feat=O * I) -> torch.Tensor:
 def factorized(b=B) -> Factorized:
     """Factorized gradient [B, I] x [B, O]."""
     return Factorized(
-        activation=torch.randn(b, I),
-        pre_activation_grad=torch.randn(b, O),
+        activation=torch.randn(b, D_IN),
+        pre_activation_grad=torch.randn(b, D_OUT),
     )
 
 
 def factorized_bt(b=B, t=T) -> Factorized:
     """Factorized gradient [B, T, I] x [B, T, O]."""
     return Factorized(
-        activation=torch.randn(b, t, I),
-        pre_activation_grad=torch.randn(b, t, O),
+        activation=torch.randn(b, t, D_IN),
+        pre_activation_grad=torch.randn(b, t, D_OUT),
     )
 
 
@@ -55,12 +55,12 @@ def make_gradient(
         fn = mat_tensor_bt if indexing == "batch_token" else mat_tensor
         data = {name: fn() for name in layers}
 
-    representation = {name: repr_type for name in layers}
-    idx_dict = {name: indexing for name in layers}
+    representation = dict.fromkeys(layers, repr_type)
+    idx_dict = dict.fromkeys(layers, indexing)
     return Gradient(
         representation=representation,
         data=data,
-        layer_types={name: layer_type for name in layers},
+        layer_types=dict.fromkeys(layers, layer_type),
         indexing=idx_dict,
     )
 
@@ -73,21 +73,21 @@ def make_gradient(
 class TestFactorized:
     def test_materialize_2d(self):
         f = Factorized(
-            activation=torch.ones(B, I),
-            pre_activation_grad=torch.ones(B, O),
+            activation=torch.ones(B, D_IN),
+            pre_activation_grad=torch.ones(B, D_OUT),
         )
         out = ops.materialize(f, "nn.Linear")
-        assert out.shape == (B, O * I)
+        assert out.shape == (B, D_OUT * D_IN)
 
     def test_materialize_3d(self):
         f = factorized_bt()
         # ops.materialize sums over the token dimension, returning (B, O*I)
         out = ops.materialize(f, "nn.Linear")
-        assert out.shape == (B, O * I)
+        assert out.shape == (B, D_OUT * D_IN)
 
     def test_materialize_invalid_ndim(self):
-        a = torch.randn(B, T, I, 1)
-        g = torch.randn(B, T, O, 1)
+        a = torch.randn(B, T, D_IN, 1)
+        g = torch.randn(B, T, D_OUT, 1)
         with pytest.raises((ValueError, RuntimeError)):
             ops.materialize(Factorized(a, g), "nn.Linear")
 
@@ -124,8 +124,11 @@ class TestValidate:
         data = {"l1": mat_tensor(), "l2": mat_tensor()}
         rep = {"l1": "materialized"}  # missing l2
         with pytest.raises(ValueError, match="Missing representation"):
-            Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
+            Gradient(
+                representation=rep,
+                data=data,
+                layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+            )
 
     def test_factorized_wrong_data_type(self):
         data = {"l1": mat_tensor()}
@@ -143,18 +146,25 @@ class TestValidate:
         data = {"l1": mat_tensor(b=2), "l2": mat_tensor(b=3)}
         rep = {"l1": "materialized", "l2": "materialized"}
         with pytest.raises(ValueError, match="batch size"):
-            Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
+            Gradient(
+                representation=rep,
+                data=data,
+                layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+            )
 
     def test_batch_token_wrong_ndim(self):
         # A layer declared as batch_token but given a 2-D tensor must fail.
         data = {"l1": mat_tensor()}
         rep = {"l1": "materialized"}
-        with pytest.raises(ValueError):
-            Gradient(representation=rep, data=data, layer_types={"l1": "nn.Linear"},
-                     indexing={"l1": "batch_token"})
+        with pytest.raises(ValueError, match="batch_token"):
+            Gradient(
+                representation=rep,
+                data=data,
+                layer_types={"l1": "nn.Linear"},
+                indexing={"l1": "batch_token"},
+            )
 
-    def _embedding_factor(self, b, t=T, d=O):
+    def _embedding_factor(self, b, t=T, d=D_OUT):
         return Factorized(torch.randint(0, t, (b, t)), torch.randn(b, t, d))
 
     def test_broadcast_embedding_validates(self):
@@ -221,9 +231,12 @@ class TestProperties:
         # Mixed: l1 is batch_token, l2 is batch.
         data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
         rep = {"l1": "materialized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
-                     indexing={"l1": "batch_token", "l2": "batch"})
+        g = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+            indexing={"l1": "batch_token", "l2": "batch"},
+        )
         assert g.token_dim == {"l1": T, "l2": None}
 
     def test_device(self):
@@ -254,7 +267,8 @@ class TestClone:
         for name in g.layer_names:
             g.data[name].activation.fill_(0)
             assert not torch.allclose(
-                g.data[name].activation, g2.data[name].activation
+                g.data[name].activation,
+                g2.data[name].activation,
             )
 
     def test_clone_copies_representation(self):
@@ -306,7 +320,7 @@ class TestMaterialize:
         g = make_gradient(repr_type="factorized")
         gm = g.materialize()
         for v in gm.data.values():
-            assert v.shape == (B, O * I)
+            assert v.shape == (B, D_OUT * D_IN)
 
     def test_materialized_returns_self(self):
         g = make_gradient(repr_type="materialized")
@@ -315,8 +329,11 @@ class TestMaterialize:
     def test_mixed_representation(self):
         data = {"l1": factorized(), "l2": mat_tensor()}
         rep = {"l1": "factorized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
+        g = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+        )
         gm = g.materialize()
         assert isinstance(gm.data["l1"], torch.Tensor)
         assert gm.representation["l1"] == "materialized"
@@ -328,25 +345,30 @@ class TestMaterialize:
 # Gradient.project                                                             #
 # --------------------------------------------------------------------------- #
 
-from dattri.func.projection import random_project  # noqa: E402
-
-_PROJ = dict(proj_max_batch_size=8, proj_type="rademacher", proj_seed=0)
+_PROJ = {"proj_max_batch_size": 8, "proj_type": "rademacher", "proj_seed": 0}
 
 
 class TestProject:
     def test_factorize_stays_factorized(self):
         g = make_gradient(repr_type="factorized")
-        p = g.project(random_project, {"__default__": {"factorize": True, "proj_dim": 32, **_PROJ}})
+        p = g.project(
+            random_project,
+            {"__default__": {"factorize": True, "proj_dim": 32, **_PROJ}},
+        )
         for name in p.layer_names:
             assert p.representation[name] == "factorized"
             assert p.layer_types[name] == "nn.Linear"
             f = p.data[name]
-            assert f.activation.shape[-1] == 32 and f.pre_activation_grad.shape[-1] == 32
+            assert f.activation.shape[-1] == 32
+            assert f.pre_activation_grad.shape[-1] == 32
             assert f.module_kwargs is None  # factors are final, not re-preprocessed
 
     def test_materialize_collapses_to_proj_dim(self):
         g = make_gradient(repr_type="factorized")
-        p = g.project(random_project, {"__default__": {"factorize": False, "proj_dim": 24, **_PROJ}})
+        p = g.project(
+            random_project,
+            {"__default__": {"factorize": False, "proj_dim": 24, **_PROJ}},
+        )
         for name in p.layer_names:
             assert p.representation[name] == "materialized"
             assert p.data[name].shape == (B, 24)
@@ -355,12 +377,18 @@ class TestProject:
     def test_per_layer_kwargs_override_default(self):
         data = {"l1": factorized(), "l2": factorized()}
         rep = {"l1": "factorized", "l2": "factorized"}
-        g = Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
-        p = g.project(random_project, {
-            "l1": {"factorize": True, "proj_dim": 16, **_PROJ},
-            "l2": {"factorize": False, "proj_dim": 16, **_PROJ},
-        })
+        g = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+        )
+        p = g.project(
+            random_project,
+            {
+                "l1": {"factorize": True, "proj_dim": 16, **_PROJ},
+                "l2": {"factorize": False, "proj_dim": 16, **_PROJ},
+            },
+        )
         assert p.representation["l1"] == "factorized"
         assert p.representation["l2"] == "materialized"
 
@@ -375,10 +403,17 @@ class TestProject:
     def test_partial_config_projects_only_named_layer(self):
         data = {"l1": factorized(), "l2": factorized()}
         rep = {"l1": "factorized", "l2": "factorized"}
-        g = Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"})
-        p = g.project(random_project, {"l1": {"factorize": False, "proj_dim": 8, **_PROJ}})
-        assert p.representation["l1"] == "materialized" and p.data["l1"].shape == (B, 8)
+        g = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+        )
+        p = g.project(
+            random_project,
+            {"l1": {"factorize": False, "proj_dim": 8, **_PROJ}},
+        )
+        assert p.representation["l1"] == "materialized"
+        assert p.data["l1"].shape == (B, 8)
         assert p.data["l2"] is data["l2"]  # l2 untouched
 
 
@@ -442,9 +477,12 @@ class TestConcatenate:
         # Build a gradient with different batch size
         data = {"l1": mat_tensor_bt(b=3), "l2": mat_tensor_bt(b=3)}
         rep = {"l1": "materialized", "l2": "materialized"}
-        g2 = Gradient(representation=rep, data=data,
-                      layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
-                      indexing={"l1": "batch_token", "l2": "batch_token"})
+        g2 = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+            indexing={"l1": "batch_token", "l2": "batch_token"},
+        )
         with pytest.raises(ValueError, match="batch size"):
             g1.concatenate(g2, dim="token")
 
@@ -453,9 +491,12 @@ class TestConcatenate:
         # must still be rejected because l2 is not batch_token.
         data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
         rep = {"l1": "materialized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
-                     indexing={"l1": "batch_token", "l2": "batch"})
+        g = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+            indexing={"l1": "batch_token", "l2": "batch"},
+        )
         with pytest.raises(ValueError, match="batch_token"):
             g.concatenate(g, dim="token")
 
@@ -472,7 +513,7 @@ class TestConcatenate:
         rep2 = {"l1": "factorized"}
         g1 = Gradient(representation=rep1, data=data1, layer_types={"l1": "nn.Linear"})
         g2 = Gradient(representation=rep2, data=data2, layer_types={"l1": "nn.Linear"})
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="representation"):
             g1.concatenate(g2)
 
 
@@ -487,7 +528,7 @@ class TestAggregate:
         ga = g.aggregate(dim="token")
         assert all(v == "batch" for v in ga.indexing.values())
         for v in ga.data.values():
-            assert v.shape == (B, O * I)
+            assert v.shape == (B, D_OUT * D_IN)
 
     def test_aggregate_is_token_sum(self):
         # Aggregation is the chain rule: the token axis is summed out --
@@ -508,12 +549,15 @@ class TestAggregate:
         # A "batch" layer is passed through unchanged; no error is raised.
         data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
         rep = {"l1": "materialized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
-                     indexing={"l1": "batch_token", "l2": "batch"})
+        g = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+            indexing={"l1": "batch_token", "l2": "batch"},
+        )
         ga = g.aggregate(dim="token")
-        assert ga.data["l1"].shape == (B, O * I)   # aggregated
-        assert ga.data["l2"].shape == (B, O * I)   # unchanged
+        assert ga.data["l1"].shape == (B, D_OUT * D_IN)  # aggregated
+        assert ga.data["l2"].shape == (B, D_OUT * D_IN)  # unchanged
         assert all(v == "batch" for v in ga.indexing.values())
 
     def test_aggregate_all_batch_still_works(self):
@@ -562,9 +606,12 @@ class TestSlice:
         # Mixed indexing: token slice must be rejected.
         data = {"l1": mat_tensor_bt(), "l2": mat_tensor()}
         rep = {"l1": "materialized", "l2": "materialized"}
-        g = Gradient(representation=rep, data=data,
-                     layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
-                     indexing={"l1": "batch_token", "l2": "batch"})
+        g = Gradient(
+            representation=rep,
+            data=data,
+            layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
+            indexing={"l1": "batch_token", "l2": "batch"},
+        )
         with pytest.raises(ValueError, match="batch_token"):
             g.slice(dim="token", index=0)
 
@@ -587,15 +634,19 @@ class TestSlice:
         Bn, Tn, Dn = 4, 3, 5
         fc = Factorized(torch.randn(Bn, Tn, Dn), torch.randn(Bn, Tn, Dn))
         pos = Factorized(torch.arange(Tn).unsqueeze(0), torch.randn(1, Tn, Dn))
-        g = Gradient(representation={"fc": "factorized", "pos": "factorized"},
-                     data={"fc": fc, "pos": pos},
-                     layer_types={"fc": "nn.Linear", "pos": "nn.Embedding"},
-                     indexing={"fc": "batch_token", "pos": "batch_token"})
+        g = Gradient(
+            representation={"fc": "factorized", "pos": "factorized"},
+            data={"fc": fc, "pos": pos},
+            layer_types={"fc": "nn.Linear", "pos": "nn.Embedding"},
+            indexing={"fc": "batch_token", "pos": "batch_token"},
+        )
         for i in range(Bn):
             s = g.slice(dim="batch", index=i)
             assert torch.equal(s.data["fc"].activation[0], fc.activation[i])
-            assert torch.equal(s.data["pos"].pre_activation_grad[0],
-                               pos.pre_activation_grad[0])   # shared row copied
+            assert torch.equal(
+                s.data["pos"].pre_activation_grad[0],
+                pos.pre_activation_grad[0],
+            )  # shared row copied
         s = g.slice(dim="batch", index=[1, 3])
         assert s.data["fc"].activation.shape[0] == 2
         assert s.data["pos"].activation.shape[0] == 2
@@ -621,12 +672,14 @@ class TestSlice:
 
 def _broadcast_gradient(B, T=3, D=5, seed=0):
     """Gradient with a per-sample 'fc' layer (B, T, D) and a broadcast 'pos'
-    embedding (batch 1) whose single row is shared across the batch."""
+    embedding (batch 1) whose single row is shared across the batch.
+    """
     g = torch.Generator().manual_seed(seed)
-    fc = Factorized(torch.randn(B, T, D, generator=g),
-                    torch.randn(B, T, D, generator=g))
-    pos = Factorized(torch.arange(T).unsqueeze(0),
-                     torch.randn(1, T, D, generator=g))
+    fc = Factorized(
+        torch.randn(B, T, D, generator=g),
+        torch.randn(B, T, D, generator=g),
+    )
+    pos = Factorized(torch.arange(T).unsqueeze(0), torch.randn(1, T, D, generator=g))
     return Gradient(
         representation={"fc": "factorized", "pos": "factorized"},
         data={"fc": fc, "pos": pos},
@@ -638,22 +691,26 @@ def _broadcast_gradient(B, T=3, D=5, seed=0):
 class TestBroadcastConcatenate:
     def test_batch_concat_unifies_broadcast_row(self):
         """Broadcast rows merge into the batch-size-weighted average; per-sample
-        layers concatenate normally."""
+        layers concatenate normally.
+        """
         g1, g2 = _broadcast_gradient(4, seed=0), _broadcast_gradient(2, seed=1)
         out = g1.concatenate(g2, dim="batch")
         out.validate()
         assert out.batch_size == 6
-        assert out.data["fc"].activation.shape[0] == 6           # plain cat
+        assert out.data["fc"].activation.shape[0] == 6  # plain cat
         # pos stays factorized: same position ids, g weighted-averaged 4:2.
         assert out.representation["pos"] == "factorized"
-        expected_g = (4 * g1.data["pos"].pre_activation_grad
-                      + 2 * g2.data["pos"].pre_activation_grad) / 6
+        expected_g = (
+            4 * g1.data["pos"].pre_activation_grad
+            + 2 * g2.data["pos"].pre_activation_grad
+        ) / 6
         assert torch.allclose(out.data["pos"].pre_activation_grad, expected_g)
         assert torch.equal(out.data["pos"].activation, g1.data["pos"].activation)
 
     def test_batch_concat_differing_activations_materializes(self):
         """Broadcast rows with different activation factors are averaged in the
-        materialized domain (the layer flips to 'materialized')."""
+        materialized domain (the layer flips to 'materialized').
+        """
         g1, g2 = _broadcast_gradient(4, seed=0), _broadcast_gradient(2, seed=1)
         # give g2's pos a different id pattern
         pos2 = g2.data["pos"]
@@ -671,12 +728,14 @@ class TestBroadcastConcatenate:
     def test_batch_concat_materialized_broadcast(self):
         """Materialized broadcast rows are weighted-averaged directly."""
         r1, r2 = torch.randn(1, 7), torch.randn(1, 7)
+
         def make(B, row):
             return Gradient(
                 representation={"fc": "materialized", "pos": "materialized"},
                 data={"fc": torch.randn(B, 7), "pos": row},
                 layer_types={"fc": "nn.Linear", "pos": "nn.Embedding"},
             )
+
         out = make(3, r1).concatenate(make(5, r2), dim="batch")
         assert torch.allclose(out.data["pos"], (3 * r1 + 5 * r2) / 8)
         assert out.data["fc"].shape[0] == 8
@@ -694,22 +753,24 @@ class TestBroadcastConcatenate:
 
     def test_genuine_batch_one_gradients_still_cat(self):
         """Two all-batch-1 gradients are NOT broadcast -- they concatenate to
-        batch 2."""
+        batch 2.
+        """
         g1, g2 = _broadcast_gradient(1, seed=0), _broadcast_gradient(1, seed=1)
         out = g1.concatenate(g2, dim="batch")
         assert out.batch_size == 2
-        assert out.data["pos"].activation.shape[0] == 2          # plain cat
+        assert out.data["pos"].activation.shape[0] == 2  # plain cat
 
 
 class TestBroadcastSimilarity:
     def test_reduce_all_expands_broadcast_layer(self):
         """The shared row contributes identically to every (i, j) pair, so the
-        full-model cross-gram is the fc gram plus a constant offset."""
+        full-model cross-gram is the fc gram plus a constant offset.
+        """
         g1, g2 = _broadcast_gradient(4, seed=0), _broadcast_gradient(2, seed=1)
         total = g1.similarity(g2, metric="dot", reduce="all")
         assert total.shape == (4, 2)
         per_layer = g1.similarity(g2, metric="dot", reduce="none")
-        assert per_layer["pos"].shape == (1, 1)                  # raw broadcast gram
+        assert per_layer["pos"].shape == (1, 1)  # raw broadcast gram
         expected = per_layer["fc"] + per_layer["pos"].expand(4, 2)
         assert torch.allclose(total, expected, atol=1e-5)
 
@@ -767,10 +828,12 @@ class TestSimilarity:
             assert torch.allclose(fac[name], mat[name], atol=1e-4, rtol=1e-4)
 
     def test_cross_shape_differing_batch(self):
-        """Cross-gram against a target with a different batch size is (B_self, B_other)."""
+        """Cross-gram against a target with a different batch size is
+        (B_self, B_other).
+        """
         g = make_gradient(repr_type="factorized")
         other = Gradient(
-            representation={n: "factorized" for n in ("l1", "l2")},
+            representation=dict.fromkeys(("l1", "l2"), "factorized"),
             data={"l1": factorized(b=5), "l2": factorized(b=5)},
             layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
         )
@@ -792,7 +855,10 @@ class TestSimilarity:
         cos = g.similarity(g, metric="cosine")
         for matrix in cos.values():
             assert torch.allclose(
-                matrix.diagonal(), torch.ones(B), atol=1e-4, rtol=1e-4
+                matrix.diagonal(),
+                torch.ones(B),
+                atol=1e-4,
+                rtol=1e-4,
             )
 
     def test_cosine_in_unit_range(self):
@@ -828,7 +894,8 @@ class TestSimilarity:
 
     def test_reduce_all_equals_sum_over_layers(self):
         """The overall matrix is the per-layer matrices summed over layers
-        (the full-model gradient cross-gram)."""
+        (the full-model gradient cross-gram).
+        """
         g = make_gradient(repr_type="factorized")
         per_layer = g.similarity(g, reduce="none")
         overall = g.similarity(g, reduce="all")
@@ -861,10 +928,11 @@ class TestSimilarity:
 def _seq_first_pair():
     """Return (batch_first_grad, seq_first_grad) holding the *same* underlying
     per-sample gradient for one ``batch_token`` linear layer -- the seq-first one
-    is the batch-first factors with the leading two axes swapped."""
+    is the batch-first factors with the leading two axes swapped.
+    """
     torch.manual_seed(0)
-    a = torch.randn(B, T, I)
-    g = torch.randn(B, T, O)
+    a = torch.randn(B, T, D_IN)
+    g = torch.randn(B, T, D_OUT)
 
     bf = Gradient(
         representation={"l": "factorized"},
@@ -883,18 +951,24 @@ def _seq_first_pair():
 
 class TestBatchFirst:
     def test_default_is_batch_first(self):
-        assert Factorized(torch.randn(B, I), torch.randn(B, O)).batch_first is True
+        assert (
+            Factorized(torch.randn(B, D_IN), torch.randn(B, D_OUT)).batch_first is True
+        )
 
     def test_as_batch_first_noop_when_already(self):
-        f = Factorized(torch.randn(B, T, I), torch.randn(B, T, O))
+        f = Factorized(torch.randn(B, T, D_IN), torch.randn(B, T, D_OUT))
         assert f.as_batch_first() is f
 
     def test_as_batch_first_transposes(self):
-        f = Factorized(torch.randn(T, B, I), torch.randn(T, B, O), batch_first=False)
+        f = Factorized(
+            torch.randn(T, B, D_IN),
+            torch.randn(T, B, D_OUT),
+            batch_first=False,
+        )
         bf = f.as_batch_first()
         assert bf.batch_first is True
-        assert bf.activation.shape == (B, T, I)
-        assert bf.pre_activation_grad.shape == (B, T, O)
+        assert bf.activation.shape == (B, T, D_IN)
+        assert bf.pre_activation_grad.shape == (B, T, D_OUT)
 
     def test_seq_first_batch_size(self):
         # Regression: a (T, B, d) layer must report B, not T.
@@ -911,12 +985,16 @@ class TestBatchFirst:
 
     def test_mixed_orientation_validates(self):
         # A batch-first layer and a seq-first layer with the same batch size B.
-        a, g = torch.randn(B, T, I), torch.randn(B, T, O)
+        a, g = torch.randn(B, T, D_IN), torch.randn(B, T, D_OUT)
         grad = Gradient(
             representation={"bf": "factorized", "sf": "factorized"},
             data={
                 "bf": Factorized(a, g),
-                "sf": Factorized(a.transpose(0, 1), g.transpose(0, 1), batch_first=False),
+                "sf": Factorized(
+                    a.transpose(0, 1),
+                    g.transpose(0, 1),
+                    batch_first=False,
+                ),
             },
             layer_types={"bf": "nn.Linear", "sf": "nn.Linear"},
             indexing={"bf": "batch_token", "sf": "batch_token"},
@@ -927,19 +1005,25 @@ class TestBatchFirst:
     def test_seq_first_materialize_matches_batch_first(self):
         bf, sf = _seq_first_pair()
         assert torch.allclose(
-            bf.materialize().data["l"], sf.materialize().data["l"], atol=1e-5
+            bf.materialize().data["l"],
+            sf.materialize().data["l"],
+            atol=1e-5,
         )
 
     def test_seq_first_similarity_matches_batch_first(self):
         bf, sf = _seq_first_pair()
         assert torch.allclose(
-            bf.similarity(bf)["l"], sf.similarity(sf)["l"], atol=1e-4
+            bf.similarity(bf)["l"],
+            sf.similarity(sf)["l"],
+            atol=1e-4,
         )
 
     def test_seq_first_aggregate_matches_batch_first(self):
         bf, sf = _seq_first_pair()
         assert torch.allclose(
-            bf.aggregate().data["l"], sf.aggregate().data["l"], atol=1e-5
+            bf.aggregate().data["l"],
+            sf.aggregate().data["l"],
+            atol=1e-5,
         )
 
     def test_clone_and_to_preserve_flag(self):
@@ -949,11 +1033,11 @@ class TestBatchFirst:
 
     def test_slice_batch_preserves_flag_and_layout(self):
         _bf, sf = _seq_first_pair()
-        sl = sf.slice("batch", 0)            # one sample
+        sl = sf.slice("batch", 0)  # one sample
         assert sl.data["l"].batch_first is False
         assert sl.batch_size == 1
         # Seq-first activation stays (T, 1, I).
-        assert sl.data["l"].activation.shape == (T, 1, I)
+        assert sl.data["l"].activation.shape == (T, 1, D_IN)
 
     def test_concatenate_batch_matches_batch_first(self):
         bf, sf = _seq_first_pair()
@@ -961,7 +1045,9 @@ class TestBatchFirst:
         cat_sf = sf.concatenate(sf, dim="batch")
         assert cat_sf.batch_size == 2 * B
         assert torch.allclose(
-            cat_bf.materialize().data["l"], cat_sf.materialize().data["l"], atol=1e-5
+            cat_bf.materialize().data["l"],
+            cat_sf.materialize().data["l"],
+            atol=1e-5,
         )
 
     def test_concatenate_mismatched_layout_raises(self):

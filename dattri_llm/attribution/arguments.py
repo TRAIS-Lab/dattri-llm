@@ -26,10 +26,8 @@ import os
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Optional, Union
 
 import torch
-
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +38,7 @@ _DICT_FIELDS = ("gradient_checkpointing_kwargs", "fsdp_config", "deepspeed")
 # -----------------------------------------------------------------------------
 # AttributionArguments
 # -----------------------------------------------------------------------------
+
 
 @dataclass
 class AttributionArguments:
@@ -111,7 +110,7 @@ class AttributionArguments:
             "help": (
                 "Directory where attribution scores, intermediate checkpoints, "
                 "and run metadata are written."
-            )
+            ),
         },
     )
 
@@ -123,7 +122,7 @@ class AttributionArguments:
             "help": (
                 "Batch size per GPU/CPU for iterating over training examples "
                 "when computing per-sample gradients or attribution scores."
-            )
+            ),
         },
     )
 
@@ -133,7 +132,7 @@ class AttributionArguments:
             "help": (
                 "Batch size per GPU/CPU for iterating over evaluation (query) "
                 "examples when computing attribution scores."
-            )
+            ),
         },
     )
 
@@ -143,34 +142,41 @@ class AttributionArguments:
     # transformers.TrainingArguments.
 
     learning_rate: float = field(
-        default=5e-5, metadata={"help": "Initial learning rate for the trajectory optimizer."},
+        default=5e-5,
+        metadata={"help": "Initial learning rate for the trajectory optimizer."},
     )
     weight_decay: float = field(
-        default=0.0, metadata={"help": "Weight decay (excludes bias / norm params, as in HF)."},
+        default=0.0,
+        metadata={"help": "Weight decay (excludes bias / norm params, as in HF)."},
     )
     optim: str = field(
         default="adamw_torch",
-        metadata={"help": "Trajectory optimizer: 'adamw_torch' or 'sgd'.",
-                  "choices": ["adamw_torch", "sgd"]},
+        metadata={
+            "help": "Trajectory optimizer: 'adamw_torch' or 'sgd'.",
+            "choices": ["adamw_torch", "sgd"],
+        },
     )
     adam_beta1: float = field(default=0.9, metadata={"help": "AdamW beta1."})
     adam_beta2: float = field(default=0.999, metadata={"help": "AdamW beta2."})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "AdamW epsilon."})
     lr_scheduler_type: str = field(
         default="linear",
-        metadata={"help": "LR schedule (transformers.get_scheduler name), e.g. 'linear', 'constant'."},
+        metadata={
+            "help": "LR schedule (transformers.get_scheduler name), "
+            "e.g. 'linear', 'constant'.",
+        },
     )
     warmup_steps: int = field(default=0, metadata={"help": "LR warmup steps."})
 
     # -- Gradient behaviour ---------------------------------------------------
 
-    max_grad_norm: Optional[float] = field(
+    max_grad_norm: float | None = field(
         default=1.0,
         metadata={
             "help": (
                 "Maximum L2 norm for gradient clipping during backward passes "
                 "used for gradient collection.  Set to ``None`` to disable."
-            )
+            ),
         },
     )
 
@@ -181,18 +187,18 @@ class AttributionArguments:
                 "Enable gradient checkpointing when running backward passes for "
                 "gradient collection.  Trades ~20%% extra compute for reduced "
                 "activation memory."
-            )
+            ),
         },
     )
 
-    gradient_checkpointing_kwargs: Optional[Union[dict, str]] = field(
+    gradient_checkpointing_kwargs: dict | str | None = field(
         default=None,
         metadata={
             "help": (
                 "Extra keyword arguments forwarded to "
                 "``model.gradient_checkpointing_enable()``.  "
                 "May be supplied as a JSON string or a path to a JSON file."
-            )
+            ),
         },
     )
 
@@ -204,7 +210,7 @@ class AttributionArguments:
             "help": (
                 "Whether or not to use cpu. If set to False, we will use the "
                 "available torch device/backend."
-            )
+            ),
         },
     )
 
@@ -217,7 +223,7 @@ class AttributionArguments:
                 "Use bfloat16 mixed precision for forward and backward passes. "
                 "Requires Ampere or newer GPU hardware.  Preferred over fp16 "
                 "for better numerical stability."
-            )
+            ),
         },
     )
 
@@ -227,18 +233,18 @@ class AttributionArguments:
             "help": (
                 "Use float16 mixed precision.  Consider bf16 instead when "
                 "hardware supports it."
-            )
+            ),
         },
     )
 
-    tf32: Optional[bool] = field(
+    tf32: bool | None = field(
         default=None,
         metadata={
             "help": (
                 "Enable TF32 tensor cores on Ampere+ GPUs for matrix "
                 "multiplications (``torch.backends.cuda.matmul.allow_tf32``).  "
                 "``None`` leaves the PyTorch default unchanged."
-            )
+            ),
         },
     )
 
@@ -251,18 +257,18 @@ class AttributionArguments:
                 "Random seed applied to Python ``random``, NumPy, and PyTorch "
                 "at the start of attribution.  Controls weight-init and "
                 "DataLoader shuffling."
-            )
+            ),
         },
     )
 
-    data_seed: Optional[int] = field(
+    data_seed: int | None = field(
         default=None,
         metadata={
             "help": (
                 "Seed for DataLoader worker processes.  Falls back to ``seed`` "
                 "when ``None``.  Set explicitly to decouple data-loading "
                 "randomness from model randomness."
-            )
+            ),
         },
     )
 
@@ -273,7 +279,7 @@ class AttributionArguments:
                 "Call ``torch.use_deterministic_algorithms(True)`` for "
                 "fully reproducible results.  May be slower and incompatible "
                 "with some CUDA kernels (e.g. certain attention implementations)."
-            )
+            ),
         },
     )
 
@@ -286,7 +292,7 @@ class AttributionArguments:
                 "Number of subprocesses for DataLoader data loading.  "
                 "``0`` loads data in the main process.  Increase for I/O-bound "
                 "workloads where data pre-processing is a bottleneck."
-            )
+            ),
         },
     )
 
@@ -297,7 +303,7 @@ class AttributionArguments:
                 "Pin DataLoader output tensors to CUDA pinned memory for faster "
                 "host-to-device transfers.  Automatically disabled when no GPU "
                 "is available."
-            )
+            ),
         },
     )
 
@@ -308,24 +314,24 @@ class AttributionArguments:
                 "Keep DataLoader worker processes alive between dataset "
                 "iterations.  Reduces per-epoch worker startup overhead when "
                 "``dataloader_num_workers > 0``."
-            )
+            ),
         },
     )
 
-    dataloader_prefetch_factor: Optional[int] = field(
+    dataloader_prefetch_factor: int | None = field(
         default=None,
         metadata={
             "help": (
                 "Number of batches each DataLoader worker prefetches ahead of "
                 "consumption.  ``None`` uses the PyTorch default (``2`` when "
                 "``dataloader_num_workers > 0``)."
-            )
+            ),
         },
     )
 
     # -- Distributed / large-model --------------------------------------------
 
-    ddp_find_unused_parameters: Optional[bool] = field(
+    ddp_find_unused_parameters: bool | None = field(
         default=None,
         metadata={
             "help": (
@@ -333,11 +339,11 @@ class AttributionArguments:
                 "  ``None`` lets PyTorch choose the default (``False`` for "
                 "gradient-as-bucket-view mode).  Set to ``True`` only if your "
                 "model has parameters that do not receive gradients on every step."
-            )
+            ),
         },
     )
 
-    fsdp: Union[str, list[str]] = field(
+    fsdp: str | list[str] = field(
         default="",
         metadata={
             "help": (
@@ -350,25 +356,25 @@ class AttributionArguments:
         },
     )
 
-    fsdp_config: Optional[Union[dict, str]] = field(
+    fsdp_config: dict | str | None = field(
         default=None,
         metadata={
             "help": (
                 "FSDP configuration passed to the ``FullyShardedDataParallel`` "
                 "constructor.  May be a ``dict``, a JSON string, or a path to a "
                 "JSON file."
-            )
+            ),
         },
     )
 
-    deepspeed: Optional[Union[dict, str]] = field(
+    deepspeed: dict | str | None = field(
         default=None,
         metadata={
             "help": (
                 "DeepSpeed configuration.  May be a ``dict``, a JSON string, or "
                 "a path to a DeepSpeed JSON config file.  ``None`` disables "
                 "DeepSpeed."
-            )
+            ),
         },
     )
 
@@ -378,7 +384,7 @@ class AttributionArguments:
 
     def __post_init__(self) -> None:
         # Expand ~ in output_dir so Path operations work correctly.
-        self.output_dir = os.path.expanduser(self.output_dir)
+        self.output_dir = str(Path(self.output_dir).expanduser())
 
         # Parse JSON-string or JSON-file dict fields.
         for fname in _DICT_FIELDS:
@@ -386,8 +392,8 @@ class AttributionArguments:
             if isinstance(value, str):
                 if value.startswith("{"):
                     setattr(self, fname, json.loads(value))
-                elif os.path.isfile(value):
-                    with open(value) as f:
+                elif Path(value).is_file():
+                    with Path(value).open(encoding="utf-8") as f:
                         setattr(self, fname, json.load(f))
 
         # data_seed defaults to seed when not explicitly set.
@@ -398,7 +404,7 @@ class AttributionArguments:
         if self.dataloader_pin_memory and not torch.cuda.is_available():
             logger.info(
                 "dataloader_pin_memory=True has no effect because no CUDA device "
-                "is available; setting to False."
+                "is available; setting to False.",
             )
             self.dataloader_pin_memory = False
 
@@ -423,16 +429,18 @@ class AttributionArguments:
 
         if self.per_device_train_batch_size <= 0:
             raise ValueError(
-                f"per_device_train_batch_size must be > 0, got {self.per_device_train_batch_size}."
+                f"per_device_train_batch_size must be > 0, "
+                f"got {self.per_device_train_batch_size}.",
             )
         if self.per_device_eval_batch_size <= 0:
             raise ValueError(
-                f"per_device_eval_batch_size must be > 0, got {self.per_device_eval_batch_size}."
+                f"per_device_eval_batch_size must be > 0, "
+                f"got {self.per_device_eval_batch_size}.",
             )
 
         if self.max_grad_norm is not None and self.max_grad_norm <= 0:
             raise ValueError(
-                f"max_grad_norm must be > 0 or None, got {self.max_grad_norm}."
+                f"max_grad_norm must be > 0 or None, got {self.max_grad_norm}.",
             )
 
         if (
@@ -441,19 +449,19 @@ class AttributionArguments:
         ):
             raise ValueError(
                 f"dataloader_prefetch_factor must be > 0 or None, "
-                f"got {self.dataloader_prefetch_factor}."
+                f"got {self.dataloader_prefetch_factor}.",
             )
 
         if self.dataloader_persistent_workers and self.dataloader_num_workers == 0:
             logger.warning(
                 "dataloader_persistent_workers=True has no effect when "
-                "dataloader_num_workers=0."
+                "dataloader_num_workers=0.",
             )
 
         if self.full_determinism and (self.bf16 or self.fp16):
             logger.warning(
                 "full_determinism=True with mixed precision may raise errors "
-                "for non-deterministic CUDA kernels."
+                "for non-deterministic CUDA kernels.",
             )
 
     # -------------------------------------------------------------------------
@@ -467,7 +475,7 @@ class AttributionArguments:
             device = torch.device("cpu")
             n_gpu = 0
         elif torch.cuda.is_available():
-            local_rank = int(os.environ.get("LOCAL_RANK", -1))
+            local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
             if local_rank != -1:
                 # Distributed: each rank uses its assigned GPU.
                 device = torch.device("cuda", local_rank)
@@ -501,7 +509,7 @@ class AttributionArguments:
 
         Returns ``1`` outside of a distributed context.
         """
-        ws = int(os.environ.get("WORLD_SIZE", 1))
+        ws = int(os.environ.get("WORLD_SIZE", "1"))
         return ws if ws > 0 else 1
 
     @property
@@ -510,7 +518,7 @@ class AttributionArguments:
 
         Returns ``0`` outside of a distributed context.
         """
-        return int(os.environ.get("RANK", 0))
+        return int(os.environ.get("RANK", "0"))
 
     @property
     def local_process_index(self) -> int:
@@ -518,7 +526,7 @@ class AttributionArguments:
 
         Returns ``0`` outside of a distributed context.
         """
-        return int(os.environ.get("LOCAL_RANK", 0))
+        return int(os.environ.get("LOCAL_RANK", "0"))
 
     @property
     def train_batch_size(self) -> int:
@@ -552,8 +560,6 @@ class AttributionArguments:
 
     def __repr__(self) -> str:
         fields_str = "\n  ".join(
-            f"{k}={v!r}"
-            for k, v in self.__dict__.items()
-            if not k.startswith("_")
+            f"{k}={v!r}" for k, v in self.__dict__.items() if not k.startswith("_")
         )
         return f"AttributionArguments(\n  {fields_str}\n)"

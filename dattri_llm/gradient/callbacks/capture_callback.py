@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
-from dattri_llm.gradient.gradient import GradientRecord
+
+if TYPE_CHECKING:
+    from dattri_llm.gradient.gradient import GradientRecord
 
 
 class CaptureCallback(HookManagerCallback):
@@ -19,7 +21,8 @@ GradientStreamer` to yield one block at a time).  Reset to ``None`` before each
     """
 
     def __init__(self) -> None:
-        self.record: Optional[GradientRecord] = None
+        self.record: GradientRecord | None = None
 
     def on_step_end(self, record: GradientRecord) -> None:
+        """Stash the step's record for immediate readback."""
         self.record = record

@@ -17,21 +17,24 @@ yield byte-identical results with the same column order as the on-disk layout.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
-from dattri_llm.attribution.arguments import AttributionArguments
-from dattri_llm.gradient.datasets import make_gradient_multistep_dataloader
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.callbacks import OffloadCallback
+from dattri_llm.gradient.datasets import make_gradient_multistep_dataloader
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
-from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 from dattri_llm.utils.hashing import hash_sample
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 IN_DIM, HID_DIM, OUT_DIM = 4, 8, 3
 N_TRAIN, N_TEST = 6, 4
@@ -88,7 +91,9 @@ def _grads_at(model, sd, x, y, *, normalized):
 def _collect_to_disk(model, checkpoints, x, y, out_dir: Path):
     fm = GradientFileManager(str(out_dir))
     offload = OffloadCallback(
-        offload_interval=1, file_manager=fm, recording_type="per_sample"
+        offload_interval=1,
+        file_manager=fm,
+        recording_type="per_sample",
     )
     hm = HookManager(
         model,
@@ -138,7 +143,7 @@ def _make_attr(out_dir: Path):
     return TracInAttributor(_args(out_dir))
 
 
-@pytest.fixture()
+@pytest.fixture
 def collected(tmp_path):
     """Single-checkpoint train + test dirs (mirrors the K-FAC fixture)."""
     torch.manual_seed(SEED)
@@ -150,23 +155,45 @@ def collected(tmp_path):
     _collect_to_disk(model, [sd], x_te, y_te, test_dir)
     train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)]
     test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
-    return dict(
-        model=model, sd=sd,
-        x_tr=x_tr, y_tr=y_tr, x_te=x_te, y_te=y_te,
-        train_dir=train_dir, test_dir=test_dir,
-        train_hashes=train_hashes, test_hashes=test_hashes,
-    )
+    return {
+        "model": model,
+        "sd": sd,
+        "x_tr": x_tr,
+        "y_tr": y_tr,
+        "x_te": x_te,
+        "y_te": y_te,
+        "train_dir": train_dir,
+        "test_dir": test_dir,
+        "train_hashes": train_hashes,
+        "test_hashes": test_hashes,
+    }
 
 
 class TestTracInOnDisk:
     @pytest.mark.parametrize("normalized", [False, True])
     @pytest.mark.parametrize("loop_over_test", [False, True])
-    def test_matches_autograd_oracle(self, collected, tmp_path, normalized, loop_over_test):
+    def test_matches_autograd_oracle(
+        self,
+        collected,
+        tmp_path,
+        normalized,
+        loop_over_test,
+    ):
         """Full pairwise cross-gram matches an independent autograd oracle."""
-        g_tr = _grads_at(collected["model"], collected["sd"],
-                         collected["x_tr"], collected["y_tr"], normalized=normalized)
-        g_te = _grads_at(collected["model"], collected["sd"],
-                         collected["x_te"], collected["y_te"], normalized=normalized)
+        g_tr = _grads_at(
+            collected["model"],
+            collected["sd"],
+            collected["x_tr"],
+            collected["y_tr"],
+            normalized=normalized,
+        )
+        g_te = _grads_at(
+            collected["model"],
+            collected["sd"],
+            collected["x_te"],
+            collected["y_te"],
+            normalized=normalized,
+        )
         oracle = g_tr @ g_te.T
 
         attr = _make_attr(tmp_path / f"out_{normalized}_{loop_over_test}")
@@ -178,7 +205,9 @@ class TestTracInOnDisk:
         )
         # Realign the hash-keyed score back to sample order for comparison.
         matrix = result.query(
-            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic"
+            collected["train_hashes"],
+            collected["test_hashes"],
+            trajectory="agnostic",
         )
         assert torch.allclose(matrix, oracle, atol=1e-5, rtol=1e-4), (
             f"max diff {(matrix - oracle).abs().max().item():.2e}"
@@ -191,8 +220,10 @@ class TestTracInOnDisk:
         )
         assert res.algorithm == "TracIn"
         assert res.scores.shape == (N_TRAIN, N_TEST)
-        assert res.algorithm_meta == {"normalized_grad": False,
-                                      "selected_training_steps": [0]}
+        assert res.algorithm_meta == {
+            "normalized_grad": False,
+            "selected_training_steps": [0],
+        }
 
         gradcos = _make_attr(tmp_path / "b").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
@@ -203,7 +234,9 @@ class TestTracInOnDisk:
 
     def test_layer_name_subsets_stored_layers(self, collected, tmp_path):
         """attribute_from_cache(layer_name=...) is a read-time filter: the fc1-only
-        score matches the fc1-only autograd oracle, and the metadata records it."""
+        score matches the fc1-only autograd oracle, and the metadata records it.
+        """
+
         def fc1_grads(x, y):
             collected["model"].load_state_dict(collected["sd"])
             p = dict(collected["model"].named_parameters())["mlp.fc1.weight"]
@@ -213,15 +246,20 @@ class TestTracInOnDisk:
                 rows.append(torch.autograd.grad(loss, [p])[0].reshape(-1))
             return torch.stack(rows)
 
-        oracle = fc1_grads(collected["x_tr"], collected["y_tr"]) @ \
-            fc1_grads(collected["x_te"], collected["y_te"]).T
+        oracle = (
+            fc1_grads(collected["x_tr"], collected["y_tr"])
+            @ fc1_grads(collected["x_te"], collected["y_te"]).T
+        )
         res = _make_attr(tmp_path / "s").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            layer_name="mlp.fc1",   # str form; normalized to a list
+            layer_name="mlp.fc1",  # str form; normalized to a list
         )
-        matrix = res.query(collected["train_hashes"], collected["test_hashes"],
-                           trajectory="agnostic")
+        matrix = res.query(
+            collected["train_hashes"],
+            collected["test_hashes"],
+            trajectory="agnostic",
+        )
         assert torch.allclose(matrix, oracle, atol=1e-5, rtol=1e-4)
         assert res.layer_name == ["mlp.fc1"]
 
@@ -235,7 +273,8 @@ class TestTracInOnDisk:
 
     def test_loop_modes_and_column_order_agree(self, collected, tmp_path):
         """Cached vs re-streamed test paths must be identical, and the lazily
-        discovered columns must equal the on-disk order."""
+        discovered columns must equal the on-disk order.
+        """
         res_false = _make_attr(tmp_path / "a").attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
@@ -267,7 +306,7 @@ class TestTracInOnDisk:
                     indexing={**gradient.indexing, name: "batch"},
                 )
                 mixed.append(
-                    GradientRecord(record.step, record.input_hash, mixed_gradient)
+                    GradientRecord(record.step, record.input_hash, mixed_gradient),
                 )
             GradientFileManager(str(destination)).save_bulk(mixed)
 
@@ -291,7 +330,9 @@ class TestTracInOnDisk:
             attr.attribute_from_cache(train_gradients_dir=str(collected["train_dir"]))
 
     def test_multistep_loader_loads_mixed_step_file_once(
-        self, tmp_path, monkeypatch
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """A file holding several steps is ``torch.load``-ed exactly once."""
         torch.manual_seed(SEED)
@@ -315,7 +356,7 @@ class TestTracInOnDisk:
 
         monkeypatch.setattr(GradientFileManager, "load_records", counted)
         blocks = list(
-            make_gradient_multistep_dataloader(reader, [0, 1], _args(tmp_path / "o"))
+            make_gradient_multistep_dataloader(reader, [0, 1], _args(tmp_path / "o")),
         )
 
         assert len(blocks) == 1
@@ -325,7 +366,8 @@ class TestTracInOnDisk:
     def test_multistep_train_rows_are_trajectory_aware(self, tmp_path):
         """A train dir with two checkpoints yields one row per (sample, step),
         each stamped with its recorded step; the step-summed score equals the
-        sum of per-checkpoint cross-grams against the (single-step) test set."""
+        sum of per-checkpoint cross-grams against the (single-step) test set.
+        """
         torch.manual_seed(SEED)
         model = MLP().eval()
         sd0, sd1 = _make_checkpoints(model)
@@ -335,11 +377,14 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd0, sd1], x_tr, y_tr, train_dir)
         _collect_to_disk(model, [sd0], x_te, y_te, test_dir)  # single-step test
 
-        train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)]
+        train_hashes = [
+            hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)
+        ]
         test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
-            train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+            train_gradients_dir=str(train_dir),
+            test_gradients_dir=str(test_dir),
         )
         # Two steps per train sample -> 2 * N_TRAIN rows, stamped {0, 1}.
         assert res.scores.shape[0] == 2 * N_TRAIN
@@ -357,8 +402,10 @@ class TestTracInOnDisk:
 
     def test_selected_training_steps_selects_checkpoints(self, tmp_path):
         """``selected_training_steps=[1]`` attributes only from checkpoint 1:
+
         rows are all stamped step 1 and the score equals that single
-        checkpoint's cross-gram (no ensemble over the dropped step 0)."""
+        checkpoint's cross-gram (no ensemble over the dropped step 0).
+        """
         torch.manual_seed(SEED)
         model = MLP().eval()
         sd0, sd1 = _make_checkpoints(model)
@@ -368,15 +415,18 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd0, sd1], x_tr, y_tr, train_dir)
         _collect_to_disk(model, [sd0], x_te, y_te, test_dir)
 
-        train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)]
+        train_hashes = [
+            hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(N_TRAIN)
+        ]
         test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
-            train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+            train_gradients_dir=str(train_dir),
+            test_gradients_dir=str(test_dir),
             selected_training_steps=[1],
         )
 
-        assert res.scores.shape[0] == N_TRAIN            # only one step's rows
+        assert res.scores.shape[0] == N_TRAIN  # only one step's rows
         assert sorted(set(res.row_steps)) == [1]
         assert res.algorithm_meta["selected_training_steps"] == [1]
 
@@ -409,9 +459,12 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd], x_te, y_te, test_dir)
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
-            train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+            train_gradients_dir=str(train_dir),
+            test_gradients_dir=str(test_dir),
         )
-        distinct = len({hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)})
+        distinct = len(
+            {hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)},
+        )
         assert distinct == N_TEST - 1
-        assert len(res.test_ids) == distinct          # collapsed, not N_TEST
+        assert len(res.test_ids) == distinct  # collapsed, not N_TEST
         assert int((res.scores.abs().sum(0) == 0).sum()) == 0  # no spurious zero column

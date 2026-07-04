@@ -19,15 +19,15 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 import tests.attribution.test_tracin as TT
-from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 from dattri_llm.utils.hashing import hash_sample
 
@@ -48,15 +48,17 @@ def _load_factors(test_dir, step, layers):
         recs = fm.load_records(file_rel)
         for i in idxs:
             rec = recs[i]
-            hashes = rec.input_hash if isinstance(rec.input_hash, list) else [rec.input_hash]
+            hashes = (
+                rec.input_hash if isinstance(rec.input_hash, list) else [rec.input_hash]
+            )
             g = rec.gradient
             for b, h in enumerate(hashes):
                 out[h] = {
-                    l: (
-                        g.data[l].activation[b].float(),
-                        g.data[l].pre_activation_grad[b].float(),
+                    layer: (
+                        g.data[layer].activation[b].float(),
+                        g.data[layer].pre_activation_grad[b].float(),
                     )
-                    for l in layers
+                    for layer in layers
                 }
     return out
 
@@ -68,9 +70,15 @@ def _stack(factors, hashes, layer, idx):
 def _kfac_oracle(tr_f, te_f, train_hashes, test_hashes, damping):
     N = len(train_hashes)
     oracle = torch.zeros(len(train_hashes), len(test_hashes))
-    for l in LAYERS:
-        a_tr, g_tr = _stack(tr_f, train_hashes, l, 0), _stack(tr_f, train_hashes, l, 1)
-        a_te, g_te = _stack(te_f, test_hashes, l, 0), _stack(te_f, test_hashes, l, 1)
+    for layer in LAYERS:
+        a_tr, g_tr = (
+            _stack(tr_f, train_hashes, layer, 0),
+            _stack(tr_f, train_hashes, layer, 1),
+        )
+        a_te, g_te = (
+            _stack(te_f, test_hashes, layer, 0),
+            _stack(te_f, test_hashes, layer, 1),
+        )
         A = a_tr.T @ a_tr / N
         G = g_tr.T @ g_tr / N
         A_inv = torch.linalg.inv(A + damping * torch.eye(A.shape[0]))
@@ -78,7 +86,7 @@ def _kfac_oracle(tr_f, te_f, train_hashes, test_hashes, damping):
         dW_tr = torch.einsum("no,ni->noi", g_tr, a_tr)  # (N_tr, out, in)
         dW_te = torch.einsum("mo,mi->moi", g_te, a_te)  # (N_te, out, in)
         T = torch.einsum("oc,nci->noi", G_inv, dW_tr)
-        T = torch.einsum("noj,jp->nop", T, A_inv)       # G^-1 dW A^-1
+        T = torch.einsum("noj,jp->nop", T, A_inv)  # G^-1 dW A^-1
         oracle += torch.einsum("nop,mop->nm", T, dW_te)
     return oracle
 
@@ -86,9 +94,15 @@ def _kfac_oracle(tr_f, te_f, train_hashes, test_hashes, damping):
 def _ekfac_oracle(tr_f, te_f, train_hashes, test_hashes, damping):
     N = len(train_hashes)
     oracle = torch.zeros(len(train_hashes), len(test_hashes))
-    for l in LAYERS:
-        a_tr, g_tr = _stack(tr_f, train_hashes, l, 0), _stack(tr_f, train_hashes, l, 1)
-        a_te, g_te = _stack(te_f, test_hashes, l, 0), _stack(te_f, test_hashes, l, 1)
+    for layer in LAYERS:
+        a_tr, g_tr = (
+            _stack(tr_f, train_hashes, layer, 0),
+            _stack(tr_f, train_hashes, layer, 1),
+        )
+        a_te, g_te = (
+            _stack(te_f, test_hashes, layer, 0),
+            _stack(te_f, test_hashes, layer, 1),
+        )
         A = a_tr.T @ a_tr / N
         G = g_tr.T @ g_tr / N
         # The faithful projection is sign-invariant, so the oracle and the
@@ -98,7 +112,7 @@ def _ekfac_oracle(tr_f, te_f, train_hashes, test_hashes, damping):
         dW_te = torch.einsum("mo,mi->moi", g_te, a_te)
         M_tr = torch.einsum("op,noi,iq->npq", U_G, dW_tr, U_A)  # U_G^T dW U_A
         M_te = torch.einsum("op,moi,iq->mpq", U_G, dW_te, U_A)
-        lam = (M_tr * M_tr).mean(0)                              # corrected eigenvalues
+        lam = (M_tr * M_tr).mean(0)  # corrected eigenvalues
         oracle += torch.einsum("npq,mpq->nm", M_tr / (lam + damping), M_te)
     return oracle
 
@@ -111,9 +125,15 @@ def _grad_dot_oracle(tr_f, te_f, train_hashes, test_hashes):
     independent of the ill-defined eigenvector choices.
     """
     out = torch.zeros(len(train_hashes), len(test_hashes))
-    for l in LAYERS:
-        a_tr, g_tr = _stack(tr_f, train_hashes, l, 0), _stack(tr_f, train_hashes, l, 1)
-        a_te, g_te = _stack(te_f, test_hashes, l, 0), _stack(te_f, test_hashes, l, 1)
+    for layer in LAYERS:
+        a_tr, g_tr = (
+            _stack(tr_f, train_hashes, layer, 0),
+            _stack(tr_f, train_hashes, layer, 1),
+        )
+        a_te, g_te = (
+            _stack(te_f, test_hashes, layer, 0),
+            _stack(te_f, test_hashes, layer, 1),
+        )
         out += (g_tr @ g_te.T) * (a_tr @ a_te.T)
     return out
 
@@ -123,7 +143,7 @@ def _grad_dot_oracle(tr_f, te_f, train_hashes, test_hashes):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture()
+@pytest.fixture
 def collected(tmp_path):
     """One-checkpoint (single-step) collection so the oracle stays transparent."""
     torch.manual_seed(TT.SEED)
@@ -133,10 +153,16 @@ def collected(tmp_path):
     train_dir, test_dir = tmp_path / "train_g", tmp_path / "test_g"
     TT._collect_to_disk(model, checkpoints, x_tr, y_tr, train_dir)
     TT._collect_to_disk(model, checkpoints, x_te, y_te, test_dir)
-    train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
+    train_hashes = [
+        hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
+    ]
     test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
-    return dict(train_dir=train_dir, test_dir=test_dir,
-                train_hashes=train_hashes, test_hashes=test_hashes)
+    return {
+        "train_dir": train_dir,
+        "test_dir": test_dir,
+        "train_hashes": train_hashes,
+        "test_hashes": test_hashes,
+    }
 
 
 def _make(attr_cls, out_dir):
@@ -159,12 +185,20 @@ class TestKFAC:
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
-        matrix = res.query(collected["train_hashes"], collected["test_hashes"],
-                           trajectory="agnostic")
+        matrix = res.query(
+            collected["train_hashes"],
+            collected["test_hashes"],
+            trajectory="agnostic",
+        )
         tr_f = _load_factors(collected["train_dir"], 0, LAYERS)
         te_f = _load_factors(collected["test_dir"], 0, LAYERS)
-        oracle = _kfac_oracle(tr_f, te_f, collected["train_hashes"],
-                              collected["test_hashes"], DAMPING)
+        oracle = _kfac_oracle(
+            tr_f,
+            te_f,
+            collected["train_hashes"],
+            collected["test_hashes"],
+            DAMPING,
+        )
         assert torch.allclose(matrix, oracle, atol=1e-4, rtol=1e-3), (
             f"max diff {(matrix - oracle).abs().max().item():.2e}"
         )
@@ -184,12 +218,20 @@ class TestEKFAC:
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
-        matrix = res.query(collected["train_hashes"], collected["test_hashes"],
-                           trajectory="agnostic")
+        matrix = res.query(
+            collected["train_hashes"],
+            collected["test_hashes"],
+            trajectory="agnostic",
+        )
         tr_f = _load_factors(collected["train_dir"], 0, LAYERS)
         te_f = _load_factors(collected["test_dir"], 0, LAYERS)
-        oracle = _ekfac_oracle(tr_f, te_f, collected["train_hashes"],
-                               collected["test_hashes"], DAMPING)
+        oracle = _ekfac_oracle(
+            tr_f,
+            te_f,
+            collected["train_hashes"],
+            collected["test_hashes"],
+            DAMPING,
+        )
         assert torch.allclose(matrix, oracle, atol=1e-4, rtol=1e-3), (
             f"max diff {(matrix - oracle).abs().max().item():.2e}"
         )
@@ -203,22 +245,36 @@ class TestEKFAC:
 
     def test_heavy_damping_limit_is_gradient_dot(self, collected, tmp_path):
         """At large damping EK-FAC -> (1/lambda)*<dW_tr, dW_te> (the eigenvalue
-        correction washes out), validating the rotate->divide->contract machinery."""
+        correction washes out), validating the rotate->divide->contract machinery.
+        """
         damping = 1e6
         res = EKFACAttributor(
-            AttributionArguments(output_dir=str(tmp_path / "o"),
-                                 dataloader_num_workers=0, dataloader_pin_memory=False),
+            AttributionArguments(
+                output_dir=str(tmp_path / "o"),
+                dataloader_num_workers=0,
+                dataloader_pin_memory=False,
+            ),
             damping=damping,
         ).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
-        matrix = res.query(collected["train_hashes"], collected["test_hashes"],
-                           trajectory="agnostic") * damping
+        matrix = (
+            res.query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
+            * damping
+        )
         tr_f = _load_factors(collected["train_dir"], 0, LAYERS)
         te_f = _load_factors(collected["test_dir"], 0, LAYERS)
-        oracle = _grad_dot_oracle(tr_f, te_f, collected["train_hashes"],
-                                  collected["test_hashes"])
+        oracle = _grad_dot_oracle(
+            tr_f,
+            te_f,
+            collected["train_hashes"],
+            collected["test_hashes"],
+        )
         assert torch.allclose(matrix, oracle, atol=1e-2, rtol=1e-2), (
             f"max diff {(matrix - oracle).abs().max().item():.2e}"
         )
@@ -227,7 +283,8 @@ class TestEKFAC:
         """Design rationale for the faithful projection ``U_G^T dW U_A``: its
         score is invariant to an (arbitrary) eigenvector sign flip, whereas the
         transposed ``U_G dW U_A^T`` (dattri's original) is not -- which is why the
-        'approx' mode was fixed to use the faithful projection too."""
+        'approx' mode was fixed to use the faithful projection too.
+        """
         torch.manual_seed(0)
         B, out, inn = 30, 4, 5
         a, g = torch.randn(B, inn), torch.randn(B, out)
@@ -239,7 +296,11 @@ class TestEKFAC:
                 (U_A.T.contiguous(), U_G.T.contiguous()) if transposed else (U_A, U_G)
             )
             M = ops.ekfac_materialize(
-                Factorized(a, g), "nn.Linear", rot_a, rot_g, include_bias=False
+                Factorized(a, g),
+                "nn.Linear",
+                rot_a,
+                rot_g,
+                include_bias=False,
             )
             lam = (M * M).mean(0)
             return (M / (lam + 1e-3)) @ M.T
@@ -247,20 +308,42 @@ class TestEKFAC:
         U_G_flip = U_G.clone()
         U_G_flip[:, 0] *= -1  # a different but equally valid eigenbasis
         # Faithful projection: invariant.  Transposed (dattri): not.
-        assert torch.allclose(score(U_A, U_G, False), score(U_A, U_G_flip, False), atol=1e-4)
-        assert not torch.allclose(score(U_A, U_G, True), score(U_A, U_G_flip, True), atol=1e-4)
+        assert torch.allclose(
+            score(U_A, U_G, transposed=False),
+            score(U_A, U_G_flip, transposed=False),
+            atol=1e-4,
+        )
+        assert not torch.allclose(
+            score(U_A, U_G, transposed=True),
+            score(U_A, U_G_flip, transposed=True),
+            atol=1e-4,
+        )
 
     def test_modes_agree(self, collected, tmp_path):
         """The fixed 'approx' mode now produces the same scores as 'exact'."""
+
         def run(mode):
-            return EKFACAttributor(
-                AttributionArguments(output_dir=str(tmp_path / mode),
-                                     dataloader_num_workers=0, dataloader_pin_memory=False),
-                damping=1e-2, mode=mode,
-            ).attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
-            ).query(collected["train_hashes"], collected["test_hashes"], trajectory="agnostic")
+            return (
+                EKFACAttributor(
+                    AttributionArguments(
+                        output_dir=str(tmp_path / mode),
+                        dataloader_num_workers=0,
+                        dataloader_pin_memory=False,
+                    ),
+                    damping=1e-2,
+                    mode=mode,
+                )
+                .attribute_from_cache(
+                    train_gradients_dir=str(collected["train_dir"]),
+                    test_gradients_dir=str(collected["test_dir"]),
+                )
+                .query(
+                    collected["train_hashes"],
+                    collected["test_hashes"],
+                    trajectory="agnostic",
+                )
+            )
+
         assert torch.allclose(run("exact"), run("approx"), atol=1e-6)
 
     def test_invalid_mode_raises(self, tmp_path):
@@ -282,8 +365,14 @@ class _MultiTokenModel(nn.Module):
 
 
 def _kfac_oracle_mt(tr_f, te_f, train_hashes, test_hashes, layer, damping):
-    a_tr, g_tr = _stack(tr_f, train_hashes, layer, 0), _stack(tr_f, train_hashes, layer, 1)
-    a_te, g_te = _stack(te_f, test_hashes, layer, 0), _stack(te_f, test_hashes, layer, 1)
+    a_tr, g_tr = (
+        _stack(tr_f, train_hashes, layer, 0),
+        _stack(tr_f, train_hashes, layer, 1),
+    )
+    a_te, g_te = (
+        _stack(te_f, test_hashes, layer, 0),
+        _stack(te_f, test_hashes, layer, 1),
+    )
     n_tok = a_tr.shape[0] * a_tr.shape[1]
     a_flat = a_tr.reshape(-1, a_tr.shape[-1])
     g_flat = g_tr.reshape(-1, g_tr.shape[-1])
@@ -310,9 +399,17 @@ class TestKFACMultiToken:
 
         def collect(x, out_dir):
             fm = GradientFileManager(str(out_dir))
-            hm = HookManager(model, config=HookManagerConfig(linear_io=[r"fc"]),
-                             callbacks=[OffloadCallback(offload_interval=1, file_manager=fm,
-                                                        recording_type="per_sample")])
+            hm = HookManager(
+                model,
+                config=HookManagerConfig(linear_io=[r"fc"]),
+                callbacks=[
+                    OffloadCallback(
+                        offload_interval=1,
+                        file_manager=fm,
+                        recording_type="per_sample",
+                    ),
+                ],
+            )
             with hm.collect():
                 model.zero_grad(set_to_none=True)
                 model(x=x).sum().backward()
@@ -324,10 +421,14 @@ class TestKFACMultiToken:
         train_hashes = [hash_sample({"x": x_tr[i]}) for i in range(B)]
         test_hashes = [hash_sample({"x": x_te[j]}) for j in range(4)]
 
-        args = AttributionArguments(output_dir=str(tmp_path / "o"),
-                                    dataloader_num_workers=0, dataloader_pin_memory=False)
+        args = AttributionArguments(
+            output_dir=str(tmp_path / "o"),
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
         res = KFACAttributor(args, damping=DAMPING).attribute_from_cache(
-            train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+            train_gradients_dir=str(train_dir),
+            test_gradients_dir=str(test_dir),
         )
         matrix = res.query(train_hashes, test_hashes, trajectory="agnostic")
         tr_f = _load_factors(train_dir, 0, ["fc"])
@@ -338,7 +439,7 @@ class TestKFACMultiToken:
         )
 
 
-@pytest.fixture()
+@pytest.fixture
 def collected_step1(tmp_path):
     """Single-checkpoint dirs whose records were recorded at a *non-zero* step.
 
@@ -359,10 +460,16 @@ def collected_step1(tmp_path):
     GradientFileManager(str(train_dir)).save_bulk(TT._load_step_records(raw_train, 1))
     GradientFileManager(str(test_dir)).save_bulk(TT._load_step_records(raw_test, 1))
 
-    train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
+    train_hashes = [
+        hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
+    ]
     test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
-    return dict(train_dir=train_dir, test_dir=test_dir,
-                train_hashes=train_hashes, test_hashes=test_hashes)
+    return {
+        "train_dir": train_dir,
+        "test_dir": test_dir,
+        "train_hashes": train_hashes,
+        "test_hashes": test_hashes,
+    }
 
 
 class TestRowStepsTracked:
@@ -376,9 +483,12 @@ class TestRowStepsTracked:
         )
         assert res.row_steps == [1] * TT.N_TRAIN
         # The hash->step pairing must be correct sample-by-sample, not just in bulk.
-        assert dict(zip(res.row_train_ids, res.row_steps)) == {
-            h: 1 for h in collected_step1["train_hashes"]
-        }
+        assert dict(
+            zip(res.row_train_ids, res.row_steps, strict=True),
+        ) == dict.fromkeys(
+            collected_step1["train_hashes"],
+            1,
+        )
 
 
 class TestStepSelection:
@@ -388,7 +498,8 @@ class TestStepSelection:
     def test_selected_steps_equal_curated_single_step_dir(self, tmp_path, cls):
         """Attributing a two-step train dir with ``selected_training_steps=[1]``
         is identical to attributing a dir curated to hold only the step-1
-        records."""
+        records.
+        """
         torch.manual_seed(TT.SEED)
         model = TT.MLP().eval()
         checkpoints = TT._make_checkpoints(model)  # steps 0 and 1
@@ -401,17 +512,25 @@ class TestStepSelection:
         curated = tmp_path / "tr_s1"
         GradientFileManager(str(curated)).save_bulk(TT._load_step_records(raw_train, 1))
 
-        train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
-        test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
+        train_hashes = [
+            hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
+        ]
+        test_hashes = [
+            hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)
+        ]
 
         def run(train_dir, steps):
             attr = cls(
-                AttributionArguments(output_dir=str(tmp_path / f"o_{steps}"),
-                                     dataloader_num_workers=0, dataloader_pin_memory=False),
+                AttributionArguments(
+                    output_dir=str(tmp_path / f"o_{steps}"),
+                    dataloader_num_workers=0,
+                    dataloader_pin_memory=False,
+                ),
                 damping=DAMPING,
             )
             return attr.attribute_from_cache(
-                train_gradients_dir=str(train_dir), test_gradients_dir=str(test_dir),
+                train_gradients_dir=str(train_dir),
+                test_gradients_dir=str(test_dir),
                 selected_training_steps=steps,
             )
 
@@ -445,26 +564,44 @@ class TestKroneckerShared:
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_loop_over_test_matches_cached(self, collected, tmp_path, cls):
         """Streaming the test set (loop_over_test=True) gives identical scores to
-        the cached path -- same result, lower peak memory."""
+        the cached path -- same result, lower peak memory.
+        """
+
         def run(loop, tag):
-            return _make(cls, tmp_path / tag).attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
-                loop_over_test=loop,
-            ).query(collected["train_hashes"], collected["test_hashes"],
-                    trajectory="agnostic")
-        assert torch.allclose(run(False, "cached"), run(True, "loop"), atol=1e-5)
+            return (
+                _make(cls, tmp_path / tag)
+                .attribute_from_cache(
+                    train_gradients_dir=str(collected["train_dir"]),
+                    test_gradients_dir=str(collected["test_dir"]),
+                    loop_over_test=loop,
+                )
+                .query(
+                    collected["train_hashes"],
+                    collected["test_hashes"],
+                    trajectory="agnostic",
+                )
+            )
+
+        assert torch.allclose(
+            run(loop=False, tag="cached"),
+            run(loop=True, tag="loop"),
+            atol=1e-5,
+        )
 
     def test_kfac_ekfac_agree_when_lambda_is_kronecker(self, collected, tmp_path):
         """Sanity bridge: EK-FAC with a *single*-token, rank-deficient setup still
-        runs and returns finite, correctly-shaped scores for both attributors."""
+        runs and returns finite, correctly-shaped scores for both attributors.
+        """
         for cls, label in ((KFACAttributor, "KFAC"), (EKFACAttributor, "EKFAC")):
             res = _make(cls, tmp_path / label).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
             )
-            m = res.query(collected["train_hashes"], collected["test_hashes"],
-                          trajectory="agnostic")
+            m = res.query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
             assert m.shape == (TT.N_TRAIN, TT.N_TEST)
             assert torch.isfinite(m).all()
 
@@ -492,7 +629,9 @@ class _NormModel(nn.Module):
 
 def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
     """Direct empirical-Fisher score for one norm layer, built from the
-    token-summed per-sample weight gradients."""
+    token-summed per-sample weight gradients.
+    """
+
     def load(d, hashes):
         fm = GradientFileManager(str(d))
         out = {}
@@ -500,17 +639,22 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
             recs = fm.load_records(file_rel)
             for i in idxs:
                 rec = recs[i]
-                hs = rec.input_hash if isinstance(rec.input_hash, list) else [rec.input_hash]
+                hs = (
+                    rec.input_hash
+                    if isinstance(rec.input_hash, list)
+                    else [rec.input_hash]
+                )
                 mat = ops.materialize(
-                    rec.gradient.data[layer], rec.gradient.layer_types[layer]
+                    rec.gradient.data[layer],
+                    rec.gradient.layer_types[layer],
                 )
                 for b, h in enumerate(hs):
                     out[h] = mat[b].float()
         return out
 
     tr, te = load(train_dir, train_hashes), load(test_dir, test_hashes)
-    G_tr = torch.stack([tr[h] for h in train_hashes])   # (N_tr, P)
-    G_te = torch.stack([te[h] for h in test_hashes])     # (N_te, P)
+    G_tr = torch.stack([tr[h] for h in train_hashes])  # (N_tr, P)
+    G_te = torch.stack([te[h] for h in test_hashes])  # (N_te, P)
     F = G_tr.T @ G_tr / G_tr.shape[0]
     F_inv = ops.sym_inverse(F, damping)
     return (G_tr @ F_inv) @ G_te.T
@@ -519,7 +663,8 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
 def _collect_norm_model(tmp_path, patterns):
     """Collect the _NormModel's factorised gradients to disk (one step), hooking
     only the layers matching *patterns* -- layer selection now happens at capture
-    (via the hook config), not at scoring."""
+    (via the hook config), not at scoring.
+    """
     torch.manual_seed(0)
     model = _NormModel().eval()
     gen = torch.Generator().manual_seed(1)
@@ -529,9 +674,15 @@ def _collect_norm_model(tmp_path, patterns):
     def collect(x, out_dir):
         fm = GradientFileManager(str(out_dir))
         hm = HookManager(
-            model, config=HookManagerConfig(linear_io=patterns),
-            callbacks=[OffloadCallback(offload_interval=1, file_manager=fm,
-                                       recording_type="per_sample")],
+            model,
+            config=HookManagerConfig(linear_io=patterns),
+            callbacks=[
+                OffloadCallback(
+                    offload_interval=1,
+                    file_manager=fm,
+                    recording_type="per_sample",
+                ),
+            ],
         )
         with hm.collect():
             model.zero_grad(set_to_none=True)
@@ -541,22 +692,26 @@ def _collect_norm_model(tmp_path, patterns):
     train_dir, test_dir = tmp_path / "tr", tmp_path / "te"
     collect(x_tr, train_dir)
     collect(x_te, test_dir)
-    return dict(
-        train_dir=train_dir, test_dir=test_dir,
-        train_hashes=[hash_sample({"x": x_tr[i]}) for i in range(6)],
-        test_hashes=[hash_sample({"x": x_te[j]}) for j in range(4)],
-    )
+    return {
+        "train_dir": train_dir,
+        "test_dir": test_dir,
+        "train_hashes": [hash_sample({"x": x_tr[i]}) for i in range(6)],
+        "test_hashes": [hash_sample({"x": x_te[j]}) for j in range(4)],
+    }
 
 
-@pytest.fixture()
+@pytest.fixture
 def norm_collected(tmp_path):
     """Both ``norm`` and ``head`` collected (one step)."""
     return _collect_norm_model(tmp_path, [r"norm", r"head"])
 
 
 def _attr(cls, out_dir):
-    args = AttributionArguments(output_dir=str(out_dir),
-                                dataloader_num_workers=0, dataloader_pin_memory=False)
+    args = AttributionArguments(
+        output_dir=str(out_dir),
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
+    )
     return cls(args, damping=DAMPING)
 
 
@@ -567,60 +722,89 @@ class TestDirectFIM:
             test_gradients_dir=str(collected["test_dir"]),
             **kw,
         )
-        return res.query(collected["train_hashes"],
-                         collected["test_hashes"], trajectory="agnostic")
+        return res.query(
+            collected["train_hashes"],
+            collected["test_hashes"],
+            trajectory="agnostic",
+        )
 
     def test_norm_only_matches_fim_oracle(self, tmp_path):
         """Collected norm-only, 'direct' is a pure empirical-Fisher score."""
         collected = _collect_norm_model(tmp_path / "norm_only", [r"norm"])
         m = self._run(collected, tmp_path / "o", non_kfac_strategy="direct")
         oracle = _fim_oracle(
-            collected["train_dir"], collected["test_dir"],
-            collected["train_hashes"], collected["test_hashes"],
-            "norm", DAMPING,
+            collected["train_dir"],
+            collected["test_dir"],
+            collected["train_hashes"],
+            collected["test_hashes"],
+            "norm",
+            DAMPING,
         )
-        assert torch.allclose(m, oracle, atol=1e-4, rtol=1e-3), \
+        assert torch.allclose(m, oracle, atol=1e-4, rtol=1e-3), (
             f"max diff {(m - oracle).abs().max().item():.2e}"
+        )
 
     def test_direct_equals_kfac_plus_fim(self, norm_collected, tmp_path):
         """With both layers, 'direct' == K-FAC(head) ['ignore'] + FIM(norm)."""
-        ignore = self._run(norm_collected, tmp_path / "i",
-                           non_kfac_strategy="ignore")
-        direct = self._run(norm_collected, tmp_path / "d",
-                           non_kfac_strategy="direct")
+        ignore = self._run(norm_collected, tmp_path / "i", non_kfac_strategy="ignore")
+        direct = self._run(norm_collected, tmp_path / "d", non_kfac_strategy="direct")
         fim = _fim_oracle(
-            norm_collected["train_dir"], norm_collected["test_dir"],
-            norm_collected["train_hashes"], norm_collected["test_hashes"],
-            "norm", DAMPING,
+            norm_collected["train_dir"],
+            norm_collected["test_dir"],
+            norm_collected["train_hashes"],
+            norm_collected["test_hashes"],
+            "norm",
+            DAMPING,
         )
-        assert not torch.allclose(ignore, direct)         # norm adds signal
+        assert not torch.allclose(ignore, direct)  # norm adds signal
         assert torch.allclose(direct, ignore + fim, atol=1e-4, rtol=1e-3)
 
     def test_ignore_is_default(self, norm_collected, tmp_path):
         default = self._run(norm_collected, tmp_path / "a")
-        ignore = self._run(norm_collected, tmp_path / "b",
-                           non_kfac_strategy="ignore")
+        ignore = self._run(norm_collected, tmp_path / "b", non_kfac_strategy="ignore")
         assert torch.allclose(default, ignore)
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
-    def test_loop_over_test_matches_cached_with_fim(self, norm_collected, tmp_path, cls):
+    def test_loop_over_test_matches_cached_with_fim(
+        self,
+        norm_collected,
+        tmp_path,
+        cls,
+    ):
         def run(loop, tag):
-            return _attr(cls, tmp_path / tag).attribute_from_cache(
-                train_gradients_dir=str(norm_collected["train_dir"]),
-                test_gradients_dir=str(norm_collected["test_dir"]),
-                non_kfac_strategy="direct", loop_over_test=loop,
-            ).query(norm_collected["train_hashes"],
-                    norm_collected["test_hashes"], trajectory="agnostic")
-        assert torch.allclose(run(False, "c"), run(True, "l"), atol=1e-5)
+            return (
+                _attr(cls, tmp_path / tag)
+                .attribute_from_cache(
+                    train_gradients_dir=str(norm_collected["train_dir"]),
+                    test_gradients_dir=str(norm_collected["test_dir"]),
+                    non_kfac_strategy="direct",
+                    loop_over_test=loop,
+                )
+                .query(
+                    norm_collected["train_hashes"],
+                    norm_collected["test_hashes"],
+                    trajectory="agnostic",
+                )
+            )
+
+        assert torch.allclose(
+            run(loop=False, tag="c"),
+            run(loop=True, tag="l"),
+            atol=1e-5,
+        )
 
     def test_cap_skips_layer_with_warning(self, norm_collected, tmp_path):
         """A cap below the norm's param count skips it (with a warning), so the
-        result collapses to the K-FAC-only ('ignore') score."""
-        ignore = self._run(norm_collected, tmp_path / "i",
-                           non_kfac_strategy="ignore")
+        result collapses to the K-FAC-only ('ignore') score.
+        """
+        ignore = self._run(norm_collected, tmp_path / "i", non_kfac_strategy="ignore")
         with pytest.warns(UserWarning, match="direct_fim_max_params"):
-            capped = self._run(norm_collected, tmp_path / "c",
-                               non_kfac_strategy="direct", direct_fim_max_params=4)
+            capped = self._run(
+                norm_collected,
+                tmp_path / "c",
+                non_kfac_strategy="direct",
+                direct_fim_max_params=4,
+            )
         assert torch.allclose(capped, ignore, atol=1e-5)
 
     def test_norm_only_ignore_raises(self, tmp_path):
@@ -631,13 +815,16 @@ class TestDirectFIM:
 
     def test_invalid_strategy_raises(self, norm_collected, tmp_path):
         with pytest.raises(ValueError, match="non_kfac_strategy"):
-            self._run(norm_collected, tmp_path / "o",
-                      non_kfac_strategy="bogus")
+            self._run(norm_collected, tmp_path / "o", non_kfac_strategy="bogus")
 
     def test_invalid_max_params_raises(self, norm_collected, tmp_path):
         with pytest.raises(ValueError, match="direct_fim_max_params"):
-            self._run(norm_collected, tmp_path / "o",
-                      non_kfac_strategy="direct", direct_fim_max_params=0)
+            self._run(
+                norm_collected,
+                tmp_path / "o",
+                non_kfac_strategy="direct",
+                direct_fim_max_params=0,
+            )
 
     def test_embedding_layer_warns_under_direct(self, tmp_path):
         """Embedding layers are heavily parametrised -> ignored with a warning."""
@@ -652,8 +839,13 @@ class TestDirectFIM:
             hm = HookManager(
                 model,
                 config=HookManagerConfig(linear_io=[r"embedding", r"norm", r"head"]),
-                callbacks=[OffloadCallback(offload_interval=1, file_manager=fm,
-                                           recording_type="per_sample")],
+                callbacks=[
+                    OffloadCallback(
+                        offload_interval=1,
+                        file_manager=fm,
+                        recording_type="per_sample",
+                    ),
+                ],
             )
             with hm.collect():
                 model.zero_grad(set_to_none=True)

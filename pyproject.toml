@@ -31,3 +31,88 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["dattri_llm*"]
+
+[tool.ruff]
+exclude = [
+    "docs/",
+    "scripts/",
+    "experiments/",
+]
+
+[tool.ruff.lint]
+preview = true
+select = ["ALL"]
+ignore = [
+    "ANN002",  # unnecessarily strict rule
+    "ANN003",  # unnecessarily strict rule
+    "D203",    # conflict with D211
+    "D213",    # conflict with D212
+    "D407",    # supporting Google style docstrings
+    "PLR0913", # strict rule on #args in function
+    "TD002",   # Missing author in TODO
+    "TD003",   # Missing issue link in TODO
+    "FIX002",  # TODO needs to be fixed
+    "CPY001",  # Missing copyright notice at top of file
+    "PLR0917", # Too many positional arguments
+    "PLR6201", # Use a `set` literal when testing for membership
+    "FBT001",  # Boolean-typed positional argument in function definition
+    "FBT002",  # Boolean default positional argument in function definition
+    "PLC0415", # strict rule on position of importing modules
+    "C901",    # too many parameters in function
+    "RUF052",  # strict rule on dummy variables
+    "RUF100",  # allow unused noqa for compatibility with different versions of checkers
+    "SLF001",  # private member access
+    "DOC201",  # don't need return in every docstring
+    "DOC501",  # don't need every raise in the docstring Raises section
+    "N803",    # mathematical notation: dimension/factor arguments (B, T, K, D, A, G)
+    "N806",    # mathematical notation: dimension/factor variables in kernels
+    "N812",    # torch.nn.functional imported as F (PyTorch convention)
+    "TRY003",  # library convention: rich inline exception messages
+    "EM101",   # library convention: rich inline exception messages
+    "EM102",   # library convention: rich inline exception messages
+    "D105",    # magic methods follow their protocol; no docstring required
+    "D107",    # constructor arguments are documented in the class docstring
+    "D205",    # multi-line summary sentences are used throughout; a one-line cap would force rewording
+    "D415",    # first-line punctuation cap conflicts with the multi-line summaries (see D205)
+    "N817",    # FSDP / DDP acronym imports are the PyTorch-community names
+    "PLR0911", # return caps unsuited to per-layer-type dispatch kernels
+    "DOC502",  # Raises sections also document exceptions propagated from callees
+    "PLR2004", # tensor rank / dimension literals in shape checks
+    "PLR0912", # branch caps unsuited to per-layer-type dispatch kernels
+    "PLR0914", # local-variable caps unsuited to assembly/scoring kernels
+    "PLR0915", # statement caps unsuited to assembly/scoring kernels
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = [
+    "E401", # Multiple imports on one line
+    "E402", # Module level import not at top of cell
+]
+"tests/**/*.py" = [
+    "S101",    # assert is fine in tests
+    "INP001",  # no need for __init__.py in test
+    "ANN",     # don't need type annotation for tests
+    "PLR6301", # Checks for the presence of unused self parameter
+    "D1",      # test names are the documentation
+    "ARG",     # stub callbacks/overrides keep interface signatures
+    "PLC2701", # unit tests exercise private helpers by design
+    "PLR1702", # distributed worker tests need deep guard nesting
+    "PLW0717", # distributed worker tests wrap whole bodies in try/finally
+    "ERA001",  # worked numeric examples in comments are not dead code
+]
+"examples/**/*.py" = [
+    "S101",    # assert is fine in examples
+    "INP001",  # examples are standalone scripts, not a package
+    "ANN",     # don't need type annotation for examples
+    "T201",    # print is the examples' output channel
+    "D1",      # examples are documented by their module docstring and comments
+    "ARG",     # stub callbacks/overrides keep interface signatures
+    "ERA001",  # commented-out config toggles are part of the demonstration
+]
+"dattri_llm/__init__.py" = [
+    "RUF067",  # the top-level module is a lazy re-export facade by design
+    "F822",    # lazy exports in __all__ are resolved via module __getattr__
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

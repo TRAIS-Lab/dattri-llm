@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import TYPE_CHECKING
 
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import GradientRecord
+
+if TYPE_CHECKING:
+    from dattri_llm.gradient.file_manager import GradientFileManager
 
 
 class OffloadCallback(HookManagerCallback):
@@ -36,23 +38,26 @@ class OffloadCallback(HookManagerCallback):
         if recording_type not in ("per_sample", "per_batch"):
             raise ValueError(
                 f"recording_type must be 'per_sample' or 'per_batch', "
-                f"got {recording_type!r}."
+                f"got {recording_type!r}.",
             )
         self._offload_interval = offload_interval
         self.file_manager = file_manager
         self._recording_type = recording_type
-        self._staged: List[GradientRecord] = []
+        self._staged: list[GradientRecord] = []
         self._staged_steps: set = set()
 
     def on_step_end(self, record: GradientRecord) -> None:
+        """Stage the step's record(s), flushing every ``offload_interval`` steps."""
         records = self._expand(record)
-        if record.step not in self._staged_steps:
-            if len(self._staged_steps) >= self._offload_interval:
-                self._flush()
+        if (
+            record.step not in self._staged_steps
+            and len(self._staged_steps) >= self._offload_interval
+        ):
+            self._flush()
         self._staged.extend(records)
         self._staged_steps.add(record.step)
 
-    def _expand(self, record: GradientRecord) -> List[GradientRecord]:
+    def _expand(self, record: GradientRecord) -> list[GradientRecord]:
         """Slice into per-sample records when ``recording_type='per_sample'``."""
         if self._recording_type != "per_sample":
             return [record]
@@ -72,6 +77,7 @@ class OffloadCallback(HookManagerCallback):
         ]
 
     def on_context_end(self) -> None:
+        """Flush any records still staged when the collect() context closes."""
         self._flush()
 
     def _flush(self) -> None:
@@ -82,6 +88,6 @@ class OffloadCallback(HookManagerCallback):
         self._staged_steps.clear()
 
     @property
-    def staged(self) -> List[GradientRecord]:
+    def staged(self) -> list[GradientRecord]:
         """Records staged but not yet written to disk."""
         return list(self._staged)

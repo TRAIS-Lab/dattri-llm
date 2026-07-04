@@ -3,23 +3,31 @@
 from __future__ import annotations
 
 import math
-from collections import namedtuple
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.utils.distributed import dist_world_size, is_dist_initialized
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+    from dattri_llm.gradient.hooks import HookManager
+
 
 # Per-parameter slice of an FSDP ``FlatParameter`` shard.  ``start``/``end`` are
 # the inclusive indices into the *flattened, unsharded* parameter that this rank
 # owns (i.e. ``param.grad`` equals ``full.reshape(-1)[start : end + 1]``);
 # ``in_shard`` is False when this rank holds none of the parameter.
-_ShardSpec = namedtuple("_ShardSpec", "orig_shape in_shard start end")
+class _ShardSpec(NamedTuple):
+    orig_shape: tuple[int, ...]
+    in_shard: bool
+    start: int | None
+    end: int | None
 
 
 _THRESHOLD_MODES = frozenset({"hard", "bottom_fraction", "negative_bottom_fraction"})
@@ -177,34 +185,36 @@ class DataSelectionCallback(HookManagerCallback):
         threshold_mode: str = "hard",
         score_mode: str = "ghost",
         target: str = "batch",
-        target_gradient: Optional[Gradient] = None,
-        val_loader: Optional[Any] = None,
-        val_loss_fn: Optional[Callable[[nn.Module, Any], torch.Tensor]] = None,
+        target_gradient: Gradient | None = None,
+        val_loader: Iterable[object] | None = None,
+        val_loss_fn: Callable[[nn.Module, Any], torch.Tensor] | None = None,
     ) -> None:
         if threshold_mode not in _THRESHOLD_MODES:
             raise ValueError(
                 f"threshold_mode must be one of {sorted(_THRESHOLD_MODES)}, "
-                f"got {threshold_mode!r}."
+                f"got {threshold_mode!r}.",
             )
-        if threshold_mode in ("bottom_fraction", "negative_bottom_fraction"):
-            if not (0.0 <= threshold < 1.0):
-                raise ValueError(
-                    f"threshold must be in [0, 1) for threshold_mode={threshold_mode!r}, "
-                    f"got {threshold}."
-                )
+        if threshold_mode in (
+            "bottom_fraction",
+            "negative_bottom_fraction",
+        ) and not (0.0 <= threshold < 1.0):
+            raise ValueError(
+                f"threshold must be in [0, 1) for "
+                f"threshold_mode={threshold_mode!r}, "
+                f"got {threshold}.",
+            )
         if score_mode not in _SCORE_MODES:
             raise ValueError(
                 f"score_mode must be one of {sorted(_SCORE_MODES)}, "
-                f"got {score_mode!r}."
+                f"got {score_mode!r}.",
             )
         if target not in _TARGET_MODES:
             raise ValueError(
-                f"target must be one of {sorted(_TARGET_MODES)}, "
-                f"got {target!r}."
+                f"target must be one of {sorted(_TARGET_MODES)}, got {target!r}.",
             )
         if target == "fixed" and target_gradient is None:
             raise ValueError(
-                "target='fixed' requires target_gradient to be a Gradient object."
+                "target='fixed' requires target_gradient to be a Gradient object.",
             )
         if target == "val_loader":
             if val_loader is None:
@@ -223,7 +233,7 @@ class DataSelectionCallback(HookManagerCallback):
         # "not FSDP".  ``_fsdp_world_size`` is the process-group size used to
         # rescale all-reduced contributions to FSDP's averaged-gradient
         # convention.
-        self._fsdp_shard_map: Optional[Dict[int, _ShardSpec]] = None
+        self._fsdp_shard_map: dict[int, _ShardSpec] | None = None
         self._fsdp_world_size: int = 1
         self._threshold = threshold
         self._threshold_mode = threshold_mode
@@ -237,7 +247,7 @@ class DataSelectionCallback(HookManagerCallback):
         # Reference to the training HookManager; set by on_register().
         # Used in _collect_val_gradient() to pause step-completion tracking
         # during the secondary (val) backward pass.
-        self._hook_manager: Optional[Any] = None
+        self._hook_manager: Any | None = None
 
         # Guard flag: True while the val backward is in flight.
         # Prevents on_layer_forward / on_step_end from re-entering val logic.
@@ -245,25 +255,25 @@ class DataSelectionCallback(HookManagerCallback):
         # Whether val target has already been collected for the current step.
         self._val_target_ready_for_step: bool = False
         # Most recently collected val gradient (used by _resolve_target).
-        self._pending_val_gradient: Optional[Gradient] = None
+        self._pending_val_gradient: Gradient | None = None
 
         # Per-layer buffers for our own val-pass hooks.
-        self._val_act_bufs: Dict[str, torch.Tensor] = {}
-        self._val_grad_bufs: Dict[str, torch.Tensor] = {}
-        self._val_hook_handles: List = []
+        self._val_act_bufs: dict[str, torch.Tensor] = {}
+        self._val_grad_bufs: dict[str, torch.Tensor] = {}
+        self._val_hook_handles: list = []
 
         if target == "val_loader":
             self._register_val_hooks()
 
         # Exposed for inspection / debugging after each step.
-        self.last_scores: Optional[torch.Tensor] = None
-        self.last_dropped: List[int] = []
+        self.last_scores: torch.Tensor | None = None
+        self.last_dropped: list[int] = []
 
     # ---------------------------------------------------------------------- #
     # HookManager registration                                                #
     # ---------------------------------------------------------------------- #
 
-    def on_register(self, hook_manager: Any) -> None:
+    def on_register(self, hook_manager: HookManager) -> None:
         """Called by :class:`~dattri_llm.gradient.hooks.HookManager` when this
         callback is registered.
 
@@ -312,13 +322,14 @@ class DataSelectionCallback(HookManagerCallback):
         """Remove val-pass hooks when the collect() context closes."""
         if self._val_hook_handles:
             from dattri_llm.gradient.hooks import remove_hooks
+
             remove_hooks(self._val_hook_handles)
 
     # ---------------------------------------------------------------------- #
     # Main entry points                                                        #
     # ---------------------------------------------------------------------- #
 
-    def on_layer_forward(self, layer_name: str, activation: torch.Tensor) -> None:
+    def on_layer_forward(self, _layer_name: str, _activation: torch.Tensor) -> None:
         """Trigger val-target collection at the start of each training step.
 
         For ``target="val_loader"``, the first ``on_layer_forward`` call of
@@ -328,8 +339,8 @@ class DataSelectionCallback(HookManagerCallback):
         ignored.
 
         Args:
-            layer_name: Fully-qualified name of the hooked layer.
-            activation: Captured input activation (on CPU).
+            _layer_name: Fully-qualified name of the hooked layer (unused).
+            _activation: Captured input activation (unused).
         """
         if self._target != "val_loader":
             return
@@ -379,7 +390,7 @@ class DataSelectionCallback(HookManagerCallback):
     # Target resolution                                                        #
     # ---------------------------------------------------------------------- #
 
-    def _resolve_target(self) -> Optional[Gradient]:
+    def _resolve_target(self) -> Gradient | None:
         """Return the target Gradient for this step, or None for batch mode.
 
         Returns:
@@ -429,7 +440,7 @@ class DataSelectionCallback(HookManagerCallback):
             batch = next(self._val_iter)  # type: ignore[arg-type]
 
         # Save parameter gradients (may be non-None under gradient accumulation).
-        saved_grads: Dict[str, Optional[torch.Tensor]] = {
+        saved_grads: dict[str, torch.Tensor | None] = {
             n: (p.grad.detach().clone() if p.grad is not None else None)
             for n, p in self._root.named_parameters()
         }
@@ -457,7 +468,7 @@ class DataSelectionCallback(HookManagerCallback):
 
         self._pending_val_gradient = self._assemble_val_gradient()
 
-    def _assemble_val_gradient(self) -> Optional[Gradient]:
+    def _assemble_val_gradient(self) -> Gradient | None:
         """Build a :class:`Gradient` from the captured val-pass buffers.
 
         Raw hook data is stored with the module reference so that
@@ -469,10 +480,10 @@ class DataSelectionCallback(HookManagerCallback):
             layer that has both activation and grad_output data, or ``None``
             if no layers were captured (e.g. the model has no hooked layers).
         """
-        data: Dict[str, Any] = {}
-        representation: Dict[str, str] = {}
-        indexing: Dict[str, str] = {}
-        layer_types: Dict[str, str] = {}
+        data: dict[str, Any] = {}
+        representation: dict[str, str] = {}
+        indexing: dict[str, str] = {}
+        layer_types: dict[str, str] = {}
         for layer_name, act in self._val_act_bufs.items():
             grad = self._val_grad_bufs.get(layer_name)
             if grad is None:
@@ -482,11 +493,16 @@ class DataSelectionCallback(HookManagerCallback):
                 layer_type = ops.canonical_class_name(module)
                 module_kwargs = ops.extract_module_kwargs(module, layer_type)
             except AttributeError:
-                layer_type = "nn.Embedding" if not act.is_floating_point() else "nn.Linear"
+                layer_type = (
+                    "nn.Embedding" if not act.is_floating_point() else "nn.Linear"
+                )
                 module_kwargs = None
             layer_types[layer_name] = layer_type
-            data[layer_name] = Factorized(activation=act, pre_activation_grad=grad,
-                                          module_kwargs=module_kwargs)
+            data[layer_name] = Factorized(
+                activation=act,
+                pre_activation_grad=grad,
+                module_kwargs=module_kwargs,
+            )
             representation[layer_name] = "factorized"
             indexing[layer_name] = (
                 "batch_token"
@@ -506,7 +522,7 @@ class DataSelectionCallback(HookManagerCallback):
     # Drop-set selection                                                       #
     # ---------------------------------------------------------------------- #
 
-    def _select_dropped(self, scores: torch.Tensor) -> List[int]:
+    def _select_dropped(self, scores: torch.Tensor) -> list[int]:
         """Return the list of batch indices to drop based on the configured mode.
 
         Args:
@@ -542,7 +558,7 @@ class DataSelectionCallback(HookManagerCallback):
     def _compute_scores(
         self,
         record: GradientRecord,
-        target: Optional[Gradient] = None,
+        target: Gradient | None = None,
     ) -> torch.Tensor:
         """Compute per-sample influence scores ``score[i] = <dW_i, dW_target>``.
 
@@ -590,13 +606,13 @@ class DataSelectionCallback(HookManagerCallback):
     # Layers whose parameters are indexed channels-first (dim 1) rather than
     # channels-last (last dim).  Determines the reduction axis for bias grads.
     _CHANNELS_FIRST_NORMS = frozenset(
-        {"nn.GroupNorm", "nn.InstanceNorm1d", "nn.InstanceNorm2d", "nn.InstanceNorm3d"}
+        {"nn.GroupNorm", "nn.InstanceNorm1d", "nn.InstanceNorm2d", "nn.InstanceNorm3d"},
     )
 
     def _remove_contributions(
         self,
         record: GradientRecord,
-        dropped: List[int],
+        dropped: list[int],
     ) -> None:
         """Subtract dropped samples' parameter-gradient contributions.
 
@@ -617,11 +633,11 @@ class DataSelectionCallback(HookManagerCallback):
                 continue
             # Normalise sequence-first captures so the batch axis is dim 0 before
             # we index samples / read the batch size below.
-            val = val.as_batch_first()
+            bf = val.as_batch_first()
             # Skip layers whose gradient was summed over the batch dim during
             # the forward broadcast (e.g. wpe in GPT-2, where position_ids has
             # shape (1, T)).  Per-sample contributions cannot be isolated.
-            if val.pre_activation_grad.shape[0] < B:
+            if bf.pre_activation_grad.shape[0] < B:
                 continue
             try:
                 module = self._root.get_submodule(layer_name)
@@ -629,16 +645,16 @@ class DataSelectionCallback(HookManagerCallback):
                 continue
 
             layer_type = ops.canonical_class_name(module)
-            a_d = val.activation[dropped]            # (n, ...)
-            g_d = val.pre_activation_grad[dropped]   # (n, ...)
-            self._subtract_weight(module, layer_type, val.module_kwargs, a_d, g_d)
+            a_d = bf.activation[dropped]  # (n, ...)
+            g_d = bf.pre_activation_grad[dropped]  # (n, ...)
+            self._subtract_weight(module, layer_type, bf.module_kwargs, a_d, g_d)
             self._subtract_bias(module, layer_type, g_d)
 
+    @staticmethod
     def _subtract_weight(
-        self,
         module: nn.Module,
         layer_type: str,
-        module_kwargs: Optional[dict],
+        module_kwargs: dict | None,
         a_d: torch.Tensor,
         g_d: torch.Tensor,
     ) -> None:
@@ -655,7 +671,9 @@ class DataSelectionCallback(HookManagerCallback):
 
         # (n, d_weight); sum over the dropped samples -> (d_weight,).
         contrib = ops.materialize(
-            Factorized(a_d, g_d, module_kwargs), layer_type, include_bias=False
+            Factorized(a_d, g_d, module_kwargs),
+            layer_type,
+            include_bias=False,
         ).sum(0)
 
         if ops.is_embedding(layer_type):
@@ -663,7 +681,7 @@ class DataSelectionCallback(HookManagerCallback):
             embed_dim = weight.shape[1]
             vocab_local = contrib.numel() // embed_dim
             weight.grad[:vocab_local] -= contrib.reshape(vocab_local, embed_dim).to(
-                weight.grad.dtype
+                weight.grad.dtype,
             )
             return
 
@@ -736,7 +754,7 @@ class DataSelectionCallback(HookManagerCallback):
         """
         if self._fsdp_shard_map is not None:
             return
-        shard_map: Dict[int, _ShardSpec] = {}
+        shard_map: dict[int, _ShardSpec] = {}
         for module in self._model.modules():
             flat_param = getattr(module, "_flat_param", None)
             if flat_param is None:
@@ -746,7 +764,7 @@ class DataSelectionCallback(HookManagerCallback):
             shapes = getattr(flat_param, "_shapes", None)
             if infos is None or params is None or shapes is None:
                 continue
-            for param, info, shape in zip(params, infos, shapes):
+            for param, info, shape in zip(params, infos, shapes, strict=True):
                 shard_map[id(param)] = _ShardSpec(
                     orig_shape=tuple(shape),
                     in_shard=bool(info.in_shard),
@@ -760,7 +778,7 @@ class DataSelectionCallback(HookManagerCallback):
     def _remove_contributions_fsdp(
         self,
         record: GradientRecord,
-        dropped: List[int],
+        dropped: list[int],
     ) -> None:
         """Shard-aware, collective version of :meth:`_remove_contributions`.
 
@@ -805,8 +823,8 @@ class DataSelectionCallback(HookManagerCallback):
     def _build_fsdp_contributions(
         self,
         record: GradientRecord,
-        dropped: List[int],
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        dropped: list[int],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Return ``[(param, full_flat_contribution)]`` for every sharded param.
 
         Each contribution is the *full*, unsharded parameter-gradient of this
@@ -817,22 +835,23 @@ class DataSelectionCallback(HookManagerCallback):
         """
         B = record.gradient.batch_size
         shard_map = self._fsdp_shard_map
-        assert shard_map is not None
-        entries: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        if shard_map is None:
+            raise RuntimeError("FSDP shard map has not been initialised")
+        entries: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_name, val in sorted(record.gradient.data.items()):
             if not isinstance(val, Factorized):
                 continue
             # Normalise sequence-first captures to batch-first before indexing.
-            val = val.as_batch_first()
-            if val.pre_activation_grad.shape[0] < B:
+            bf = val.as_batch_first()
+            if bf.pre_activation_grad.shape[0] < B:
                 continue
             try:
                 module = self._root.get_submodule(layer_name)
             except AttributeError:
                 continue
             layer_type = ops.canonical_class_name(module)
-            a_d = val.activation[dropped] if dropped else None
-            g_d = val.pre_activation_grad[dropped] if dropped else None
+            a_d = bf.activation[dropped] if dropped else None
+            g_d = bf.pre_activation_grad[dropped] if dropped else None
 
             weight = getattr(module, "weight", None)
             if weight is not None and id(weight) in shard_map:
@@ -840,7 +859,10 @@ class DataSelectionCallback(HookManagerCallback):
                 flat = torch.zeros(full_numel, dtype=torch.float32)
                 if dropped:
                     contrib, off = self._weight_contrib_natural(
-                        layer_type, val.module_kwargs, a_d, g_d,
+                        layer_type,
+                        bf.module_kwargs,
+                        a_d,
+                        g_d,
                         shard_map[id(weight)].orig_shape,
                     )
                     flat[off : off + contrib.numel()] = contrib.float()
@@ -855,14 +877,14 @@ class DataSelectionCallback(HookManagerCallback):
                 entries.append((bias, flat))
         return entries
 
+    @staticmethod
     def _weight_contrib_natural(
-        self,
         layer_type: str,
-        module_kwargs: Optional[dict],
+        module_kwargs: dict | None,
         a_d: torch.Tensor,
         g_d: torch.Tensor,
-        full_shape: Tuple[int, ...],
-    ) -> Tuple[torch.Tensor, int]:
+        full_shape: tuple[int, ...],
+    ) -> tuple[torch.Tensor, int]:
         """Full weight-gradient contribution as a 1-D tensor in the parameter's
         natural C-order, plus the flat offset at which it begins.
 
@@ -872,7 +894,9 @@ class DataSelectionCallback(HookManagerCallback):
         for embeddings, whose contribution covers just rows ``0..max_token``.
         """
         contrib = ops.materialize(
-            Factorized(a_d, g_d, module_kwargs), layer_type, include_bias=False
+            Factorized(a_d, g_d, module_kwargs),
+            layer_type,
+            include_bias=False,
         ).sum(0)
         if ops.is_embedding(layer_type):
             # materialize scatters into rows 0..max_token, flattened row-major

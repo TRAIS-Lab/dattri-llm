@@ -26,13 +26,12 @@ populated by the time ``on_step_end`` fires.
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
 import pytest
+import torch
+from torch import nn
 
-from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 from dattri_llm.gradient.callbacks import DataSelectionCallback
-
+from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 
 # --------------------------------------------------------------------------- #
 # Minimal model fixture                                                         #
@@ -66,7 +65,7 @@ class MinimalEmbeddingMLP(nn.Module):
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:  # (B, T) -> (B, T, out)
         x = self.embedding(token_ids)  # (B, T, embed_dim) -- requires grad
-        return self.mlp(x)             # (B, T, out_features)
+        return self.mlp(x)  # (B, T, out_features)
 
 
 # --------------------------------------------------------------------------- #
@@ -87,11 +86,8 @@ def _run_step_with_callback(
         callbacks=[callback],
     )
     with collector.collect():
-        out = model(token_ids)   # (B, T, out)
-        if loss_reduction == "mean":
-            loss = out.mean()
-        else:
-            loss = out.sum()
+        out = model(token_ids)  # (B, T, out)
+        loss = out.mean() if loss_reduction == "mean" else out.sum()
         loss.backward()
 
 
@@ -108,7 +104,7 @@ class TestDataSelectionCallbackHardThreshold:
     """hard threshold_mode (default) -- scores below a cutoff are dropped."""
 
     @pytest.mark.parametrize("loss_reduction", ["mean", "sum"])
-    @pytest.mark.parametrize("B,T", [(2, 5), (4, 1), (1, 10)])
+    @pytest.mark.parametrize(("B", "T"), [(2, 5), (4, 1), (1, 10)])
     def test_drop_all_zeroes_grad(self, loss_reduction, B, T):
         """Dropping every sample must zero out all MLP weight and bias grads.
 
@@ -122,7 +118,7 @@ class TestDataSelectionCallbackHardThreshold:
 
         cb = DataSelectionCallback(
             model=model,
-            threshold=float("inf"),   # drop everything
+            threshold=float("inf"),  # drop everything
         )
 
         _run_step_with_callback(model, token_ids, cb, loss_reduction=loss_reduction)
@@ -221,7 +217,9 @@ class TestDataSelectionCallbackHardThreshold:
         model = MinimalEmbeddingMLP()
         with pytest.raises(ValueError, match=r"\[0, 1\)"):
             DataSelectionCallback(
-                model=model, threshold=1.5, threshold_mode="bottom_fraction"
+                model=model,
+                threshold=1.5,
+                threshold_mode="bottom_fraction",
             )
 
 
@@ -237,7 +235,11 @@ def _mlp_grads_zero(model: MinimalEmbeddingMLP, atol: float = 1e-6) -> bool:
             continue
         if m.weight.grad is None or m.bias.grad is None:
             return False
-        if not torch.allclose(m.weight.grad, torch.zeros_like(m.weight.grad), atol=atol):
+        if not torch.allclose(
+            m.weight.grad,
+            torch.zeros_like(m.weight.grad),
+            atol=atol,
+        ):
             return False
         if not torch.allclose(m.bias.grad, torch.zeros_like(m.bias.grad), atol=atol):
             return False
@@ -292,7 +294,8 @@ class TestBottomFraction:
             )
             _run_step_with_callback(model, token_ids, cb)
             assert len(cb.last_dropped) == round(B * frac), (
-                f"frac={frac}: expected {round(B * frac)} dropped, got {len(cb.last_dropped)}"
+                f"frac={frac}: expected {round(B * frac)} dropped, "
+                f"got {len(cb.last_dropped)}"
             )
 
     def test_dropped_are_lowest_scored(self):
@@ -344,7 +347,9 @@ class TestNegativeBottomFraction:
     """threshold_mode='negative_bottom_fraction' -- drop bottom k% only if score < 0."""
 
     def test_all_positive_scores_drops_nothing(self):
-        """When all scores are >= 0, no sample is ever dropped regardless of fraction."""
+        """When all scores are >= 0, no sample is ever dropped regardless of
+        fraction.
+        """
         model = MinimalEmbeddingMLP()
         cb = DataSelectionCallback(
             model=model,
@@ -428,7 +433,7 @@ def _scores_for_mode(
     """Return last_scores produced by one forward+backward step."""
     cb = DataSelectionCallback(
         model=model,
-        threshold=-float("inf"),   # keep everything -- only compute scores
+        threshold=-float("inf"),  # keep everything -- only compute scores
         score_mode=score_mode,
     )
     _run_step_with_callback(model, token_ids, cb)
@@ -452,7 +457,7 @@ class TestScoreModeEquivalence:
     * for ``nn.Embedding`` layers specifically (activation = integer token IDs)
     """
 
-    @pytest.mark.parametrize("B,T", [(2, 5), (4, 1), (1, 10), (3, 8)])
+    @pytest.mark.parametrize(("B", "T"), [(2, 5), (4, 1), (1, 10), (3, 8)])
     def test_ghost_eq_materialized_with_token_dim(self, B, T):
         """Both score modes agree for all (B, T) configurations.
 
@@ -494,6 +499,7 @@ class TestScoreModeEquivalence:
         dimension before the linear layers (mean-pooling), so the hooks see
         (B, F) tensors only.
         """
+
         class MeanPoolMLP(nn.Module):
             """Embedding -> mean-pool over T -> two-layer MLP.
 
@@ -501,6 +507,7 @@ class TestScoreModeEquivalence:
             subsequent linear layer's hook captures 2-D tensors (B, F) --
             no token dimension.  The Embedding hook still captures (B, T) ints.
             """
+
             def __init__(
                 self,
                 vocab_size: int = 32,
@@ -518,7 +525,7 @@ class TestScoreModeEquivalence:
 
             def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
                 x = self.embedding(token_ids).mean(1)  # (B, embed_dim) -- no token dim
-                return self.mlp(x)                     # (B, out_features)
+                return self.mlp(x)  # (B, out_features)
 
         torch.manual_seed(99)
         B, T = 4, 6
@@ -586,16 +593,17 @@ class _NormMLP(nn.Module):
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        x = self.ln(self.embedding(token_ids))   # (B, T, embed_dim)
+        x = self.ln(self.embedding(token_ids))  # (B, T, embed_dim)
         return self.mlp(x)
 
 
 class TestNormLayerConsistency:
     """ghost == materialized must hold for models containing norm layers, and
     dropping all samples must zero the norm layer's grads (exercises the
-    materialize-based gradient subtraction for norms)."""
+    materialize-based gradient subtraction for norms).
+    """
 
-    @pytest.mark.parametrize("B,T", [(3, 5), (4, 1)])
+    @pytest.mark.parametrize(("B", "T"), [(3, 5), (4, 1)])
     def test_ghost_eq_materialized_with_layernorm(self, B, T):
         torch.manual_seed(7)
         model = _NormMLP()
@@ -616,25 +624,38 @@ class TestNormLayerConsistency:
     @pytest.mark.parametrize("score_mode", ["ghost", "materialized"])
     def test_drop_all_zeroes_layernorm_grad(self, score_mode):
         """Dropping every sample must zero the LayerNorm weight & bias grads,
-        validating the materialize-based subtraction for norm layers."""
+        validating the materialize-based subtraction for norm layers.
+        """
         torch.manual_seed(11)
         B, T = 4, 6
         model = _NormMLP()
         token_ids = _make_token_ids(B, T)
         cb = DataSelectionCallback(
             model=model,
-            threshold=float("inf"),   # hard mode: every sample dropped
+            threshold=float("inf"),  # hard mode: every sample dropped
             score_mode=score_mode,
         )
         _run_step_with_callback(model, token_ids, cb)
 
-        assert len(cb.last_dropped) == B, f"expected all {B} dropped, got {cb.last_dropped}"
+        assert len(cb.last_dropped) == B, (
+            f"expected all {B} dropped, got {cb.last_dropped}"
+        )
         assert torch.allclose(
-            model.ln.weight.grad, torch.zeros_like(model.ln.weight.grad), atol=1e-4
-        ), f"LayerNorm weight.grad not zeroed: max |g| = {model.ln.weight.grad.abs().max():.2e}"
+            model.ln.weight.grad,
+            torch.zeros_like(model.ln.weight.grad),
+            atol=1e-4,
+        ), (
+            f"LayerNorm weight.grad not zeroed: "
+            f"max |g| = {model.ln.weight.grad.abs().max():.2e}"
+        )
         assert torch.allclose(
-            model.ln.bias.grad, torch.zeros_like(model.ln.bias.grad), atol=1e-4
-        ), f"LayerNorm bias.grad not zeroed: max |g| = {model.ln.bias.grad.abs().max():.2e}"
+            model.ln.bias.grad,
+            torch.zeros_like(model.ln.bias.grad),
+            atol=1e-4,
+        ), (
+            f"LayerNorm bias.grad not zeroed: "
+            f"max |g| = {model.ln.bias.grad.abs().max():.2e}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -652,9 +673,14 @@ class _CaptureGradient:
         self.gradient = record.gradient
 
     # Make it usable as a HookManagerCallback without subclassing:
-    on_layer_forward = lambda self, *_: None   # noqa: E731
-    on_layer_backward = lambda self, *_: None  # noqa: E731
-    on_context_end = lambda self: None         # noqa: E731
+    def on_layer_forward(self, *_):
+        return None
+
+    def on_layer_backward(self, *_):
+        return None
+
+    def on_context_end(self):
+        return None
 
 
 def _capture_batch_gradient(
@@ -699,14 +725,20 @@ class TestTargetModes:
         model = MinimalEmbeddingMLP()
         with pytest.raises(ValueError, match="val_loader"):
             DataSelectionCallback(
-                model=model, target="val_loader", val_loss_fn=lambda m, b: m(b).mean()
+                model=model,
+                target="val_loader",
+                val_loss_fn=lambda m, b: m(b).mean(),
             )
 
     def test_val_loader_missing_loss_fn_raises(self):
         model = MinimalEmbeddingMLP()
         dummy_loader = [_make_token_ids(2, 4)]
         with pytest.raises(ValueError, match="val_loss_fn"):
-            DataSelectionCallback(model=model, target="val_loader", val_loader=dummy_loader)
+            DataSelectionCallback(
+                model=model,
+                target="val_loader",
+                val_loader=dummy_loader,
+            )
 
     # ------------------------------------------------------------------ #
     # 'batch' target (default) is unchanged                                #
@@ -722,19 +754,27 @@ class TestTargetModes:
 
         # default (target='batch' implicitly)
         cb_default = DataSelectionCallback(
-            model=model, threshold=-float("inf"), score_mode=score_mode
+            model=model,
+            threshold=-float("inf"),
+            score_mode=score_mode,
         )
         _run_step_with_callback(model, token_ids, cb_default)
 
         model2 = MinimalEmbeddingMLP()
         model2.load_state_dict(model.state_dict())
         cb_explicit = DataSelectionCallback(
-            model=model2, threshold=-float("inf"),
-            score_mode=score_mode, target="batch",
+            model=model2,
+            threshold=-float("inf"),
+            score_mode=score_mode,
+            target="batch",
         )
         _run_step_with_callback(model2, token_ids, cb_explicit)
 
-        assert torch.allclose(cb_default.last_scores, cb_explicit.last_scores, atol=1e-6)
+        assert torch.allclose(
+            cb_default.last_scores,
+            cb_explicit.last_scores,
+            atol=1e-6,
+        )
 
     # ------------------------------------------------------------------ #
     # 'fixed' target                                                        #
@@ -742,7 +782,7 @@ class TestTargetModes:
 
     @pytest.mark.parametrize("score_mode", ["ghost", "materialized"])
     def test_fixed_with_same_batch_matches_batch_mode(self, score_mode):
-        """fixed target == the training batch gradient -> identical scores.
+        """Fixed target == the training batch gradient -> identical scores.
 
         Justification: score[i] = <dW_i, dW_target>.  When dW_target is the
         sum of all training gradients, this equals sum_j <dW_i, dW_j>,
@@ -761,7 +801,9 @@ class TestTargetModes:
 
         # 'batch' mode scores.
         cb_batch = DataSelectionCallback(
-            model=model, threshold=-float("inf"), score_mode=score_mode
+            model=model,
+            threshold=-float("inf"),
+            score_mode=score_mode,
         )
         _run_step_with_callback(model, token_ids, cb_batch)
 
@@ -769,7 +811,8 @@ class TestTargetModes:
         model2 = MinimalEmbeddingMLP()
         model2.load_state_dict(model.state_dict())
         cb_fixed = DataSelectionCallback(
-            model=model2, threshold=-float("inf"),
+            model=model2,
+            threshold=-float("inf"),
             score_mode=score_mode,
             target="fixed",
             target_gradient=batch_gradient,
@@ -798,14 +841,17 @@ class TestTargetModes:
         val_gradient = _capture_batch_gradient(ref_model, val_ids)
 
         cb_batch = DataSelectionCallback(
-            model=model, threshold=-float("inf"), score_mode=score_mode
+            model=model,
+            threshold=-float("inf"),
+            score_mode=score_mode,
         )
         _run_step_with_callback(model, train_ids, cb_batch)
 
         model2 = MinimalEmbeddingMLP()
         model2.load_state_dict(model.state_dict())
         cb_fixed = DataSelectionCallback(
-            model=model2, threshold=-float("inf"),
+            model=model2,
+            threshold=-float("inf"),
             score_mode=score_mode,
             target="fixed",
             target_gradient=val_gradient,
@@ -813,9 +859,11 @@ class TestTargetModes:
         _run_step_with_callback(model2, train_ids, cb_fixed)
 
         # Scores should NOT be identical (different targets -> different alignment).
-        assert not torch.allclose(cb_batch.last_scores, cb_fixed.last_scores, atol=1e-4), (
-            "Expected different scores for different targets, but they were equal."
-        )
+        assert not torch.allclose(
+            cb_batch.last_scores,
+            cb_fixed.last_scores,
+            atol=1e-4,
+        ), "Expected different scores for different targets, but they were equal."
 
     def test_fixed_scores_finite_and_shaped(self):
         torch.manual_seed(42)
@@ -828,8 +876,10 @@ class TestTargetModes:
         tgt = _capture_batch_gradient(ref, _make_token_ids(B, T))
 
         cb = DataSelectionCallback(
-            model=model, threshold=-float("inf"),
-            target="fixed", target_gradient=tgt,
+            model=model,
+            threshold=-float("inf"),
+            target="fixed",
+            target_gradient=tgt,
         )
         _run_step_with_callback(model, token_ids, cb)
 
@@ -937,9 +987,11 @@ class TestTargetModes:
         model_fixed = MinimalEmbeddingMLP()
         model_fixed.load_state_dict(model.state_dict())
         cb_fixed = DataSelectionCallback(
-            model=model_fixed, threshold=-float("inf"),
+            model=model_fixed,
+            threshold=-float("inf"),
             score_mode=score_mode,
-            target="fixed", target_gradient=fixed_target,
+            target="fixed",
+            target_gradient=fixed_target,
         )
         _run_step_with_callback(model_fixed, train_ids, cb_fixed)
 
@@ -947,7 +999,8 @@ class TestTargetModes:
         model_val = MinimalEmbeddingMLP()
         model_val.load_state_dict(model.state_dict())
         cb_val = DataSelectionCallback(
-            model=model_val, threshold=-float("inf"),
+            model=model_val,
+            threshold=-float("inf"),
             score_mode=score_mode,
             target="val_loader",
             val_loader=[val_ids],

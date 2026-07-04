@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import operator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
-from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
+
+if TYPE_CHECKING:
+    from dattri_llm.gradient.gradient import Gradient, GradientRecord
 
 
 def _merge_index(dst: dict[str, list[dict]], src: dict[str, list[dict]]) -> None:
@@ -68,7 +72,8 @@ class GradientFileManager:
 
         {
             "<sha256_hex>": [
-                {"file": "rank_0/batch_000000.pt", "idx": 2, "step": 0, "sample_idx": 5},
+                {"file": "rank_0/batch_000000.pt", "idx": 2, "step": 0, "sample_idx":
+                5},
                 {"file": "rank_0/batch_000002.pt", "idx": 0, "step": 4, "sample_idx": 1}
             ]
         }
@@ -124,12 +129,16 @@ class GradientFileManager:
             record: The record to persist.
 
         Returns:
-            The :class:`~pathlib.Path` of the written file.
+            Path: The written file.
+
+        Raises:
+            TypeError: If the record carries a per-batch hash list (use
+                :meth:`save_bulk` for those).
         """
         if isinstance(record.input_hash, list):
             raise TypeError(
                 "save() takes a single-hash record; this record carries a "
-                "per-batch hash list -- use save_bulk([record]) instead."
+                "per-batch hash list -- use save_bulk([record]) instead.",
             )
         self._save_dir.mkdir(parents=True, exist_ok=True)
         h = record.input_hash
@@ -157,7 +166,7 @@ class GradientFileManager:
                 length must equal its gradient's batch size (checked).
 
         Returns:
-            The :class:`~pathlib.Path` of the written batch file.
+            Path: The written batch file.
         """
         self._save_dir.mkdir(parents=True, exist_ok=True)
         batch_id = self._next_batch_id
@@ -171,19 +180,28 @@ class GradientFileManager:
         return path
 
     def _index_entry(self, record: GradientRecord, filename: str, idx: int) -> None:
-        hashes = record.input_hash if isinstance(record.input_hash, list) else [record.input_hash]
+        hashes = (
+            record.input_hash
+            if isinstance(record.input_hash, list)
+            else [record.input_hash]
+        )
         if isinstance(record.input_hash, list):
             batch = record.gradient.batch_size
             if len(hashes) != batch:
                 raise ValueError(
                     f"Record at step {record.step} carries {len(hashes)} sample "
                     f"hashes but its gradient batch size is {batch}; the indexed "
-                    "sample_idx positions would not match the gradient rows."
+                    "sample_idx positions would not match the gradient rows.",
                 )
         for pos, h in enumerate(hashes):
             # "sample_idx" is the sample's position within the record's batch, so
             # a per-sample gradient is retrieved by direct slicing (see load_sample).
-            entry = {"file": filename, "idx": idx, "step": record.step, "sample_idx": pos}
+            entry = {
+                "file": filename,
+                "idx": idx,
+                "step": record.step,
+                "sample_idx": pos,
+            }
             entries = self._index.setdefault(h, [])
             if entry not in entries:
                 entries.append(entry)
@@ -234,11 +252,9 @@ class GradientFileManager:
         if input_hash not in self._index:
             raise KeyError(
                 f"Hash {input_hash[:16]}... not in index. "
-                "Has the collect() context closed, and is save_dir correct?"
+                "Has the collect() context closed, and is save_dir correct?",
             )
-        return sorted(
-            (e["step"], e["sample_idx"]) for e in self._index[input_hash]
-        )
+        return sorted((e["step"], e["sample_idx"]) for e in self._index[input_hash])
 
     def load_sample(
         self,
@@ -255,11 +271,16 @@ class GradientFileManager:
                 returned by :meth:`lookup`.
 
         Returns:
-            The sample's :class:`Gradient` -- see :meth:`load_sample_by_hash`.
+            Gradient: The sample's gradient -- see :meth:`load_sample_by_hash`.
         """
         return self.load_sample_by_hash(hash_sample(inputs), step, sample_idx)
 
-    def load_sample_by_hash(self, input_hash: str, step: int, sample_idx: int) -> Gradient:
+    def load_sample_by_hash(
+        self,
+        input_hash: str,
+        step: int,
+        sample_idx: int,
+    ) -> Gradient:
         """Load one sample's gradient at one training step, by direct slicing.
 
         Uses the indexed ``sample`` position to slice the stored record's batch
@@ -272,7 +293,7 @@ class GradientFileManager:
                 returned by :meth:`lookup_by_hash`.
 
         Returns:
-            The sample's :class:`Gradient` (batch dimension 1).
+            Gradient: The sample's gradient (batch dimension 1).
 
         Raises:
             KeyError: If no record matches ``(input_hash, step, sample_idx)``.
@@ -284,7 +305,7 @@ class GradientFileManager:
         pairs = self.lookup_by_hash(input_hash) if input_hash in self._index else []
         raise KeyError(
             f"No record for hash {input_hash[:16]}... at (step={step}, "
-            f"sample_idx={sample_idx}). Available (step, sample_idx) pairs: {pairs}."
+            f"sample_idx={sample_idx}). Available (step, sample_idx) pairs: {pairs}.",
         )
 
     def load_all(
@@ -320,9 +341,9 @@ class GradientFileManager:
         if input_hash not in self._index:
             raise KeyError(
                 f"Hash {input_hash[:16]}... not in index. "
-                "Has the collect() context closed, and is save_dir correct?"
+                "Has the collect() context closed, and is save_dir correct?",
             )
-        entries = sorted(self._index[input_hash], key=lambda e: e["step"])
+        entries = sorted(self._index[input_hash], key=operator.itemgetter("step"))
         return [self._load_entry(e) for e in entries]
 
     def available_steps(self) -> list[int]:
@@ -379,13 +400,13 @@ class GradientFileManager:
                 step = e["step"]
                 if step in wanted:
                     by_file.setdefault(e["file"], {}).setdefault(
-                        step, set()
+                        step,
+                        set(),
                     ).add(e["idx"])
         out: list[tuple[str, dict[int, list[int]]]] = []
         for file_rel in sorted(by_file):
             by_step = {
-                step: sorted(idxs)
-                for step, idxs in sorted(by_file[file_rel].items())
+                step: sorted(idxs) for step, idxs in sorted(by_file[file_rel].items())
             }
             out.append((file_rel, by_step))
         return out
@@ -431,7 +452,7 @@ class GradientFileManager:
         # Root-level index: non-distributed saves or old-format saves.
         root_idx = self._root_dir / self._INDEX_FILE
         if root_idx.exists():
-            with open(root_idx) as f:
+            with Path(root_idx).open(encoding="utf-8") as f:
                 _merge_index(merged, json.load(f))
         # Per-rank indexes written by this class under DDP.
         for rank_dir in sorted(self._root_dir.glob("rank_*")):
@@ -439,7 +460,7 @@ class GradientFileManager:
                 continue
             rank_idx = rank_dir / self._INDEX_FILE
             if rank_idx.exists():
-                with open(rank_idx) as f:
+                with Path(rank_idx).open(encoding="utf-8") as f:
                     _merge_index(merged, json.load(f))
         return merged
 
@@ -453,7 +474,7 @@ class GradientFileManager:
             local = [e for e in entries if e["file"].startswith(self._local_prefix)]
             if local:
                 local_index[h] = local
-        with open(self._save_dir / self._INDEX_FILE, "w") as f:
+        with Path(self._save_dir / self._INDEX_FILE).open("w", encoding="utf-8") as f:
             json.dump(local_index, f)
 
     def _compute_next_batch_id(self) -> int:

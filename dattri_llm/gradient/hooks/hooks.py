@@ -42,10 +42,10 @@ inside a PyTorch hook they work with any training loop.
 from __future__ import annotations
 
 import threading
-from typing import Callable, Optional
+from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.ops import (
@@ -53,6 +53,9 @@ from dattri_llm.gradient.ops import (
     extract_module_kwargs,
     is_embedding,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 try:
     from transformers.pytorch_utils import Conv1D as HF_Conv1D
@@ -74,9 +77,10 @@ def _queue_backward_end_callback(fn: Callable[[], None]) -> bool:
     """
     try:
         torch.autograd.Variable._execution_engine.queue_callback(fn)
-        return True
-    except Exception:  # pragma: no cover - unexpected autograd internals
+    except Exception:  # noqa: BLE001 - guarded probe of autograd internals
         return False
+    return True
+
 
 # -- Linear-IO-capable types -------------------------------------------------
 # Layers whose per-sample gradient factorises as an outer product of the input
@@ -106,15 +110,11 @@ _LINEAR_IO_TYPES: tuple[type, ...] = (
 ) + ((HF_Conv1D,) if HF_Conv1D is not None else ())
 # RMSNorm was added in PyTorch 2.4 -- guard for older versions.
 if hasattr(nn, "RMSNorm"):
-    _LINEAR_IO_TYPES = _LINEAR_IO_TYPES + (nn.RMSNorm,)  # type: ignore[assignment]
+    _LINEAR_IO_TYPES += (nn.RMSNorm,)  # type: ignore[assignment]
 
 # Buffer type alias.
 # Keys: "activation", "grad_output", "_act_parts", "_grad_parts", "_lock"
 LayerBuffer = dict
-
-
-def _device_sort_key(item: tuple[int, torch.Tensor]) -> int:
-    return item[0]
 
 
 def _is_linear_io_capable(module: nn.Module) -> bool:
@@ -158,12 +158,12 @@ def _make_layer_buffer() -> LayerBuffer:
 
 def register_linear_io_hooks(
     model: nn.Module,
-    layer_names: Optional[set[str]] = None,
-    on_layer_forward: Optional[Callable[[str, torch.Tensor], None]] = None,
-    on_layer_backward: Optional[Callable[[str, torch.Tensor], None]] = None,
-    type_overrides: Optional[dict[str, str]] = None,
-    projection: Optional[dict[str, dict]] = None,
-    projector: Optional[Callable] = None,
+    layer_names: set[str] | None = None,
+    on_layer_forward: Callable[[str, torch.Tensor], None] | None = None,
+    on_layer_backward: Callable[[str, torch.Tensor], None] | None = None,
+    type_overrides: dict[str, str] | None = None,
+    projection: dict[str, dict] | None = None,
+    projector: Callable | None = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
@@ -193,6 +193,10 @@ def register_linear_io_hooks(
         on_layer_backward: Optional callable fired after each backward hook
             capture.  Signature: ``(layer_name: str, grad_output: Tensor)``.
             The tensor is on CPU.
+        projection: Optional per-layer proj_kwargs map (a ``"__default__"``
+            entry covers unlisted layers); ``None`` captures raw factors.
+        projector: Projection factory following dattri's ``random_project``
+            protocol; required when *projection* is given.
         type_overrides: Optional mapping from layer name to a layer-type string
             that overrides the type inferred by :func:`canonical_class_name`.
             Use this for user-defined layer classes that subclass a supported
@@ -227,10 +231,13 @@ def register_linear_io_hooks(
         buffers[name]["_class_name"] = layer_type
         buffers[name]["_module_kwargs"] = extract_module_kwargs(module, layer_type)
         if projection is not None:
-            buffers[name]["_proj_kw"] = projection.get(name, projection.get("__default__"))
+            buffers[name]["_proj_kw"] = projection.get(
+                name,
+                projection.get("__default__"),
+            )
 
-        def _make_forward_hook(layer_name: str):
-            def _fwd(_module, inp, _out):
+        def _make_forward_hook(layer_name: str) -> Callable:
+            def _fwd(_module: nn.Module, inp: tuple, _out: object) -> None:
                 # A forward under no_grad / inference_mode can never produce a
                 # backward, so capturing its activation would only contaminate
                 # the step buffers (e.g. an RL log-prob or eval pass between
@@ -256,10 +263,15 @@ def register_linear_io_hooks(
                         buf["_device_id"].setdefault(dev_idx, []).append(a)
                 if on_layer_forward is not None:
                     on_layer_forward(layer_name, a)
+
             return _fwd
 
-        def _make_backward_hook(layer_name: str):
-            def _bwd(_module, _grad_input, grad_output):
+        def _make_backward_hook(layer_name: str) -> Callable:
+            def _bwd(
+                _module: nn.Module,
+                _grad_input: tuple,
+                grad_output: tuple,
+            ) -> None:
                 g = grad_output[0].detach()
                 dev_idx = grad_output[0].device.index if grad_output[0].is_cuda else 0
                 buf = buffers[layer_name]
@@ -272,16 +284,24 @@ def register_linear_io_hooks(
                     _capture_projected(buf, g, dev_idx, projector)
                 if on_layer_backward is not None:
                     on_layer_backward(layer_name, g)
+
             return _bwd
 
-        handles.append(module.register_forward_hook(_make_forward_hook(name)))
-        handles.append(module.register_full_backward_hook(_make_backward_hook(name)))
+        handles.extend(
+            (
+                module.register_forward_hook(_make_forward_hook(name)),
+                module.register_full_backward_hook(_make_backward_hook(name)),
+            ),
+        )
 
     return buffers, handles
 
 
 def _capture_projected(
-    buf: LayerBuffer, g: torch.Tensor, dev_idx: int, projector: Callable
+    buf: LayerBuffer,
+    g: torch.Tensor,
+    dev_idx: int,
+    projector: Callable,
 ) -> None:
     """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
 
@@ -296,23 +316,37 @@ def _capture_projected(
         stack = buf["_device_id"].get(dev_idx)
         a = stack.pop() if stack else None
     if a is None:
-        return   # backward without a matching forward capture -- nothing to project
+        return  # backward without a matching forward capture -- nothing to project
 
     kw = dict(buf["_proj_kw"])
     factorize = kw.pop("factorize", True)
-    kw.pop("device", None)          # project on the tensors' own (training) device
+    kw.pop("device", None)  # project on the tensors' own (training) device
     layer_type = buf["_class_name"]
     module_kwargs = buf["_module_kwargs"]
     if a.ndim == 1 and is_embedding(layer_type):
         a, g = a.unsqueeze(0), g.unsqueeze(0)
 
     if factorize:
-        a_p, g_p = ops._project_factorized(a, g, layer_type, projector, module_kwargs, **kw)
+        a_p, g_p = ops._project_factorized(
+            a,
+            g,
+            layer_type,
+            projector,
+            module_kwargs,
+            **kw,
+        )
         with buf["_lock"]:
             buf["_act_parts"].append((dev_idx, a_p.cpu()))
             buf["_grad_parts"].append((dev_idx, g_p.cpu()))
     else:
-        mat = ops._project_materialized(a, g, layer_type, projector, module_kwargs, **kw)
+        mat = ops._project_materialized(
+            a,
+            g,
+            layer_type,
+            projector,
+            module_kwargs,
+            **kw,
+        )
         with buf["_lock"]:
             buf["_proj_parts"].append((dev_idx, mat.cpu()))
 
@@ -340,8 +374,8 @@ ParamGradBuffer = dict  # {param_name: Tensor | None}
 
 def register_param_grad_hooks(
     model: nn.Module,
-    layer_names: Optional[set[str]] = None,
-    on_param_grad: Optional[Callable[[str, str, torch.Tensor], None]] = None,
+    layer_names: set[str] | None = None,
+    on_param_grad: Callable[[str, str, torch.Tensor], None] | None = None,
 ) -> tuple[dict[str, ParamGradBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register parameter-gradient hooks on general module layers.
 
@@ -403,7 +437,8 @@ def register_param_grad_hooks(
         buffers[layer_name] = {pname: None for pname, _ in trainable}
 
         for pname, param in trainable:
-            def _make_hook(ln: str, pn: str):
+
+            def _make_hook(ln: str, pn: str) -> Callable:
                 def _hook(grad: torch.Tensor) -> None:
                     # grad is the freshly-computed gradient for this parameter.
                     # It arrives here before being written to param.grad, so
@@ -412,6 +447,7 @@ def register_param_grad_hooks(
                     buffers[ln][pn] = g
                     if on_param_grad is not None:
                         on_param_grad(ln, pn, g)
+
                 return _hook
 
             handles.append(param.register_hook(_make_hook(layer_name, pname)))
@@ -421,8 +457,8 @@ def register_param_grad_hooks(
 
 def register_linear_param_hooks(
     model: nn.Module,
-    layer_names: Optional[set[str]] = None,
-    on_linear_param_grad: Optional[Callable[[str, str, torch.Tensor], None]] = None,
+    layer_names: set[str] | None = None,
+    on_linear_param_grad: Callable[[str, str, torch.Tensor], None] | None = None,
 ) -> tuple[int, list[torch.utils.hooks.RemovableHook]]:
     """Register post-accumulate-grad hooks on linear layers' trainable params.
 
@@ -433,7 +469,8 @@ def register_linear_param_hooks(
 
     This guarantees that when the callback runs, ``param.grad`` is non-None --
     a precondition for any callback that needs to read or modify weight
-    gradients in-place (e.g. :class:`~dattri_llm.gradient.callbacks.DataSelectionCallback`).
+    gradients in-place
+    (e.g. :class:`~dattri_llm.gradient.callbacks.DataSelectionCallback`).
 
     The same layer-selection rule as :func:`register_linear_io_hooks` is used
     to identify qualifying layers.
@@ -471,15 +508,16 @@ def register_linear_param_hooks(
                 continue
             n_params += 1
 
-            def _make_hook(ln: str, pn: str):
+            def _make_hook(ln: str, pn: str) -> Callable:
                 def _hook(p: torch.nn.Parameter) -> None:
                     if on_linear_param_grad is not None:
                         g = p.grad.detach().cpu()
                         on_linear_param_grad(ln, pn, g)
+
                 return _hook
 
             handles.append(
-                param.register_post_accumulate_grad_hook(_make_hook(name, pname))
+                param.register_post_accumulate_grad_hook(_make_hook(name, pname)),
             )
 
     return n_params, handles

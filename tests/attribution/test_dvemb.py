@@ -3,9 +3,11 @@
 DVEmb corrects the TracIn inner product for how a training update at step
 ``t_s`` propagates through every later step up to the final model ``theta_T``:
 
-    I(z*, t_s) = eta_{t_s} * g_val(theta_T)^T [prod_{k=t_s+1}^{T-1}(I - eta_k H_k)] g(theta_{t_s}, z*)
+    I(z*, t_s) = eta_{t_s} * g_val(theta_T)^T
+                 [prod_{k=t_s+1}^{T-1}(I - eta_k H_k)] g(theta_{t_s}, z*)
 
-with ``H_k = sum_{zinB_k} g(theta_k, z) g(theta_k, z)^T`` (empirical Fisher of the batch).
+with ``H_k = sum_{zinB_k} g(theta_k, z) g(theta_k, z)^T`` (empirical Fisher of the
+batch).
 
 The oracle here builds the per-step Fisher and the explicit matrix product over
 full concatenated parameter gradients -- independent of the attributor's
@@ -22,8 +24,8 @@ import pytest
 import torch
 
 import tests.attribution.test_tracin as TT
-from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.attribution.algorithm.dvemb import DVEmbAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.utils.hashing import hash_sample
 
 LAYERS = TT.LAYER_NAMES  # ["mlp.fc1", "mlp.fc2"]
@@ -42,8 +44,18 @@ def _full_grads(model, sd, x, y):
     return TT._grads_at(model, sd, x, y, normalized=False)
 
 
-def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_step,
-                  fisher_scale=1.0):
+def _dvemb_oracle(
+    model,
+    train_sds,
+    x_tr,
+    y_tr,
+    test_sd,
+    x_te,
+    y_te,
+    lr,
+    final_step,
+    fisher_scale=1.0,
+):
     """Explicit DVEmb influence: (num_train_rows grouped by step, num_test).
 
     Returns ``{step: (B, num_test) tensor}`` of eta * g_val^T M g(z*).
@@ -54,9 +66,11 @@ def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_s
     prop_steps = [s for s in steps if s < final_step]
     # Full gradients per step and the final-model test gradients.
     g_tr = {s: _full_grads(model, train_sds[s], x_tr, y_tr) for s in prop_steps}
-    g_te = _full_grads(model, test_sd, x_te, y_te)              # (num_test, P)
+    g_te = _full_grads(model, test_sd, x_te, y_te)  # (num_test, P)
     dim = g_te.shape[1]
-    H = {s: fisher_scale * (g_tr[s].T @ g_tr[s]) for s in prop_steps}   # (fs)*sum_z g g^T
+    H = {
+        s: fisher_scale * (g_tr[s].T @ g_tr[s]) for s in prop_steps
+    }  # (fs)*sum_z g g^T
     eye = torch.eye(dim)
 
     out = {}
@@ -64,13 +78,13 @@ def _dvemb_oracle(model, train_sds, x_tr, y_tr, test_sd, x_te, y_te, lr, final_s
         M = eye.clone()
         for k in prop_steps:
             if ts < k < final_step:
-                M = M @ (eye - lr * H[k])
+                M @= eye - lr * H[k]
         # eta * g_val^T M g(z*)  -> (num_train, num_test)
         out[ts] = lr * (g_tr[ts] @ M @ g_te.T)
     return out
 
 
-@pytest.fixture()
+@pytest.fixture
 def collected(tmp_path):
     """Two-checkpoint train dir + single-checkpoint (final-model) test dir."""
     torch.manual_seed(TT.SEED)
@@ -85,24 +99,32 @@ def collected(tmp_path):
     TT._collect_to_disk(model, [sd0, sd1], x_tr, y_tr, train_dir)
     TT._collect_to_disk(model, [sdT], x_te, y_te, test_dir)
 
-    train_hashes = [hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)]
+    train_hashes = [
+        hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
+    ]
     test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)]
-    return dict(
-        model=model, train_sds=[sd0, sd1], test_sd=sdT,
-        x_tr=x_tr, y_tr=y_tr, x_te=x_te, y_te=y_te,
-        train_dir=train_dir, test_dir=test_dir,
-        train_hashes=train_hashes, test_hashes=test_hashes,
-    )
+    return {
+        "model": model,
+        "train_sds": [sd0, sd1],
+        "test_sd": sdT,
+        "x_tr": x_tr,
+        "y_tr": y_tr,
+        "x_te": x_te,
+        "y_te": y_te,
+        "train_dir": train_dir,
+        "test_dir": test_dir,
+        "train_hashes": train_hashes,
+        "test_hashes": test_hashes,
+    }
 
 
 def _make_attr(out_dir, lr):
     """Attributor whose ``attribute_from_cache`` defaults to this test's
-    per-attribution ``learning_rate`` (now a method argument, not a ctor one)."""
+    per-attribution ``learning_rate`` (now a method argument, not a ctor one).
+    """
     attr = DVEmbAttributor(_args(out_dir))
     orig = attr.attribute_from_cache
-    attr.attribute_from_cache = (
-        lambda *a, **k: orig(*a, **{"learning_rate": lr, **k})
-    )
+    attr.attribute_from_cache = lambda *a, **k: orig(*a, **{"learning_rate": lr, **k})
     return attr
 
 
@@ -111,7 +133,10 @@ class TestDVEmbOnDisk:
     @pytest.mark.parametrize("loop_over_test", [False, True])
     def test_matches_explicit_oracle(self, collected, tmp_path, lr, loop_over_test):
         """Full propagated influence matches the explicit-matrix oracle."""
-        res = _make_attr(tmp_path / f"o_{lr}_{loop_over_test}", lr).attribute_from_cache(
+        res = _make_attr(
+            tmp_path / f"o_{lr}_{loop_over_test}",
+            lr,
+        ).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             propagation="test",
@@ -120,10 +145,15 @@ class TestDVEmbOnDisk:
             loss_reduction="sum",  # fixture collects with a sum loss
         )
         oracle = _dvemb_oracle(
-            collected["model"], collected["train_sds"],
-            collected["x_tr"], collected["y_tr"],
-            collected["test_sd"], collected["x_te"], collected["y_te"],
-            lr=lr, final_step=2,
+            collected["model"],
+            collected["train_sds"],
+            collected["x_tr"],
+            collected["y_tr"],
+            collected["test_sd"],
+            collected["x_te"],
+            collected["y_te"],
+            lr=lr,
+            final_step=2,
         )
         # Per-step rows must match the oracle for that step.
         for step, (train_ids, matrix) in res.step_matrices().items():
@@ -139,13 +169,17 @@ class TestDVEmbOnDisk:
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             propagation="test",
-            loop_over_test=False, final_step=2, loss_reduction="sum",
+            loop_over_test=False,
+            final_step=2,
+            loss_reduction="sum",
         )
         b = _make_attr(tmp_path / "b", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             propagation="test",
-            loop_over_test=True, final_step=2, loss_reduction="sum",
+            loop_over_test=True,
+            final_step=2,
+            loss_reduction="sum",
         )
         assert a.test_ids == b.test_ids
         assert a.row_train_ids == b.row_train_ids
@@ -156,7 +190,8 @@ class TestDVEmbOnDisk:
     def test_train_side_propagation_matches_oracle(self, collected, tmp_path, lr):
         """``propagation="train"`` -- the explicit data-value-embedding operator
         over the concatenated layer axis -- matches the same explicit-matrix
-        oracle as the test-side sweep."""
+        oracle as the test-side sweep.
+        """
         res = _make_attr(tmp_path / f"tr_{lr}", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
@@ -165,10 +200,15 @@ class TestDVEmbOnDisk:
             loss_reduction="sum",
         )
         oracle = _dvemb_oracle(
-            collected["model"], collected["train_sds"],
-            collected["x_tr"], collected["y_tr"],
-            collected["test_sd"], collected["x_te"], collected["y_te"],
-            lr=lr, final_step=2,
+            collected["model"],
+            collected["train_sds"],
+            collected["x_tr"],
+            collected["y_tr"],
+            collected["test_sd"],
+            collected["x_te"],
+            collected["y_te"],
+            lr=lr,
+            final_step=2,
         )
         for step, (train_ids, matrix) in res.step_matrices().items():
             want = oracle[step][[collected["train_hashes"].index(h) for h in train_ids]]
@@ -180,16 +220,21 @@ class TestDVEmbOnDisk:
 
     def test_propagation_modes_agree(self, collected, tmp_path):
         """Test-side and train-side propagation are two evaluation orders of the
-        same bilinear form -- rows, columns, and scores must coincide."""
+        same bilinear form -- rows, columns, and scores must coincide.
+        """
         a = _make_attr(tmp_path / "pt", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            propagation="test", final_step=2, loss_reduction="sum",
+            propagation="test",
+            final_step=2,
+            loss_reduction="sum",
         )
         b = _make_attr(tmp_path / "ptr", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            propagation="train", final_step=2, loss_reduction="sum",
+            propagation="train",
+            final_step=2,
+            loss_reduction="sum",
         )
         assert a.test_ids == b.test_ids
         assert a.row_train_ids == b.row_train_ids
@@ -199,30 +244,37 @@ class TestDVEmbOnDisk:
     def test_dvemb_dir_storage_scored_by_tracin(self, collected, tmp_path):
         """Embeddings persisted via ``dvemb_dir`` (eta folded in), dotted against
         the test gradients by a plain TracIn pass, reproduce the DVEmb scores --
-        the store-then-attribute workflow."""
+        the store-then-attribute workflow.
+        """
         from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
         dvemb_dir = tmp_path / "dvemb"
         res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            propagation="train", dvemb_dir=str(dvemb_dir),
-            final_step=2, loss_reduction="sum",
+            propagation="train",
+            dvemb_dir=str(dvemb_dir),
+            final_step=2,
+            loss_reduction="sum",
         )
         tracin = TracInAttributor(_args(tmp_path / "t")).attribute_from_cache(
             train_gradients_dir=str(dvemb_dir),
             test_gradients_dir=str(collected["test_dir"]),
         )
         # Same rows/columns up to ordering (TracIn reads steps ascending).
-        assert sorted(zip(tracin.row_train_ids, tracin.row_steps)) == sorted(
-            zip(res.row_train_ids, res.row_steps)
+        assert sorted(
+            zip(tracin.row_train_ids, tracin.row_steps, strict=True),
+        ) == sorted(
+            zip(res.row_train_ids, res.row_steps, strict=True),
         )
         t_row = {
             key: i
-            for i, key in enumerate(zip(tracin.row_train_ids, tracin.row_steps))
+            for i, key in enumerate(
+                zip(tracin.row_train_ids, tracin.row_steps, strict=True),
+            )
         }
         t_cols = [tracin.test_ids.index(h) for h in res.test_ids]
-        for i, key in enumerate(zip(res.row_train_ids, res.row_steps)):
+        for i, key in enumerate(zip(res.row_train_ids, res.row_steps, strict=True)):
             want = tracin.scores[t_row[key]][t_cols]
             assert torch.allclose(res.scores[i], want, atol=1e-5, rtol=1e-4), (
                 f"row {key}: max diff {(res.scores[i] - want).abs().max():.2e}"
@@ -231,17 +283,23 @@ class TestDVEmbOnDisk:
     def test_cache_dvemb_matches_scoring_run(self, collected, tmp_path):
         """``cache_dvemb`` (embedding-only sweep over the gradient store, no test
         gradients involved) stores the same embeddings as a scoring run --
-        verified through the TracIn dot products."""
+        verified through the TracIn dot products.
+        """
         from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
         res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            propagation="train", final_step=2, loss_reduction="sum",
+            propagation="train",
+            final_step=2,
+            loss_reduction="sum",
         )
         dvemb_dir = DVEmbAttributor(_args(tmp_path / "e")).cache_dvemb(
-            str(collected["train_dir"]), str(tmp_path / "dvemb"),
-            final_step=2, loss_reduction="sum", learning_rate=0.3,
+            str(collected["train_dir"]),
+            str(tmp_path / "dvemb"),
+            final_step=2,
+            loss_reduction="sum",
+            learning_rate=0.3,
         )
         tracin = TracInAttributor(_args(tmp_path / "t")).attribute_from_cache(
             train_gradients_dir=dvemb_dir,
@@ -249,10 +307,12 @@ class TestDVEmbOnDisk:
         )
         t_row = {
             key: i
-            for i, key in enumerate(zip(tracin.row_train_ids, tracin.row_steps))
+            for i, key in enumerate(
+                zip(tracin.row_train_ids, tracin.row_steps, strict=True),
+            )
         }
         t_cols = [tracin.test_ids.index(h) for h in res.test_ids]
-        for i, key in enumerate(zip(res.row_train_ids, res.row_steps)):
+        for i, key in enumerate(zip(res.row_train_ids, res.row_steps, strict=True)):
             want = tracin.scores[t_row[key]][t_cols]
             assert torch.allclose(res.scores[i], want, atol=1e-5, rtol=1e-4)
 
@@ -261,8 +321,10 @@ class TestDVEmbOnDisk:
             _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
-                propagation="test", dvemb_dir=str(tmp_path / "d"),
-                final_step=2, loss_reduction="sum",
+                propagation="test",
+                dvemb_dir=str(tmp_path / "d"),
+                final_step=2,
+                loss_reduction="sum",
             )
 
     def test_train_side_rejects_loop_over_test(self, collected, tmp_path):
@@ -270,8 +332,10 @@ class TestDVEmbOnDisk:
             _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
-                propagation="train", loop_over_test=True,
-                final_step=2, loss_reduction="sum",
+                propagation="train",
+                loop_over_test=True,
+                final_step=2,
+                loss_reduction="sum",
             )
 
     def test_invalid_propagation_raises(self, collected, tmp_path):
@@ -279,13 +343,16 @@ class TestDVEmbOnDisk:
             _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
-                propagation="both", final_step=2, loss_reduction="sum",
+                propagation="both",
+                final_step=2,
+                loss_reduction="sum",
             )
 
     def test_loop_over_test_multiblock_scatter(self, collected, tmp_path):
         """With the test set split across two on-disk blocks, the column-blocked
         ``loop_over_test=True`` path must scatter each block's columns into the
-        right places and match both the all-resident path and the oracle."""
+        right places and match both the all-resident path and the oracle.
+        """
         model, sd = collected["model"], collected["test_sd"]
         x_te, y_te = collected["x_te"], collected["y_te"]
 
@@ -294,10 +361,13 @@ class TestDVEmbOnDisk:
         test_dir2 = tmp_path / "te2"
         fm = TT.GradientFileManager(str(test_dir2))
         offload = TT.OffloadCallback(
-            offload_interval=1, file_manager=fm, recording_type="per_sample"
+            offload_interval=1,
+            file_manager=fm,
+            recording_type="per_sample",
         )
         hm = TT.HookManager(
-            model, config=TT.HookManagerConfig(linear_io=[r"mlp\."]),
+            model,
+            config=TT.HookManagerConfig(linear_io=[r"mlp\."]),
             callbacks=[offload],
         )
         model.load_state_dict(sd)
@@ -309,22 +379,37 @@ class TestDVEmbOnDisk:
         hm.remove()
 
         lr = 0.5
-        common = dict(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(test_dir2), final_step=2, loss_reduction="sum",
-            propagation="test",
+        common = {
+            "train_gradients_dir": str(collected["train_dir"]),
+            "test_gradients_dir": str(test_dir2),
+            "final_step": 2,
+            "loss_reduction": "sum",
+            "propagation": "test",
+        }
+        res_f = _make_attr(tmp_path / "f", lr).attribute_from_cache(
+            loop_over_test=False,
+            **common,
         )
-        res_f = _make_attr(tmp_path / "f", lr).attribute_from_cache(loop_over_test=False, **common)
-        res_t = _make_attr(tmp_path / "t", lr).attribute_from_cache(loop_over_test=True, **common)
+        res_t = _make_attr(tmp_path / "t", lr).attribute_from_cache(
+            loop_over_test=True,
+            **common,
+        )
 
         assert res_f.test_ids == res_t.test_ids
-        assert len(res_t.test_ids) == TT.N_TEST          # both blocks' columns present
+        assert len(res_t.test_ids) == TT.N_TEST  # both blocks' columns present
         assert res_f.row_train_ids == res_t.row_train_ids
         assert torch.equal(res_f.scores, res_t.scores)
 
         oracle = _dvemb_oracle(
-            model, collected["train_sds"], collected["x_tr"], collected["y_tr"],
-            sd, x_te, y_te, lr=lr, final_step=2,
+            model,
+            collected["train_sds"],
+            collected["x_tr"],
+            collected["y_tr"],
+            sd,
+            x_te,
+            y_te,
+            lr=lr,
+            final_step=2,
         )
         for step, (train_ids, matrix) in res_t.step_matrices().items():
             want = oracle[step][[collected["train_hashes"].index(h) for h in train_ids]]
@@ -333,21 +418,27 @@ class TestDVEmbOnDisk:
 
     def test_reduces_to_tracin_at_final_step(self, collected, tmp_path):
         """The last step (t_s = T-1) has an empty propagation product, so its
-        DVEmb rows are exactly eta * <g_train, g_test> -- plain TracIn."""
+        DVEmb rows are exactly eta * <g_train, g_test> -- plain TracIn.
+        """
         lr = 0.4
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            final_step=2, loss_reduction="sum",
+            final_step=2,
+            loss_reduction="sum",
         )
         # Oracle: eta * g(theta_1) g^T_val (no Fisher factor for the final train step).
         g_tr1 = _full_grads(
-            collected["model"], collected["train_sds"][1],
-            collected["x_tr"], collected["y_tr"],
+            collected["model"],
+            collected["train_sds"][1],
+            collected["x_tr"],
+            collected["y_tr"],
         )
         g_te = _full_grads(
-            collected["model"], collected["test_sd"],
-            collected["x_te"], collected["y_te"],
+            collected["model"],
+            collected["test_sd"],
+            collected["x_te"],
+            collected["y_te"],
         )
         tracin = lr * (g_tr1 @ g_te.T)
         train_ids, matrix = res.step_matrix(1)
@@ -357,25 +448,36 @@ class TestDVEmbOnDisk:
 
     def test_selected_steps_filter_rows_but_not_propagation(self, collected, tmp_path):
         """Restricting output to step 0 still propagates through step 1: the
-        step-0 rows keep their full (I - eta H_1) correction."""
+        step-0 rows keep their full (I - eta H_1) correction.
+        """
         lr = 0.5
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            selected_training_steps=[0], final_step=2, loss_reduction="sum",
+            selected_training_steps=[0],
+            final_step=2,
+            loss_reduction="sum",
         )
         assert sorted(set(res.row_steps)) == [0]
         oracle = _dvemb_oracle(
-            collected["model"], collected["train_sds"],
-            collected["x_tr"], collected["y_tr"],
-            collected["test_sd"], collected["x_te"], collected["y_te"],
-            lr=lr, final_step=2,
+            collected["model"],
+            collected["train_sds"],
+            collected["x_tr"],
+            collected["y_tr"],
+            collected["test_sd"],
+            collected["x_te"],
+            collected["y_te"],
+            lr=lr,
+            final_step=2,
         )
         train_ids, matrix = res.step_matrix(0)
         rows = [collected["train_hashes"].index(h) for h in train_ids]
         cols = [collected["test_hashes"].index(h) for h in res.test_ids]
         assert torch.allclose(
-            matrix, oracle[0][rows][:, cols], atol=1e-5, rtol=1e-4
+            matrix,
+            oracle[0][rows][:, cols],
+            atol=1e-5,
+            rtol=1e-4,
         )
 
     def test_loss_reduction_mean_scales_fisher_by_batch_size(self, collected, tmp_path):
@@ -392,15 +494,22 @@ class TestDVEmbOnDisk:
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            final_step=2, loss_reduction="mean",
+            final_step=2,
+            loss_reduction="mean",
         )
         assert res.algorithm_meta["loss_reduction"] == "mean"
 
         oracle = _dvemb_oracle(
-            collected["model"], collected["train_sds"],
-            collected["x_tr"], collected["y_tr"],
-            collected["test_sd"], collected["x_te"], collected["y_te"],
-            lr=lr, final_step=2, fisher_scale=TT.N_TRAIN,
+            collected["model"],
+            collected["train_sds"],
+            collected["x_tr"],
+            collected["y_tr"],
+            collected["test_sd"],
+            collected["x_te"],
+            collected["y_te"],
+            lr=lr,
+            final_step=2,
+            fisher_scale=TT.N_TRAIN,
         )
         for step, (train_ids, matrix) in res.step_matrices().items():
             want = oracle[step][[collected["train_hashes"].index(h) for h in train_ids]]
@@ -415,7 +524,8 @@ class TestDVEmbOnDisk:
             _make_attr(tmp_path / "o", 0.1).attribute_from_cache(
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
-                final_step=2, loss_reduction="average",
+                final_step=2,
+                loss_reduction="average",
             )
 
     def test_per_step_learning_rate_mapping(self, collected, tmp_path):
@@ -424,13 +534,22 @@ class TestDVEmbOnDisk:
         res = DVEmbAttributor(_args(tmp_path / "o")).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
-            final_step=2, loss_reduction="sum", learning_rate=lrs,
+            final_step=2,
+            loss_reduction="sum",
+            learning_rate=lrs,
         )
         # Oracle with per-step rates: eta_{t_s} scale and eta_k factors.
         model, train_sds = collected["model"], collected["train_sds"]
-        g_tr = {s: _full_grads(model, train_sds[s], collected["x_tr"], collected["y_tr"])
-                for s in (0, 1)}
-        g_te = _full_grads(model, collected["test_sd"], collected["x_te"], collected["y_te"])
+        g_tr = {
+            s: _full_grads(model, train_sds[s], collected["x_tr"], collected["y_tr"])
+            for s in (0, 1)
+        }
+        g_te = _full_grads(
+            model,
+            collected["test_sd"],
+            collected["x_te"],
+            collected["y_te"],
+        )
         dim = g_te.shape[1]
         eye = torch.eye(dim)
         H1 = g_tr[1].T @ g_tr[1]
@@ -442,15 +561,24 @@ class TestDVEmbOnDisk:
             rows = [collected["train_hashes"].index(h) for h in train_ids]
             cols = [collected["test_hashes"].index(h) for h in res.test_ids]
             assert torch.allclose(
-                matrix, oracle[step][rows][:, cols], atol=1e-5, rtol=1e-4
+                matrix,
+                oracle[step][rows][:, cols],
+                atol=1e-5,
+                rtol=1e-4,
             )
 
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", 0.1)
         with pytest.raises(TypeError, match=r"train_gradients_dir"):
-            attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]), final_step=2)
+            attr.attribute_from_cache(
+                test_gradients_dir=str(collected["test_dir"]),
+                final_step=2,
+            )
         with pytest.raises(TypeError, match=r"test_gradients_dir"):
-            attr.attribute_from_cache(train_gradients_dir=str(collected["train_dir"]), final_step=2)
+            attr.attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                final_step=2,
+            )
 
     def test_no_step_below_final_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", 0.1)

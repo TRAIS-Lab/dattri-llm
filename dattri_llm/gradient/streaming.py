@@ -29,37 +29,33 @@ from __future__ import annotations
 import contextlib
 import logging
 import warnings
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager
 from typing import (
     TYPE_CHECKING,
-    Callable,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
     Protocol,
-    Tuple,
-    Union,
     runtime_checkable,
 )
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from dattri_llm.gradient.callbacks import CaptureCallback
 from dattri_llm.gradient.datasets import iter_gradient_blocks, resolve_steps
 from dattri_llm.gradient.gradient import Gradient
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_ALL
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 
 if TYPE_CHECKING:
+    from typing_extensions import Self
+
     from dattri_llm.attribution.arguments import AttributionArguments
+    from dattri_llm.gradient.file_manager import GradientFileManager
 
 logger = logging.getLogger(__name__)
 
 # (step, factorized per-sample gradient block, per-sample input hashes)
-StreamBatch = Tuple[int, Gradient, List[str]]
+StreamBatch = tuple[int, Gradient, list[str]]
 
 # A loss callable: ``(model, batch) -> scalar loss``.  It MUST run the model on
 # ``batch`` (so HookManager's forward pre-hook captures the inputs for hashing)
@@ -85,7 +81,8 @@ class GradientSource(Protocol):
     @property
     def reusable(self) -> bool:
         """Whether the source can be iterated more than once at the *same*
-        parameters (required by attributors with a pre-pass, e.g. K-FAC)."""
+        parameters (required by attributors with a pre-pass, e.g. K-FAC).
+        """
 
 
 class DiskGradientSource(GradientSource):
@@ -115,15 +112,15 @@ class DiskGradientSource(GradientSource):
         file_manager: GradientFileManager,
         args: AttributionArguments,
         *,
-        steps: Optional[Iterable[int]] = None,
-        layer_name: Optional[Union[str, List[str]]] = None,
-        desc: Optional[str] = None,
+        steps: Iterable[int] | None = None,
+        layer_name: str | list[str] | None = None,
+        desc: str | None = None,
         verbose: bool = False,
     ) -> None:
         self._fm = file_manager
         self._args = args
         if isinstance(layer_name, str):
-            self._layer_name: Optional[List[str]] = [layer_name]
+            self._layer_name: list[str] | None = [layer_name]
         elif layer_name is None:
             self._layer_name = None
         else:
@@ -135,6 +132,7 @@ class DiskGradientSource(GradientSource):
 
     @property
     def reusable(self) -> bool:
+        """Disk is immutable for the run, so the source re-reads identically."""
         return True
 
     def __len__(self) -> int:
@@ -151,13 +149,14 @@ class DiskGradientSource(GradientSource):
             verbose=self._verbose,
         )
 
-    def for_steps(self, steps: Iterable[int]) -> "DiskGradientSource":
+    def for_steps(self, steps: Iterable[int]) -> DiskGradientSource:
         """A view of this source restricted to ``steps`` (same file manager and
         layer filter).  Disk is random-access by step, so a trajectory attributor
         (e.g. DVEmb) can pull one step's blocks at a time for its latest->earliest
         sweep while still going through the source abstraction.  The sub-read
         shows no progress bar (``verbose=False``) to avoid nesting under the
-        sweep's own bar."""
+        sweep's own bar.
+        """
         return DiskGradientSource(
             self._fm,
             self._args,
@@ -176,14 +175,14 @@ def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
     if not isinstance(batch, dict):
         raise TypeError(
             "The default loss_fn expects a dict batch (model(**batch).loss). "
-            "Pass a custom loss_fn for other batch formats."
+            "Pass a custom loss_fn for other batch formats.",
         )
     out = model(**batch)
     loss = getattr(out, "loss", None)
     if loss is None:
         raise ValueError(
             "Default loss_fn expected the model output to carry a ``.loss``; "
-            "none found. Pass an explicit loss_fn."
+            "none found. Pass an explicit loss_fn.",
         )
     return loss
 
@@ -196,7 +195,8 @@ class GradientStreamer(GradientSource):
     HF Trainer**: ``args`` drives mixed precision (``bf16``/``fp16`` autocast, with
     a dynamic ``GradScaler`` for fp16), gradient clipping (``max_grad_norm``), and
     gradient checkpointing, and the per-step order is
-    forward -> backward -> clip -> ``optimizer.step`` -> ``scheduler.step`` -> ``zero_grad``.
+    forward -> backward -> clip -> ``optimizer.step`` -> ``scheduler.step`` ->
+    ``zero_grad``.
     DeepSpeed is **not** supported (the hook capture is incompatible with its
     engine); a ``deepspeed`` config is ignored with a warning.  Verified bit-exact
     against ``Trainer`` in ``scripts/verify_streamer_vs_trainer.py``.
@@ -254,13 +254,13 @@ class GradientStreamer(GradientSource):
         *,
         batch_size: int,
         enable_update: bool = False,
-        loss_fn: Optional[LossFn] = None,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        scheduler: Optional[object] = None,
-        config: Optional[HookManagerConfig] = None,
-        collate_fn: Optional[Callable] = None,
+        loss_fn: LossFn | None = None,
+        optimizer: torch.optim.Optimizer | None = None,
+        scheduler: object | None = None,
+        config: HookManagerConfig | None = None,
+        collate_fn: Callable | None = None,
         checkpoint_step: int = 0,
-        hook_manager: Optional[HookManager] = None,
+        hook_manager: HookManager | None = None,
     ) -> None:
         self._model = model
         self._dataset = dataset
@@ -277,13 +277,17 @@ class GradientStreamer(GradientSource):
             self._hm = hook_manager
             self._owns_hm = False
             shared = next(
-                (cb for cb in hook_manager._callbacks if isinstance(cb, CaptureCallback)),
+                (
+                    cb
+                    for cb in hook_manager._callbacks
+                    if isinstance(cb, CaptureCallback)
+                ),
                 None,
             )
             if shared is None:
                 raise ValueError(
                     "A shared hook_manager must carry a CaptureCallback; pass the "
-                    "``.hook_manager`` of another GradientStreamer."
+                    "``.hook_manager`` of another GradientStreamer.",
                 )
             self._capture = shared
         else:
@@ -292,8 +296,10 @@ class GradientStreamer(GradientSource):
             self._capture = CaptureCallback()
             self._hm = HookManager(
                 model,
-                config=config if config is not None else HookManagerConfig(
-                    linear_io=REGISTER_ALL
+                config=config
+                if config is not None
+                else HookManagerConfig(
+                    linear_io=REGISTER_ALL,
                 ),
                 callbacks=[self._capture],
             )
@@ -306,22 +312,26 @@ class GradientStreamer(GradientSource):
             raise NotImplementedError(
                 "GradientStreamer does not support DeepSpeed (the hook-based "
                 "capture is incompatible with its engine); the ``deepspeed`` config "
-                "is ignored. Run single-process, DDP, or FSDP instead."
+                "is ignored. Run single-process, DDP, or FSDP instead.",
             )
         # Gradient checkpointing must be enabled on the *unwrapped* model, before
         # DDP/FSDP wrapping -- exactly as Trainer does (Trainer._inner_training_loop).
-        if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        if args.gradient_checkpointing and hasattr(
+            model,
+            "gradient_checkpointing_enable",
+        ):
             model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs
+                gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs,
             )
         # Mixed precision: bf16/fp16 autocast around the forward; fp16 also needs a
         # dynamic GradScaler -- but only when we actually step the optimizer (a
         # frozen probe must capture *unscaled* gradients).  bf16 needs no scaler.
-        self._amp_dtype: Optional[torch.dtype] = (
+        self._amp_dtype: torch.dtype | None = (
             torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else None
         )
         self._scaler = torch.amp.GradScaler(
-            "cuda", enabled=bool(args.fp16 and enable_update and not args.use_cpu)
+            "cuda",
+            enabled=bool(args.fp16 and enable_update and not args.use_cpu),
         )
         self._max_grad_norm = args.max_grad_norm
 
@@ -339,16 +349,16 @@ class GradientStreamer(GradientSource):
         if self.enable_update and self._optimizer is None:
             self._optimizer, self._scheduler = self._create_optimizer_and_scheduler()
         # Iteration state.
-        self._batch_iter: Optional[Iterator] = None
+        self._batch_iter: Iterator | None = None
         self._batch_index: int = 0
         self._consumed: bool = False
         # Per-step LR actually applied (``enable_update``), keyed by step index --
         # so a trajectory attributor can use/verify the true schedule.
-        self._step_lrs: Dict[int, float] = {}
+        self._step_lrs: dict[int, float] = {}
         # Saved-state for frozen probes (restored on __exit__).
         self._entered: bool = False
         self._collect_ctx = None
-        self._saved_grads: Optional[Dict[str, Optional[torch.Tensor]]] = None
+        self._saved_grads: dict[str, torch.Tensor | None] | None = None
 
     # ------------------------------------------------------------------ #
     # GradientSource contract                                            #
@@ -356,24 +366,28 @@ class GradientStreamer(GradientSource):
 
     @property
     def reusable(self) -> bool:
+        """A frozen probe re-iterates; an updating trajectory is single-shot."""
         return not self.enable_update
 
     @property
     def model(self) -> nn.Module:
+        """The unwrapped model the hooks are registered on."""
         return self._model
 
     @property
     def hook_manager(self) -> HookManager:
         """The underlying :class:`HookManager`.  Pass it to another streamer's
         ``hook_manager=`` (over the same model) so both share one set of hooks --
-        the cleaner alternative to two managers cross-capturing each backward."""
+        the cleaner alternative to two managers cross-capturing each backward.
+        """
         return self._hm
 
     @property
-    def learning_rates(self) -> Dict[int, float]:
+    def learning_rates(self) -> dict[int, float]:
         """The LR actually applied at each optimizer step of the last pass
         (``enable_update``), keyed by step index.  Empty for a frozen probe.
-        Lets a trajectory attributor (DVEmb) recover the true schedule."""
+        Lets a trajectory attributor (DVEmb) recover the true schedule.
+        """
         return dict(self._step_lrs)
 
     def __len__(self) -> int:
@@ -383,7 +397,7 @@ class GradientStreamer(GradientSource):
     # Hook lifecycle                                                      #
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> "GradientStreamer":
+    def __enter__(self) -> Self:
         if self._entered:
             raise RuntimeError("GradientStreamer is already active.")
         self._entered = True
@@ -433,12 +447,12 @@ class GradientStreamer(GradientSource):
         if not self._entered:
             raise RuntimeError(
                 "Use the streamer as a context manager before iterating: "
-                "``with streamer as s: for ... in s: ...``."
+                "``with streamer as s: for ... in s: ...``.",
             )
         if self._consumed and not self.reusable:
             raise RuntimeError(
                 "This streamer is single-shot (enable_update=True) and was "
-                "already consumed; the training trajectory cannot be replayed."
+                "already consumed; the training trajectory cannot be replayed.",
             )
         # Set the train/eval mode for THIS pass on the (possibly shared) model: a
         # training trajectory runs in train() to match real training (dropout/BN
@@ -470,7 +484,7 @@ class GradientStreamer(GradientSource):
         if record is None:
             raise RuntimeError(
                 "No gradient was captured this step. Ensure loss_fn runs the "
-                "model on the batch and backward flows through the hooked layers."
+                "model on the batch and backward flows through the hooked layers.",
             )
         # Consistency check: with both counters zeroed at __iter__, the manager's
         # capture index must advance exactly once per batch.  A mismatch means a
@@ -480,7 +494,7 @@ class GradientStreamer(GradientSource):
             raise RuntimeError(
                 f"Step desync: HookManager captured step {record.step} but the "
                 f"streamer is on batch {self._batch_index}. Exactly one capture "
-                f"step is expected per streamed batch."
+                f"step is expected per streamed batch.",
             )
 
         step = self._step_label()
@@ -497,15 +511,16 @@ class GradientStreamer(GradientSource):
     # Forward / backward / optimizer step (mirrors HF Trainer)            #
     # ------------------------------------------------------------------ #
 
-    def _autocast(self):
+    def _autocast(self) -> AbstractContextManager:
         """Mixed-precision context for the forward pass (``Trainer``'s
         ``autocast_smart_context_manager`` / accelerate autocast).  No-op in
-        full precision."""
+        full precision.
+        """
         if self._amp_dtype is None:
             return contextlib.nullcontext()
-        device_type = "cuda" if (
-            torch.cuda.is_available() and not self._args.use_cpu
-        ) else "cpu"
+        device_type = (
+            "cuda" if (torch.cuda.is_available() and not self._args.use_cpu) else "cpu"
+        )
         return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
 
     def _forward_backward(self, batch: object) -> torch.Tensor:
@@ -517,7 +532,7 @@ class GradientStreamer(GradientSource):
         not.  Leaves the per-sample gradient in ``self._capture.record``.
         """
         if self.enable_update:
-            self._fwd_model.train()        # Trainer calls model.train() each step
+            self._fwd_model.train()  # Trainer calls model.train() each step
         self._fwd_model.zero_grad(set_to_none=True)
         self._capture.record = None
         with self._autocast():
@@ -539,7 +554,7 @@ class GradientStreamer(GradientSource):
         # below, before ``scheduler.step`` advances it), keyed by the current
         # step index (``_batch_index`` is incremented only after __next__).
         self._step_lrs[self._batch_index] = float(
-            self._optimizer.param_groups[0]["lr"]  # type: ignore[union-attr]
+            self._optimizer.param_groups[0]["lr"],  # type: ignore[union-attr]
         )
         if self._scaler.is_enabled():
             self._scaler.unscale_(self._optimizer)
@@ -549,11 +564,11 @@ class GradientStreamer(GradientSource):
             self._scaler.step(self._optimizer)
             self._scaler.update()
         else:
-            self._optimizer.step()          # type: ignore[union-attr]
+            self._optimizer.step()  # type: ignore[union-attr]
         if self._scheduler is not None:
             self._scheduler.step()
 
-    def _create_optimizer_and_scheduler(self):
+    def _create_optimizer_and_scheduler(self) -> tuple[torch.optim.Optimizer, object]:
         """Build the trajectory optimizer + LR scheduler from ``args`` -- the
         streamer analogue of ``Trainer.create_optimizer_and_scheduler``.
 
@@ -571,21 +586,28 @@ class GradientStreamer(GradientSource):
             {"params": no_decay, "weight_decay": 0.0},
         ]
         if a.optim == "sgd":
-            optimizer: torch.optim.Optimizer = torch.optim.SGD(groups, lr=a.learning_rate)
+            optimizer: torch.optim.Optimizer = torch.optim.SGD(
+                groups,
+                lr=a.learning_rate,
+            )
         elif a.optim in ("adamw_torch", "adamw"):
             optimizer = torch.optim.AdamW(
-                groups, lr=a.learning_rate,
-                betas=(a.adam_beta1, a.adam_beta2), eps=a.adam_epsilon,
+                groups,
+                lr=a.learning_rate,
+                betas=(a.adam_beta1, a.adam_beta2),
+                eps=a.adam_epsilon,
             )
         else:
             raise ValueError(
-                f"Unsupported args.optim={a.optim!r}; use 'adamw_torch' or 'sgd'."
+                f"Unsupported args.optim={a.optim!r}; use 'adamw_torch' or 'sgd'.",
             )
         from transformers import get_scheduler
 
         scheduler = get_scheduler(
-            a.lr_scheduler_type, optimizer,
-            num_warmup_steps=a.warmup_steps, num_training_steps=len(self._loader),
+            a.lr_scheduler_type,
+            optimizer,
+            num_warmup_steps=a.warmup_steps,
+            num_training_steps=len(self._loader),
         )
         return optimizer, scheduler
 
@@ -618,7 +640,11 @@ class GradientStreamer(GradientSource):
         # content hashes keep rows hash-keyed regardless of order, so shuffling is
         # safe for correctness).
         shuffle = self.enable_update
-        seed = self._args.data_seed if self._args.data_seed is not None else self._args.seed
+        seed = (
+            self._args.data_seed
+            if self._args.data_seed is not None
+            else self._args.seed
+        )
         # Distributed: each rank streams a disjoint shard via DistributedSampler
         # (sampler and shuffle are mutually exclusive, so set only one). Content
         # hashes stay globally unique, so per-rank rows concatenate cleanly -- the
@@ -643,7 +669,8 @@ class GradientStreamer(GradientSource):
                 kwargs["prefetch_factor"] = self._args.dataloader_prefetch_factor
         return DataLoader(**kwargs)
 
-    def _wrap_model(self, model: nn.Module, args: AttributionArguments) -> nn.Module:
+    @staticmethod
+    def _wrap_model(model: nn.Module, args: AttributionArguments) -> nn.Module:
         """Wrap the model for distributed execution, mirroring HF ``Trainer``.
 
         Hooks are already registered on ``model``'s submodules (in ``__init__``),
@@ -676,9 +703,8 @@ class GradientStreamer(GradientSource):
                 torch.cuda.set_device(args.local_process_index)
 
             if fsdp_tokens:
-                from torch.distributed.fsdp import CPUOffload
+                from torch.distributed.fsdp import CPUOffload, ShardingStrategy
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import ShardingStrategy
 
                 strategy = (
                     ShardingStrategy.SHARD_GRAD_OP
@@ -686,11 +712,15 @@ class GradientStreamer(GradientSource):
                     else ShardingStrategy.FULL_SHARD
                 )
                 fsdp_kwargs = dict(args.fsdp_config or {})
-                # use_orig_params keeps the original submodule params (what the hooks captured and what per-sample gradient reads need).
+                # use_orig_params keeps the original submodule params (what the hooks
+                # captured and what per-sample gradient reads need).
                 fsdp_kwargs.setdefault("use_orig_params", True)
                 fsdp_kwargs.setdefault("sharding_strategy", strategy)
                 if "offload" in fsdp_tokens:
-                    fsdp_kwargs.setdefault("cpu_offload", CPUOffload(offload_params=True))
+                    fsdp_kwargs.setdefault(
+                        "cpu_offload",
+                        CPUOffload(offload_params=True),
+                    )
                 return FSDP(model, **fsdp_kwargs)
 
             device_ids = (

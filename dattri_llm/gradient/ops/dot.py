@@ -1,10 +1,11 @@
 """Gradient dot products: cross/pairwise grams, per-sample dots and norms,
-plus the factorized-vs-materialized representation routing heuristic."""
+plus the factorized-vs-materialized representation routing heuristic.
+"""
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -24,9 +25,12 @@ if TYPE_CHECKING:
 # cross_dot / pairwise_dot
 # ---------------------------------------------------------------------------
 
+
 def _cross_gram(
-    a1: torch.Tensor, g1: torch.Tensor,
-    a2: torch.Tensor, g2: torch.Tensor,
+    a1: torch.Tensor,
+    g1: torch.Tensor,
+    a2: torch.Tensor,
+    g2: torch.Tensor,
     layer_type: str,
     mode: str = "auto",
 ) -> torch.Tensor:
@@ -47,7 +51,7 @@ def _cross_gram(
     if is_embedding(layer_type):
         # K[i,j] = sum_t g1_i[t] * G2_sum_j[tok1_i[t]]
         # where G2_sum_j[k] = sum_{s: tok2_j[s]==k} g2_j[s]
-        tok1, tok2 = a1, a2          # (B1, T1), (B2, T2) int
+        tok1, tok2 = a1, a2  # (B1, T1), (B2, T2) int
         g1_f, g2_f = g1.float(), g2.float()
         B1, T1 = tok1.shape
         B2, T2 = tok2.shape
@@ -58,40 +62,48 @@ def _cross_gram(
         for j in range(B2):
             G2_sum = torch.zeros(vocab, E, dtype=g2_f.dtype, device=g2_f.device)
             G2_sum.scatter_add_(0, tok2[j].unsqueeze(-1).expand(T2, E), g2_f[j])
-            gathered = G2_sum[flat1].reshape(B1, T1, E)   # (B1, T1, E)
+            gathered = G2_sum[flat1].reshape(B1, T1, E)  # (B1, T1, E)
             K[:, j] = (g1_f * gathered).sum((1, 2))
         return K
 
-    a1_f = _to_3d(a1.float()); g1_f = _to_3d(g1.float())
-    a2_f = _to_3d(a2.float()); g2_f = _to_3d(g2.float())
+    a1_f = _to_3d(a1.float())
+    g1_f = _to_3d(g1.float())
+    a2_f = _to_3d(a2.float())
+    g2_f = _to_3d(g2.float())
 
     if is_norm(layer_type):
-        grad1 = (a1_f * g1_f).flatten(1)   # (B1, T*d)
-        grad2 = (a2_f * g2_f).flatten(1)   # (B2, T*d)
-        return grad1 @ grad2.T             # (B1, B2)
+        grad1 = (a1_f * g1_f).flatten(1)  # (B1, T*d)
+        grad2 = (a2_f * g2_f).flatten(1)  # (B2, T*d)
+        return grad1 @ grad2.T  # (B1, B2)
 
     # Linear, Conv, ConvTranspose -- route factorized (ghost) vs materialized.
-    B1, S, K = a1_f.shape          # K = input width, S = token/patch count
+    B1, S, K = a1_f.shape  # K = input width, S = token/patch count
     B2 = a2_f.shape[0]
-    D = g1_f.shape[-1]             # output width
+    D = g1_f.shape[-1]  # output width
     if mode == "auto":
-        mode = "materialized" if maybe_use_materialized_gram(B1, B2, S, K, D) else "factorized"
+        mode = (
+            "materialized"
+            if maybe_use_materialized_gram(B1, B2, S, K, D)
+            else "factorized"
+        )
     if mode == "materialized":
         # Contract tokens into per-sample weight grads, then GEMM -- no S^2 tensor.
-        M1 = torch.einsum("btk,btd->bkd", a1_f, g1_f).reshape(B1, -1)   # (B1, K*D)
-        M2 = torch.einsum("csk,csd->ckd", a2_f, g2_f).reshape(B2, -1)   # (B2, K*D)
-        return M1 @ M2.T                                                # (B1, B2)
+        M1 = torch.einsum("btk,btd->bkd", a1_f, g1_f).reshape(B1, -1)  # (B1, K*D)
+        M2 = torch.einsum("csk,csd->ckd", a2_f, g2_f).reshape(B2, -1)  # (B2, K*D)
+        return M1 @ M2.T  # (B1, B2)
     K_a = torch.einsum("btk,csk->btcs", a1_f, a2_f)
     K_g = torch.einsum("btd,csd->btcs", g1_f, g2_f)
-    return torch.einsum("btcs,btcs->bc", K_a, K_g)   # (B1, B2)
+    return torch.einsum("btcs,btcs->bc", K_a, K_g)  # (B1, B2)
 
 
 def _cross_dot(
-    a1: torch.Tensor, g1: torch.Tensor,
-    a2: torch.Tensor, g2: torch.Tensor,
+    a1: torch.Tensor,
+    g1: torch.Tensor,
+    a2: torch.Tensor,
+    g2: torch.Tensor,
     layer_type: str,
-    module_kwargs1: Optional[dict] = None,
-    module_kwargs2: Optional[dict] = None,
+    module_kwargs1: dict | None = None,
+    module_kwargs2: dict | None = None,
     include_bias: bool = True,
     mode: str = "auto",
 ) -> torch.Tensor:
@@ -118,7 +130,7 @@ def _pairwise_dot(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
-    module_kwargs: Optional[dict] = None,
+    module_kwargs: dict | None = None,
     include_bias: bool = True,
     mode: str = "auto",
 ) -> torch.Tensor:
@@ -135,12 +147,15 @@ def _pairwise_dot(
 # dot
 # ---------------------------------------------------------------------------
 
+
 def _dot(
-    a1: torch.Tensor, g1: torch.Tensor,
-    a2: torch.Tensor, g2: torch.Tensor,
+    a1: torch.Tensor,
+    g1: torch.Tensor,
+    a2: torch.Tensor,
+    g2: torch.Tensor,
     layer_type: str,
-    module_kwargs1: Optional[dict] = None,
-    module_kwargs2: Optional[dict] = None,
+    module_kwargs1: dict | None = None,
+    module_kwargs2: dict | None = None,
     include_bias: bool = True,
 ) -> torch.Tensor:
     """Return (B,) per-sample dot products <dW1_i, dW2_i>.
@@ -162,33 +177,36 @@ def _dot(
         for i in range(B):
             G2_sum = torch.zeros(vocab, E, dtype=g2_f.dtype, device=g2_f.device)
             G2_sum.scatter_add_(0, a2[i].unsqueeze(-1).expand(T, E), g2_f[i])
-            gathered = G2_sum[a1[i]]             # (T, E)
+            gathered = G2_sum[a1[i]]  # (T, E)
             result[i] = (g1_f[i] * gathered).sum()
         return result
 
-    a1_f = _to_3d(a1.float()); g1_f = _to_3d(g1.float())
-    a2_f = _to_3d(a2.float()); g2_f = _to_3d(g2.float())
+    a1_f = _to_3d(a1.float())
+    g1_f = _to_3d(g1.float())
+    a2_f = _to_3d(a2.float())
+    g2_f = _to_3d(g2.float())
 
     if is_norm(layer_type):
-        grad1 = (a1_f * g1_f).flatten(1)         # (B, T*d)
-        grad2 = (a2_f * g2_f).flatten(1)         # (B, T*d)
-        return (grad1 * grad2).sum(-1)            # (B,)
+        grad1 = (a1_f * g1_f).flatten(1)  # (B, T*d)
+        grad2 = (a2_f * g2_f).flatten(1)  # (B, T*d)
+        return (grad1 * grad2).sum(-1)  # (B,)
 
     # Linear, Conv, ConvTranspose
-    K_a = torch.einsum("btd,bsd->bts", a1_f, a2_f)   # (B, T, T)
-    K_g = torch.einsum("bte,bse->bts", g1_f, g2_f)   # (B, T, T)
-    return (K_a * K_g).sum((1, 2))                    # (B,)
+    K_a = torch.einsum("btd,bsd->bts", a1_f, a2_f)  # (B, T, T)
+    K_g = torch.einsum("bte,bse->bts", g1_f, g2_f)  # (B, T, T)
+    return (K_a * K_g).sum((1, 2))  # (B,)
 
 
 # ---------------------------------------------------------------------------
 # grad_norm_sq
 # ---------------------------------------------------------------------------
 
+
 def _grad_norm_sq(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
-    module_kwargs: Optional[dict] = None,
+    module_kwargs: dict | None = None,
     include_bias: bool = True,
     mode: str = "auto",
 ) -> torch.Tensor:
@@ -205,8 +223,8 @@ def _grad_norm_sq(
     if is_embedding(layer_type):
         return _pairwise_dot(a, g, layer_type).diagonal()
 
-    a_f = _to_3d(a.float())   # (B, T, d_in)
-    g_f = _to_3d(g.float())   # (B, T, d_out)
+    a_f = _to_3d(a.float())  # (B, T, d_in)
+    g_f = _to_3d(g.float())  # (B, T, d_out)
 
     if is_norm(layer_type):
         return (a_f * g_f).square().sum((1, 2))  # (B,)
@@ -217,60 +235,95 @@ def _grad_norm_sq(
     if mode == "auto":
         mode = "materialized" if maybe_use_materialized_norm(S, K, D) else "factorized"
     if mode == "materialized":
-        M = torch.einsum("btk,btd->bkd", a_f, g_f).flatten(1)   # (B, K*D)
-        return (M * M).sum(-1)                                   # (B,)
-    K_a = torch.einsum("btk,bsk->bts", a_f, a_f)   # (B, T, T)
-    K_g = torch.einsum("btd,bsd->bts", g_f, g_f)   # (B, T, T)
-    return (K_a * K_g).sum((1, 2))                  # (B,)
+        M = torch.einsum("btk,btd->bkd", a_f, g_f).flatten(1)  # (B, K*D)
+        return (M * M).sum(-1)  # (B,)
+    K_a = torch.einsum("btk,bsk->bts", a_f, a_f)  # (B, T, T)
+    K_g = torch.einsum("btd,bsd->bts", g_f, g_f)  # (B, T, T)
+    return (K_a * K_g).sum((1, 2))  # (B,)
 
 
 def grad_norm_sq(
-    f: "Factorized", layer_type: str, include_bias: bool = True, mode: str = "auto"
+    f: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
+    mode: str = "auto",
 ) -> torch.Tensor:
     """:func:`_grad_norm_sq` on a :class:`Factorized` (batch-first-safe).
 
-    ``mode`` routes factorized vs materialized per :func:`_grad_norm_sq`."""
+    ``mode`` routes factorized vs materialized per :func:`_grad_norm_sq`.
+    """
     bf = f.as_batch_first()
     return _grad_norm_sq(
-        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs,
-        include_bias, mode,
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        bf.module_kwargs,
+        include_bias,
+        mode,
     )
 
 
 def pairwise_dot(
-    f: "Factorized", layer_type: str, include_bias: bool = True, mode: str = "auto"
+    f: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
+    mode: str = "auto",
 ) -> torch.Tensor:
     """:func:`_pairwise_dot` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
     return _pairwise_dot(
-        bf.activation, bf.pre_activation_grad, layer_type, bf.module_kwargs,
-        include_bias, mode,
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        bf.module_kwargs,
+        include_bias,
+        mode,
     )
 
 
 def dot(
-    f1: "Factorized", f2: "Factorized", layer_type: str, include_bias: bool = True
+    f1: Factorized,
+    f2: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
 ) -> torch.Tensor:
     """:func:`_dot` on two :class:`Factorized` (batch-first-safe)."""
     b1, b2 = f1.as_batch_first(), f2.as_batch_first()
     return _dot(
-        b1.activation, b1.pre_activation_grad, b2.activation, b2.pre_activation_grad,
-        layer_type, b1.module_kwargs, b2.module_kwargs, include_bias,
+        b1.activation,
+        b1.pre_activation_grad,
+        b2.activation,
+        b2.pre_activation_grad,
+        layer_type,
+        b1.module_kwargs,
+        b2.module_kwargs,
+        include_bias,
     )
 
 
 def cross_dot(
-    f1: "Factorized", f2: "Factorized", layer_type: str, include_bias: bool = True,
+    f1: Factorized,
+    f2: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
     mode: str = "auto",
 ) -> torch.Tensor:
     """:func:`_cross_dot` on two :class:`Factorized` (batch-first-safe).
 
     ``mode`` (``"auto"``/``"factorized"``/``"materialized"``) routes the cross-gram
-    per :func:`_cross_gram`; ``"auto"`` is the cost-optimal choice."""
+    per :func:`_cross_gram`; ``"auto"`` is the cost-optimal choice.
+    """
     b1, b2 = f1.as_batch_first(), f2.as_batch_first()
     return _cross_dot(
-        b1.activation, b1.pre_activation_grad, b2.activation, b2.pre_activation_grad,
-        layer_type, b1.module_kwargs, b2.module_kwargs, include_bias, mode,
+        b1.activation,
+        b1.pre_activation_grad,
+        b2.activation,
+        b2.pre_activation_grad,
+        layer_type,
+        b1.module_kwargs,
+        b2.module_kwargs,
+        include_bias,
+        mode,
     )
 
 
@@ -288,11 +341,12 @@ def cross_dot(
 # --------------------------------------------------------------------------- #
 
 
-def effective_dims(f: "Factorized", layer_type: str) -> Tuple[int, int, int, int]:
+def effective_dims(f: Factorized, layer_type: str) -> tuple[int, int, int, int]:
     """Cheap ``(B, S, K, D)`` for the cost heuristic: batch, token/patch count,
     input width, output width -- the *post-preprocess* dims, read straight from the
     raw factor shapes (no im2col / materialization).  Bias's ``+1`` on ``K`` is
-    ignored (it is a heuristic)."""
+    ignored (it is a heuristic).
+    """
     bf = f.as_batch_first()
     a, g = bf.activation, bf.pre_activation_grad
     mk = bf.module_kwargs or {}
@@ -302,7 +356,8 @@ def effective_dims(f: "Factorized", layer_type: str) -> Tuple[int, int, int, int
         kprod = math.prod(mk["kernel_size"]) if "kernel_size" in mk else 1
         return a.shape[0], math.prod(g.shape[2:]), a.shape[1] * kprod, g.shape[1]
     if is_conv_transpose(layer_type):
-        # roles reversed: a flattened over spatial (K=C_in), g unfolded (D=C_out*prod(K))
+        # roles reversed: a flattened over spatial (K=C_in), g unfolded
+        # (D=C_out*prod(K))
         kprod = math.prod(mk["kernel_size"]) if "kernel_size" in mk else 1
         return a.shape[0], math.prod(a.shape[2:]), a.shape[1], g.shape[1] * kprod
     # linear-family (and norm layers): a=(B, *T, K), g=(B, *T, D)
@@ -310,7 +365,12 @@ def effective_dims(f: "Factorized", layer_type: str) -> Tuple[int, int, int, int
 
 
 def maybe_use_materialized_gram(
-    B1: int, B2: int, S: int, K: int, D: int, kappa: float = 1.0
+    B1: int,
+    B2: int,
+    S: int,
+    K: int,
+    D: int,
+    kappa: float = 1.0,
 ) -> bool:
     """``True`` when materialize-then-GEMM is the cheaper way to form the
     ``(B1, B2)`` cross-gram (Sec. 3.2):
@@ -327,5 +387,6 @@ def maybe_use_materialized_gram(
 def maybe_use_materialized_norm(S: int, K: int, D: int) -> bool:
     """``True`` when materializing is cheaper for per-sample norms (Sec. 3.1).  Here
     ``cost_F = S^2(D+K)`` and ``cost_M = S*D*K`` (per sample, batch cancels), so
-    materialize iff ``S*(D+K) >= DK``, i.e. ``S >= H = DK/(D+K)``."""
+    materialize iff ``S*(D+K) >= DK``, i.e. ``S >= H = DK/(D+K)``.
+    """
     return S * (D + K) >= D * K

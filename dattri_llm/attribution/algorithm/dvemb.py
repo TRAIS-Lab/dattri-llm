@@ -23,7 +23,7 @@ the test gradient taken at the **final** model ``theta_T`` (capital ``T`` =
 ``final_step``).  The per-step Hessian is the Gauss-Newton / empirical-Fisher
 approximation built from that step's recorded per-sample gradients,
 
-    H_k ~ (1/c) sum_{z in B_k} g_hat(theta_k, z) g_hat(theta_k, z)^T                            (2)
+    H_k ~ (1/c) sum_{z in B_k} g_hat(theta_k, z) g_hat(theta_k, z)^T          (2)
 
 where ``g_hat`` is the *recorded* per-sample gradient and ``c`` its per-sample loss
 weight: the empirical Fisher must use the **true** per-sample gradients, so when
@@ -58,14 +58,16 @@ given test set.
 With ``propagation="train"`` the product is applied to the *train* side,
 yielding the paper's **data value embedding** per training sample,
 
-    e_{t_s}(z*) = eta_{t_s} * [ prod_{k=t_s+1}^{T-1}(I - eta_k H_k) ]^T g_hat(theta_{t_s}, z*),
+    e_{t_s}(z*) = eta_{t_s} * [ prod_{k=t_s+1}^{T-1}(I - eta_k H_k) ]^T
+                  g_hat(theta_{t_s}, z*),
 
 so a row's score against any test column is simply ``<e, dl(theta_T, z_val)>``.
 Because the propagated object now lives on the train side, the sweep carries
 the explicit accumulated operator ``M_{t_s}`` with
 ``I - M_{t_s} = [ prod_{k>t_s}(I - eta_k H_k) ]^T`` -- a dense ``(d, d)`` matrix over
 the concatenated layer dimension -- updated as
-``M <- M + eta_{t_s} sum_{zinB_{t_s}} (g_hat(z) - M g_hat(z)) g_hat(z)^T``.  This costs ``d^2``
+``M <- M + eta_{t_s} sum_{zinB_{t_s}} (g_hat(z) - M g_hat(z)) g_hat(z)^T``.  This
+costs ``d^2``
 memory (use projected gradients or ``layer_name`` to keep ``d`` small) but
 makes the embeddings test-independent.
 
@@ -82,25 +84,29 @@ on-disk order -- identical bookkeeping to TracIn and the K-FAC family.
 from __future__ import annotations
 
 import json
-import os
+import pathlib
 import warnings
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING
 
 import torch
-from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
-from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.attribution.base import BaseAttributor
-from dattri_llm.attribution.utils import normalize_layer_names, task_loss_fn
 from dattri_llm.attribution.score import AttributionScore
-from dattri_llm.gradient.datasets import resolve_steps
-from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
-from dattri.task import AttributionTask
+from dattri_llm.attribution.utils import normalize_layer_names, task_loss_fn
 from dattri_llm.gradient.callbacks import OffloadCallback
+from dattri_llm.gradient.datasets import resolve_steps
 from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.hooks import HookManagerConfig
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
+
+if TYPE_CHECKING:
+    from dattri.task import AttributionTask
+    from torch.utils.data import Dataset
+
+    from dattri_llm.attribution.arguments import AttributionArguments
+    from dattri_llm.gradient.hooks import HookManagerConfig
 
 
 class DVEmbAttributor(BaseAttributor):
@@ -139,7 +145,7 @@ class DVEmbAttributor(BaseAttributor):
         self,
         args: AttributionArguments,
         *,
-        task: Optional[AttributionTask] = None,
+        task: AttributionTask | None = None,
     ) -> None:
         self.args = args
         self.task = task
@@ -149,10 +155,10 @@ class DVEmbAttributor(BaseAttributor):
         train_dataset: Dataset,
         test_dataset: Dataset,
         *,
-        cache_dir: Optional[str] = None,
+        cache_dir: str | None = None,
         offload_interval: int = 1,
-        hook_config: Optional[HookManagerConfig] = None,
-    ) -> Tuple[str, str]:
+        hook_config: HookManagerConfig | None = None,
+    ) -> tuple[str, str]:
         """Run the training trajectory live and cache the gradients DVEmb needs.
 
         DVEmb is trajectory-aware, so -- unlike the trajectory-agnostic attributors
@@ -171,8 +177,9 @@ class DVEmbAttributor(BaseAttributor):
         on-the-fly :meth:`attribute` is exactly *cache + attribute_from_cache*.
 
         Args:
-            train_dataset, test_dataset: Datasets to stream (batches go straight
-                to the task's loss / ``target_func``).
+            train_dataset: Training dataset to stream (batches go straight to
+                the task's loss / ``target_func``).
+            test_dataset: Test dataset to stream, likewise.
             cache_dir: Parent directory for the two gradient stores
                 (``<cache_dir>/train_grads`` and ``<cache_dir>/test_grads``);
                 defaults to ``args.output_dir``.
@@ -189,7 +196,7 @@ class DVEmbAttributor(BaseAttributor):
         if self.task is None:
             raise ValueError(
                 "cache() (live collection) requires a ``task`` with a model; pass "
-                "pre-collected gradients to attribute_from_cache() instead."
+                "pre-collected gradients to attribute_from_cache() instead.",
             )
         n_ckpt = len(self.task.get_checkpoints())
         if n_ckpt > 1:
@@ -199,8 +206,8 @@ class DVEmbAttributor(BaseAttributor):
                 stacklevel=2,
             )
         cache_dir = cache_dir if cache_dir is not None else self.args.output_dir
-        train_dir = os.path.join(cache_dir, "train_grads")
-        test_dir = os.path.join(cache_dir, "test_grads")
+        train_dir = str(pathlib.Path(cache_dir) / "train_grads")
+        test_dir = str(pathlib.Path(cache_dir) / "test_grads")
         train_fm = GradientFileManager(train_dir)
         test_fm = GradientFileManager(test_dir)
 
@@ -211,14 +218,19 @@ class DVEmbAttributor(BaseAttributor):
         # defaults to the loss when none is given), at the final model theta_T.
         test_loss = task_loss_fn(self.task.original_target_func)
 
-        # 1) Train trajectory theta_0 -> theta_T: offload each step's per-batch gradient.
+        # 1) Train trajectory theta_0 -> theta_T: offload each step's per-batch
+        # gradient.
         train_streamer = GradientStreamer(
-            model, train_dataset, self.args,
+            model,
+            train_dataset,
+            self.args,
             batch_size=self.args.per_device_train_batch_size,
-            enable_update=True, loss_fn=train_loss, config=hook_config,
+            enable_update=True,
+            loss_fn=train_loss,
+            config=hook_config,
         )
         train_streamer.hook_manager.add_callback(
-            OffloadCallback(offload_interval, train_fm, recording_type="per_batch")
+            OffloadCallback(offload_interval, train_fm, recording_type="per_batch"),
         )
         with train_streamer:
             for _ in train_streamer:
@@ -229,12 +241,16 @@ class DVEmbAttributor(BaseAttributor):
 
         # 2) Test gradients at the now-final model theta_T (frozen probe).
         test_streamer = GradientStreamer(
-            model, test_dataset, self.args,
+            model,
+            test_dataset,
+            self.args,
             batch_size=self.args.per_device_eval_batch_size,
-            enable_update=False, loss_fn=test_loss, config=hook_config,
+            enable_update=False,
+            loss_fn=test_loss,
+            config=hook_config,
         )
         test_streamer.hook_manager.add_callback(
-            OffloadCallback(offload_interval, test_fm, recording_type="per_batch")
+            OffloadCallback(offload_interval, test_fm, recording_type="per_batch"),
         )
         with test_streamer:
             for _ in test_streamer:
@@ -245,21 +261,22 @@ class DVEmbAttributor(BaseAttributor):
     def cache_dvemb(
         self,
         train_gradients_dir: str,
-        dvemb_dir: Optional[str] = None,
+        dvemb_dir: str | None = None,
         *,
-        selected_training_steps: Optional[Iterable[int]] = None,
-        final_step: Optional[int] = None,
+        selected_training_steps: Iterable[int] | None = None,
+        final_step: int | None = None,
         loss_reduction: str = "mean",
         verbose: bool = False,
-        layer_name: Optional[Union[str, List[str]]] = None,
-        learning_rate: Union[float, Mapping[int, float]] = 1.0,
+        layer_name: str | list[str] | None = None,
+        learning_rate: float | Mapping[int, float] = 1.0,
     ) -> str:
         """Turn a stored gradient trajectory into persisted **data value embeddings**.
 
         One train-side sweep (``propagation="train"``) over an existing
         per-step gradient store -- written by :meth:`cache` or by any training
         run wrapped with hooks -- turning every train record into its embedding
-        ``e = eta * prod_{k>t_s}(I - eta_k H_k)^T g_hat`` and storing it in ``dvemb_dir``
+        ``e = eta * prod_{k>t_s}(I - eta_k H_k)^T g_hat`` and storing it in
+        ``dvemb_dir``
         as materialized per-layer :class:`Gradient` records via
         :class:`GradientFileManager` -- same hashes and steps as the source
         records.  No test gradients are involved and nothing is scored.
@@ -283,37 +300,58 @@ class DVEmbAttributor(BaseAttributor):
             selected_training_steps: Restrict which steps' embeddings are
                 *stored* (the sweep always propagates through every step);
                 ``None`` stores all of them.
-            final_step, loss_reduction, verbose, layer_name, learning_rate: As
-                in :meth:`attribute_from_cache`.
+            final_step: As in :meth:`attribute_from_cache`.
+            loss_reduction: As in :meth:`attribute_from_cache`.
+            verbose: As in :meth:`attribute_from_cache`.
+            layer_name: As in :meth:`attribute_from_cache`.
+            learning_rate: As in :meth:`attribute_from_cache`.
 
         Returns:
             ``dvemb_dir``.
         """
         if dvemb_dir is None:
-            dvemb_dir = os.path.join(self.args.output_dir, "dvemb_grads")
+            dvemb_dir = str(pathlib.Path(self.args.output_dir) / "dvemb_grads")
         if loss_reduction not in ("mean", "sum"):
             raise ValueError(
-                f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}."
+                f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}.",
             )
         (
-            _train_fm, prop_steps, output_steps, _final_step, learning_rate,
+            _train_fm,
+            prop_steps,
+            output_steps,
+            _final_step,
+            learning_rate,
         ) = self._resolve_sweep(
-            train_gradients_dir, selected_training_steps, final_step,
+            train_gradients_dir,
+            selected_training_steps,
+            final_step,
             learning_rate,
         )
         device = self.args.device
         train_source = DiskGradientSource(
-            GradientFileManager(train_gradients_dir), self.args,
-            steps=prop_steps, layer_name=normalize_layer_names(layer_name),
+            GradientFileManager(train_gradients_dir),
+            self.args,
+            steps=prop_steps,
+            layer_name=normalize_layer_names(layer_name),
         )
         # No test matrix to derive the concatenated layout from -- peek it off
         # the latest propagated step's first train block instead.
         layers, slices = self._train_layer_slices(
-            train_source, max(prop_steps), device,
+            train_source,
+            max(prop_steps),
+            device,
         )
         self._propagate_train_and_score(
-            None, layers, slices, train_source, prop_steps, output_steps,
-            device, loss_reduction, verbose, learning_rate,
+            None,
+            layers,
+            slices,
+            train_source,
+            prop_steps,
+            output_steps,
+            device,
+            loss_reduction,
+            verbose,
+            learning_rate,
             dvemb_fm=GradientFileManager(dvemb_dir),
         )
         return dvemb_dir
@@ -324,8 +362,8 @@ class DVEmbAttributor(BaseAttributor):
 
     @staticmethod
     def _normalize_lr(
-        learning_rate: Union[float, Mapping[int, float]],
-    ) -> Union[float, Dict[int, float]]:
+        learning_rate: float | Mapping[int, float],
+    ) -> float | dict[int, float]:
         """Validate / canonicalise a per-attribution learning-rate schedule."""
         if isinstance(learning_rate, Mapping):
             return {int(k): float(v) for k, v in learning_rate.items()}
@@ -335,7 +373,7 @@ class DVEmbAttributor(BaseAttributor):
         return lr
 
     @staticmethod
-    def _lr(learning_rate: Union[float, Dict[int, float]], step: int) -> float:
+    def _lr(learning_rate: float | dict[int, float], step: int) -> float:
         """Learning rate ``eta`` at *step*."""
         if isinstance(learning_rate, dict):
             try:
@@ -344,50 +382,59 @@ class DVEmbAttributor(BaseAttributor):
                 raise ValueError(
                     f"learning_rate mapping has no entry for step {step}; it must "
                     f"cover every propagated step (step < final_step). "
-                    f"Provided steps: {sorted(learning_rate)}."
+                    f"Provided steps: {sorted(learning_rate)}.",
                 ) from None
         return learning_rate
 
     @staticmethod
-    def _materialize(block: Gradient, device: torch.device) -> Dict[str, torch.Tensor]:
+    def _materialize(block: Gradient, device: torch.device) -> dict[str, torch.Tensor]:
         """Materialise a gradient block into ``{layer: (B, d) float tensor}``."""
         mat = block.to(device).materialize()
         return {name: value.float() for name, value in mat.data.items()}
 
     @staticmethod
     def _lr_schedule_path(train_gradients_dir: str) -> str:
-        return os.path.join(train_gradients_dir, "lr_schedule.json")
+        return str(pathlib.Path(train_gradients_dir) / "lr_schedule.json")
 
     def _write_lr_schedule(
-        self, train_gradients_dir: str, lrs: Mapping[int, float]
+        self,
+        train_gradients_dir: str,
+        lrs: Mapping[int, float],
     ) -> None:
         """Persist the per-step LR actually applied during training."""
-        os.makedirs(train_gradients_dir, exist_ok=True)
-        with open(self._lr_schedule_path(train_gradients_dir), "w") as f:
+        pathlib.Path(train_gradients_dir).mkdir(exist_ok=True, parents=True)
+        with pathlib.Path(self._lr_schedule_path(train_gradients_dir)).open(
+            "w",
+            encoding="utf-8",
+        ) as f:
             json.dump({str(k): float(v) for k, v in lrs.items()}, f)
 
     def _read_lr_schedule(
-        self, train_gradients_dir: str
-    ) -> Optional[Dict[int, float]]:
+        self,
+        train_gradients_dir: str,
+    ) -> dict[int, float] | None:
         """The per-step LR recorded by :meth:`cache`, or ``None`` if absent (e.g.
-        a directory produced outside the on-the-fly workflow)."""
+
+        a directory produced outside the on-the-fly workflow).
+        """
         path = self._lr_schedule_path(train_gradients_dir)
-        if not os.path.exists(path):
+        if not pathlib.Path(path).exists():
             return None
-        with open(path) as f:
+        with pathlib.Path(path).open(encoding="utf-8") as f:
             return {int(k): float(v) for k, v in json.load(f).items()}
 
     def _warn_on_lr_mismatch(
         self,
-        learning_rate: Union[float, Dict[int, float]],
+        learning_rate: float | dict[int, float],
         recorded_lr: Mapping[int, float],
-        prop_steps: List[int],
+        prop_steps: list[int],
     ) -> None:
         """Warn if the configured ``learning_rate`` disagrees with the recorded
         training schedule over any propagated step.  The configured schedule is
         still the one used for the Fisher factors ``(I - eta H)`` -- this only flags
-        a likely mismatch with the trajectory that produced the gradients."""
-        mismatched: List[Tuple[int, float, float]] = []
+        a likely mismatch with the trajectory that produced the gradients.
+        """
+        mismatched: list[tuple[int, float, float]] = []
         for s in sorted(prop_steps):
             want = recorded_lr.get(s)
             if want is None:
@@ -411,17 +458,17 @@ class DVEmbAttributor(BaseAttributor):
 
     def _propagate_test_and_score(
         self,
-        w: Dict[str, torch.Tensor],
+        w: dict[str, torch.Tensor],
         n_cols: int,
-        layers: List[str],
+        layers: list[str],
         train_source: DiskGradientSource,
-        prop_steps: List[int],
+        prop_steps: list[int],
         output_steps: set,
         device: torch.device,
         loss_reduction: str,
         verbose: bool,
-        learning_rate: Union[float, Dict[int, float]],
-    ) -> Tuple[torch.Tensor, List[str], List[int]]:
+        learning_rate: float | dict[int, float],
+    ) -> tuple[torch.Tensor, list[str], list[int]]:
         """One latest->earliest sweep for the ``n_cols`` columns held in ``w``.
 
         The step is the outer loop; each step's train blocks are pulled from
@@ -435,9 +482,9 @@ class DVEmbAttributor(BaseAttributor):
 
         Returns ``(scores (num_rows, n_cols), row_train_ids, row_steps)``.
         """
-        row_chunks: List[torch.Tensor] = []
-        row_train_ids: List[str] = []
-        row_steps: List[int] = []
+        row_chunks: list[torch.Tensor] = []
+        row_train_ids: list[str] = []
+        row_steps: list[int] = []
         steps = tqdm(
             sorted(prop_steps, reverse=True),
             desc="DVEmb: propagating",
@@ -452,7 +499,7 @@ class DVEmbAttributor(BaseAttributor):
             # Accumulate this step's Fisher contribution across all its blocks
             # before advancing w, so the whole batch B_ts forms one (I - eta H_ts)
             # factor.  ``n_t`` counts the step's recorded samples for B_ts.
-            delta: Dict[str, torch.Tensor] = {
+            delta: dict[str, torch.Tensor] = {
                 name: torch.zeros_like(w[name]) for name in layers
             }
             n_t = 0
@@ -474,7 +521,8 @@ class DVEmbAttributor(BaseAttributor):
                 # Fisher update term: sum_i D[i, j] g(z*_i) -> (n_cols, d).
                 for name in shared:
                     delta[name] += D.T @ mat[name]
-            # H_t = (1/c) sum g_hat g_hat^T: xB_t for mean-loss-recorded grads, x1 for sum.
+            # H_t = (1/c) sum g_hat g_hat^T: xB_t for mean-loss-recorded grads, x1 for
+            # sum.
             fisher_scale = float(n_t) if loss_reduction == "mean" else 1.0
             for name in layers:
                 w[name] -= lr * fisher_scale * delta[name]
@@ -488,18 +536,18 @@ class DVEmbAttributor(BaseAttributor):
 
     def _propagate_train_and_score(
         self,
-        test_flat: Optional[torch.Tensor],
-        layers: List[str],
-        slices: Dict[str, Tuple[int, int]],
+        test_flat: torch.Tensor | None,
+        layers: list[str],
+        slices: dict[str, tuple[int, int]],
         train_source: DiskGradientSource,
-        prop_steps: List[int],
+        prop_steps: list[int],
         output_steps: set,
         device: torch.device,
         loss_reduction: str,
         verbose: bool,
-        learning_rate: Union[float, Dict[int, float]],
-        dvemb_fm: Optional[GradientFileManager] = None,
-    ) -> Tuple[torch.Tensor, List[str], List[int]]:
+        learning_rate: float | dict[int, float],
+        dvemb_fm: GradientFileManager | None = None,
+    ) -> tuple[torch.Tensor, list[str], list[int]]:
         """One latest->earliest sweep carrying the operator on the *train* side.
 
         The counterpart of :meth:`_propagate_and_score` for
@@ -520,8 +568,16 @@ class DVEmbAttributor(BaseAttributor):
             test_flat: ``(num_test, d)`` final-model test gradients, layer
                 blocks concatenated in ``layers`` order.  ``None`` skips scoring
                 (embedding-only sweep -- requires ``dvemb_fm``).
-            layers, slices: Layer order and the ``{name: (start, end)}``
-                column ranges of each layer inside the concatenated axis.
+            train_source: Source of the recorded train blocks, step by step.
+            layers: Layer order of the concatenated axis.
+            slices: The ``{name: (start, end)}`` column ranges of each layer
+                inside the concatenated axis.
+            output_steps: Steps whose embeddings/scores are emitted.
+            prop_steps: Steps the sweep propagates through.
+            learning_rate: As in :meth:`attribute_from_cache`.
+            loss_reduction: As in :meth:`attribute_from_cache`.
+            device: Device the blocks are moved to for the sweep.
+            verbose: Show the per-step progress bar.
             dvemb_fm: When given, each emitted step's embeddings ``e`` are also
                 persisted through this :class:`GradientFileManager` as
                 **materialized** per-layer :class:`Gradient` records (eta folded
@@ -536,13 +592,13 @@ class DVEmbAttributor(BaseAttributor):
         """
         if test_flat is None and dvemb_fm is None:
             raise ValueError(
-                "embedding-only sweep (test_flat=None) requires dvemb_fm."
+                "embedding-only sweep (test_flat=None) requires dvemb_fm.",
             )
         d_total = slices[layers[-1]][1] if layers else 0
-        row_chunks: List[torch.Tensor] = []
-        row_train_ids: List[str] = []
-        row_steps: List[int] = []
-        M: Optional[torch.Tensor] = None  # lazy: no (d, d) alloc for the last step
+        row_chunks: list[torch.Tensor] = []
+        row_train_ids: list[str] = []
+        row_steps: list[int] = []
+        M: torch.Tensor | None = None  # lazy: no (d, d) alloc for the last step
         steps = tqdm(
             sorted(prop_steps, reverse=True),
             desc="DVEmb: propagating (train side)",
@@ -557,7 +613,7 @@ class DVEmbAttributor(BaseAttributor):
             # Accumulate this step's Fisher contribution across all its blocks
             # before advancing M -- every embedding of the step must use the
             # pre-step operator, and the whole batch forms one (I - eta H_ts).
-            delta: Optional[torch.Tensor] = None
+            delta: torch.Tensor | None = None
             n_t = 0
             for _s, train_g, train_hashes in train_source.for_steps([ts]):
                 mat = self._materialize(train_g, device)
@@ -576,7 +632,7 @@ class DVEmbAttributor(BaseAttributor):
                     emb = lr * e_raw
                     if test_flat is not None:
                         row_chunks.append(
-                            (emb @ test_flat.T).detach().to("cpu", torch.float)
+                            (emb @ test_flat.T).detach().to("cpu", torch.float),
                         )
                         row_train_ids.extend(train_hashes)
                         row_steps.extend([ts] * batch)
@@ -588,26 +644,29 @@ class DVEmbAttributor(BaseAttributor):
                         # torch.save doesn't serialise the whole (B, d) tensor
                         # per layer.
                         grad = Gradient(
-                            representation={n: "materialized" for n in shared},
+                            representation=dict.fromkeys(shared, "materialized"),
                             data={
-                                n: emb[:, slices[n][0]:slices[n][1]]
-                                .contiguous().cpu()
+                                n: emb[:, slices[n][0] : slices[n][1]]
+                                .contiguous()
+                                .cpu()
                                 for n in shared
                             },
-                            layer_types={
-                                n: train_g.layer_types[n] for n in shared
-                            },
+                            layer_types={n: train_g.layer_types[n] for n in shared},
                         )
                         dvemb_fm.save_bulk(
-                            [GradientRecord(
-                                step=ts, input_hash=list(train_hashes),
-                                gradient=grad,
-                            )]
+                            [
+                                GradientRecord(
+                                    step=ts,
+                                    input_hash=list(train_hashes),
+                                    gradient=grad,
+                                ),
+                            ],
                         )
                 upd = e_raw.T @ g_flat  # sum_b (I - M) g_hat_b g_hat_b^T -> (d, d)
                 delta = upd if delta is None else delta + upd
             if delta is not None:
-                # H_t = (1/c) sum g_hat g_hat^T: xB_t for mean-loss-recorded grads, x1 for sum.
+                # H_t = (1/c) sum g_hat g_hat^T: xB_t for mean-loss-recorded grads, x1
+                # for sum.
                 fisher_scale = float(n_t) if loss_reduction == "mean" else 1.0
                 scaled = (lr * fisher_scale) * delta
                 M = scaled if M is None else M + scaled
@@ -623,10 +682,10 @@ class DVEmbAttributor(BaseAttributor):
     def _resolve_sweep(
         self,
         train_gradients_dir: str,
-        selected_training_steps: Optional[Iterable[int]],
-        final_step: Optional[int],
-        learning_rate: Union[float, Mapping[int, float]],
-    ) -> Tuple[GradientFileManager, List[int], set, int, Union[float, Dict[int, float]]]:
+        selected_training_steps: Iterable[int] | None,
+        final_step: int | None,
+        learning_rate: float | Mapping[int, float],
+    ) -> tuple[GradientFileManager, list[int], set, int, float | dict[int, float]]:
         """Resolve the sweep parameters shared by scoring and embedding-only runs.
 
         Opens the train store, fixes ``final_step`` (default: one past the last
@@ -646,7 +705,7 @@ class DVEmbAttributor(BaseAttributor):
         if not prop_steps:
             raise ValueError(
                 f"No training step satisfies step < final_step ({final_step}); "
-                f"available steps: {available}."
+                f"available steps: {available}.",
             )
         # If the train dir carries a schedule recorded by cache(), check the
         # configured learning_rate against it (warn-only; configured one is used).
@@ -660,13 +719,16 @@ class DVEmbAttributor(BaseAttributor):
             output_steps = set(prop_steps)
         else:
             output_steps = set(resolve_steps(train_fm, selected_training_steps)) & set(
-                prop_steps
+                prop_steps,
             )
         return train_fm, prop_steps, output_steps, final_step, learning_rate
 
     def _train_layer_slices(
-        self, train_source: DiskGradientSource, step: int, device: torch.device
-    ) -> Tuple[List[str], Dict[str, Tuple[int, int]]]:
+        self,
+        train_source: DiskGradientSource,
+        step: int,
+        device: torch.device,
+    ) -> tuple[list[str], dict[str, tuple[int, int]]]:
         """Layer order and concatenated-axis slices, peeked from one train block.
 
         Materialises the first block of *step* to learn the stored layers and
@@ -676,7 +738,7 @@ class DVEmbAttributor(BaseAttributor):
         for _s, train_g, _hashes in train_source.for_steps([step]):
             mat = self._materialize(train_g, device)
             layers = list(mat.keys())
-            slices: Dict[str, Tuple[int, int]] = {}
+            slices: dict[str, tuple[int, int]] = {}
             offset = 0
             for name in layers:
                 slices[name] = (offset, offset + mat[name].shape[1])
@@ -694,13 +756,13 @@ class DVEmbAttributor(BaseAttributor):
         test_dataset: Dataset,
         *,
         propagation: str = "train",
-        dvemb_dir: Optional[str] = None,
+        dvemb_dir: str | None = None,
         loop_over_test: bool = False,
-        selected_training_steps: Optional[Iterable[int]] = None,
+        selected_training_steps: Iterable[int] | None = None,
         loss_reduction: str = "mean",
         verbose: bool = False,
-        hook_config: Optional[HookManagerConfig] = None,
-        learning_rate: Union[float, Mapping[int, float]] = 1.0,
+        hook_config: HookManagerConfig | None = None,
+        learning_rate: float | Mapping[int, float] = 1.0,
     ) -> AttributionScore:
         """Score **on the fly**: cache the trajectory, then attribute from cache.
 
@@ -717,14 +779,22 @@ class DVEmbAttributor(BaseAttributor):
         if the configured schedule disagrees with it.
 
         Args:
-            train_dataset, test_dataset: Datasets to stream.
-            propagation, dvemb_dir, loop_over_test, selected_training_steps,
-                loss_reduction, verbose, learning_rate: As in
-                :meth:`attribute_from_cache`.
+            train_dataset: Training dataset to stream.
+            test_dataset: Test dataset to stream.
+            propagation: As in :meth:`attribute_from_cache`.
+            dvemb_dir: As in :meth:`attribute_from_cache`.
+            loop_over_test: As in :meth:`attribute_from_cache`.
+            selected_training_steps: As in :meth:`attribute_from_cache`.
+            loss_reduction: As in :meth:`attribute_from_cache`.
+            verbose: As in :meth:`attribute_from_cache`.
+            learning_rate: As in :meth:`attribute_from_cache`.
             hook_config: As in :meth:`cache`.
         """
-        train_dir, test_dir = self.cache(train_dataset, test_dataset,
-                                         hook_config=hook_config)
+        train_dir, test_dir = self.cache(
+            train_dataset,
+            test_dataset,
+            hook_config=hook_config,
+        )
         return self.attribute_from_cache(
             train_dir,
             test_dir,
@@ -742,14 +812,14 @@ class DVEmbAttributor(BaseAttributor):
         train_gradients_dir: str,
         test_gradients_dir: str,
         propagation: str = "train",
-        dvemb_dir: Optional[str] = None,
+        dvemb_dir: str | None = None,
         loop_over_test: bool = False,
-        selected_training_steps: Optional[Iterable[int]] = None,
-        final_step: Optional[int] = None,
+        selected_training_steps: Iterable[int] | None = None,
+        final_step: int | None = None,
         loss_reduction: str = "mean",
         verbose: bool = False,
-        layer_name: Optional[Union[str, List[str]]] = None,
-        learning_rate: Union[float, Mapping[int, float]] = 1.0,
+        layer_name: str | list[str] | None = None,
+        learning_rate: float | Mapping[int, float] = 1.0,
     ) -> AttributionScore:
         """Compute the ``(num_train_rows, num_test)`` DVEmb attribution score.
 
@@ -820,7 +890,8 @@ class DVEmbAttributor(BaseAttributor):
                 (default) or ``"sum"``.  This fixes the scale of the empirical
                 Fisher ``H_t`` in the propagation factor ``(I - eta H_t)``.  The
                 exact SGD Jacobian is ``I - eta d^2L_t``; its empirical-Fisher form
-                needs the **true** per-sample gradients, ``H_t ~ (1/c)sum_z g_hat_zg_hat_z^T``
+                needs the **true** per-sample gradients,
+                ``H_t ~ (1/c)sum_z g_hat_zg_hat_z^T``
                 where ``g_hat_z`` is the recorded gradient and ``c`` its per-sample
                 loss weight.  Under ``"mean"`` the backward scaled each ``g_hat_z`` by
                 ``1/B_t`` (``c = 1/B_t``), so the Fisher is multiplied by the
@@ -857,35 +928,41 @@ class DVEmbAttributor(BaseAttributor):
         """
         if loss_reduction not in ("mean", "sum"):
             raise ValueError(
-                f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}."
+                f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}.",
             )
         if propagation not in ("test", "train"):
             raise ValueError(
-                f"propagation must be 'test' or 'train', got {propagation!r}."
+                f"propagation must be 'test' or 'train', got {propagation!r}.",
             )
         if propagation == "train" and loop_over_test:
             raise ValueError(
                 "loop_over_test applies only to propagation='test': the "
                 "train-side sweep is test-independent (its memory is the (d, d) "
                 "operator, not the test embedding), so there is nothing to "
-                "block over."
+                "block over.",
             )
         if dvemb_dir is not None and propagation != "train":
             raise ValueError(
                 "dvemb_dir requires propagation='train': data value embeddings "
-                "only exist in the train-side sweep."
+                "only exist in the train-side sweep.",
             )
         if train_gradients_dir is None or test_gradients_dir is None:
             raise ValueError(
                 f"{type(self).__name__} requires both train_gradients_dir and "
-                "test_gradients_dir."
+                "test_gradients_dir.",
             )
 
         test_fm = GradientFileManager(test_gradients_dir)
         (
-            train_fm, prop_steps, output_steps, final_step, learning_rate,
+            train_fm,
+            prop_steps,
+            output_steps,
+            final_step,
+            learning_rate,
         ) = self._resolve_sweep(
-            train_gradients_dir, selected_training_steps, final_step,
+            train_gradients_dir,
+            selected_training_steps,
+            final_step,
             learning_rate,
         )
 
@@ -894,11 +971,17 @@ class DVEmbAttributor(BaseAttributor):
         # source supplies every column (the final-model gradients).
         layer_name = normalize_layer_names(layer_name)
         train_source = DiskGradientSource(
-            train_fm, self.args, steps=prop_steps, layer_name=layer_name,
+            train_fm,
+            self.args,
+            steps=prop_steps,
+            layer_name=layer_name,
         )
         test_source = DiskGradientSource(
-            test_fm, self.args, layer_name=layer_name,
-            desc="DVEmb: test", verbose=verbose,
+            test_fm,
+            self.args,
+            layer_name=layer_name,
+            desc="DVEmb: test",
+            verbose=verbose,
         )
         return self._run(
             train_source,
@@ -924,8 +1007,10 @@ class DVEmbAttributor(BaseAttributor):
         )
 
     def _collect_test_matrix(
-        self, test_source: DiskGradientSource, device: torch.device
-    ) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+        self,
+        test_source: DiskGradientSource,
+        device: torch.device,
+    ) -> tuple[dict[str, torch.Tensor], list[str]]:
         """Materialise every test gradient into one dense per-layer embedding.
 
         Returns ``(w, test_ids)`` where ``w`` maps each layer to its
@@ -933,12 +1018,12 @@ class DVEmbAttributor(BaseAttributor):
         first appearance of each test hash (duplicate-hash rows collapse via
         ``index_copy_`` -- last wins).
         """
-        test_ids: List[str] = []
-        test_index: Dict[str, int] = {}
-        pending: List[Tuple[Dict[str, torch.Tensor], List[int]]] = []
+        test_ids: list[str] = []
+        test_index: dict[str, int] = {}
+        pending: list[tuple[dict[str, torch.Tensor], list[int]]] = []
         for _step, test_g, test_hashes in test_source:
             mat = self._materialize(test_g, device)
-            cols: List[int] = []
+            cols: list[int] = []
             for h in test_hashes:
                 if h not in test_index:
                     test_index[h] = len(test_ids)
@@ -947,7 +1032,7 @@ class DVEmbAttributor(BaseAttributor):
             pending.append((mat, cols))
         num_test = len(test_ids)
         layers = list(pending[0][0].keys()) if pending else []
-        w: Dict[str, torch.Tensor] = {
+        w: dict[str, torch.Tensor] = {
             name: torch.zeros(num_test, pending[0][0][name].shape[1], device=device)
             for name in layers
         }
@@ -962,16 +1047,16 @@ class DVEmbAttributor(BaseAttributor):
         train_source: DiskGradientSource,
         test_source: DiskGradientSource,
         *,
-        prop_steps: List[int],
+        prop_steps: list[int],
         output_steps: set,
         loss_reduction: str,
         propagation: str,
         loop_over_test: bool,
         verbose: bool,
         algorithm_meta: dict,
-        layer_name: Optional[List[str]] = None,
-        learning_rate: Union[float, Dict[int, float]] = 1.0,
-        dvemb_fm: Optional[GradientFileManager] = None,
+        layer_name: list[str] | None = None,
+        learning_rate: float | dict[int, float] = 1.0,
+        dvemb_fm: GradientFileManager | None = None,
     ) -> AttributionScore:
         """Score a train source against a test source -- the shared DVEmb loop.
 
@@ -995,7 +1080,7 @@ class DVEmbAttributor(BaseAttributor):
             w, test_ids = self._collect_test_matrix(test_source, device)
             num_test = len(test_ids)
             layers = list(w.keys())
-            slices: Dict[str, Tuple[int, int]] = {}
+            slices: dict[str, tuple[int, int]] = {}
             offset = 0
             for name in layers:
                 slices[name] = (offset, offset + w[name].shape[1])
@@ -1016,8 +1101,16 @@ class DVEmbAttributor(BaseAttributor):
             )
             del w
             scores, row_train_ids, row_steps = self._propagate_train_and_score(
-                test_flat, layers, slices, train_source, prop_steps,
-                output_steps, device, loss_reduction, verbose, learning_rate,
+                test_flat,
+                layers,
+                slices,
+                train_source,
+                prop_steps,
+                output_steps,
+                device,
+                loss_reduction,
+                verbose,
+                learning_rate,
                 dvemb_fm=dvemb_fm,
             )
         elif not loop_over_test:
@@ -1029,8 +1122,16 @@ class DVEmbAttributor(BaseAttributor):
             num_test = len(test_ids)
             layers = list(w.keys())
             scores, row_train_ids, row_steps = self._propagate_test_and_score(
-                w, num_test, layers, train_source, prop_steps, output_steps,
-                device, loss_reduction, verbose, learning_rate,
+                w,
+                num_test,
+                layers,
+                train_source,
+                prop_steps,
+                output_steps,
+                device,
+                loss_reduction,
+                verbose,
+                learning_rate,
             )
         else:
             # ---- test outer: one block's embedding resident, train re-streamed.
@@ -1055,12 +1156,22 @@ class DVEmbAttributor(BaseAttributor):
                 layers = list(w_block.keys())
                 block_cols = [test_index[h] for h in test_hashes]
                 block_scores, rtids, rsteps = self._propagate_test_and_score(
-                    w_block, len(block_cols), layers, train_source, prop_steps,
-                    output_steps, device, loss_reduction, verbose, learning_rate,
+                    w_block,
+                    len(block_cols),
+                    layers,
+                    train_source,
+                    prop_steps,
+                    output_steps,
+                    device,
+                    loss_reduction,
+                    verbose,
+                    learning_rate,
                 )
                 if scores is None:
                     scores = torch.zeros(
-                        block_scores.shape[0], num_test, dtype=torch.float
+                        block_scores.shape[0],
+                        num_test,
+                        dtype=torch.float,
                     )
                     row_train_ids, row_steps = rtids, rsteps
                 # Scatter this block's columns into the shared (rows x num_test).

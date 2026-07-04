@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import math
 import os
+import pathlib
 import socket
 import tempfile
 
 import pytest
 import torch
 import torch.multiprocessing as mp
-import torch.nn as nn
+from torch import nn
 
 from dattri_llm.gradient.callbacks import DataSelectionCallback
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
@@ -86,11 +87,11 @@ def _hooked_linear_grads(model: EmbeddingMLP):
 
 def _callback_kwargs(mode: str) -> dict:
     if mode == "none":
-        return dict(threshold_mode="bottom_fraction", threshold=0.0)
+        return {"threshold_mode": "bottom_fraction", "threshold": 0.0}
     if mode == "half":
-        return dict(threshold_mode="bottom_fraction", threshold=0.5)
+        return {"threshold_mode": "bottom_fraction", "threshold": 0.5}
     if mode == "hard0":
-        return dict(threshold_mode="hard", threshold=0.0)
+        return {"threshold_mode": "hard", "threshold": 0.0}
     raise ValueError(mode)
 
 
@@ -101,7 +102,10 @@ def _fsdp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
 
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     dist.init_process_group(
-        "gloo", init_method=f"file://{rendezvous_path}", rank=rank, world_size=world_size
+        "gloo",
+        init_method=f"file://{rendezvous_path}",
+        rank=rank,
+        world_size=world_size,
     )
     try:
         # Same initial weights on every rank; distinct per-rank batch so that a
@@ -115,7 +119,8 @@ def _fsdp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
 
         # HookManager on the unwrapped model (hooks survive FSDP wrapping).
         collector = HookManager(
-            model, config=HookManagerConfig(linear_io=REGISTER_ALL)
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
         )
         fsdp_model = FSDP(
             model,
@@ -126,7 +131,10 @@ def _fsdp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
         # DataSelectionCallback needs the *wrapped* module to discover the shard
         # layout; attach it after wrapping via the manager's add_callback().
         ds_cb = DataSelectionCallback(
-            model=fsdp_model, score_mode="ghost", target="batch", **_callback_kwargs(mode)
+            model=fsdp_model,
+            score_mode="ghost",
+            target="batch",
+            **_callback_kwargs(mode),
         )
         collector.add_callback(ds_cb)
 
@@ -167,15 +175,15 @@ def _fsdp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
         if rank == 0:
             ok = True
             report = [f"mode={mode} dropped(rank0)={dropped}"]
-            for name in actual_full:
-                a, e = actual_full[name], ref_full[name]
+            for name, a in actual_full.items():
+                e = ref_full[name]
                 close = torch.allclose(a, e, atol=ATOL, rtol=RTOL)
                 ok = ok and close
                 report.append(
-                    f"  {name}: match={close} maxdiff={(a - e).abs().max().item():.2e}"
+                    f"  {name}: match={close} maxdiff={(a - e).abs().max().item():.2e}",
                 )
             result_queue.put((ok, "\n".join(report)))
-    except Exception:  # pragma: no cover - surface worker failures to the test
+    except Exception:  # noqa: BLE001 - surface any worker failure to the test
         import traceback
 
         if rank == 0:
@@ -204,8 +212,8 @@ class TestDataSelectionFSDP:
                 join=True,
             )
         finally:
-            if os.path.exists(rendezvous_path):
-                os.unlink(rendezvous_path)
+            if pathlib.Path(rendezvous_path).exists():
+                pathlib.Path(rendezvous_path).unlink()
 
         assert not result_queue.empty(), "rank-0 worker did not report a result"
         ok, report = result_queue.get()
