@@ -32,13 +32,34 @@ data attribution. Three principles drive the design:
 
 ## Repository Structure
 
+The library is three layers; **imports flow strictly downward**:
+
 ```
 dattri_llm/
-├── gradients/      # Gradient container + metadata
-├── algorithm/      # Attributor implementation
-├── trainer/        # Trainer utilities
-└── utils/          # Common utility functions
+├── utils/            # Bottom layer: generic, gradient-agnostic helpers
+│   ├── hashing.py    #   content hashing of model inputs (sample identity)
+│   └── distributed.py#   guarded torch.distributed helpers
+├── gradient/         # Middle layer: the gradient system
+│   ├── gradient.py   #   data model: Factorized, Gradient, GradientRecord
+│   ├── ops/          #   factorized-gradient math (types, preprocess, materialize,
+│   │                 #   dot, projection, kronecker) behind a re-exporting façade
+│   ├── hooks/        #   capture: low-level hooks, HookManagerConfig, HookManager
+│   ├── callbacks/    #   extension point: one module per callback
+│   ├── file_manager.py #  on-disk storage/retrieval of gradient records
+│   ├── datasets.py   #   file-level reading of stored records (block streaming)
+│   └── streaming.py  #   GradientSource: DiskGradientSource + live GradientStreamer
+└── attribution/      # Top layer: the TDA methods
+    ├── arguments.py  #   AttributionArguments (HF TrainingArguments-style config)
+    ├── base.py       #   attributor ABCs
+    ├── score.py      #   AttributionScore result container
+    ├── utils.py      #   shared scoring/orchestration helpers
+    └── algorithm/    #   one module per attributor (tracin, kronecker, dvemb)
 ```
+
+The top-level `dattri_llm/__init__.py` exports the advertised API. The capture
+core (gradient layer) is importable with **torch alone**; the attribution layer
+and streamer resolve lazily so optional dependencies (`dattri`, `transformers`,
+`tqdm`) are only required when actually used. Preserve this when adding exports.
 
 Roughly, the moving parts are:
 
@@ -47,6 +68,8 @@ Roughly, the moving parts are:
 - **Callbacks** — pluggable interventions in the training loop (offloading,
   online data selection, etc.).
 - **GradientFileManager** — storage/retrieval layer for offloaded gradients.
+- **GradientSource** — the streaming contract attributors consume: per-step
+  `(step, Gradient, hashes)` blocks, read from disk or computed live.
 - **Attributors** — the actual TDA methods (TracIn, GradCos, KFAC/EKFAC, etc.).
 
 ## Core Components (high-level)
@@ -95,7 +118,9 @@ Internally it buffers per-layer activations and gradient outputs, detects when a
 full step has completed (all hooked layers fired across all replicas), assembles a
 batch-level `Gradient`, and emits per-sample records to its callbacks. It exposes
 `remove` (deregister hooks) and `pause` (temporarily suspend collection, e.g. during
-a secondary validation backward).
+a secondary validation backward). Which layers are hooked, and with which hook
+family (per-sample factorized `linear_io` vs. batch-level `param_grad`), is decided
+by `HookManagerConfig`; capture-time random projection is configured there too.
 
 ### Callbacks
 
@@ -113,18 +138,30 @@ collection-complete. Two representative implementations:
 
 ### GradientFileManager
 
-The storage layer responsible for file naming, index management, and retrieval. It
-uses a two-level mapping (`input_hash → steps → gradient records`) with an on-disk
-index. Design goals: O(1) lookups via the in-memory index (no directory scans), and
-crash-safety via write-then-index ordering and frequent index persistence.
+The storage layer responsible for file naming, index management, and retrieval.
+Samples are identified by a **content hash** of their model inputs (position- and
+shuffling-independent; see `utils/hashing.py`), and the on-disk index maps
+`input_hash → (step, sample_idx) → file`, so a per-sample gradient is retrieved by
+direct slicing—never by scanning a batch record. Design goals: O(1) lookups via the
+in-memory index (no directory scans), crash-safety via write-then-index ordering and
+frequent index persistence, and rank-transparent loading under DDP (each rank writes
+to its own subdirectory; a fresh manager merges all per-rank indexes).
 
-### Attribution Trainer
+### GradientSource (streaming)
 
-Adapted from the Hugging Face Trainer to enable efficient gradient caching during
-training (cf. logix). It lets users specify whether capture is enabled, the gradient
-format, target modules/parameters, projection settings, the storage backend, and the
-capture granularity (per-sample / per-token / aggregated)—**without** changing the
-original training arguments or configuration.
+Attributors consume gradients through one contract: a `GradientSource` yielding
+per-step `(step, Gradient, hashes)` blocks. Two implementations:
+
+- **DiskGradientSource** — re-iterable reads of pre-collected gradients
+  (built on `gradient/datasets.py`, which loads one *file* per item so a standard
+  DataLoader can prefetch whole batch blocks).
+- **GradientStreamer** — computes blocks live from a forward+backward pass. Its
+  `enable_update=False` mode is a frozen probe at a fixed checkpoint (re-iterable);
+  `enable_update=True` advances the optimizer so each step is a real checkpoint
+  along the training trajectory (single-shot). The updating mode deliberately
+  mirrors the HF Trainer's inner loop (optimizer/scheduler construction, mixed
+  precision, clipping, DDP/FSDP wrapping) so that under the same
+  `AttributionArguments` the trajectory matches the Trainer bit-for-bit.
 
 ## Supported Layers
 
@@ -151,22 +188,30 @@ gradients are part of the expected workflow.
 
 Methods expected to run on top of the HookManager infrastructure include TracIn and
 GradCos (incl. online variants), the LoGRA family (KFAC, EKFAC), and DVEmb (with GGN
-approximation).
+approximation). Attributors branch on one axis of the source contract —
+`GradientSource.reusable` (methods with a pre-pass, e.g. K-FAC's Fisher fit, need a
+re-iterable source); everything method-specific stays inside the attributor.
 
 ## Workflows
 
 Two intended usage paths:
 
-1. **On-the-fly attribution** — call an `Attributor` directly, which drives an
-   `LLMBackend` (e.g. a Hugging Face backend) and an attribution trainer.
-2. **Store-then-attribute** — wrap the model, run training while caching gradients,
-   then run an attributor over the stored gradients.
+1. **On-the-fly attribution** — call an `Attributor` directly; it drives a
+   `GradientStreamer` over the model and datasets, collecting and scoring in one
+   run (`attribute` == *cache + attribute_from_cache*).
+2. **Store-then-attribute** — wrap the model, run training while caching gradients
+   (HookManager + OffloadCallback), then run an attributor over the stored
+   gradients via `attribute_from_cache`.
 
 ## Development Notes
 
 - **Try not to modify user training loops.** The whole point of the hook-based design is
   that TDA is added by wrapping a context, not by editing the loop or the trainer
   config. Preserve this property in any new code.
+- **Respect the layering.** Runtime imports flow `utils → gradient → attribution`
+  only. The gradient layer must stay importable with torch alone (soft-import
+  `transformers`; keep `dattri`/`tqdm` out of its eager paths); type-only references
+  upward go under `TYPE_CHECKING`.
 - **Stay in the factorized domain by default.** Only materialize gradients when
   necessary (verification, or when it is genuinely cheaper). New gradient operations
   should offer a factorized path.
