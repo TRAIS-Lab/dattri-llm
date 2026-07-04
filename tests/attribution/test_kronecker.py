@@ -171,7 +171,7 @@ def _make(attr_cls, out_dir):
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
     )
-    return attr_cls(args, damping=DAMPING)
+    return attr_cls(args)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +182,7 @@ def _make(attr_cls, out_dir):
 class TestKFAC:
     def test_matches_kronecker_oracle(self, collected, tmp_path):
         res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+            damping=DAMPING,
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -205,6 +206,7 @@ class TestKFAC:
 
     def test_algorithm_label_and_shape(self, collected, tmp_path):
         res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+            damping=DAMPING,
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -215,6 +217,7 @@ class TestKFAC:
 class TestEKFAC:
     def test_matches_eigenbasis_oracle(self, collected, tmp_path):
         res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
+            damping=DAMPING,
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -238,6 +241,7 @@ class TestEKFAC:
 
     def test_algorithm_label(self, collected, tmp_path):
         res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
+            damping=DAMPING,
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
         )
@@ -254,10 +258,10 @@ class TestEKFAC:
                 dataloader_num_workers=0,
                 dataloader_pin_memory=False,
             ),
-            damping=damping,
         ).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
+            damping=damping,
         )
         matrix = (
             res.query(
@@ -330,10 +334,10 @@ class TestEKFAC:
                         dataloader_num_workers=0,
                         dataloader_pin_memory=False,
                     ),
-                    damping=1e-2,
                     mode=mode,
                 )
                 .attribute_from_cache(
+                    damping=DAMPING,
                     train_gradients_dir=str(collected["train_dir"]),
                     test_gradients_dir=str(collected["test_dir"]),
                 )
@@ -426,9 +430,10 @@ class TestKFACMultiToken:
             dataloader_num_workers=0,
             dataloader_pin_memory=False,
         )
-        res = KFACAttributor(args, damping=DAMPING).attribute_from_cache(
+        res = KFACAttributor(args).attribute_from_cache(
             train_gradients_dir=str(train_dir),
             test_gradients_dir=str(test_dir),
+            damping=DAMPING,
         )
         matrix = res.query(train_hashes, test_hashes, trajectory="agnostic")
         tr_f = _load_factors(train_dir, 0, ["fc"])
@@ -478,6 +483,7 @@ class TestRowStepsTracked:
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_row_steps_reflect_recorded_step(self, collected_step1, tmp_path, cls):
         res = _make(cls, tmp_path / "o").attribute_from_cache(
+            damping=DAMPING,
             train_gradients_dir=str(collected_step1["train_dir"]),
             test_gradients_dir=str(collected_step1["test_dir"]),
         )
@@ -526,9 +532,9 @@ class TestStepSelection:
                     dataloader_num_workers=0,
                     dataloader_pin_memory=False,
                 ),
-                damping=DAMPING,
             )
             return attr.attribute_from_cache(
+                damping=DAMPING,
                 train_gradients_dir=str(train_dir),
                 test_gradients_dir=str(test_dir),
                 selected_training_steps=steps,
@@ -547,6 +553,7 @@ class TestStepSelection:
         attr = _make(KFACAttributor, tmp_path / "o")
         with pytest.raises(ValueError, match=r"requested steps"):
             attr.attribute_from_cache(
+                damping=DAMPING,
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 selected_training_steps=[99],
@@ -557,9 +564,15 @@ class TestKroneckerShared:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")
         with pytest.raises(TypeError, match=r"train_gradients_dir"):
-            attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]))
+            attr.attribute_from_cache(
+                damping=DAMPING,
+                test_gradients_dir=str(collected["test_dir"]),
+            )
         with pytest.raises(TypeError, match=r"test_gradients_dir"):
-            attr.attribute_from_cache(train_gradients_dir=str(collected["train_dir"]))
+            attr.attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+            )
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_loop_over_test_matches_cached(self, collected, tmp_path, cls):
@@ -571,6 +584,7 @@ class TestKroneckerShared:
             return (
                 _make(cls, tmp_path / tag)
                 .attribute_from_cache(
+                    damping=DAMPING,
                     train_gradients_dir=str(collected["train_dir"]),
                     test_gradients_dir=str(collected["test_dir"]),
                     loop_over_test=loop,
@@ -594,6 +608,7 @@ class TestKroneckerShared:
         """
         for cls, label in ((KFACAttributor, "KFAC"), (EKFACAttributor, "EKFAC")):
             res = _make(cls, tmp_path / label).attribute_from_cache(
+                damping=DAMPING,
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
             )
@@ -712,12 +727,13 @@ def _attr(cls, out_dir):
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
     )
-    return cls(args, damping=DAMPING)
+    return cls(args)
 
 
 class TestDirectFIM:
     def _run(self, collected, out_dir, **kw):
         res = _attr(KFACAttributor, out_dir).attribute_from_cache(
+            damping=DAMPING,
             train_gradients_dir=str(collected["train_dir"]),
             test_gradients_dir=str(collected["test_dir"]),
             **kw,
@@ -775,6 +791,7 @@ class TestDirectFIM:
             return (
                 _attr(cls, tmp_path / tag)
                 .attribute_from_cache(
+                    damping=DAMPING,
                     train_gradients_dir=str(norm_collected["train_dir"]),
                     test_gradients_dir=str(norm_collected["test_dir"]),
                     non_kfac_strategy="direct",
@@ -858,6 +875,7 @@ class TestDirectFIM:
         test_hashes = [hash_sample({"x": x_te[j]}) for j in range(4)]
         with pytest.warns(UserWarning, match="embedding"):
             _attr(KFACAttributor, tmp_path / "o").attribute_from_cache(
+                damping=DAMPING,
                 train_gradients_dir=str(tmp_path / "tr"),
                 test_gradients_dir=str(tmp_path / "te"),
                 non_kfac_strategy="direct",

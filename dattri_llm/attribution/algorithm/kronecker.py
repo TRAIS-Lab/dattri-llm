@@ -102,14 +102,10 @@ class _KroneckerBaseAttributor(BaseAttributor):
         self,
         args: AttributionArguments,
         *,
-        damping: float = 1e-3,
         task: AttributionTask | None = None,
     ) -> None:
-        if damping < 0:
-            raise ValueError(f"damping must be non-negative, got {damping}.")
         self.args = args
         self.task = task
-        self.damping = float(damping)
 
     def cache(
         self,
@@ -193,6 +189,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_source: GradientSource,
         device: torch.device,
         fisher_acc: ops.FisherAccumulator | None,
+        damping: float,
     ) -> object:
         """Estimate the per-layer K-FAC preconditioner from the training gradients.
 
@@ -235,6 +232,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_source: GradientSource,
         test_source: GradientSource,
         *,
+        damping: float = 1e-3,
         loop_over_test: bool = False,
         non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
         direct_fim_max_params: int = 4096,
@@ -249,6 +247,8 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train gradients before scoring (EK-FAC reads them twice more), so a
         single-shot trajectory stream is rejected.
         """
+        if damping < 0:
+            raise ValueError(f"damping must be non-negative, got {damping}.")
         if non_kfac_strategy not in ("ignore", "direct"):
             raise ValueError(
                 "non_kfac_strategy must be 'ignore' or 'direct', got "
@@ -277,9 +277,9 @@ class _KroneckerBaseAttributor(BaseAttributor):
             if non_kfac_strategy == "direct"
             else None
         )
-        ctx = self._fit(train_source, device, fisher_acc)
+        ctx = self._fit(train_source, device, fisher_acc, damping)
         fim_ctx: dict[str, torch.Tensor] = (
-            self._finalize_fisher(fisher_acc, direct_fim_max_params)
+            self._finalize_fisher(fisher_acc, direct_fim_max_params, damping)
             if fisher_acc is not None
             else {}
         )
@@ -324,7 +324,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             row_steps=row_steps,
             test_ids=test_ids,
             algorithm_meta={
-                "damping": self.damping,
+                "damping": damping,
                 "non_kfac_strategy": non_kfac_strategy,
                 "direct_fim_layers": sorted(fim_ctx),
                 **(algorithm_meta_extra or {}),
@@ -340,6 +340,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_gradients_dir: str,
         test_gradients_dir: str,
         *,
+        damping: float = 1e-3,
         selected_training_steps: Iterable[int] | None = None,
         loop_over_test: bool = False,
         verbose: bool = False,
@@ -357,6 +358,8 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 :class:`GradientFileManager` for the train pass.
             test_gradients_dir: Directory written by
                 :class:`GradientFileManager` for the test pass.
+            damping: Tikhonov term added to each covariance factor (K-FAC) or
+                to the corrected eigenvalues (EK-FAC) before inversion.
             selected_training_steps: Restrict the train checkpoints (Fisher fit +
                 output rows) to these steps; ``None`` uses all on disk.
             loop_over_test: Re-stream + rebuild the test reps per train block (low
@@ -396,6 +399,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         return self._run(
             train,
             test,
+            damping=damping,
             loop_over_test=loop_over_test,
             non_kfac_strategy=non_kfac_strategy,
             direct_fim_max_params=direct_fim_max_params,
@@ -408,6 +412,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         train_dataset: Dataset,
         test_dataset: Dataset,
         *,
+        damping: float = 1e-3,
         loop_over_test: bool = False,
         non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
         direct_fim_max_params: int = 4096,
@@ -458,6 +463,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             return self._run(
                 train,
                 test,
+                damping=damping,
                 loop_over_test=loop_over_test,
                 non_kfac_strategy=non_kfac_strategy,
                 direct_fim_max_params=direct_fim_max_params,
@@ -510,6 +516,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         self,
         fisher_acc: ops.FisherAccumulator,
         max_params: int,
+        damping: float,
     ) -> dict[str, torch.Tensor]:
         """Turn the accumulated Fishers into ``{layer: F_l^-1}``, warning about the
         norm layers dropped by the ``max_params`` cap and the ignored embeddings.
@@ -529,7 +536,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 stacklevel=2,
             )
         return {
-            layer: ops.sym_inverse(F, self.damping)
+            layer: ops.sym_inverse(F, damping)
             for layer, F in fisher_acc.result().items()
         }
 
@@ -607,8 +614,10 @@ class KFACAttributor(_KroneckerBaseAttributor):
     Args:
         args: :class:`AttributionArguments` (``dataloader_*``, ``device``,
             ``output_dir`` are consulted).
-        damping: Tikhonov term added to each covariance factor before inversion.
         task: Accepted for API parity; unused.
+
+    The ``damping`` term is a per-attribution argument of :meth:`attribute` and
+    :meth:`attribute_from_cache`.
 
     The training checkpoints used are chosen per call via
     :meth:`attribute`'s ``selected_training_steps`` argument.
@@ -621,6 +630,7 @@ class KFACAttributor(_KroneckerBaseAttributor):
         train_source: GradientSource,
         device: torch.device,
         fisher_acc: ops.FisherAccumulator | None,
+        damping: float,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         kron = ops.KroneckerAccumulator()
         for _step, train_block, _ in train_source:
@@ -631,8 +641,8 @@ class KFACAttributor(_KroneckerBaseAttributor):
                 self._accumulate_fisher(fisher_acc, train_g)
         return {
             layer: (
-                ops.sym_inverse(A, self.damping),
-                ops.sym_inverse(G, self.damping),
+                ops.sym_inverse(A, damping),
+                ops.sym_inverse(G, damping),
             )
             for layer, (A, G) in kron.result().items()
         }
@@ -691,10 +701,12 @@ class EKFACAttributor(_KroneckerBaseAttributor):
 
     Args:
         args: :class:`AttributionArguments`.
-        damping: Added to the corrected eigenvalues before inversion.
         task: Accepted for API parity; unused.
         mode: ``"exact"`` (default) or ``"approx"``; see above.  Currently
             equivalent.
+
+    The ``damping`` term is a per-attribution argument of :meth:`attribute` and
+    :meth:`attribute_from_cache`.
 
     The training checkpoints used are chosen per call via
     :meth:`attribute`'s ``selected_training_steps`` argument.
@@ -707,7 +719,6 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         self,
         args: AttributionArguments,
         *,
-        damping: float = 1e-3,
         task: AttributionTask | None = None,
         mode: str = "exact",
     ) -> None:
@@ -715,7 +726,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
             raise ValueError(
                 f"mode must be one of {self.EKFAC_MODES}, got {mode!r}.",
             )
-        super().__init__(args, damping=damping, task=task)
+        super().__init__(args, task=task)
         self.mode = mode
 
     def _fit(
@@ -723,6 +734,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         train_source: GradientSource,
         device: torch.device,
         fisher_acc: ops.FisherAccumulator | None,
+        damping: float,
     ) -> dict:
         # Pass 1 -- Kronecker covariance factors and their eigenbases (and, when
         # requested, the direct Fisher for norm layers from the same sweep).
@@ -758,9 +770,11 @@ class EKFACAttributor(_KroneckerBaseAttributor):
                 lam_sum[layer] = lam_sum.get(layer, 0) + (M * M).sum(0)
                 counts[layer] = counts.get(layer, 0) + M.shape[0]
 
+        # Damping is folded into the stored eigenvalues here, at fit time, so
+        # scoring divides by the damped spectrum directly.
         layers: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         for layer, (U_A, U_G) in eig.items():
-            layers[layer] = (U_A, U_G, lam_sum[layer] / counts[layer])
+            layers[layer] = (U_A, U_G, lam_sum[layer] / counts[layer] + damping)
         return layers
 
     @staticmethod
@@ -782,8 +796,8 @@ class EKFACAttributor(_KroneckerBaseAttributor):
             if layer in test_g.data
         }
 
+    @staticmethod
     def _score(
-        self,
         train_g: Gradient,
         test_mats: dict[str, torch.Tensor],
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -799,7 +813,7 @@ class EKFACAttributor(_KroneckerBaseAttributor):
                 U_G,
             )  # (B_tr, D)
             M_te = test_mats[layer]  # (B_te, D)
-            block = (M_tr / (lam + self.damping)) @ M_te.T  # (B_tr, B_te)
+            block = (M_tr / lam) @ M_te.T  # lam is damped at fit time; (B_tr, B_te)
             total = block if total is None else total + block
         if total is None:
             total = torch.zeros(
