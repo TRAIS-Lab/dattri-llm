@@ -217,6 +217,57 @@ class TestKFACShapes:
         assert F.shape[0] == F.shape[1]    # square
 
 
+class TestKfacGradientFreeRows:
+    """Padded / fully masked token rows (g exactly 0) are excluded from the
+    K-FAC covariance factors and from the normalizing row count."""
+
+    def _padded(self):
+        """(B, T, d) factors where the last 2 of 5 positions are 'padded':
+        nonzero activations (as real pads have) but exactly-zero gradients."""
+        torch.manual_seed(0)
+        a = torch.randn(B, 5, I)
+        g = torch.randn(B, 5, O)
+        g[:, 3:] = 0.0
+        return a, g
+
+    def test_padded_rows_excluded(self):
+        a, g = self._padded()
+        A_pad, G_pad = _kfac(a, g, "nn.Linear")
+        # Reference: the same data with the padded positions physically removed.
+        A_ref, G_ref = _kfac(a[:, :3], g[:, :3], "nn.Linear")
+        assert torch.allclose(A_pad, A_ref, atol=1e-6)
+        assert torch.allclose(G_pad, G_ref, atol=1e-6)
+
+    def test_accumulator_matches_one_shot(self):
+        a, g = self._padded()
+        acc = LayerKroneckerAccumulator()
+        acc.update(a, g, "nn.Linear")
+        A_s, G_s = acc.result()
+        A_b, G_b = _kfac(a, g, "nn.Linear")
+        assert torch.allclose(A_s, A_b, atol=1e-6)
+        assert torch.allclose(G_s, G_b, atol=1e-6)
+
+    def test_padding_invariance(self):
+        # Padding the same sequences to a longer length must not change (A, G).
+        a, g = self._padded()
+        a_long = torch.cat([a, torch.randn(B, 4, I)], dim=1)   # pads: a != 0
+        g_long = torch.cat([g, torch.zeros(B, 4, O)], dim=1)   #        g == 0
+        A1, G1 = _kfac(a, g, "nn.Linear")
+        A2, G2 = _kfac(a_long, g_long, "nn.Linear")
+        assert torch.allclose(A1, A2, atol=1e-6)
+        assert torch.allclose(G1, G2, atol=1e-6)
+
+    def test_all_rows_gradient_free_raises(self):
+        a = torch.randn(B, 3, I)
+        g = torch.zeros(B, 3, O)
+        with pytest.raises(ValueError, match="zero"):
+            _kfac(a, g, "nn.Linear")
+        acc = LayerKroneckerAccumulator()
+        acc.update(a, g, "nn.Linear")
+        with pytest.raises(RuntimeError, match="gradient-carrying"):
+            acc.result()
+
+
 class TestStreamingAccumulators:
     def test_kfac_streaming_equals_batch(self):
         a1, g1 = _linear_2d()

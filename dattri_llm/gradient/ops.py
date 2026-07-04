@@ -767,6 +767,24 @@ def _flatten_for_kfac(
     return a_f, g_f
 
 
+def _drop_gradient_free_rows(
+    a_f: torch.Tensor, g_f: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Drop flattened token rows whose output-gradient is exactly zero.
+
+    Such rows contribute nothing to the true Fisher: their ``g gᵀ`` term
+    vanishes and their activation carries no learning signal.  Excluding them
+    from both factors *and* the row count keeps ``(A, G)`` proper means over
+    the gradient-carrying token distribution.  Detection is on the gradient
+    side (exact zeros), so no mask metadata is needed.  Whether to drop at all
+    is the caller's policy decision.
+    """
+    keep = ~(g_f == 0).all(dim=1)
+    if bool(keep.all()):
+        return a_f, g_f
+    return a_f[keep], g_f[keep]
+
+
 def _kfac(
     a: torch.Tensor,
     g: torch.Tensor,
@@ -777,10 +795,22 @@ def _kfac(
     """Return (A, G) K-FAC covariance factor matrices.
 
     *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
+    For sequence (linear) layers, gradient-free (padded / fully masked) token
+    rows are excluded from both factors — see :func:`_drop_gradient_free_rows`.
     """
     a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
     a_f, g_f = _flatten_for_kfac(a, g, layer_type)
+    # Sequence layers only: conv zero-gradient spatial rows are architectural
+    # (max-pooling losers, dead ReLU paths), not padding — the KFC convention
+    # estimates A over all spatial positions.
+    if not (is_conv(layer_type) or is_conv_transpose(layer_type)):
+        a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
     N = a_f.shape[0]
+    if N == 0:
+        raise ValueError(
+            "K-FAC factors are undefined: every token row carries a zero "
+            "gradient (fully padded / masked input)."
+        )
     A = a_f.T @ a_f / N
     G = g_f.T @ g_f / N
     return A, G
@@ -1238,6 +1268,11 @@ class LayerKroneckerAccumulator:
         """
         a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
         a_f, g_f = _flatten_for_kfac(a, g, layer_type)
+        # Sequence layers only: padded / fully masked positions carry
+        # exactly-zero gradients and no learning signal; keep (A, G) means over
+        # gradient-carrying rows.  Conv spatial zeros are architectural — kept.
+        if not (is_conv(layer_type) or is_conv_transpose(layer_type)):
+            a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
         N = a_f.shape[0]
         if self._A is None:
             self._A = torch.zeros(
@@ -1252,8 +1287,8 @@ class LayerKroneckerAccumulator:
 
     def result(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (A, G) normalized covariance matrices."""
-        if self._A is None:
-            raise RuntimeError("No data has been accumulated")
+        if self._A is None or self._n == 0:
+            raise RuntimeError("No gradient-carrying data has been accumulated")
         return self._A / self._n, self._G / self._n
 
     def reset(self) -> None:
