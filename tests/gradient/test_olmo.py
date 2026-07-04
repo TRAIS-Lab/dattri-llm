@@ -46,7 +46,15 @@ pytestmark = pytest.mark.skipif(
 
 from dattri_llm.gradient.gradient import Factorized, GradientRecord  # noqa: E402
 from dattri_llm.gradient.hooks import HookManager, HookManagerCallback, HookManagerConfig  # noqa: E402
-from dattri_llm.trainers.olmo import OLMO_MLP_PATTERNS  # noqa: E402
+
+# OLMo names its block-level MLP linears ``ff_proj`` / ``ff_out`` under
+# ``transformer.blocks.<i>``.  Anchoring to ``blocks.\d+`` excludes the
+# top-level ``transformer.ff_out`` (vocabulary projection, present when
+# ``weight_tying=False``).
+OLMO_MLP_PATTERNS: list[str] = [
+    r"transformer\.blocks\.\d+\.ff_proj",
+    r"transformer\.blocks\.\d+\.ff_out",
+]
 
 # ---------------------------------------------------------------------------
 # Config (kept tiny for CPU / CI speed)
