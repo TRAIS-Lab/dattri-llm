@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback  # noqa: E402
-from dattri_llm.utils.file_manager import GradientFileManager  # noqa: E402
+from dattri_llm.gradient.file_manager import GradientFileManager  # noqa: E402
 from dattri_llm.gradient.gradient import Factorized, GradientRecord  # noqa: E402
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig  # noqa: E402
 

@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.tracin import TracInAttributor
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.utils.file_manager import GradientFileManager
+from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_ALL
 from dattri_llm.utils.hashing import hash_batch
 

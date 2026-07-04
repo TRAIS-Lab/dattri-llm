@@ -2,7 +2,7 @@
 
 This attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
 records produced earlier by the gradient-collection pipeline and persisted to
-disk via :class:`~dattri_llm.utils.file_manager.GradientFileManager`.  No
+disk via :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  No
 forward/backward pass is performed at attribution time — only inner products
 between pre-stored per-sample gradients.
 
@@ -44,13 +44,13 @@ from dattri_llm.algorithm.base import (
     task_loss_fn,
 )
 from dattri_llm.algorithm.score import AttributionScore
-from dattri_llm.algorithm.streaming import (
+from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientSource,
     GradientStreamer,
 )
 from dattri.task import AttributionTask
-from dattri_llm.utils.file_manager import GradientFileManager
+from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManagerConfig
 
 

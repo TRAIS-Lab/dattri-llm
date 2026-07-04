@@ -13,7 +13,7 @@ class CaptureCallback(HookManagerCallback):
 
     The minimal callback: it persists nothing and simply stashes the latest
     step's record on :attr:`record`, so a caller can read it back immediately
-    after the step (used by the live :class:`~dattri_llm.algorithm.streaming.\
+    after the step (used by the live :class:`~dattri_llm.gradient.streaming.\
 GradientStreamer` to yield one block at a time).  Reset to ``None`` before each
     step by the consumer if a missed capture should be detectable.
     """

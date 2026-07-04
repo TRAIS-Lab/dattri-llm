@@ -2,7 +2,7 @@
 
 Like :class:`~dattri_llm.algorithm.tracin.TracInAttributor`, these attributors
 consume :class:`~dattri_llm.gradient.gradient.Gradient` records previously
-persisted by :class:`~dattri_llm.utils.file_manager.GradientFileManager`; no
+persisted by :class:`~dattri_llm.gradient.file_manager.GradientFileManager`; no
 forward/backward pass is run at attribution time.  Unlike TracIn (a raw inner
 product), they precondition the inner product by an approximate inverse Fisher
 estimated *from the training gradients themselves*.
@@ -60,14 +60,14 @@ from dattri_llm.algorithm.base import (
     task_loss_fn,
 )
 from dattri_llm.algorithm.score import AttributionScore
-from dattri_llm.algorithm.streaming import (
+from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientStreamer,
     GradientSource,
 )
 from dattri.task import AttributionTask
 from dattri_llm.gradient import ops
-from dattri_llm.utils.file_manager import GradientFileManager
+from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.hooks import HookManagerConfig
 from torch.utils.data import Dataset

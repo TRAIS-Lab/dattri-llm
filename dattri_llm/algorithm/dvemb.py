@@ -3,7 +3,7 @@
 Like :class:`~dattri_llm.algorithm.tracin.TracInAttributor` and the K-FAC
 family, this attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
 records previously persisted by
-:class:`~dattri_llm.utils.file_manager.GradientFileManager`; no
+:class:`~dattri_llm.gradient.file_manager.GradientFileManager`; no
 forward/backward pass is run at attribution time.
 
 Unlike TracIn — which simply dots the train gradient at the step a sample was
@@ -94,14 +94,14 @@ from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import (
     BaseAttributor,
     normalize_layer_names,
-    resolve_steps,
     task_loss_fn,
 )
 from dattri_llm.algorithm.score import AttributionScore
-from dattri_llm.algorithm.streaming import DiskGradientSource, GradientStreamer
+from dattri_llm.gradient.datasets import resolve_steps
+from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
 from dattri.task import AttributionTask
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.utils.file_manager import GradientFileManager
+from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManagerConfig
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 

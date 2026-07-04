@@ -17,7 +17,7 @@ from dattri_llm.gradient.hooks import (
     HookManagerCallback,
     HookManagerConfig,
 )
-from dattri_llm.utils.file_manager import GradientFileManager
+from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 from dattri_llm.utils.hashing import hash_batch, hash_sample
@@ -1028,12 +1028,12 @@ class TestGradientFileManagerDDP:
 
     def _manager_for_rank(self, tmpdir, rank, monkeypatch):
         """Return a GradientFileManager that behaves as if running on *rank*."""
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
         monkeypatch.setattr(fm_module, "dist_rank", lambda: rank)
         return GradientFileManager(tmpdir)
 
     def test_each_rank_writes_to_own_subdir(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 0)
         m0 = GradientFileManager(str(tmp_path))
@@ -1052,7 +1052,7 @@ class TestGradientFileManagerDDP:
 
     def test_no_batch_id_collision(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
         """Both ranks start _next_batch_id at 0 but write to different subdirs."""
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
 
         for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
             monkeypatch.setattr(fm_module, "dist_rank", lambda r=rank: r)
@@ -1065,7 +1065,7 @@ class TestGradientFileManagerDDP:
         assert (tmp_path / "rank_1" / "batch_000000.pt").exists()
 
     def test_each_rank_has_own_index_json(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
 
         for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
             monkeypatch.setattr(fm_module, "dist_rank", lambda r=rank: r)
@@ -1080,7 +1080,7 @@ class TestGradientFileManagerDDP:
         assert self._HASH_B in idx1 and self._HASH_A not in idx1
 
     def test_index_entries_use_rank_relative_paths(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 0)
         m = GradientFileManager(str(tmp_path))
@@ -1092,7 +1092,7 @@ class TestGradientFileManagerDDP:
 
     def test_fresh_manager_merges_all_ranks(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
         """A reader opened after training sees gradients from every rank."""
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
 
         for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
             monkeypatch.setattr(fm_module, "dist_rank", lambda r=rank: r)
@@ -1108,7 +1108,7 @@ class TestGradientFileManagerDDP:
 
     def test_load_across_ranks(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
         """A reader opened after training can load records from any rank."""
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
 
         # Simulate training: rank 0 and rank 1 each write their own records.
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 0)
@@ -1129,7 +1129,7 @@ class TestGradientFileManagerDDP:
 
     def test_non_distributed_still_writes_to_root(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
         """Single-GPU path: no rank_N/ subdirectory created."""
-        import dattri_llm.utils.file_manager as fm_module
+        import dattri_llm.gradient.file_manager as fm_module
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
         m = GradientFileManager(str(tmp_path))
