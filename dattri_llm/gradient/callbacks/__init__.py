@@ -8,7 +8,7 @@ Three built-in callbacks are provided:
 
 ``OffloadCallback``
     Periodically flushes :class:`GradientRecord` objects to disk via
-    :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.
+    :class:`~dattri_llm.utils.file_manager.GradientFileManager`.
     Supports both per-batch and per-sample recording granularity.
 
 ``DataSelectionCallback``

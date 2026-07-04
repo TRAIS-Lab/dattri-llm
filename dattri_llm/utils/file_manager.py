@@ -8,18 +8,8 @@ from pathlib import Path
 import torch
 
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
-from dattri_llm.gradient.utils import hash_sample
-
-
-def _dist_rank() -> int | None:
-    """Return the current distributed rank, or None if not in a distributed context."""
-    try:
-        import torch.distributed as dist
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank()
-    except Exception:
-        pass
-    return None
+from dattri_llm.utils.distributed import dist_rank
+from dattri_llm.utils.hashing import hash_sample
 
 
 def _merge_index(dst: dict[str, list[dict]], src: dict[str, list[dict]]) -> None:
@@ -110,7 +100,7 @@ class GradientFileManager:
     def __init__(self, save_dir: str) -> None:
         self._root_dir = Path(save_dir)
 
-        rank = _dist_rank()
+        rank = dist_rank()
         if rank is not None:
             self._save_dir = self._root_dir / f"rank_{rank}"
             self._local_prefix = f"rank_{rank}/"
@@ -233,7 +223,7 @@ class GradientFileManager:
 
         Args:
             input_hash: Full 64-character SHA-256 hash (see
-                :func:`~dattri_llm.gradient.utils.hash_sample`).
+                :func:`~dattri_llm.utils.hashing.hash_sample`).
 
         Returns:
             Sorted list of ``(step, sample_idx)`` pairs.

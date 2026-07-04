@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.utils.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 
 if TYPE_CHECKING:

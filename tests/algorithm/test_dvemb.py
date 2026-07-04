@@ -24,7 +24,7 @@ import torch
 import tests.algorithm.test_tracin as TT
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.dvemb import DVEmbAttributor
-from dattri_llm.gradient.utils import hash_sample
+from dattri_llm.utils.hashing import hash_sample
 
 LAYERS = TT.LAYER_NAMES  # ["mlp.fc1", "mlp.fc2"]
 

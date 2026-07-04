@@ -27,11 +27,11 @@ from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import make_gradient_multistep_dataloader
 from dattri_llm.algorithm.tracin import TracInAttributor
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.utils.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.gradient.utils import hash_sample
+from dattri_llm.utils.hashing import hash_sample
 
 IN_DIM, HID_DIM, OUT_DIM = 4, 8, 3
 N_TRAIN, N_TEST = 6, 4

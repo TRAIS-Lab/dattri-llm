@@ -17,8 +17,6 @@ from dattri_llm.gradient.hooks import (
     remove_hooks,
 )
 from dattri_llm.gradient.gradient import GradientRecord
-from dattri_llm.gradient.utils import hash_batch, hash_sample
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.ops import (
     FisherAccumulator,
@@ -48,9 +46,6 @@ __all__ = [
     "register_param_grad_hooks",
     "remove_hooks",
     "GradientRecord",
-    "hash_batch",
-    "hash_sample",
-    "GradientFileManager",
     "ops",
     "FisherAccumulator",
     "KroneckerAccumulator",

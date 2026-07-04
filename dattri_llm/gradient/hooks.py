@@ -59,7 +59,7 @@ from dattri_llm.gradient.ops import (
     extract_module_kwargs,
     is_embedding,
 )
-from dattri_llm.gradient.utils import hash_batch
+from dattri_llm.utils.hashing import hash_batch
 
 try:
     from transformers.pytorch_utils import Conv1D as HF_Conv1D

@@ -27,9 +27,9 @@ from dattri_llm.algorithm.kronecker import EKFACAttributor, KFACAttributor
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.utils.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.gradient.utils import hash_sample
+from dattri_llm.utils.hashing import hash_sample
 
 DAMPING = 1e-2
 LAYERS = TT.LAYER_NAMES  # ["mlp.fc1", "mlp.fc2"]

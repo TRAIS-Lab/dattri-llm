@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import List
 
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.utils.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import GradientRecord
 
 

@@ -9,7 +9,7 @@
   trajectory-agnostic: one column per test sample.
 
 * **Hash identifiers.**  Rows and columns are keyed by the content hash of a
-  sample's inputs (:func:`~dattri_llm.gradient.utils.hash_sample`), not by a
+  sample's inputs (:func:`~dattri_llm.utils.hashing.hash_sample`), not by a
   dataset index.  Hashes are stable under reshuffling and independent of the
   dataset object, so a user holding only an input hash can recover the
   relevant rows/columns without knowing dataset order or which steps a sample

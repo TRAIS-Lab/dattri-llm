@@ -41,9 +41,9 @@ except ImportError:
     )
 
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.utils.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.gradient.utils import hash_sample
+from dattri_llm.utils.hashing import hash_sample
 
 VOCAB, SEQ, BATCH = 256, 32, 2
 

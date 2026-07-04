@@ -12,6 +12,7 @@ import torch.nn as nn
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.utils.distributed import dist_world_size, is_dist_initialized
 
 
 # Per-parameter slice of an FSDP ``FlatParameter`` shard.  ``start``/``end`` are
@@ -754,13 +755,7 @@ class DataSelectionCallback(HookManagerCallback):
                 )
         self._fsdp_shard_map = shard_map
         if shard_map:
-            import torch.distributed as dist
-
-            self._fsdp_world_size = (
-                dist.get_world_size()
-                if dist.is_available() and dist.is_initialized()
-                else 1
-            )
+            self._fsdp_world_size = dist_world_size()
 
     def _remove_contributions_fsdp(
         self,
@@ -775,7 +770,7 @@ class DataSelectionCallback(HookManagerCallback):
         import torch.distributed as dist
 
         world = self._fsdp_world_size
-        use_dist = world > 1 and dist.is_available() and dist.is_initialized()
+        use_dist = world > 1 and is_dist_initialized()
 
         # Skip the (expensive) contribution all-reduce when *no* rank dropped
         # anything this step.  The drop count itself is reduced first so the

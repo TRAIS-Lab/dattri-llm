@@ -6,7 +6,7 @@ concrete implementations so the same scoring loop serves both workflows:
 
 * :class:`DiskGradientSource` — *store-then-attribute*: reads pre-collected
   gradients off disk via a
-  :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  ``reusable=True``.
+  :class:`~dattri_llm.utils.file_manager.GradientFileManager`.  ``reusable=True``.
 * :class:`GradientStreamer` — *on-the-fly*: runs a forward+backward pass over a
   dataset and yields each per-step block on demand, never persisting it.  Its
   ``enable_update`` flag selects the two regimes:
@@ -49,7 +49,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from dattri_llm.algorithm.arguments import AttributionArguments
 from dattri_llm.algorithm.base import iter_gradient_blocks, resolve_steps
 from dattri_llm.gradient.callbacks import CaptureCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.utils.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_ALL
 
