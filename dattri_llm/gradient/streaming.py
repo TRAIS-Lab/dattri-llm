@@ -54,7 +54,7 @@ from dattri_llm.gradient.hooks import HookManager, HookManagerConfig, REGISTER_A
 from dattri_llm.gradient.file_manager import GradientFileManager
 
 if TYPE_CHECKING:
-    from dattri_llm.algorithm.arguments import AttributionArguments
+    from dattri_llm.attribution.arguments import AttributionArguments
 
 logger = logging.getLogger(__name__)
 

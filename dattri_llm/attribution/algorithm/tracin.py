@@ -11,13 +11,13 @@ Every train record is scored against every test record::
     score[i, j] = <g_train_i, g_test_j>
 
 i.e. the full ``(num_train, num_test)`` cross-gram, exactly mirroring the
-:class:`~dattri_llm.algorithm.kronecker.KFACAttributor` assembly — there is no
+:class:`~dattri_llm.attribution.algorithm.kronecker.KFACAttributor` assembly — there is no
 train/test step alignment.  With ``normalized_grad=True`` the inner product
 becomes a cosine similarity (the GradCos / CosIn variant);
 ``GradCos`` is TracIn with ``normalized_grad=True`` passed to the attribute
 methods — there is no separate subclass.
 
-The result is a :class:`~dattri_llm.algorithm.score.AttributionScore`.  Rows are
+The result is a :class:`~dattri_llm.attribution.score.AttributionScore`.  Rows are
 stamped with the step each train gradient was recorded at (read straight off the
 on-disk records), so a sample collected at several checkpoints contributes one
 row per checkpoint; summing a sample's rows over steps recovers the classic
@@ -35,15 +35,15 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 from torch.utils.data import Dataset
 
-from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import (
-    BaseAttributor,
+from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.attribution.base import BaseAttributor
+from dattri_llm.attribution.utils import (
     collect_to_disk,
     normalize_layer_names,
     score_sources,
     task_loss_fn,
 )
-from dattri_llm.algorithm.score import AttributionScore
+from dattri_llm.attribution.score import AttributionScore
 from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientSource,

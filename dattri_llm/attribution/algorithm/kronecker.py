@@ -1,6 +1,6 @@
 """K-FAC / EK-FAC influence attribution over on-disk gradients (workflow 2).
 
-Like :class:`~dattri_llm.algorithm.tracin.TracInAttributor`, these attributors
+Like :class:`~dattri_llm.attribution.algorithm.tracin.TracInAttributor`, these attributors
 consume :class:`~dattri_llm.gradient.gradient.Gradient` records previously
 persisted by :class:`~dattri_llm.gradient.file_manager.GradientFileManager`; no
 forward/backward pass is run at attribution time.  Unlike TracIn (a raw inner
@@ -29,7 +29,7 @@ output-gradient covariance) fit over the whole training set.
 Only linear and convolution layers are K-FAC-eligible; normalisation and
 embedding layers (for which K-FAC is undefined) are skipped by default.  Token/
 spatial positions are summed (matching a sum-over-tokens loss).  Rows and columns
-of the returned :class:`~dattri_llm.algorithm.score.AttributionScore` are
+of the returned :class:`~dattri_llm.attribution.score.AttributionScore` are
 identified by the on-disk content hash, in disk order.
 
 Normalisation layers are not heavily parametrised, so their per-layer Fisher can
@@ -51,15 +51,15 @@ from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import torch
 
-from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import (
-    BaseAttributor,
+from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.attribution.base import BaseAttributor
+from dattri_llm.attribution.utils import (
     collect_to_disk,
     normalize_layer_names,
     score_sources,
     task_loss_fn,
 )
-from dattri_llm.algorithm.score import AttributionScore
+from dattri_llm.attribution.score import AttributionScore
 from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientStreamer,

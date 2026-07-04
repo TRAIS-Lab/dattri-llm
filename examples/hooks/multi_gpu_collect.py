@@ -27,7 +27,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import Dataset
 
-from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.streaming import GradientStreamer
 from dattri_llm.gradient.hooks import HookManagerConfig, REGISTER_ALL
 

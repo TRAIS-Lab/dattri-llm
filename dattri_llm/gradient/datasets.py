@@ -21,7 +21,7 @@ from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.file_manager import GradientFileManager
 
 if TYPE_CHECKING:
-    from dattri_llm.algorithm.arguments import AttributionArguments
+    from dattri_llm.attribution.arguments import AttributionArguments
 
 
 def identity_collate(batch: list) -> object:

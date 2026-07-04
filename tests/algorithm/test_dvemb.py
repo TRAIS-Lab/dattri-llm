@@ -22,8 +22,8 @@ import pytest
 import torch
 
 import tests.algorithm.test_tracin as TT
-from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.dvemb import DVEmbAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.attribution.algorithm.dvemb import DVEmbAttributor
 from dattri_llm.utils.hashing import hash_sample
 
 LAYERS = TT.LAYER_NAMES  # ["mlp.fc1", "mlp.fc2"]
@@ -200,7 +200,7 @@ class TestDVEmbOnDisk:
         """Embeddings persisted via ``dvemb_dir`` (η folded in), dotted against
         the test gradients by a plain TracIn pass, reproduce the DVEmb scores —
         the store-then-attribute workflow."""
-        from dattri_llm.algorithm.tracin import TracInAttributor
+        from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
         dvemb_dir = tmp_path / "dvemb"
         res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
@@ -232,7 +232,7 @@ class TestDVEmbOnDisk:
         """``cache_dvemb`` (embedding-only sweep over the gradient store, no test
         gradients involved) stores the same embeddings as a scoring run —
         verified through the TracIn dot products."""
-        from dattri_llm.algorithm.tracin import TracInAttributor
+        from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
         res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
             train_gradients_dir=str(collected["train_dir"]),

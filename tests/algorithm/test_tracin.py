@@ -23,9 +23,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from dattri_llm.algorithm.arguments import AttributionArguments
+from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.datasets import make_gradient_multistep_dataloader
-from dattri_llm.algorithm.tracin import TracInAttributor
+from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord

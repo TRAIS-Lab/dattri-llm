@@ -1,6 +1,6 @@
 """DVEmb (Data Value Embedding) trajectory-aware attribution (workflow 2).
 
-Like :class:`~dattri_llm.algorithm.tracin.TracInAttributor` and the K-FAC
+Like :class:`~dattri_llm.attribution.algorithm.tracin.TracInAttributor` and the K-FAC
 family, this attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
 records previously persisted by
 :class:`~dattri_llm.gradient.file_manager.GradientFileManager`; no
@@ -73,7 +73,7 @@ This is the **basic** DVEmb estimator — it materialises the per-layer gradient
 and propagates the exact (Fisher-approximated) product.  Influence-checkpointing
 and the low-rank embedding compression of the paper are deliberately omitted.
 
-The result is an :class:`~dattri_llm.algorithm.score.AttributionScore` whose
+The result is an :class:`~dattri_llm.attribution.score.AttributionScore` whose
 rows are ``(train_hash, step)`` pairs (one row per recorded checkpoint of a
 sample, stamped with its step) and whose columns are the test-sample hashes in
 on-disk order — identical bookkeeping to TracIn and the K-FAC family.
@@ -90,13 +90,10 @@ import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
-from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.base import (
-    BaseAttributor,
-    normalize_layer_names,
-    task_loss_fn,
-)
-from dattri_llm.algorithm.score import AttributionScore
+from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.attribution.base import BaseAttributor
+from dattri_llm.attribution.utils import normalize_layer_names, task_loss_fn
+from dattri_llm.attribution.score import AttributionScore
 from dattri_llm.gradient.datasets import resolve_steps
 from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
 from dattri.task import AttributionTask

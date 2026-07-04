@@ -22,8 +22,8 @@ import torch
 import torch.nn as nn
 
 import tests.algorithm.test_tracin as TT
-from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.kronecker import EKFACAttributor, KFACAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttributor
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.callbacks import OffloadCallback

@@ -16,8 +16,8 @@ from torch.utils.data import Dataset
 
 from dattri.task import AttributionTask
 
-from dattri_llm.algorithm.arguments import AttributionArguments
-from dattri_llm.algorithm.tracin import TracInAttributor
+from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
 IN, HID, OUT = 8, 16, 4
 
