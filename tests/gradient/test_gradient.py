@@ -484,20 +484,22 @@ class TestConcatenate:
 class TestAggregate:
     def test_aggregate_materialized_sum(self):
         g = make_gradient(indexing="batch_token")
-        ga = g.aggregate(dim="token", mode="sum")
+        ga = g.aggregate(dim="token")
         assert all(v == "batch" for v in ga.indexing.values())
         for v in ga.data.values():
             assert v.shape == (B, O * I)
 
-    def test_aggregate_materialized_mean(self):
+    def test_aggregate_is_token_sum(self):
+        # Aggregation is the chain rule: the token axis is summed out —
+        # normalization (mean/masked losses) lives in the captured gradients.
         g = make_gradient(indexing="batch_token")
-        ga = g.aggregate(dim="token", mode="mean")
-        for v in ga.data.values():
-            assert v.shape == (B, O * I)
+        ga = g.aggregate(dim="token")
+        for name in g.layer_names:
+            assert torch.allclose(ga.data[name], g.data[name].sum(dim=1))
 
     def test_aggregate_factorized_promotes_to_materialized(self):
         g = make_gradient(repr_type="factorized", indexing="batch_token")
-        ga = g.aggregate(dim="token", mode="sum")
+        ga = g.aggregate(dim="token")
         for name in ga.layer_names:
             assert ga.representation[name] == "materialized"
             assert isinstance(ga.data[name], torch.Tensor)
@@ -509,7 +511,7 @@ class TestAggregate:
         g = Gradient(representation=rep, data=data,
                      layer_types={"l1": "nn.Linear", "l2": "nn.Linear"},
                      indexing={"l1": "batch_token", "l2": "batch"})
-        ga = g.aggregate(dim="token", mode="sum")
+        ga = g.aggregate(dim="token")
         assert ga.data["l1"].shape == (B, O * I)   # aggregated
         assert ga.data["l2"].shape == (B, O * I)   # unchanged
         assert all(v == "batch" for v in ga.indexing.values())
@@ -527,10 +529,12 @@ class TestAggregate:
         with pytest.raises(NotImplementedError):
             g.aggregate(dim="batch")  # type: ignore[arg-type]
 
-    def test_aggregate_invalid_mode(self):
+    def test_aggregate_mean_mode_removed(self):
+        # mode was removed: a mean over tokens double-applies the loss's own
+        # normalization and never computes a gradient.
         g = make_gradient(indexing="batch_token")
-        with pytest.raises(ValueError, match="mode"):
-            g.aggregate(dim="token", mode="max")  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            g.aggregate(dim="token", mode="mean")  # type: ignore[call-arg]
 
 
 # --------------------------------------------------------------------------- #

@@ -483,27 +483,28 @@ class Gradient:
     def aggregate(
         self,
         dim: Literal["token"] = "token",
-        mode: Literal["sum", "mean"] = "sum",
     ) -> "Gradient":
-        """Reduce the token dimension of ``"batch_token"`` layers.
+        """Sum out the token dimension of ``"batch_token"`` layers.
 
         Layers with ``"batch"`` indexing are passed through unchanged.
         This allows a mixed-indexing :class:`Gradient` to be unified into
         a purely ``"batch"``-indexed one.
 
+        Summation is the only aggregation offered because it is the chain rule:
+        ``∂L/∂W = Σ_t g_t a_tᵀ`` for **any** loss — a token-mean (or masked)
+        loss already carries its normalization inside the captured per-token
+        gradients, so averaging here would divide by the token count a second
+        time and yields the gradient of nothing.
+
         Args:
             dim: Must be ``"token"`` (only token aggregation is supported).
-            mode: ``"sum"`` (default) or ``"mean"``.
 
         Returns:
             A new :class:`Gradient` with all layers at ``"batch"`` indexing.
         """
         if dim != "token":
             raise NotImplementedError("Only token aggregation is supported")
-        if mode not in {"sum", "mean"}:
-            raise ValueError("mode must be 'sum' or 'mean'")
 
-        reduce_fn = torch.sum if mode == "sum" else torch.mean
         new_data = {}
         new_repr = {}
 
@@ -511,24 +512,11 @@ class Gradient:
             layer_type = self.layer_types[name]
             if self._layer_indexing(name) == "batch_token":
                 if isinstance(value, Factorized):
-                    mat = ops.materialize(value, layer_type)  # (B, d), summed over T
-                    if mode == "mean":
-                        # T is the token count after preprocessing: for raw Conv
-                        # this is L_out (spatial positions), not C_in.
-                        if value.module_kwargs is not None and (
-                            ops.is_conv(layer_type) or ops.is_conv_transpose(layer_type)
-                        ):
-                            # L_out is encoded in mat's flattened dim; recover it
-                            # from the preprocessed activation shape.
-                            a_p, _ = ops.preprocess_factorized(value, layer_type)
-                            T = a_p.shape[1]
-                        else:
-                            T = value.as_batch_first().activation.shape[1]
-                        mat = mat / T
-                    new_data[name] = mat
+                    # (B, d), summed over T
+                    new_data[name] = ops.materialize(value, layer_type)
                     new_repr[name] = "materialized"
                 else:
-                    new_data[name] = reduce_fn(value, dim=1)
+                    new_data[name] = torch.sum(value, dim=1)
                     new_repr[name] = self.representation[name]
             else:
                 # "batch" layer — pass through unchanged.
