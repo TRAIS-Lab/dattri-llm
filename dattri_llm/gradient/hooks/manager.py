@@ -42,8 +42,15 @@ if TYPE_CHECKING:
 class HookManager:
     """Collect per-sample or per-batch gradients via forward/backward hooks.
 
-    Hooks are registered at construction and remain active until
-    :meth:`remove` is called.  Collection is gated by :meth:`collect`.
+    Hooks are registered at construction (via :meth:`register`) and remain
+    active until :meth:`remove` is called; a removed manager can be re-armed
+    with another :meth:`register` call.  Collection is gated by
+    :meth:`collect`, which can also take down the hooks itself when the
+    context exits (``deregister_on_exit=True``) -- the safe form for a
+    throwaway manager that is never referenced again::
+
+        with HookManager(model, callbacks=[...]).collect(deregister_on_exit=True):
+            trainer.train()
 
     Args:
         model: The model to hook (plain ``nn.Module``, ``DataParallel``, or
@@ -143,89 +150,27 @@ class HookManager:
         self._mlp_params_ready: bool = False
         self._backward_end_scheduled: bool = False
 
-        root = getattr(model, "module", model)
         self._n_replicas: int = (
             len(model.device_ids) if isinstance(model, nn.DataParallel) else 1
         )
 
         self._last_inputs: dict[str, torch.Tensor] = {}
-        self._model_fwd_handle = root.register_forward_pre_hook(
-            self._capture_model_input,
-            with_kwargs=True,
-        )
 
-        # Resolve which hook family each layer is assigned to (one family per
-        # layer), then register concrete layer-name sets.
-        assignment = resolve_hook_assignments(root, self._config)
-        linear_io_layers = {n for n, t in assignment.items() if t == LINEAR_IO}
-        param_grad_layers = {n for n, t in assignment.items() if t == PARAM_GRAD}
-        self._has_linear_io = bool(linear_io_layers)
-        self._has_param_grad = bool(param_grad_layers)
-
+        # Hook state -- populated by register(), emptied by remove().
+        self._registered: bool = False
+        self._model_fwd_handle: torch.utils.hooks.RemovableHandle | None = None
+        self._has_linear_io: bool = False
         self._buffers: dict = {}
         self._handles: list = []
         self._mlp_weight_handles: list = []  # post-accumulate hooks for sub-cond (b)
         self._n_layers: int = 0
-        if self._has_linear_io:
-            self._bwd_done = False
-            self._buffers, self._handles = register_linear_io_hooks(
-                model,
-                layer_names=linear_io_layers,
-                on_layer_forward=self._dispatch_layer_forward,
-                on_layer_backward=self._check_step_bwd_complete,
-                type_overrides=self._config.layer_types,
-                projection=self._config.projection,
-                projector=(
-                    _resolve_projector(self._config.projector)
-                    if self._config.projection is not None
-                    else None
-                ),
-            )
-            self._n_layers = len(self._buffers)
-            self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
-                model,
-                layer_names=linear_io_layers,
-                on_linear_param_grad=self._check_step_mlp_param_complete,
-            )
-
+        self._has_param_grad: bool = False
         self._param_buffers: dict = {}
         self._param_handles: list = []
         self._n_params_hooked: int = 0
         self._param_hook_count: int = 0
-        if self._has_param_grad:
-            self._grad_done = False
-            self._param_buffers, self._param_handles = register_param_grad_hooks(
-                model,
-                layer_names=param_grad_layers,
-                on_param_grad=self._check_step_grad_complete,
-            )
-            self._n_params_hooked = len(self._param_handles)
 
-        # Warn about manual layer_types that never took effect because the named
-        # layer was not hooked (e.g. a typo, or a layer excluded by the hook
-        # selection).  Overrides only apply to factorized linear_io layers.
-        if self._config.layer_types:
-            hooked = set(self._buffers) | set(self._param_buffers)
-            unused = sorted(set(self._config.layer_types) - hooked)
-            if unused:
-                warnings.warn(
-                    "HookManagerConfig.layer_types designated a type for layers "
-                    f"that were not hooked: {unused}. These overrides had no "
-                    "effect.",
-                    stacklevel=2,
-                )
-
-        # The sequence-first flag only applies to factorized (linear_io) layers;
-        # warn about names that are not hooked that way (typo / excluded / a
-        # param_grad layer, which is always batch-first).
-        if self._non_batch_first_layers:
-            unused = sorted(self._non_batch_first_layers - set(self._buffers))
-            if unused:
-                warnings.warn(
-                    "non_batch_first_layers names layers not hooked with factorized "
-                    f"(linear_io) capture; the flag had no effect: {unused}.",
-                    stacklevel=2,
-                )
+        self.register()
 
         # Notify callbacks of this HookManager so they can reference it
         # (e.g. to call pause() during a secondary pass).
@@ -588,7 +533,10 @@ class HookManager:
     # ---------------------------------------------------------------------- #
 
     @contextmanager
-    def collect(self) -> Generator[HookManager, None, None]:
+    def collect(
+        self,
+        deregister_on_exit: bool = False,
+    ) -> Generator[HookManager, None, None]:
         """Enable gradient collection for the duration of the context.
 
         Works with any training loop::
@@ -599,9 +547,30 @@ class HookManager:
             with collector.collect():
                 trainer.train()
 
+        Entering the context re-registers the hooks if they were previously
+        removed, so a manager can alternate ``remove()`` / ``collect()`` (or
+        chain ``deregister_on_exit=True`` contexts) freely.
+
+        Args:
+            deregister_on_exit: When ``True``, remove all hooks once the
+                context exits (after the callbacks' ``on_context_end`` flush),
+                leaving no trace on the model.  This makes the throwaway
+                one-liner safe -- without it, an unreferenced manager's hooks
+                stay registered on the model forever::
+
+                    with HookManager(model, callbacks=[...]).collect(
+                        deregister_on_exit=True,
+                    ):
+                        trainer.train()
+
+                The last assembled gradient survives the teardown, so
+                :meth:`get_gradient` still works after the context.  Defaults
+                to ``False``: the hooks stay up until :meth:`remove`.
+
         Yields:
             This :class:`HookManager` instance.
         """
+        self.register()
         self._reset_layer_buffers()
         self._reset_param_buffers()
         # Drop any cached gradient from a prior context before collecting anew.
@@ -619,6 +588,12 @@ class HookManager:
             self._collecting = False
             for cb in self._callbacks:
                 cb.on_context_end()
+            if deregister_on_exit:
+                # remove() clears the cached gradient; preserve it so
+                # get_gradient() remains valid after an auto-teardown context.
+                last_gradient = self._last_gradient
+                self.remove()
+                self._last_gradient = last_gradient
 
     @contextmanager
     def pause(self) -> Generator[HookManager, None, None]:
@@ -688,15 +663,115 @@ class HookManager:
     # Lifecycle and introspection                                              #
     # ---------------------------------------------------------------------- #
 
+    def register(self) -> None:
+        """Register all hooks on the model.
+
+        Called automatically at construction.  Call it again to re-arm a
+        manager whose hooks were taken down by :meth:`remove` (or by a
+        ``collect(deregister_on_exit=True)`` context); no-op while the hooks
+        are already registered.
+        """
+        if self._registered:
+            return
+        model = self._model
+        root = getattr(model, "module", model)
+        self._model_fwd_handle = root.register_forward_pre_hook(
+            self._capture_model_input,
+            with_kwargs=True,
+        )
+
+        # Resolve which hook family each layer is assigned to (one family per
+        # layer), then register concrete layer-name sets.
+        assignment = resolve_hook_assignments(root, self._config)
+        linear_io_layers = {n for n, t in assignment.items() if t == LINEAR_IO}
+        param_grad_layers = {n for n, t in assignment.items() if t == PARAM_GRAD}
+        self._has_linear_io = bool(linear_io_layers)
+        self._has_param_grad = bool(param_grad_layers)
+
+        self._bwd_done = True
+        self._n_mlp_params = 0
+        self._n_layers = 0
+        if self._has_linear_io:
+            self._bwd_done = False
+            self._buffers, self._handles = register_linear_io_hooks(
+                model,
+                layer_names=linear_io_layers,
+                on_layer_forward=self._dispatch_layer_forward,
+                on_layer_backward=self._check_step_bwd_complete,
+                type_overrides=self._config.layer_types,
+                projection=self._config.projection,
+                projector=(
+                    _resolve_projector(self._config.projector)
+                    if self._config.projection is not None
+                    else None
+                ),
+            )
+            self._n_layers = len(self._buffers)
+            self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
+                model,
+                layer_names=linear_io_layers,
+                on_linear_param_grad=self._check_step_mlp_param_complete,
+            )
+
+        self._grad_done = True
+        self._n_params_hooked = 0
+        if self._has_param_grad:
+            self._grad_done = False
+            self._param_buffers, self._param_handles = register_param_grad_hooks(
+                model,
+                layer_names=param_grad_layers,
+                on_param_grad=self._check_step_grad_complete,
+            )
+            self._n_params_hooked = len(self._param_handles)
+
+        # Warn about manual layer_types that never took effect because the named
+        # layer was not hooked (e.g. a typo, or a layer excluded by the hook
+        # selection).  Overrides only apply to factorized linear_io layers.
+        if self._config.layer_types:
+            hooked = set(self._buffers) | set(self._param_buffers)
+            unused = sorted(set(self._config.layer_types) - hooked)
+            if unused:
+                warnings.warn(
+                    "HookManagerConfig.layer_types designated a type for layers "
+                    f"that were not hooked: {unused}. These overrides had no "
+                    "effect.",
+                    stacklevel=2,
+                )
+
+        # The sequence-first flag only applies to factorized (linear_io) layers;
+        # warn about names that are not hooked that way (typo / excluded / a
+        # param_grad layer, which is always batch-first).
+        if self._non_batch_first_layers:
+            unused = sorted(self._non_batch_first_layers - set(self._buffers))
+            if unused:
+                warnings.warn(
+                    "non_batch_first_layers names layers not hooked with factorized "
+                    f"(linear_io) capture; the flag had no effect: {unused}.",
+                    stacklevel=2,
+                )
+
+        self._registered = True
+
     def remove(self) -> None:
-        """Remove all registered hooks and clear all buffer dicts."""
+        """Remove all registered hooks and clear all buffer dicts.
+
+        Idempotent: safe to call on a manager whose hooks are already down.
+        :meth:`register` re-arms the manager afterwards.
+        """
+        if not self._registered:
+            return
         self._model_fwd_handle.remove()
+        self._model_fwd_handle = None
         remove_hooks(self._handles)
+        self._handles = []
         self._buffers.clear()
         remove_hooks(self._mlp_weight_handles)
+        self._mlp_weight_handles = []
         remove_hooks(self._param_handles)
+        self._param_handles = []
         self._param_buffers.clear()
         self._last_gradient = None
+        self._registered = False
 
     def add_callback(self, callback: HookManagerCallback) -> None:
         """Attach a callback after construction and run its ``on_register``.

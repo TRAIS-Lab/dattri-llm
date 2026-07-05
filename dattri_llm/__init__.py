@@ -4,7 +4,7 @@ The advertised surface is importable from the top level::
 
     from dattri_llm import HookManager, HookManagerConfig, OffloadCallback
 
-    with HookManager(model, callbacks=[...]).collect():
+    with HookManager(model, callbacks=[...]).collect(deregister_on_exit=True):
         trainer.train()
 
 The gradient-capture core (hooks, callbacks, data model, storage) is imported

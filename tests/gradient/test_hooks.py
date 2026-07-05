@@ -951,3 +951,121 @@ class TestUnbatchedPositionalEmbedding:
         broadcast = [str(w.message) for w in caught if "broadcast" in str(w.message)]
         assert len(broadcast) == 1
         assert "wpe" in broadcast[0]
+
+
+# --------------------------------------------------------------------------- #
+# Hook lifecycle -- register() / remove() / collect(deregister_on_exit=...)     #
+# --------------------------------------------------------------------------- #
+
+
+def _n_live_hooks(model: nn.Module) -> int:
+    """Count every hook the HookManager could have left on the model."""
+    module_dicts = (
+        "_forward_hooks",
+        "_forward_pre_hooks",
+        "_full_backward_hooks",
+        "_backward_hooks",
+    )
+    n = 0
+    for m in model.modules():
+        # Some hook dicts are created lazily depending on the torch version.
+        n += sum(len(getattr(m, d, None) or {}) for d in module_dicts)
+    for p in model.parameters():
+        n += len(getattr(p, "_backward_hooks", None) or {})
+        n += len(getattr(p, "_post_accumulate_grad_hooks", None) or {})
+    return n
+
+
+class TestHookLifecycle:
+    @staticmethod
+    def _model():
+        return nn.Sequential(nn.Linear(8, 4, bias=False))
+
+    def test_deregister_on_exit_leaves_no_hooks(self):
+        # The throwaway one-liner: no reference to the manager survives the
+        # context, so the context itself must take the hooks down.
+        model = self._model()
+        cb = _Recording()
+        with HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[cb],
+        ).collect(deregister_on_exit=True):
+            model(torch.randn(3, 8)).sum().backward()
+        assert len(cb.records) == 1
+        assert _n_live_hooks(model) == 0
+        # Later training activity must be completely unobserved.
+        model(torch.randn(2, 8)).sum().backward()
+        assert len(cb.records) == 1
+
+    def test_default_keeps_hooks_until_remove(self):
+        model = self._model()
+        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL))
+        with hm.collect():
+            model(torch.randn(3, 8)).sum().backward()
+        assert _n_live_hooks(model) > 0  # default: hooks stay up
+        hm.remove()
+        assert _n_live_hooks(model) == 0
+
+    def test_remove_is_idempotent(self):
+        model = self._model()
+        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL))
+        hm.remove()
+        hm.remove()  # second call must be a no-op, not an AttributeError
+        assert _n_live_hooks(model) == 0
+
+    def test_register_rearms_after_remove(self):
+        model = self._model()
+        cb = _Recording()
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[cb],
+        )
+        hm.remove()
+        hm.register()
+        with hm.collect():
+            model(torch.randn(3, 8)).sum().backward()
+        hm.remove()
+        assert len(cb.records) == 1
+
+    def test_collect_reregisters_after_remove(self):
+        # collect() re-arms a removed manager on its own.
+        model = self._model()
+        cb = _Recording()
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[cb],
+        )
+        hm.remove()
+        with hm.collect():
+            model(torch.randn(3, 8)).sum().backward()
+        hm.remove()
+        assert len(cb.records) == 1
+
+    def test_chained_deregister_contexts(self):
+        # A named manager can run consecutive auto-teardown contexts; the
+        # step counter spans them.
+        model = self._model()
+        cb = _Recording()
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[cb],
+        )
+        for _ in range(2):
+            with hm.collect(deregister_on_exit=True):
+                model(torch.randn(3, 8)).sum().backward()
+            assert _n_live_hooks(model) == 0
+        assert len(cb.records) == 2
+        assert hm.steps_collected == 2
+
+    def test_gradient_survives_deregister_on_exit(self):
+        model = self._model()
+        hm = HookManager(model, config=HookManagerConfig(linear_io=REGISTER_ALL))
+        with hm.collect(deregister_on_exit=True):
+            model(torch.randn(3, 8)).sum().backward()
+        grad = hm.get_gradient()
+        assert grad is not None
+        assert grad.batch_size == 3

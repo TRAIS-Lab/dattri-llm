@@ -36,7 +36,7 @@ official benchmark suite on attribution quality (LDS, LOO) and runtime (see
   forward/backward step:
 
   ```python
-  with HookManager(model, callbacks=[...]).collect():
+  with HookManager(model, callbacks=[...]).collect(deregister_on_exit=True):
       trainer.train()
   ```
 
