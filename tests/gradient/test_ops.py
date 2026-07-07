@@ -15,10 +15,11 @@ Two suites:
         _grad_norm_sq(a, g, lt)[i]     ==  ||mat[i]||^2
         _dot(a1,g1, a2,g2, lt)[i]      ==  mat1[i] * mat2[i]
 
-    where ``mat = _materialize(a, g, lt, per_token=True)`` (the per-position form,
-    so a norm layer's diagonal cross-gram matches).  Factors are supplied already
-    in the preprocessed form (no ``module_kwargs``), so these tests exercise the
-    core einsum kernels independently of layer-specific preprocessing.
+    where ``mat = _materialize(a, g, lt)`` is the true per-sample weight
+    gradient (positions summed -- for norm layers this includes the
+    cross-position terms).  Factors are supplied already in the preprocessed
+    form (no ``module_kwargs``), so these tests exercise the core einsum
+    kernels independently of layer-specific preprocessing.
 
 2.  **K-FAC / FIM tests**: covariance-factor shapes, the NotImplementedError
     contract for norm/embedding layers, and streaming-equals-batch consistency
@@ -142,7 +143,7 @@ class TestPairwiseDotIdentity:
 
     @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_matches_materialized_gram(self, lt, a, g):
-        mat = _materialize(a, g, lt, per_token=True).float()  # norm: per-position
+        mat = _materialize(a, g, lt).float()  # true per-sample weight grads
         expected = mat @ mat.T  # (B, B)
         actual = _pairwise_dot(a, g, lt).float()
         assert actual.shape == (B, B)
@@ -166,7 +167,7 @@ class TestGradNormSqIdentity:
 
     @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_matches_materialized_norm(self, lt, a, g):
-        mat = _materialize(a, g, lt, per_token=True).float()  # norm: per-position
+        mat = _materialize(a, g, lt).float()  # true per-sample weight grads
         expected = mat.pow(2).sum(-1)  # (B,)
         actual = _grad_norm_sq(a, g, lt).float()
         assert actual.shape == (B,)
@@ -186,8 +187,8 @@ class TestDotIdentity:
 
     @pytest.mark.parametrize(("lt", "a1", "g1", "a2", "g2"), _PARAMS_CROSS)
     def test_matches_materialized_dot(self, lt, a1, g1, a2, g2):
-        mat1 = _materialize(a1, g1, lt, per_token=True).float()  # norm: per-position
-        mat2 = _materialize(a2, g2, lt, per_token=True).float()
+        mat1 = _materialize(a1, g1, lt).float()  # true per-sample weight grads
+        mat2 = _materialize(a2, g2, lt).float()
         expected = (mat1 * mat2).sum(-1)  # (B,)
         actual = _dot(a1, g1, a2, g2, lt).float()
         assert actual.shape == (B,)

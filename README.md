@@ -56,8 +56,8 @@ print(score.agnostic_matrix()[1])  # (num_train, num_val) influence scores
 ```
 
 ```
-tensor([[20073.3711],       # <- "Influence functions trace a model's ..."
-        [16199.3711]])      # <- "Preheat the oven and mix flour, ..."
+tensor([[20337.7832],       # <- "Influence functions trace a model's ..."
+        [16444.2383]])      # <- "Preheat the oven and mix flour, ..."
 ```
 
 ## Key Features

@@ -1246,6 +1246,76 @@ class TestQKNormGroundTruth:
                 f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
             )
 
+    def test_grad_norm_sq(self) -> None:
+        inputs = self._inputs()
+        ref = _per_sample_weight_grads(self.model, "ln", inputs)
+        norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs)), "ln")
+        for i in range(B):
+            assert torch.allclose(norms[i], ref[i].float().pow(2).sum(), atol=1e-4)
+
+    def test_pairwise_dot(self) -> None:
+        inputs = self._inputs()
+        ref = _per_sample_weight_grads(self.model, "ln", inputs)
+        K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs)), "ln")
+        for i in range(B):
+            for j in range(B):
+                expected = (ref[i].float() * ref[j].float()).sum()
+                assert torch.allclose(K[i, j], expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Token norms with T > 1 -- cross-position dot terms
+# ---------------------------------------------------------------------------
+
+
+class TestTokenNormMultiPositionGroundTruth:
+    """LayerNorm / RMSNorm fed 3-D ``(B, T, d)`` inputs with ``T > 1``.
+
+    The per-sample weight gradient sums the per-position products over T, so
+    dots must include the cross-position terms ``<v(t), v(s)>, t != s`` --
+    previously only ``T == 1`` was covered and the norm dot kernels silently
+    dropped those terms.
+    """
+
+    def _check(self, model, layer_attr: str, with_bias: bool) -> None:
+        torch.manual_seed(1)
+        inputs = [torch.randn(1, T, D_IN) for _ in range(B)]
+        w_ref = _per_sample_weight_grads(model, layer_attr, inputs)
+        if with_bias:
+            b_ref = _per_sample_bias_grads(model, layer_attr, inputs)
+            full_ref = [
+                torch.cat([w.float(), b.float()])
+                for w, b in zip(w_ref, b_ref, strict=True)
+            ]
+        else:
+            full_ref = [w.float() for w in w_ref]
+        gradient = _run_batch(model, torch.cat(inputs))
+
+        norms = _grad_norm_sq(gradient, layer_attr)
+        K = _pairwise_dot(gradient, layer_attr)
+        for i in range(B):
+            assert torch.allclose(norms[i], full_ref[i].pow(2).sum(), atol=1e-4), (
+                f"grad_norm_sq mismatch sample {i}"
+            )
+            for j in range(B):
+                expected = (full_ref[i] * full_ref[j]).sum()
+                assert torch.allclose(K[i, j], expected, atol=1e-4), (
+                    f"pairwise_dot mismatch ({i}, {j})"
+                )
+
+    def test_layer_norm_with_bias(self) -> None:
+        torch.manual_seed(0)
+        self._check(_LayerNormModel(D_IN, bias=True), "ln", with_bias=True)
+
+    def test_layer_norm_no_bias(self) -> None:
+        torch.manual_seed(0)
+        self._check(_LayerNormModel(D_IN, bias=False), "ln", with_bias=False)
+
+    @pytest.mark.skipif(not _HAS_RMSNORM, reason="nn.RMSNorm requires PyTorch >= 2.4")
+    def test_rms_norm(self) -> None:
+        torch.manual_seed(0)
+        self._check(_RMSNormModel(D_IN), "ln", with_bias=False)
+
 
 # ---------------------------------------------------------------------------
 # Shared driver for per-channel norms (GroupNorm / InstanceNorm)
@@ -1268,6 +1338,14 @@ class _ChannelNormChecks:
         R = self.model.R
         return _channel_norm_diag_grad(self._xhat(x), R, has_bias)
 
+    def _param_grad_vec(self, x: torch.Tensor, has_bias: bool) -> torch.Tensor:
+        """True per-sample ``[dgamma | dbeta]``: the per-position (diagonal)
+        gradient summed over spatial positions -- what grad_norm_sq and
+        pairwise_dot contract, cross-position terms included.
+        """
+        width = 2 * self.C if has_bias else self.C
+        return self._diag(x, has_bias).reshape(-1, width).sum(0)
+
     # -- with bias (affine=True, bias folded) --------------------------------
 
     def test_materialize_with_bias(self) -> None:
@@ -1289,7 +1367,7 @@ class _ChannelNormChecks:
         inputs = self._inputs()
         norms = _grad_norm_sq(_run_batch(self.model, torch.cat(inputs)), "norm")
         for i in range(B):
-            ref = self._diag(inputs[i], has_bias=True).pow(2).sum()
+            ref = self._param_grad_vec(inputs[i], has_bias=True).pow(2).sum()
             assert torch.allclose(norms[i], ref, atol=1e-4), (
                 f"sample {i}: {norms[i]:.4f} vs {ref:.4f}"
             )
@@ -1297,10 +1375,10 @@ class _ChannelNormChecks:
     def test_pairwise_dot_with_bias(self) -> None:
         inputs = self._inputs()
         K = _pairwise_dot(_run_batch(self.model, torch.cat(inputs)), "norm")
-        diags = [self._diag(x, has_bias=True) for x in inputs]
+        vecs = [self._param_grad_vec(x, has_bias=True) for x in inputs]
         for i in range(B):
             for j in range(B):
-                expected = (diags[i] * diags[j]).sum()
+                expected = (vecs[i] * vecs[j]).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3)
 
     # -- no bias (include_bias=False: only the gamma gradient is kept) --------
@@ -1326,7 +1404,7 @@ class _ChannelNormChecks:
             include_bias=False,
         )
         for i in range(B):
-            ref = self._diag(inputs[i], has_bias=False).pow(2).sum()
+            ref = self._param_grad_vec(inputs[i], has_bias=False).pow(2).sum()
             assert torch.allclose(norms[i], ref, atol=1e-4)
 
     def test_pairwise_dot_no_bias(self) -> None:
@@ -1336,10 +1414,10 @@ class _ChannelNormChecks:
             "norm",
             include_bias=False,
         )
-        diags = [self._diag(x, has_bias=False) for x in inputs]
+        vecs = [self._param_grad_vec(x, has_bias=False) for x in inputs]
         for i in range(B):
             for j in range(B):
-                expected = (diags[i] * diags[j]).sum()
+                expected = (vecs[i] * vecs[j]).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-3)
 
 

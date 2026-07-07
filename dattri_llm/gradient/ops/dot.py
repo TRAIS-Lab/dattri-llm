@@ -72,8 +72,11 @@ def _cross_gram(
     g2_f = _to_3d(g2.float())
 
     if is_norm(layer_type):
-        grad1 = (a1_f * g1_f).flatten(1)  # (B1, T*d)
-        grad2 = (a2_f * g2_f).flatten(1)  # (B2, T*d)
+        # dW_i = sum_t x_hat_it * g_it: contract positions first so the dot is
+        # the true weight-gradient inner product (cross-position terms
+        # included) and the two sides may have different position counts.
+        grad1 = (a1_f * g1_f).sum(1)  # (B1, d)
+        grad2 = (a2_f * g2_f).sum(1)  # (B2, d)
         return grad1 @ grad2.T  # (B1, B2)
 
     # Linear, Conv, ConvTranspose -- route factorized (ghost) vs materialized.
@@ -187,8 +190,10 @@ def _dot(
     g2_f = _to_3d(g2.float())
 
     if is_norm(layer_type):
-        grad1 = (a1_f * g1_f).flatten(1)  # (B, T*d)
-        grad2 = (a2_f * g2_f).flatten(1)  # (B, T*d)
+        # Contract positions into per-sample weight grads before the dot
+        # (see the matching branch in _cross_gram).
+        grad1 = (a1_f * g1_f).sum(1)  # (B, d)
+        grad2 = (a2_f * g2_f).sum(1)  # (B, d)
         return (grad1 * grad2).sum(-1)  # (B,)
 
     # Linear, Conv, ConvTranspose
@@ -227,7 +232,8 @@ def _grad_norm_sq(
     g_f = _to_3d(g.float())  # (B, T, d_out)
 
     if is_norm(layer_type):
-        return (a_f * g_f).square().sum((1, 2))  # (B,)
+        # ||sum_t x_hat_it * g_it||^2 -- positions contracted first.
+        return (a_f * g_f).sum(1).square().sum(-1)  # (B,)
 
     # Linear, Conv, ConvTranspose -- route factorized (ghost) vs materialized.
     _, S, K = a_f.shape
