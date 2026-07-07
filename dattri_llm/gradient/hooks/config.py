@@ -366,18 +366,21 @@ def resolve_hook_assignments(
                 f"hook_types names layer '{layer_name}', which does not exist "
                 "in the model.",
             )
-        if hook_type == LINEAR_IO and not _is_linear_io_capable(module):
-            # A layer_types override declaring a supported factorizable type
-            # (e.g. a hand-rolled HF RMSNorm declared as "nn.RMSNorm") makes
-            # the layer eligible; without one it is only param_grad material.
-            if config.layer_types.get(layer_name) not in ALL_LAYER_TYPES:
-                raise ValueError(
-                    f"Layer '{layer_name}' was assigned 'linear_io' but its type "
-                    f"({canonical_class_name(module)}) does not support factorized "
-                    "linear-IO hooks. If the layer computes the same math as a "
-                    "supported type, declare it via layer_types "
-                    f"(e.g. layer_types={{'{layer_name}': 'nn.RMSNorm'}}).",
-                )
+        # A layer_types override declaring a supported factorizable type
+        # (e.g. a hand-rolled HF RMSNorm declared as "nn.RMSNorm") makes
+        # the layer eligible; without one it is only param_grad material.
+        if (
+            hook_type == LINEAR_IO
+            and not _is_linear_io_capable(module)
+            and config.layer_types.get(layer_name) not in ALL_LAYER_TYPES
+        ):
+            raise ValueError(
+                f"Layer '{layer_name}' was assigned 'linear_io' but its type "
+                f"({canonical_class_name(module)}) does not support factorized "
+                "linear-IO hooks. If the layer computes the same math as a "
+                "supported type, declare it via layer_types "
+                f"(e.g. layer_types={{'{layer_name}': 'nn.RMSNorm'}}).",
+            )
         if hook_type == PARAM_GRAD and not _has_trainable_params(module):
             raise ValueError(
                 f"Layer '{layer_name}' was assigned 'param_grad' but has no "
