@@ -23,6 +23,9 @@ transformers = [
     "transformers>=4.40",
     "accelerate>=0.28",
 ]
+trl = [
+    "trl>=0.19",
+]
 olmo = [
     "ai2-olmo",
 ]
@@ -31,6 +34,7 @@ dev = [
     "dattri>=0.3.0",
     "transformers>=4.40",
     "accelerate>=0.28",
+    "trl>=0.19",
     "ai2-olmo",
 ]
 

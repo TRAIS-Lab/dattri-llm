@@ -169,6 +169,16 @@ All attributors consume the same `GradientSource` contract (per-step
 `(step, Gradient, hashes)` blocks), read either from disk or computed live, so new
 methods plug into the same capture/storage/streaming infrastructure.
 
+## Supported Models & Frameworks
+
+**Models** — Our hook-based implementation is compatible with any `nn.Module`, enabling support for a broad range of LLM architectures, including the GPT-2, Llama, Qwen, and Gemma families.
+
+**Frameworks** — Our library integrates directly with a variety of training frameworks, including but not limited to
+[Transformers](https://github.com/huggingface/transformers),
+[TRL](https://github.com/huggingface/trl), and
+[OLMo](https://github.com/allenai/OLMo).
+See [`examples/trainers`](examples/trainers) for detailed examples.
+
 ## Architecture
 
 The library is organized in three layers:

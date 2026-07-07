@@ -20,6 +20,7 @@ additionally supports multi-process (and multi-GPU) launches via `torchrun`.
 | [`attribution/attribution_on_the_fly.py`](attribution/attribution_on_the_fly.py) | one-call live attribution | `dattri`, `transformers` |
 | [`data_selection/gpt2_data_selection.py`](data_selection/gpt2_data_selection.py) | online data selection on GPT-2 | `transformers` |
 | [`trainers/transformers_trainer.py`](trainers/transformers_trainer.py) | wrapping the Hugging Face `Trainer` | `transformers`, `accelerate` |
+| [`trainers/trl_trainer.py`](trainers/trl_trainer.py) | wrapping TRL's `SFTTrainer` | `trl` |
 | [`trainers/olmo_trainer.py`](trainers/olmo_trainer.py) | wrapping the OLMo `Trainer` | `ai2-olmo` |
 
 ("—" means the capture core's only dependency, `torch`, suffices.)
@@ -121,7 +122,7 @@ Downloads the `gpt2` checkpoint from the Hugging Face Hub on first run.
 
 ## trainers/
 
-Both trainer examples make the same point: **the training loop is never
+The trainer examples all make the same point: **the training loop is never
 modified** — TDA is added by wrapping the trainer's fit/train call in a
 `HookManager` collection context.
 
@@ -146,6 +147,32 @@ shows its gradient drifting as the model trains.
 ```bash
 python examples/trainers/transformers_trainer.py             # 2 epochs
 python examples/trainers/transformers_trainer.py --epochs 3
+```
+
+### `trl_trainer.py` — TRL `SFTTrainer`
+
+Fine-tunes a tiny GPT-2 with TRL's `SFTTrainer` on **raw text** — TRL does its
+own tokenization, collation, and label masking, and the wrapped
+`trainer.train()` captures per-sample gradients below all of it. Retrieval
+works by the content hash of the model inputs TRL actually produced: the same
+sample lands at different `(step, sample_idx)` positions across shuffled
+epochs, and the hash ties its occurrences together.
+
+Three TRL-specific settings in the script are deliberate:
+
+- **gradient checkpointing is disabled** — TRL enables it by default, and its
+  non-reentrant recomputation runs each block forward twice with grad enabled,
+  which would double-capture activations;
+- **`lm_head` is not hooked** — TRL's SFT loss applies the tied output weight
+  functionally (fused linear + cross-entropy), so the module's hooks would
+  never fire and step completion would stall;
+- **one fixed-length batch per epoch** — TRL feeds the batch-dependent
+  `num_items_in_batch` count into the model forward, so a sample's content
+  hash only stays epoch-stable when its batch context is stable.
+
+```bash
+pip install trl
+python examples/trainers/trl_trainer.py
 ```
 
 ### `olmo_trainer.py` — OLMo `Trainer`
