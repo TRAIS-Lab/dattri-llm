@@ -162,6 +162,7 @@ def register_linear_io_hooks(
     on_layer_forward: Callable[[str, torch.Tensor], None] | None = None,
     on_layer_backward: Callable[[str, torch.Tensor], None] | None = None,
     type_overrides: dict[str, str] | None = None,
+    kwargs_overrides: dict[str, dict] | None = None,
     projection: dict[str, dict] | None = None,
     projector: Callable | None = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
@@ -203,6 +204,12 @@ def register_linear_io_hooks(
             linear-family type but whose class name is not recognised (e.g. a
             custom ``MyLinear`` that should be treated as ``"nn.Linear"``).
             Layers absent from the mapping fall back to ``canonical_class_name``.
+        kwargs_overrides: Optional mapping from layer name to the hyperparameter
+            dict normally produced by :func:`extract_module_kwargs`.  A listed
+            layer uses the provided dict verbatim (no extraction) -- for
+            declared-type overrides on classes whose attributes do not follow
+            the standard names (e.g. HF ``LlamaRMSNorm``).  Layers absent from
+            the mapping are extracted as usual.
 
     Returns:
         ``(buffers, handles)`` where ``buffers`` maps layer name to a
@@ -215,7 +222,12 @@ def register_linear_io_hooks(
     handles: list[torch.utils.hooks.RemovableHook] = []
 
     for name, module in root.named_modules():
-        if not _is_linear_io_capable(module):
+        # An explicit type_overrides entry vouches for the layer's math (e.g.
+        # a hand-rolled HF RMSNorm declared as "nn.RMSNorm"), so it bypasses
+        # the type-based capability check.
+        if (
+            type_overrides is None or name not in type_overrides
+        ) and not _is_linear_io_capable(module):
             continue
         if layer_names is not None and name not in layer_names:
             continue
@@ -229,7 +241,10 @@ def register_linear_io_hooks(
         else:
             layer_type = canonical_class_name(module)
         buffers[name]["_class_name"] = layer_type
-        buffers[name]["_module_kwargs"] = extract_module_kwargs(module, layer_type)
+        if kwargs_overrides is not None and name in kwargs_overrides:
+            buffers[name]["_module_kwargs"] = dict(kwargs_overrides[name])
+        else:
+            buffers[name]["_module_kwargs"] = extract_module_kwargs(module, layer_type)
         if projection is not None:
             buffers[name]["_proj_kw"] = projection.get(
                 name,

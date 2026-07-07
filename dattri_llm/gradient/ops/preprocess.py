@@ -18,6 +18,7 @@ from dattri_llm.gradient.ops.norm import (
     _compute_group_norm_x_hat,
     _compute_layer_norm_x_hat,
     _compute_rms_x_hat,
+    _fold_broadcast_axes,
 )
 from dattri_llm.gradient.ops.types import (
     CONV_TRANSPOSE_TYPES,
@@ -287,19 +288,23 @@ def _preprocess_factorized(
 
     # -- Normalisation layers ------------------------------------------------
     if layer_type == "nn.LayerNorm":
+        normalized_shape = module_kwargs.get("normalized_shape", (a.shape[-1],))
         x_hat = _compute_layer_norm_x_hat(
             a,
-            module_kwargs.get("normalized_shape", (a.shape[-1],)),
+            normalized_shape,
             module_kwargs.get("eps", 1e-5),
         )
+        x_hat, g = _fold_broadcast_axes(x_hat, g, normalized_shape)
         return _augment_token_norm(x_hat, g, has_bias)
 
     if layer_type == "nn.RMSNorm":
+        normalized_shape = module_kwargs.get("normalized_shape", (a.shape[-1],))
         x_hat = _compute_rms_x_hat(
             a,
-            module_kwargs.get("normalized_shape", (a.shape[-1],)),
+            normalized_shape,
             module_kwargs.get("eps"),
         )
+        x_hat, g = _fold_broadcast_axes(x_hat, g, normalized_shape)
         return _augment_token_norm(x_hat, g, has_bias)
 
     if layer_type == "nn.GroupNorm":

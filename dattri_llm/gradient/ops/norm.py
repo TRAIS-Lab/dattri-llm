@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -58,6 +60,31 @@ def _compute_group_norm_x_hat(
     var = grouped.var(dim=2, unbiased=False, keepdim=True)
     x_hat = (grouped - mean) * torch.rsqrt(var + eps)
     return x_hat.reshape(n, c, *spatial)
+
+
+def _fold_broadcast_axes(
+    x_hat: torch.Tensor,
+    g: torch.Tensor,
+    normalized_shape: tuple,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold every axis between batch and *normalized_shape* into one position
+    axis, restoring the ``(batch, positions, features)`` contract.
+
+    A token norm broadcasts over all leading axes, so its weight gradient sums
+    ``g * x_hat`` over every non-normalized axis.  Inputs with more than one
+    broadcast axis -- e.g. Qwen3's per-head QK-norm, whose input is
+    ``(B, T, heads, head_dim)`` with a ``(head_dim,)`` weight -- are reshaped
+    to ``(B, T*heads, head_dim)`` so the extra axes become position axes for
+    every downstream op.  Inputs already in canonical layout pass through
+    unchanged.
+    """
+    if x_hat.ndim <= 2 + len(normalized_shape):
+        return x_hat, g
+    d = math.prod(normalized_shape)
+    return (
+        x_hat.reshape(x_hat.shape[0], -1, d),
+        g.reshape(g.shape[0], -1, d),
+    )
 
 
 # ---------------------------------------------------------------------------

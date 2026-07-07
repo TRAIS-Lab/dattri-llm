@@ -699,6 +699,7 @@ class HookManager:
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
                 type_overrides=self._config.layer_types,
+                kwargs_overrides=self._config.module_kwargs,
                 projection=self._config.projection,
                 projector=(
                     _resolve_projector(self._config.projector)

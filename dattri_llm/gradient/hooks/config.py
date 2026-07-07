@@ -14,7 +14,7 @@ from dattri_llm.gradient.hooks.hooks import (
     _is_linear_io_capable,
     remove_hooks,
 )
-from dattri_llm.gradient.ops import canonical_class_name
+from dattri_llm.gradient.ops import ALL_LAYER_TYPES, canonical_class_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -133,6 +133,41 @@ class HookManagerConfig:
     automatically detected type.  It is orthogonal to which layers get hooked --
     a layer named here is only relabelled, not forced to be hooked.  If a named
     layer is not hooked in the end, :class:`HookManager` emits a warning.
+
+    **Manual module kwargs** -- :attr:`module_kwargs` maps a layer name to the
+    hyperparameter dict normally produced by
+    :func:`~dattri_llm.gradient.ops.extract_module_kwargs`, and the provided
+    dict is used verbatim for that layer (no extraction).  Use it together
+    with :attr:`layer_types` when the declared class stores its
+    hyperparameters under non-standard attribute names (e.g. an HF
+    ``LlamaRMSNorm``, whose epsilon is ``variance_epsilon``).  Layers it does
+    not mention are extracted as usual.
+
+    Every provided dict must contain ``has_bias`` (``bool``, whether the layer
+    has a bias parameter).  The remaining required keys depend on the layer's
+    (declared) type:
+
+    * ``nn.Linear``, ``nn.Bilinear``, ``nn.Embedding``,
+      ``transformers.pytorch_utils.Conv1D`` -- no additional keys.
+    * ``nn.Conv1d/2d/3d``, ``nn.ConvTranspose1d/2d/3d`` -- ``kernel_size``,
+      ``stride``, ``padding``, ``dilation`` (the module-attribute tuples,
+      e.g. ``kernel_size=(3, 3)`` for a Conv2d).
+    * ``nn.LayerNorm``, ``nn.RMSNorm`` -- ``normalized_shape`` (tuple) and
+      ``eps`` (float).
+    * ``nn.GroupNorm`` -- ``num_groups`` (int), ``num_channels`` (int),
+      ``eps`` (float).
+    * ``nn.InstanceNorm1d/2d/3d`` -- ``num_features`` (int), ``eps`` (float).
+    * ``nn.EmbeddingBag`` -- ``mode`` (``"sum"`` or ``"mean"``).
+
+    Example -- per-sample capture of a Llama-style RMSNorm::
+
+        HookManagerConfig(
+            hook_types={"model.norm": "linear_io"},
+            layer_types={"model.norm": "nn.RMSNorm"},
+            module_kwargs={"model.norm": {
+                "has_bias": False, "normalized_shape": (4096,), "eps": 1e-6,
+            }},
+        )
     """
 
     def __init__(
@@ -141,6 +176,7 @@ class HookManagerConfig:
         linear_io: Selector = None,
         param_grad: Selector = None,
         layer_types: dict[str, str] | None = None,
+        module_kwargs: dict[str, dict] | None = None,
         projection: dict[str, dict] | None = None,
         projector: Callable | None = None,
     ) -> None:
@@ -148,6 +184,7 @@ class HookManagerConfig:
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
         self.param_grad = self._validate_selector(PARAM_GRAD, param_grad)
         self.layer_types = self._validate_layer_types(layer_types)
+        self.module_kwargs = self._validate_module_kwargs(module_kwargs)
         # Optional per-layer random projection applied to every assembled step
         # gradient (see :meth:`Gradient.project`).  ``projection`` is the per-layer
         # proj_kwargs map ``{layer_name: {factorize, proj_dim, ...}}`` (a
@@ -210,6 +247,23 @@ class HookManagerConfig:
                     f"{layer_name!r}: {layer_type!r}.",
                 )
         return dict(layer_types)
+
+    @staticmethod
+    def _validate_module_kwargs(
+        module_kwargs: dict[str, dict] | None,
+    ) -> dict[str, dict]:
+        if module_kwargs is None:
+            return {}
+        if not isinstance(module_kwargs, dict) or not all(
+            isinstance(k, str) and isinstance(v, dict) for k, v in module_kwargs.items()
+        ):
+            raise TypeError(
+                "module_kwargs must be a dict mapping layer name to the layer's "
+                "hyperparameter dict (see extract_module_kwargs), e.g. "
+                "{'model.norm': {'has_bias': False, 'normalized_shape': (4096,), "
+                "'eps': 1e-6}}.",
+            )
+        return {k: dict(v) for k, v in module_kwargs.items()}
 
     @staticmethod
     def _validate_selector(name: str, selector: Selector) -> Selector:
@@ -313,11 +367,17 @@ def resolve_hook_assignments(
                 "in the model.",
             )
         if hook_type == LINEAR_IO and not _is_linear_io_capable(module):
-            raise ValueError(
-                f"Layer '{layer_name}' was assigned 'linear_io' but its type "
-                f"({canonical_class_name(module)}) does not support factorized "
-                "linear-IO hooks.",
-            )
+            # A layer_types override declaring a supported factorizable type
+            # (e.g. a hand-rolled HF RMSNorm declared as "nn.RMSNorm") makes
+            # the layer eligible; without one it is only param_grad material.
+            if config.layer_types.get(layer_name) not in ALL_LAYER_TYPES:
+                raise ValueError(
+                    f"Layer '{layer_name}' was assigned 'linear_io' but its type "
+                    f"({canonical_class_name(module)}) does not support factorized "
+                    "linear-IO hooks. If the layer computes the same math as a "
+                    "supported type, declare it via layer_types "
+                    f"(e.g. layer_types={{'{layer_name}': 'nn.RMSNorm'}}).",
+                )
         if hook_type == PARAM_GRAD and not _has_trainable_params(module):
             raise ValueError(
                 f"Layer '{layer_name}' was assigned 'param_grad' but has no "

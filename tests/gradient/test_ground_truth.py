@@ -168,6 +168,23 @@ class _RMSNormModel(nn.Module):
         return self.ln(x)
 
 
+class _QKNormModel(nn.Module):
+    """RMSNorm over the last dim of a 4-D ``(B, T, heads, head_dim)`` input --
+    the Qwen3 QK-norm pattern.  The ``(head_dim,)`` weight is shared across
+    heads, so the head axis is a broadcast axis that the weight gradient sums
+    over, exactly like the token axis.
+    """
+
+    def __init__(self, heads: int, head_dim: int) -> None:
+        super().__init__()
+        self.heads, self.head_dim = heads, head_dim
+        self.ln = nn.RMSNorm(head_dim, elementwise_affine=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t = x.shape[:2]
+        return self.ln(x.view(b, t, self.heads, self.head_dim)).flatten(2)
+
+
 class _ChannelNormModel(nn.Module):
     """Wraps a per-channel norm (GroupNorm/InstanceNorm) and scales the output
     by a fixed buffer ``R`` so the captured output gradient is non-trivial and
@@ -1171,6 +1188,63 @@ class TestRMSNormGroundTruth:
             for j in range(B):
                 expected = (ref[i].float() * ref[j].float()).sum()
                 assert torch.allclose(K[i, j], expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# nn.RMSNorm over a 4-D per-head input (Qwen3-style QK-norm)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _HAS_RMSNORM, reason="nn.RMSNorm requires PyTorch >= 2.4")
+class TestQKNormGroundTruth:
+    """nn.RMSNorm fed ``(B, T, heads, head_dim)`` -- the extra head axis is a
+    broadcast axis and must be folded into the positions, not flattened into
+    the features (see ``_fold_broadcast_axes``).  Regression test for the
+    Qwen3 QK-norm case, where the per-sample gradient previously came out
+    ``(heads, head_dim)``-shaped and pairwise dots silently dropped the
+    cross-head terms.
+    """
+
+    HEADS, HEAD_DIM = 3, 4
+
+    def setup_method(self) -> None:
+        torch.manual_seed(0)
+        self.model = _QKNormModel(self.HEADS, self.HEAD_DIM)
+        with torch.no_grad():  # non-unit weight so x_hat scaling matters
+            self.model.ln.weight.copy_(torch.randn(self.HEAD_DIM).abs() + 0.5)
+
+    def _inputs(self) -> list[torch.Tensor]:
+        torch.manual_seed(1)
+        return [torch.randn(1, T, self.HEADS * self.HEAD_DIM) for _ in range(B)]
+
+    def test_materialize_per_token(self) -> None:
+        inputs = self._inputs()
+        ref = _per_sample_weight_grads(self.model, "ln", inputs)
+        mat = _materialize(_run_batch(self.model, torch.cat(inputs)), "ln")
+        # per_token=True flattens the folded (T*heads) positions with the
+        # features; positions sum back to weight.grad.
+        assert mat.shape == (B, T * self.HEADS * self.HEAD_DIM)
+        for i in range(B):
+            got = mat[i].reshape(T * self.HEADS, self.HEAD_DIM).sum(0)
+            assert torch.allclose(got, ref[i].float(), atol=1e-4), (
+                f"sample {i} max diff {(got - ref[i]).abs().max():.2e}"
+            )
+
+    def test_materialize_summed(self) -> None:
+        inputs = self._inputs()
+        ref = _per_sample_weight_grads(self.model, "ln", inputs)
+        gradient = _run_batch(self.model, torch.cat(inputs))
+        mat = ops.materialize(
+            gradient.data["ln"],
+            gradient.layer_types["ln"],
+        ).float()
+        # per_token=False contracts every broadcast axis (tokens AND heads)
+        # straight to the weight gradient.
+        assert mat.shape == (B, self.HEAD_DIM)
+        for i in range(B):
+            assert torch.allclose(mat[i], ref[i].float(), atol=1e-4), (
+                f"sample {i} max diff {(mat[i] - ref[i]).abs().max():.2e}"
+            )
 
 
 # ---------------------------------------------------------------------------
