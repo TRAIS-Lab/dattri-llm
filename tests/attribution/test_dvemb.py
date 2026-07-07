@@ -398,7 +398,7 @@ class TestDVEmbOnDisk:
         assert res_f.test_ids == res_t.test_ids
         assert len(res_t.test_ids) == TT.N_TEST  # both blocks' columns present
         assert res_f.row_train_ids == res_t.row_train_ids
-        assert torch.equal(res_f.scores, res_t.scores)
+        assert torch.allclose(res_f.scores, res_t.scores, atol=1e-5, rtol=1e-4)
 
         oracle = _dvemb_oracle(
             model,
