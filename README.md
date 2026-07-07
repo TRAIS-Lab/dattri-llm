@@ -79,14 +79,14 @@ tensor([[20073.3711],       # <- "Influence functions trace a model's ..."
   `OffloadCallback` (persist gradients to disk) and `DataSelectionCallback`
   (**online data selection**: drop low-influence samples' contributions from
   `param.grad` before the optimizer step, as if they were never in the batch).
-- ⚡ **Two workflows** — *on-the-fly* (one call streams gradients live and scores
-  them) or *store-then-attribute* (cache during training, attribute later, re-run
-  with different settings for free); the two paths produce the same scores (see
-  [`examples/attribution/`](examples/attribution/)).
+- ⚡ **On-the-fly scoring or disk offloading** — attribute on-the-fly in one call
+  with nothing persisted, or offload per-sample gradients to disk during customized training runs (no extra forward/backward) and attribute afterwards without the
+  model — different attributors and settings re-run over the same cache for free
+  (see [`examples/attribution/`](examples/attribution/)).
 - 🌐 **Distributed-training support** — gradients captured under DDP and FSDP match
   the single-device reference; each rank writes its own shard and the store merges
   them transparently.
-- 📏 **Broad layer coverage** — linear, convolution (incl. transposed), embedding,
+- 📚 **Broad layer coverage** — linear, convolution (incl. transposed), embedding,
   and normalization (`LayerNorm`, `RMSNorm`, `GroupNorm`, `InstanceNorm`) layers,
   with optional capture-time random projection.
 
@@ -97,8 +97,8 @@ tensor([[20073.3711],       # <- "Influence functions trace a model's ..."
 ```bash
 git clone https://github.com/TRAIS-Lab/dattri-llm
 cd dattri-llm
-pip install -e .                  # capture core: needs torch only
-pip install -e ".[transformers]"  # + HF Trainer
+pip install -e .
+pip install -e ".[transformers]"  # [Optional] + HF Trainer
 ```
 
 ### 1. Collect per-sample gradients during training
@@ -171,8 +171,7 @@ methods plug into the same capture/storage/streaming infrastructure.
 
 ## Architecture
 
-Three layers; imports flow strictly downward, and the gradient layer is importable
-with **torch alone**:
+The library is organized in three layers:
 
 ```
 dattri_llm/
@@ -182,10 +181,16 @@ dattri_llm/
 └── attribution/   # attributor interface, arguments, scores, algorithms
 ```
 
-`AttributionArguments` mirrors `transformers.TrainingArguments` (same field
-conventions, parseable with `HfArgumentParser`), and the live `GradientStreamer`
-mirrors the HF Trainer's inner loop so that, under the same arguments, a streamed
-trajectory reproduces the Trainer's.
+- **`utils/`** — generic helpers: content hashing that gives every sample a
+  position- and shuffling-independent identity, and guarded
+  `torch.distributed` utilities.
+- **`gradient/`** — the gradient system: the `Gradient` data model
+  (factorized or materialized), the math on factorized gradients, the
+  `HookManager` and its callbacks for capture, the on-disk gradient store,
+  and the streaming sources attributors read from.
+- **`attribution/`** — the TDA methods: the attributor interface,
+  `AttributionArguments`, the `AttributionScore` result container, and one
+  module per algorithm.
 
 ## Related Projects
 

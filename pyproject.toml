@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dattri-llm"
 version = "0.1.0"
-description = "Gradient collection utilities for LLM training workflows."
+description = "Efficient training data attribution (TDA) infrastructure for LLM-scale models."
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
