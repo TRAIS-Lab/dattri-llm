@@ -26,8 +26,39 @@ infrastructure** on which attribution methods can run at LLM scale:
 
 `dattri-llm` is the LLM-scale companion of
 [`dattri`](https://github.com/TRAIS-Lab/dattri), and is validated on `dattri`'s
-official benchmark suite on attribution quality (LDS, LOO) and runtime (see
-[`experiments/`](experiments/)).
+official benchmark suite on attribution quality (LDS, LOO) and runtime. `dattri-llm` attributes LLM-scale models with only a few lines of code:
+
+```python
+import torch
+from dattri.task import AttributionTask
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from dattri_llm import AttributionArguments, TracInAttributor
+
+tok = AutoTokenizer.from_pretrained("gpt2"); tok.pad_token = tok.eos_token
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+def encode(*texts):
+    ids = tok(list(texts), padding="max_length", max_length=32, return_tensors="pt")["input_ids"]
+    return [{"input_ids": i} for i in ids]
+
+train_set = encode("Influence functions trace a model's predictions back to its training data.",
+                   "Preheat the oven and mix flour, sugar, and butter until crumbly.")
+val_set = encode("Which training examples shaped this language model's behavior?")
+
+def loss_fn(params, batch):
+    ids = batch["input_ids"]
+    return torch.func.functional_call(model, params, kwargs={"input_ids": ids, "labels": ids}).loss * len(ids)
+
+task = AttributionTask(loss_func=loss_fn, model=model, checkpoints=[model.state_dict()])
+attributor = TracInAttributor(AttributionArguments(output_dir="scores", use_cpu=True), task=task)
+score = attributor.attribute(train_set, val_set)
+print(score.agnostic_matrix()[1])  # (num_train, num_val) influence scores
+```
+
+```
+tensor([[20073.3711],       # <- "Influence functions trace a model's ..."
+        [16199.3711]])      # <- "Preheat the oven and mix flour, ..."
+```
 
 ## Key Features
 
