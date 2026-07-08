@@ -101,9 +101,10 @@ pip install -e .
 pip install -e ".[transformers]"  # [Optional] + HF Trainer
 ```
 
-### 1. Collect per-sample gradients during training
+### 1. Attribution from disk offloading
 
-Wrap any training loop — the loop itself is untouched:
+Wrap any training loop to offload per-sample gradients to disk — the loop
+itself is untouched:
 
 ```python
 from dattri_llm import (
@@ -122,9 +123,8 @@ with hm.collect():
 hm.remove()
 ```
 
-### 2. Attribute from cached gradients
-
-No model or backward pass needed at attribution time:
+Then attribute from the cache — no model or backward pass needed, and
+different attributors or settings re-run over the same cache for free:
 
 ```python
 from dattri_llm import AttributionArguments, TracInAttributor
@@ -134,7 +134,7 @@ score = TracInAttributor(args).attribute_from_cache("./train_grads", "./test_gra
 train_ids, matrix = score.agnostic_matrix()   # (num_train, num_test)
 ```
 
-### 3. Or do both in one call (on-the-fly)
+### 2. Attribution on-the-fly
 
 Describe the target with a `dattri` `AttributionTask`; the attributor streams
 gradients live and scores them — nothing is written to disk:
