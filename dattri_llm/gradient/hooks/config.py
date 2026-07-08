@@ -168,6 +168,81 @@ class HookManagerConfig:
                 "has_bias": False, "normalized_shape": (4096,), "eps": 1e-6,
             }},
         )
+
+    **Per-layer projection** -- :attr:`projection` enables capture-time random
+    projection: instead of buffering a layer's raw factors, each backward pass
+    projects them down to ``proj_dim`` on the training device, and only the
+    small projected result is kept (on CPU).  It maps a layer name -- or
+    ``"__default__"``, covering every hooked layer without its own entry -- to
+    that layer's ``proj_kwargs`` dict.  A layer with neither an entry nor a
+    ``"__default__"`` is captured raw (unprojected), so mixed configs are
+    fine.  :attr:`projector` is the projection factory, following dattri's
+    ``random_project`` protocol; ``None`` (the default) lazily imports
+    dattri's ``random_project``.
+
+    Keys consumed by the library:
+
+    * ``proj_dim`` (int, **required**) -- target width of the projection.
+    * ``factorize`` (bool, default ``True``) -- ``True`` projects the two
+      factors independently (LoGRA style): the layer stays *factorized* at
+      width ``proj_dim`` and is relabelled ``"nn.Linear"``.  This is defined
+      only for outer-product gradients (the linear / conv families); **norm
+      and embedding layers must use** ``factorize=False`` (TRAK style:
+      materialize the per-sample weight gradient, then project it to a dense
+      ``(B, proj_dim)`` block).
+    * ``proj_seed`` (int, default ``0``) -- base seed.  Factorized projection
+      uses ``proj_seed`` for the output-gradient factor and ``proj_seed + 1``
+      for the activation factor (dattri's LoGRA convention).  Keep it fixed
+      per layer so gradients captured at different steps stay comparable.
+    * ``device`` -- where the projection runs.  The factors are moved to this
+      device before projecting (dattri builds a device-specific projector for
+      it); the small projected result is then buffered to CPU as usual.
+      Unset, it defaults to the tensors' own (training) device.
+      **Caution**: dattri's CPU and CUDA projectors do not
+      produce the same projection for the same ``proj_seed``, and the valid
+      ``proj_type`` sets differ (``"sjlt"``/``"grass"`` are CUDA-only) -- use
+      one device consistently across every gradient that will be compared
+      (train and test, capture-time and post-hoc).
+
+    Every remaining key is forwarded verbatim to the projector factory.  With
+    the default dattri projector that means:
+
+    * ``proj_max_batch_size`` (int, **required** -- dattri's
+      ``random_project`` has no default for it; must be a multiple of 8 for
+      the CUDA projector).
+    * ``proj_type`` (str, default ``"normal"``) -- e.g. ``"rademacher"`` or
+      ``"sjlt"``.
+
+    Example -- LoGRA projection on a GPT-2-style model.  The regexes hook the
+    attention/MLP linears plus the token embedding; the linears fall through
+    to ``"__default__"`` (factorized projection), while the embedding -- whose
+    gradient is not an outer product of its factors -- gets an explicit
+    materialize-then-project entry::
+
+        HookManagerConfig(
+            linear_io=[r"transformer\.h\.\d+\.(attn|mlp)\.", r"wte$"],
+            projection={
+                "__default__": {          # the linears: project both factors
+                    "factorize": True,
+                    "proj_dim": 512,
+                    "proj_max_batch_size": 8,
+                    "proj_type": "rademacher",
+                    "device": "cuda",
+                },
+                "transformer.wte": {      # embedding: materialize-then-project
+                    "factorize": False,
+                    "proj_dim": 512,
+                    "proj_max_batch_size": 8,
+                    "device": "cuda",
+                },
+            },
+        )
+
+    Note that a ``"__default__"`` entry with ``factorize=True`` combined with
+    a hook selection that includes norm or embedding layers (e.g.
+    ``linear_io=REGISTER_ALL``) raises inside the first backward pass -- give
+    those layers explicit ``factorize=False`` entries, or exclude them from
+    hooking.
     """
 
     def __init__(

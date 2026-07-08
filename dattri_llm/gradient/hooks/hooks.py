@@ -335,7 +335,6 @@ def _capture_projected(
 
     kw = dict(buf["_proj_kw"])
     factorize = kw.pop("factorize", True)
-    kw.pop("device", None)  # project on the tensors' own (training) device
     layer_type = buf["_class_name"]
     module_kwargs = buf["_module_kwargs"]
     if a.ndim == 1 and is_embedding(layer_type):

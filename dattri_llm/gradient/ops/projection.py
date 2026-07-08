@@ -30,18 +30,26 @@ def _apply_projector(
     ``projector(feature, batch_size, proj_dim=..., proj_seed=..., **kw)`` returns
     a callable mapping a ``(N, D)`` feature to ``(N, proj_dim)``.  Any leading
     axes of *x* (the batch, plus the token axis when projecting a factor) are
-    folded into ``N`` and restored afterward.  ``device`` defaults to *x*'s.
+    folded into ``N`` and restored afterward.
+
+    ``device`` selects where the projection runs (dattri builds a
+    device-specific projector for it) and defaults to *x*'s own device.  The
+    feature is moved there before projecting and the result is returned on
+    that same (projection) device.  Note that dattri's CPU and CUDA projectors
+    do **not** produce the same projection for the same seed -- use one device
+    consistently across every gradient that will be compared.
     """
     lead = x.shape[:-1]
     flat = x.reshape(-1, x.shape[-1]).float()  # (N, D)
-    proj_kwargs.setdefault("device", flat.device)
+    device = proj_kwargs.setdefault("device", flat.device)
+    flat = flat.to(device)
     out = projector(
         flat,
         flat.shape[0],
         proj_dim=proj_dim,
         proj_seed=proj_seed,
         **proj_kwargs,
-    )(flat)  # (N, proj_dim)
+    )(flat)  # (N, proj_dim), on the projection device
     return out.reshape(*lead, proj_dim)
 
 
