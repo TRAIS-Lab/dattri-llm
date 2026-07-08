@@ -207,3 +207,7 @@ dattri_llm/
 - [`dattri`](https://github.com/TRAIS-Lab/dattri) — general-purpose data attribution
   library and benchmark suite from the same group; `dattri-llm` targets LLM-scale
   models and training-framework integration.
+
+## License
+
+`dattri-llm` is released under the [MIT License](LICENSE).

@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# setuptools >= 77 is required for the PEP 639 SPDX `license` string.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dattri-llm"
 version = "0.1.0"
 description = "Efficient training data attribution (TDA) infrastructure for LLM-scale models."
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
