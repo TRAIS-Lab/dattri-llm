@@ -35,6 +35,14 @@ while under a **sum** loss (``g_hat = dl``, ``c = 1``) it is used as-is -- see t
 Setting every ``H_k = 0`` recovers TracIn (eta * <g_test, g_train>); the Fisher
 factors are exactly the "training dynamics" correction DVEmb adds.
 
+The ``hessian_mode`` argument selects the structure of (2): ``"full"``
+(default) uses the exact rank-1 sum over *concatenated* per-sample gradients,
+whose off-diagonal blocks couple layers through the training dynamics;
+``"diagonal"`` zeroes the cross-layer blocks (block-diagonal per layer), which
+is the approximation made by the official DVEmb implementation
+(arXiv:2412.09538 released code) and is provided for benchmarking and
+comparison.
+
 **Computation.** The bilinear form in (1) can be evaluated by carrying the
 Fisher product on either side; the ``propagation`` argument of
 :meth:`attribute` / :meth:`attribute_from_cache` selects which.  Both sweep
@@ -264,6 +272,7 @@ class DVEmbAttributor(BaseAttributor):
         dvemb_dir: str | None = None,
         *,
         selected_training_steps: Iterable[int] | None = None,
+        hessian_mode: str = "full",
         final_step: int | None = None,
         loss_reduction: str = "mean",
         verbose: bool = False,
@@ -300,6 +309,9 @@ class DVEmbAttributor(BaseAttributor):
             selected_training_steps: Restrict which steps' embeddings are
                 *stored* (the sweep always propagates through every step);
                 ``None`` stores all of them.
+            hessian_mode: As in :meth:`attribute_from_cache` -- ``"full"``
+                (default) or ``"diagonal"`` (block-diagonal per layer, the
+                official-implementation behaviour).
             final_step: As in :meth:`attribute_from_cache`.
             loss_reduction: As in :meth:`attribute_from_cache`.
             verbose: As in :meth:`attribute_from_cache`.
@@ -314,6 +326,10 @@ class DVEmbAttributor(BaseAttributor):
         if loss_reduction not in ("mean", "sum"):
             raise ValueError(
                 f"loss_reduction must be 'mean' or 'sum', got {loss_reduction!r}.",
+            )
+        if hessian_mode not in ("full", "diagonal"):
+            raise ValueError(
+                f"hessian_mode must be 'full' or 'diagonal', got {hessian_mode!r}.",
             )
         (
             _train_fm,
@@ -353,6 +369,7 @@ class DVEmbAttributor(BaseAttributor):
             verbose,
             learning_rate,
             dvemb_fm=GradientFileManager(dvemb_dir),
+            hessian_mode=hessian_mode,
         )
         return dvemb_dir
 
@@ -468,6 +485,7 @@ class DVEmbAttributor(BaseAttributor):
         loss_reduction: str,
         verbose: bool,
         learning_rate: float | dict[int, float],
+        hessian_mode: str = "full",
     ) -> tuple[torch.Tensor, list[str], list[int]]:
         """One latest->earliest sweep for the ``n_cols`` columns held in ``w``.
 
@@ -479,6 +497,13 @@ class DVEmbAttributor(BaseAttributor):
         propagates independently, scoring a subset of columns gives identical
         values to scoring them all -- this is what makes the ``loop_over_test``
         column-blocking exact.
+
+        ``hessian_mode`` selects the empirical-Fisher structure of ``H_t``:
+        ``"full"`` couples layers through the whole-model inner product (the
+        exact rank-1 sum over concatenated gradients), ``"diagonal"`` keeps
+        only each layer's own block (block-diagonal across layers, the
+        reference DVEmb implementation).  The emitted *scores* always sum over
+        layers; only the propagation update differs.
 
         Returns ``(scores (num_rows, n_cols), row_train_ids, row_steps)``.
         """
@@ -511,16 +536,21 @@ class DVEmbAttributor(BaseAttributor):
                 batch = mat[shared[0]].shape[0]
                 n_t += batch
                 # D[i, j] = <g(z*_i), w_j> summed over layers -> (B, n_cols).
+                D_layer = {name: mat[name] @ w[name].T for name in shared}
                 D = torch.zeros(batch, n_cols, device=device)
                 for name in shared:
-                    D += mat[name] @ w[name].T
+                    D += D_layer[name]
                 if emit:
                     row_chunks.append((lr * D).detach().to("cpu", torch.float))
                     row_train_ids.extend(train_hashes)
                     row_steps.extend([ts] * batch)
                 # Fisher update term: sum_i D[i, j] g(z*_i) -> (n_cols, d).
+                # "full" drives every layer's update with the whole-model
+                # alignment D (cross-layer H blocks); "diagonal" uses each
+                # layer's own alignment only (block-diagonal H).
                 for name in shared:
-                    delta[name] += D.T @ mat[name]
+                    src = D if hessian_mode == "full" else D_layer[name]
+                    delta[name] += src.T @ mat[name]
             # H_t = (1/c) sum g_hat g_hat^T: xB_t for mean-loss-recorded grads, x1 for
             # sum.
             fisher_scale = float(n_t) if loss_reduction == "mean" else 1.0
@@ -547,6 +577,7 @@ class DVEmbAttributor(BaseAttributor):
         verbose: bool,
         learning_rate: float | dict[int, float],
         dvemb_fm: GradientFileManager | None = None,
+        hessian_mode: str = "full",
     ) -> tuple[torch.Tensor, list[str], list[int]]:
         """One latest->earliest sweep carrying the operator on the *train* side.
 
@@ -560,9 +591,13 @@ class DVEmbAttributor(BaseAttributor):
         advanced by that step's full Fisher factor
         ``M <- M + eta * scale * sum_b (g_hat_b - M g_hat_b) g_hat_b^T``.
 
-        Layers are concatenated (not block-diagonal): the Fisher rank-1 terms
-        ``g_hat g_hat^T`` couple layers exactly as in the test-side sweep, so the two
-        propagation modes produce identical scores.
+        With ``hessian_mode="full"`` (default) layers are concatenated: the
+        Fisher rank-1 terms ``g_hat g_hat^T`` couple layers exactly as in the
+        test-side sweep, so the two propagation modes produce identical scores,
+        and ``M`` is one dense ``(d, d)`` matrix.  With ``"diagonal"`` the
+        operator is kept as one ``(d_l, d_l)`` block per layer (block-diagonal
+        across layers — the reference DVEmb implementation), costing
+        ``sum d_l**2`` memory instead of ``(sum d_l)**2``.
 
         Args:
             test_flat: ``(num_test, d)`` final-model test gradients, layer
@@ -586,6 +621,9 @@ class DVEmbAttributor(BaseAttributor):
                 directory can be consumed directly by
                 ``TracInAttributor.attribute_from_cache`` against the test
                 gradients, reproducing this attributor's scores.
+            hessian_mode: ``"full"`` (dense concatenated operator) or
+                ``"diagonal"`` (one block per layer) -- see
+                :meth:`attribute_from_cache`.
 
         Returns ``(scores (num_rows, num_test), row_train_ids, row_steps)``;
         ``scores`` is empty for an embedding-only sweep.
@@ -599,6 +637,7 @@ class DVEmbAttributor(BaseAttributor):
         row_train_ids: list[str] = []
         row_steps: list[int] = []
         M: torch.Tensor | None = None  # lazy: no (d, d) alloc for the last step
+        M_blocks: dict[str, torch.Tensor | None] = dict.fromkeys(layers)
         steps = tqdm(
             sorted(prop_steps, reverse=True),
             desc="DVEmb: propagating (train side)",
@@ -614,6 +653,7 @@ class DVEmbAttributor(BaseAttributor):
             # before advancing M -- every embedding of the step must use the
             # pre-step operator, and the whole batch forms one (I - eta H_ts).
             delta: torch.Tensor | None = None
+            delta_blocks: dict[str, torch.Tensor] = {}
             n_t = 0
             for _s, train_g, train_hashes in train_source.for_steps([ts]):
                 mat = self._materialize(train_g, device)
@@ -627,7 +667,17 @@ class DVEmbAttributor(BaseAttributor):
                     s, e = slices[name]
                     g_flat[:, s:e] = mat[name]
                 # e_raw[b] = (I - M) g_hat_b; the embedding is eta * e_raw.
-                e_raw = g_flat if M is None else g_flat - g_flat @ M.T
+                if hessian_mode == "full":
+                    e_raw = g_flat if M is None else g_flat - g_flat @ M.T
+                else:
+                    # Block-diagonal operator: each layer's slice propagates
+                    # through its own (d_l, d_l) block only.
+                    e_raw = g_flat.clone()
+                    for name in shared:
+                        Mb = M_blocks[name]
+                        if Mb is not None:
+                            s, e = slices[name]
+                            e_raw[:, s:e] = g_flat[:, s:e] - g_flat[:, s:e] @ Mb.T
                 if emit:
                     emb = lr * e_raw
                     if test_flat is not None:
@@ -662,14 +712,30 @@ class DVEmbAttributor(BaseAttributor):
                                 ),
                             ],
                         )
-                upd = e_raw.T @ g_flat  # sum_b (I - M) g_hat_b g_hat_b^T -> (d, d)
-                delta = upd if delta is None else delta + upd
+                if hessian_mode == "full":
+                    # sum_b (I - M) g_hat_b g_hat_b^T -> (d, d)
+                    upd = e_raw.T @ g_flat
+                    delta = upd if delta is None else delta + upd
+                else:
+                    for name in shared:
+                        s, e = slices[name]
+                        upd = e_raw[:, s:e].T @ g_flat[:, s:e]  # (d_l, d_l)
+                        delta_blocks[name] = (
+                            upd
+                            if name not in delta_blocks
+                            else delta_blocks[name] + upd
+                        )
+            # H_t = (1/c) sum g_hat g_hat^T: xB_t for mean-loss-recorded grads, x1
+            # for sum.
+            fisher_scale = float(n_t) if loss_reduction == "mean" else 1.0
             if delta is not None:
-                # H_t = (1/c) sum g_hat g_hat^T: xB_t for mean-loss-recorded grads, x1
-                # for sum.
-                fisher_scale = float(n_t) if loss_reduction == "mean" else 1.0
                 scaled = (lr * fisher_scale) * delta
                 M = scaled if M is None else M + scaled
+            for name, upd in delta_blocks.items():
+                scaled = (lr * fisher_scale) * upd
+                M_blocks[name] = (
+                    scaled if M_blocks[name] is None else M_blocks[name] + scaled
+                )
 
         n_cols = test_flat.shape[0] if test_flat is not None else 0
         scores = (
@@ -757,6 +823,7 @@ class DVEmbAttributor(BaseAttributor):
         *,
         propagation: str = "train",
         dvemb_dir: str | None = None,
+        hessian_mode: str = "full",
         loop_over_test: bool = False,
         selected_training_steps: Iterable[int] | None = None,
         loss_reduction: str = "mean",
@@ -783,6 +850,7 @@ class DVEmbAttributor(BaseAttributor):
             test_dataset: Test dataset to stream.
             propagation: As in :meth:`attribute_from_cache`.
             dvemb_dir: As in :meth:`attribute_from_cache`.
+            hessian_mode: As in :meth:`attribute_from_cache`.
             loop_over_test: As in :meth:`attribute_from_cache`.
             selected_training_steps: As in :meth:`attribute_from_cache`.
             loss_reduction: As in :meth:`attribute_from_cache`.
@@ -800,6 +868,7 @@ class DVEmbAttributor(BaseAttributor):
             test_dir,
             propagation=propagation,
             dvemb_dir=dvemb_dir,
+            hessian_mode=hessian_mode,
             loop_over_test=loop_over_test,
             selected_training_steps=selected_training_steps,
             loss_reduction=loss_reduction,
@@ -813,6 +882,7 @@ class DVEmbAttributor(BaseAttributor):
         test_gradients_dir: str,
         propagation: str = "train",
         dvemb_dir: str | None = None,
+        hessian_mode: str = "full",
         loop_over_test: bool = False,
         selected_training_steps: Iterable[int] | None = None,
         final_step: int | None = None,
@@ -857,6 +927,19 @@ class DVEmbAttributor(BaseAttributor):
                 scored against *any* test gradient directory with
                 ``TracInAttributor.attribute_from_cache(dvemb_dir, test_dir)``
                 -- no re-sweep of the trajectory.
+            hessian_mode: Structure of the per-step empirical Fisher ``H_t``
+                in the propagation factors ``(I - eta H_t)`` -- ``"full"``
+                (default) or ``"diagonal"``.  ``"full"`` uses the exact rank-1
+                sum over **concatenated** per-sample gradients, whose
+                off-diagonal blocks couple layers (an update to one layer
+                shifts every layer's later gradients).  ``"diagonal"`` keeps
+                only each layer's own block (block-diagonal across layers) --
+                the approximation used by the official DVEmb implementation
+                (arXiv:2412.09538 released code), provided for benchmarking /
+                comparison.  It also shrinks ``propagation="train"``'s
+                operator from ``(sum d_l)^2`` to ``sum d_l^2`` memory.  Both
+                propagation sides honour the choice and remain mutually
+                equivalent within each mode.
             loop_over_test: Memory/disk trade-off for the per-test-column
                 embedding ``w`` (shape ``(num_test, d)``), which is
                 back-propagated through the steps (``propagation="test"``
@@ -934,6 +1017,10 @@ class DVEmbAttributor(BaseAttributor):
             raise ValueError(
                 f"propagation must be 'test' or 'train', got {propagation!r}.",
             )
+        if hessian_mode not in ("full", "diagonal"):
+            raise ValueError(
+                f"hessian_mode must be 'full' or 'diagonal', got {hessian_mode!r}.",
+            )
         if propagation == "train" and loop_over_test:
             raise ValueError(
                 "loop_over_test applies only to propagation='test': the "
@@ -991,6 +1078,7 @@ class DVEmbAttributor(BaseAttributor):
             loss_reduction=loss_reduction,
             propagation=propagation,
             dvemb_fm=GradientFileManager(dvemb_dir) if dvemb_dir else None,
+            hessian_mode=hessian_mode,
             loop_over_test=loop_over_test,
             verbose=verbose,
             layer_name=layer_name,
@@ -1003,6 +1091,7 @@ class DVEmbAttributor(BaseAttributor):
                 "loss_reduction": loss_reduction,
                 "propagation": propagation,
                 "dvemb_dir": dvemb_dir,
+                "hessian_mode": hessian_mode,
             },
         )
 
@@ -1057,6 +1146,7 @@ class DVEmbAttributor(BaseAttributor):
         layer_name: list[str] | None = None,
         learning_rate: float | dict[int, float] = 1.0,
         dvemb_fm: GradientFileManager | None = None,
+        hessian_mode: str = "full",
     ) -> AttributionScore:
         """Score a train source against a test source -- the shared DVEmb loop.
 
@@ -1085,13 +1175,19 @@ class DVEmbAttributor(BaseAttributor):
             for name in layers:
                 slices[name] = (offset, offset + w[name].shape[1])
                 offset = slices[name][1]
-            gib = offset * offset * 4 / 2**30
+            if hessian_mode == "full":
+                op_elems = offset * offset
+                op_shape = f"({offset}, {offset})"
+            else:  # block-diagonal: one (d_l, d_l) block per layer
+                op_elems = sum((e - s) ** 2 for s, e in slices.values())
+                op_shape = "block-diagonal"
+            gib = op_elems * 4 / 2**30
             if gib > 2.0:
                 warnings.warn(
-                    f"propagation='train' maintains a ({offset}, {offset}) "
-                    f"float32 operator (~{gib:.1f} GiB) on {device}. Project "
-                    "the gradients at collection time and/or restrict "
-                    "layer_name to shrink d, or use propagation='test'.",
+                    f"propagation='train' maintains a {op_shape} float32 "
+                    f"operator (~{gib:.1f} GiB) on {device}. Project the "
+                    "gradients at collection time and/or restrict layer_name "
+                    "to shrink d, or use propagation='test'.",
                     stacklevel=3,
                 )
             test_flat = (
@@ -1112,6 +1208,7 @@ class DVEmbAttributor(BaseAttributor):
                 verbose,
                 learning_rate,
                 dvemb_fm=dvemb_fm,
+                hessian_mode=hessian_mode,
             )
         elif not loop_over_test:
             # ---- step outer / test inner: one dense embedding, train read once.
@@ -1132,6 +1229,7 @@ class DVEmbAttributor(BaseAttributor):
                 loss_reduction,
                 verbose,
                 learning_rate,
+                hessian_mode=hessian_mode,
             )
         else:
             # ---- test outer: one block's embedding resident, train re-streamed.
@@ -1166,6 +1264,7 @@ class DVEmbAttributor(BaseAttributor):
                     loss_reduction,
                     verbose,
                     learning_rate,
+                    hessian_mode=hessian_mode,
                 )
                 if scores is None:
                     scores = torch.zeros(

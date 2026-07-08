@@ -55,12 +55,15 @@ def _dvemb_oracle(
     lr,
     final_step,
     fisher_scale=1.0,
+    block_sizes=None,
 ):
     """Explicit DVEmb influence: (num_train_rows grouped by step, num_test).
 
     Returns ``{step: (B, num_test) tensor}`` of eta * g_val^T M g(z*).
     ``fisher_scale`` multiplies each step's Hessian (e.g. the batch size under
-    ``loss_reduction="mean"``).
+    ``loss_reduction="mean"``).  ``block_sizes`` (per-layer parameter counts in
+    the concatenation order of ``_per_sample_grads``) masks the Hessian to its
+    block-diagonal -- the ``hessian_mode="diagonal"`` reference behaviour.
     """
     steps = list(range(len(train_sds)))
     prop_steps = [s for s in steps if s < final_step]
@@ -71,6 +74,9 @@ def _dvemb_oracle(
     H = {
         s: fisher_scale * (g_tr[s].T @ g_tr[s]) for s in prop_steps
     }  # (fs)*sum_z g g^T
+    if block_sizes is not None:
+        mask = torch.block_diag(*[torch.ones(n, n) for n in block_sizes])
+        H = {s: h * mask for s, h in H.items()}
     eye = torch.eye(dim)
 
     out = {}
@@ -128,7 +134,7 @@ def _make_attr(out_dir, lr):
     return attr
 
 
-class TestDVEmbOnDisk:
+class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
     @pytest.mark.parametrize("lr", [0.1, 0.5])
     @pytest.mark.parametrize("loop_over_test", [False, True])
     def test_matches_explicit_oracle(self, collected, tmp_path, lr, loop_over_test):
@@ -240,6 +246,136 @@ class TestDVEmbOnDisk:
         assert a.row_train_ids == b.row_train_ids
         assert a.row_steps == b.row_steps
         assert torch.allclose(a.scores, b.scores, atol=1e-5, rtol=1e-4)
+
+    @pytest.mark.parametrize("propagation", ["test", "train"])
+    def test_three_step_product_ordering(self, tmp_path, propagation):
+        """With >=2 propagated Fisher factors the product is order-sensitive
+        (the ``(I - eta H_k)`` factors do not commute), so a three-step
+        trajectory pins the sweeps' factor ordering against the oracle's — the
+        two-step fixture cannot (any ordering agrees on a single factor).
+        """
+        torch.manual_seed(TT.SEED)
+        model = TT.MLP().eval()
+        sd0, sd1 = TT._make_checkpoints(model)
+        g2 = torch.Generator().manual_seed(TT.SEED + 11)
+        sd2 = {k: v + 0.05 * torch.randn(v.shape, generator=g2) for k, v in sd1.items()}
+        gT = torch.Generator().manual_seed(TT.SEED + 12)
+        sdT = {k: v + 0.05 * torch.randn(v.shape, generator=gT) for k, v in sd2.items()}
+        x_tr, y_tr, x_te, y_te = TT._make_data()
+        train_dir, test_dir = tmp_path / "tr3", tmp_path / "te3"
+        TT._collect_to_disk(model, [sd0, sd1, sd2], x_tr, y_tr, train_dir)
+        TT._collect_to_disk(model, [sdT], x_te, y_te, test_dir)
+        train_hashes = [
+            hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
+        ]
+        test_hashes = [
+            hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(TT.N_TEST)
+        ]
+
+        lr = 0.5
+        res = _make_attr(tmp_path / f"o3_{propagation}", lr).attribute_from_cache(
+            train_gradients_dir=str(train_dir),
+            test_gradients_dir=str(test_dir),
+            propagation=propagation,
+            final_step=3,
+            loss_reduction="sum",
+        )
+        oracle = _dvemb_oracle(
+            model,
+            [sd0, sd1, sd2],
+            x_tr,
+            y_tr,
+            sdT,
+            x_te,
+            y_te,
+            lr=lr,
+            final_step=3,
+        )
+        assert set(res.row_steps) == {0, 1, 2}
+        for step, (train_ids, matrix) in res.step_matrices().items():
+            want = oracle[step][[train_hashes.index(h) for h in train_ids]]
+            cols = [test_hashes.index(h) for h in res.test_ids]
+            assert torch.allclose(matrix, want[:, cols], atol=1e-5, rtol=1e-4), (
+                f"step {step}: max diff "
+                f"{(matrix - want[:, cols]).abs().max().item():.2e}"
+            )
+
+    @pytest.mark.parametrize("propagation", ["test", "train"])
+    def test_hessian_mode_diagonal_matches_blockdiag_oracle(
+        self,
+        collected,
+        tmp_path,
+        propagation,
+    ):
+        """``hessian_mode="diagonal"`` (the official-implementation behaviour)
+        matches the oracle with the Hessian masked to its per-layer blocks, on
+        both propagation sides.
+        """
+        lr = 0.5
+        res = _make_attr(tmp_path / f"d_{propagation}", lr).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            propagation=propagation,
+            hessian_mode="diagonal",
+            final_step=2,
+            loss_reduction="sum",
+        )
+        params = dict(collected["model"].named_parameters())
+        block_sizes = [params[n].numel() for n in TT.WEIGHT_NAMES]
+        oracle = _dvemb_oracle(
+            collected["model"],
+            collected["train_sds"],
+            collected["x_tr"],
+            collected["y_tr"],
+            collected["test_sd"],
+            collected["x_te"],
+            collected["y_te"],
+            lr=lr,
+            final_step=2,
+            block_sizes=block_sizes,
+        )
+        for step, (train_ids, matrix) in res.step_matrices().items():
+            want = oracle[step][[collected["train_hashes"].index(h) for h in train_ids]]
+            cols = [collected["test_hashes"].index(h) for h in res.test_ids]
+            assert torch.allclose(matrix, want[:, cols], atol=1e-5, rtol=1e-4), (
+                f"step {step}: max diff "
+                f"{(matrix - want[:, cols]).abs().max().item():.2e}"
+            )
+
+    def test_hessian_mode_diagonal_differs_from_full(self, collected, tmp_path):
+        """The switch must actually change the propagated scores (the fixture's
+        cross-layer Fisher blocks are nonzero); only propagated steps differ --
+        the last step (no factors applied) is identical in both modes.
+        """
+        kw = {
+            "train_gradients_dir": str(collected["train_dir"]),
+            "test_gradients_dir": str(collected["test_dir"]),
+            "final_step": 2,
+            "loss_reduction": "sum",
+        }
+        full = _make_attr(tmp_path / "f", 0.5).attribute_from_cache(
+            hessian_mode="full",
+            **kw,
+        )
+        diag = _make_attr(tmp_path / "d", 0.5).attribute_from_cache(
+            hessian_mode="diagonal",
+            **kw,
+        )
+        assert full.row_steps == diag.row_steps
+        step0 = [i for i, s in enumerate(full.row_steps) if s == 0]
+        step1 = [i for i, s in enumerate(full.row_steps) if s == 1]
+        assert not torch.allclose(full.scores[step0], diag.scores[step0])
+        assert torch.allclose(full.scores[step1], diag.scores[step1])
+
+    def test_invalid_hessian_mode_raises(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="hessian_mode"):
+            _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                hessian_mode="block",
+                final_step=2,
+                loss_reduction="sum",
+            )
 
     def test_dvemb_dir_storage_scored_by_tracin(self, collected, tmp_path):
         """Embeddings persisted via ``dvemb_dir`` (eta folded in), dotted against
