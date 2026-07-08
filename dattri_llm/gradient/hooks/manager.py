@@ -184,7 +184,8 @@ class HookManager:
         self.register()
 
         # Notify callbacks of this HookManager so they can reference it
-        # (e.g. to call pause() during a secondary pass).
+        # (e.g. to checkpoint capture state around a secondary pass via
+        # save_state / clear_state / load_state).
         for cb in self._callbacks:
             if hasattr(cb, "on_register"):
                 cb.on_register(self)
@@ -547,6 +548,120 @@ class HookManager:
                 buf[pname] = None
 
     # ---------------------------------------------------------------------- #
+    # Capture-state checkpointing                                              #
+    # ---------------------------------------------------------------------- #
+
+    def save_state(self) -> dict:
+        """Checkpoint the manager's capture state; undo with :meth:`load_state`.
+
+        Together with :meth:`clear_state` and :meth:`load_state`, this lets a
+        callback run a *secondary* forward+backward pass through the
+        already-registered hooks without disturbing the surrounding training
+        step -- e.g.
+        :class:`~dattri_llm.gradient.callbacks.DataSelectionCallback`
+        collecting a fresh validation target mid-step::
+
+            state = hm.save_state()   # checkpoint the in-flight capture
+            hm.clear_state()          # clean slate for the secondary pass
+            try:
+                # The secondary pass completes a capture step of its own:
+                # its record (assembled from only the secondary captures)
+                # is dispatched to on_step_end like any other.
+                val_loss_fn(model, val_batch).backward()
+            finally:
+                hm.load_state(state)  # put the training step back exactly
+
+        The secondary step's *external* effects (its ``on_step_end`` dispatch)
+        are deliberately not undone -- the callback that triggered it consumes
+        the record; sibling callbacks observe one extra record per secondary
+        pass.
+
+        Snapshots everything a completed (or in-flight) step touches: the
+        per-layer capture buffers (raw and projected fields), the ``param_grad``
+        buffers, the captured model inputs, the step counter, the last-step
+        gradient cache, and the step-completion counters/flags.  Copies are
+        shallow -- tensors are shared with the live buffers, which is safe
+        because captures are only ever appended, never mutated in place.
+
+        Returns:
+            An opaque state dict to pass to :meth:`load_state`.
+        """
+        return {
+            "layer_buffers": {
+                name: {
+                    "_act_parts": list(buf["_act_parts"]),
+                    "_grad_parts": list(buf["_grad_parts"]),
+                    "_proj_parts": list(buf["_proj_parts"]),
+                    "_device_id": {k: list(v) for k, v in buf["_device_id"].items()},
+                    "activation": buf["activation"],
+                    "grad_output": buf["grad_output"],
+                }
+                for name, buf in self._buffers.items()
+            },
+            "param_buffers": {
+                name: dict(buf) for name, buf in self._param_buffers.items()
+            },
+            "last_inputs": dict(self._last_inputs),
+            "step_count": self._step_count,
+            "last_gradient": self._last_gradient,
+            "seen_bwd": set(self._seen_bwd),
+            "bwd_replica_counts": dict(self._bwd_replica_counts),
+            "mlp_param_hook_count": self._mlp_param_hook_count,
+            "param_hook_count": self._param_hook_count,
+            "bwd_done": self._bwd_done,
+            "grad_done": self._grad_done,
+            "mlp_params_ready": self._mlp_params_ready,
+            "backward_end_scheduled": self._backward_end_scheduled,
+        }
+
+    def clear_state(self) -> None:
+        """Empty every capture buffer (a clean slate for a secondary pass).
+
+        Only the buffers are cleared; counters, the step count, and the
+        last-gradient cache are left alone -- :meth:`load_state` restores
+        those wholesale.
+        """
+        self._reset_layer_buffers()
+        self._reset_param_buffers()
+
+    def load_state(self, state: dict) -> None:
+        """Restore a checkpoint taken by :meth:`save_state`.
+
+        Puts back the capture buffers, model inputs, step counter, last-step
+        gradient cache, and completion counters exactly as they were, so a
+        training step interrupted by a secondary pass resumes as if the
+        secondary pass never ran.
+
+        Args:
+            state: The dict returned by :meth:`save_state`.
+        """
+        saved_layer = state["layer_buffers"]
+        for name, buf in self._buffers.items():
+            s = saved_layer.get(name, {})
+            buf["_act_parts"] = s.get("_act_parts", [])
+            buf["_grad_parts"] = s.get("_grad_parts", [])
+            buf["_proj_parts"] = s.get("_proj_parts", [])
+            buf["_device_id"] = s.get("_device_id", {})
+            buf["activation"] = s.get("activation")
+            buf["grad_output"] = s.get("grad_output")
+        saved_param = state["param_buffers"]
+        for name, buf in self._param_buffers.items():
+            buf.clear()
+            buf.update(saved_param.get(name, {}))
+        self._last_inputs = state["last_inputs"]
+        self._last_gradient = state["last_gradient"]
+        with self._step_lock:
+            self._step_count = state["step_count"]
+            self._seen_bwd = state["seen_bwd"]
+            self._bwd_replica_counts = state["bwd_replica_counts"]
+            self._mlp_param_hook_count = state["mlp_param_hook_count"]
+            self._param_hook_count = state["param_hook_count"]
+            self._bwd_done = state["bwd_done"]
+            self._grad_done = state["grad_done"]
+            self._mlp_params_ready = state["mlp_params_ready"]
+            self._backward_end_scheduled = state["backward_end_scheduled"]
+
+    # ---------------------------------------------------------------------- #
     # Primary API: collect()                                                   #
     # ---------------------------------------------------------------------- #
 
@@ -612,70 +727,6 @@ class HookManager:
                 last_gradient = self._last_gradient
                 self.remove()
                 self._last_gradient = last_gradient
-
-    @contextmanager
-    def pause(self) -> Generator[HookManager, None, None]:
-        """Temporarily suspend step-completion tracking within ``collect()``.
-
-        Use this when running a secondary forward+backward pass (e.g. a val
-        pass triggered from ``on_layer_forward``) so that the secondary pass
-        is not counted as a training step and does not contaminate the
-        in-flight training-pass buffers.
-
-        Behaviour during the pause:
-        * ``_collecting`` is set to ``False``, so backward hooks do not
-          trigger step completion.
-        * Forward and backward hooks still fire and may append data to
-          ``_act_parts`` / ``_grad_parts`` (PyTorch does not allow
-          selectively suppressing individual hooks).
-        * On exit, buffer state is fully *restored* to what it was before
-          the pause, so any training-pass data captured before the pause
-          (e.g. the first layer's activation in a mid-forward pause) is
-          preserved intact for the continuing training pass.
-
-        Example -- val pass triggered from ``on_layer_forward``::
-
-            def on_layer_forward(self, layer_name, activation):
-                if self._first_layer and self._need_val_target:
-                    with self._hook_manager.pause():
-                        loss = val_loss_fn(model, val_batch)
-                        loss.backward()   # does NOT trigger another on_step_end
-
-        Yields:
-            This :class:`HookManager` instance.
-        """
-        was_collecting = self._collecting
-        self._collecting = False
-        # Snapshot current buffer state so any training-pass data already
-        # captured (e.g. activations for layers visited before the pause)
-        # survives the secondary pass unmodified.
-        saved_layer: dict = {
-            name: {
-                "_act_parts": list(buf["_act_parts"]),
-                "_grad_parts": list(buf["_grad_parts"]),
-                "activation": buf["activation"],
-                "grad_output": buf["grad_output"],
-            }
-            for name, buf in self._buffers.items()
-        }
-        saved_param: dict = {
-            name: dict(buf) for name, buf in self._param_buffers.items()
-        }
-        try:
-            yield self
-        finally:
-            self._collecting = was_collecting
-            # Restore buffer state, discarding any data accumulated during
-            # the secondary pass.
-            for name, buf in self._buffers.items():
-                s = saved_layer.get(name, {})
-                buf["_act_parts"] = s.get("_act_parts", [])
-                buf["_grad_parts"] = s.get("_grad_parts", [])
-                buf["activation"] = s.get("activation")
-                buf["grad_output"] = s.get("grad_output")
-            for name, buf in self._param_buffers.items():
-                buf.clear()
-                buf.update(saved_param.get(name, {}))
 
     # ---------------------------------------------------------------------- #
     # Lifecycle and introspection                                              #

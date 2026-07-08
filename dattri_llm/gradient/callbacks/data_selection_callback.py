@@ -81,17 +81,28 @@ class DataSelectionCallback(HookManagerCallback):
     ``"val_loader"``
         At each step, draw one batch from ``val_loader``, run
         ``val_loss_fn(model, batch).backward()`` to obtain a fresh target
-        gradient, and use it for scoring. This mode re-uses the training
-        ``HookManager``'s hooks to capture the val-batch factorised gradient
-        via a re-entrancy guard, then restores ``param.grad`` so the training
-        update is unaffected. ``val_loader`` and ``val_loss_fn`` must be
-        provided.
+        gradient, and use it for scoring.  The val gradient is captured
+        through the training ``HookManager``'s **own** hooks -- no second
+        hook set -- so it is consistent with the scored training gradients by
+        construction (same layer selection, projection, and device
+        placement).  The manager's capture state is checkpointed around the
+        val pass (``HookManager.save_state`` / ``clear_state`` /
+        ``load_state``) and ``param.grad`` is restored afterwards, so the
+        in-flight training step and its update are unaffected.
+        ``val_loader`` and ``val_loss_fn`` must be provided, and the callback
+        must be attached to the ``HookManager`` (via
+        ``HookManager(callbacks=[...])`` or ``add_callback``).
 
-        Note: the training ``HookManager``'s ``steps_collected`` counter
-        increments once per training step *and* once per val pass (because
-        the val backward triggers the same completion hooks). This is a
-        known side-effect of the re-entrancy approach and does not affect
-        gradient correctness or the training update.
+        Two properties of this design to be aware of:
+
+        * The val backward completes a capture step of its own, whose record
+          is dispatched to **every** attached callback's ``on_step_end``
+          (this callback consumes it as the target).  A persistence callback
+          on the same manager (e.g. ``OffloadCallback``) would therefore
+          store one extra (val) record per training step.
+        * ``val_loss_fn`` must run a backward that reaches **all** hooked
+          layers; otherwise the val capture step never completes and a
+          ``RuntimeError`` is raised.
 
     **Threshold modes**:
 
@@ -245,25 +256,19 @@ class DataSelectionCallback(HookManagerCallback):
         self._val_iter = iter(val_loader) if val_loader is not None else None
 
         # Reference to the training HookManager; set by on_register().
-        # Used in _collect_val_gradient() to pause step-completion tracking
-        # during the secondary (val) backward pass.
+        # _collect_val_gradient() checkpoints its capture state (save_state /
+        # clear_state / load_state) around the secondary (val) backward pass
+        # and consumes the val step's record as the scoring target.
         self._hook_manager: Any | None = None
 
         # Guard flag: True while the val backward is in flight.
-        # Prevents on_layer_forward / on_step_end from re-entering val logic.
+        # Routes on_step_end to the val-record capture and prevents
+        # on_layer_forward from re-entering val collection.
         self._in_val_pass: bool = False
         # Whether val target has already been collected for the current step.
         self._val_target_ready_for_step: bool = False
         # Most recently collected val gradient (used by _resolve_target).
         self._pending_val_gradient: Gradient | None = None
-
-        # Per-layer buffers for our own val-pass hooks.
-        self._val_act_bufs: dict[str, torch.Tensor] = {}
-        self._val_grad_bufs: dict[str, torch.Tensor] = {}
-        self._val_hook_handles: list = []
-
-        if target == "val_loader":
-            self._register_val_hooks()
 
         # Exposed for inspection / debugging after each step.
         self.last_scores: torch.Tensor | None = None
@@ -278,8 +283,9 @@ class DataSelectionCallback(HookManagerCallback):
         callback is registered.
 
         Stores a reference to the HookManager so that
-        :meth:`_collect_val_gradient` can call
-        :meth:`~dattri_llm.gradient.hooks.HookManager.pause` during the
+        :meth:`_collect_val_gradient` can checkpoint its capture state
+        (:meth:`~dattri_llm.gradient.hooks.HookManager.save_state` /
+        :meth:`~dattri_llm.gradient.hooks.HookManager.load_state`) around the
         secondary (val) backward pass.
 
         Args:
@@ -287,43 +293,6 @@ class DataSelectionCallback(HookManagerCallback):
                 that registered this callback.
         """
         self._hook_manager = hook_manager
-
-    # ---------------------------------------------------------------------- #
-    # Val-pass hook registration                                              #
-    # ---------------------------------------------------------------------- #
-
-    def _register_val_hooks(self) -> None:
-        """Register lightweight forward+backward hooks for val-pass collection.
-
-        These hooks are separate from the training HookManager's hooks and
-        only capture data when ``_in_val_pass`` is ``True``.  They fire for
-        both training and val passes (PyTorch does not allow selective hook
-        suppression), but the flag ensures only val data is stored.
-        """
-        from dattri_llm.gradient.hooks import register_linear_io_hooks
-
-        cb_self = self  # capture for closures
-
-        def _val_fwd(layer_name: str, act: torch.Tensor) -> None:
-            if cb_self._in_val_pass:
-                cb_self._val_act_bufs[layer_name] = act
-
-        def _val_bwd(layer_name: str, grad: torch.Tensor) -> None:
-            if cb_self._in_val_pass:
-                cb_self._val_grad_bufs[layer_name] = grad
-
-        _, self._val_hook_handles = register_linear_io_hooks(
-            model=self._root,
-            on_layer_forward=_val_fwd,
-            on_layer_backward=_val_bwd,
-        )
-
-    def on_context_end(self) -> None:
-        """Remove val-pass hooks when the collect() context closes."""
-        if self._val_hook_handles:
-            from dattri_llm.gradient.hooks import remove_hooks
-
-            remove_hooks(self._val_hook_handles)
 
     # ---------------------------------------------------------------------- #
     # Main entry points                                                        #
@@ -355,17 +324,18 @@ class DataSelectionCallback(HookManagerCallback):
     def on_step_end(self, record: GradientRecord) -> None:
         """Score and optionally drop samples at the end of each training step.
 
-        When ``_in_val_pass`` is ``True`` the call originates from the
-        val backward (triggered inside :meth:`_collect_val_gradient`) and is
-        silently ignored -- the val gradient has already been captured by the
-        dedicated val hooks.
+        When ``_in_val_pass`` is ``True`` the call carries the **val** step's
+        record (the val backward completes a capture step of its own inside
+        :meth:`_collect_val_gradient`); its gradient is stashed as the scoring
+        target and no scoring happens.
 
         Args:
             record: The assembled :class:`GradientRecord` for this step.
         """
         if self._in_val_pass:
-            # Val pass completed -- data captured by our own val hooks.
-            # Do not score; just return.
+            # Val pass completed through the manager's own hooks -- the
+            # record IS the val gradient.  Stash it; do not score.
+            self._pending_val_gradient = record.gradient
             return
 
         # Reset for the next step.
@@ -415,23 +385,31 @@ class DataSelectionCallback(HookManagerCallback):
         the training backward).  Running backward from here does **not**
         trigger re-entrancy in PyTorch's autograd engine.
 
-        The training HookManager is paused via
-        :meth:`~dattri_llm.gradient.hooks.HookManager.pause` so that:
+        The val gradient is captured through the training HookManager's own
+        hooks: the manager's capture state is checkpointed
+        (:meth:`~dattri_llm.gradient.hooks.HookManager.save_state`) and
+        cleared (:meth:`~dattri_llm.gradient.hooks.HookManager.clear_state`),
+        the val backward then completes a capture step of its own whose
+        record -- assembled from only the val captures, with the manager's
+        full configuration (layer selection, projection, device placement) --
+        is delivered to :meth:`on_step_end` and stashed as the target.
+        Afterwards :meth:`~dattri_llm.gradient.hooks.HookManager.load_state`
+        puts the in-flight training step's state back exactly, and
+        ``param.grad`` is restored so the training update is unaffected.
 
-        * The val backward does not trigger HookManager's step-completion
-          logic (no spurious ``on_step_end`` call from the training
-          HookManager).
-        * Any training-pass activation data already captured in HookManager's
-          buffers (e.g. the first layer's activation captured just before this
-          call) is preserved and restored after the pause exits.
-
-        Our own val hooks (registered in :meth:`_register_val_hooks`) capture
-        the val factorised data into ``_val_act_bufs`` / ``_val_grad_bufs``
-        independently of HookManager's buffers.
-
-        ``param.grad`` is saved before the val pass and restored afterwards
-        so the training gradient update is completely unaffected.
+        Raises:
+            RuntimeError: If the callback is not attached to a
+                :class:`~dattri_llm.gradient.hooks.HookManager`, or the val
+                backward did not complete a capture step (``val_loss_fn``
+                must reach every hooked layer).  # noqa: DAR402
         """
+        if self._hook_manager is None:
+            raise RuntimeError(
+                "target='val_loader' requires this callback to be attached to "
+                "a HookManager (via HookManager(callbacks=[...]) or "
+                "add_callback): the val gradient is captured through the "
+                "manager's own hooks.",
+            )
         # Advance the val iterator, cycling when exhausted.
         try:
             batch = next(self._val_iter)  # type: ignore[arg-type]
@@ -445,78 +423,27 @@ class DataSelectionCallback(HookManagerCallback):
             for n, p in self._root.named_parameters()
         }
 
-        self._val_act_bufs.clear()
-        self._val_grad_bufs.clear()
+        state = self._hook_manager.save_state()
+        self._hook_manager.clear_state()
+        self._pending_val_gradient = None  # staleness guard (see below)
         self._in_val_pass = True
         try:
             self._root.zero_grad()
-            if self._hook_manager is not None:
-                # Pause the training HookManager so val backward does not
-                # trigger step completion or contaminate training buffers.
-                with self._hook_manager.pause():
-                    loss = self._val_loss_fn(self._root, batch)  # type: ignore[misc]
-                    loss.backward()
-            else:
-                # No HookManager reference yet (e.g. standalone test).
-                loss = self._val_loss_fn(self._root, batch)  # type: ignore[misc]
-                loss.backward()
+            loss = self._val_loss_fn(self._root, batch)  # type: ignore[misc]
+            loss.backward()
         finally:
             self._in_val_pass = False
+            self._hook_manager.load_state(state)
             # Restore the training parameter gradients.
             for n, p in self._root.named_parameters():
                 p.grad = saved_grads[n]
 
-        self._pending_val_gradient = self._assemble_val_gradient()
-
-    def _assemble_val_gradient(self) -> Gradient | None:
-        """Build a :class:`Gradient` from the captured val-pass buffers.
-
-        Raw hook data is stored with the module reference so that
-        :func:`~dattri_llm.gradient.ops.preprocess_factorized` is called
-        lazily inside ops functions rather than at assembly time.
-
-        Returns:
-            A :class:`Gradient` with ``"factorized"`` representation for each
-            layer that has both activation and grad_output data, or ``None``
-            if no layers were captured (e.g. the model has no hooked layers).
-        """
-        data: dict[str, Any] = {}
-        representation: dict[str, str] = {}
-        indexing: dict[str, str] = {}
-        layer_types: dict[str, str] = {}
-        for layer_name, act in self._val_act_bufs.items():
-            grad = self._val_grad_bufs.get(layer_name)
-            if grad is None:
-                continue
-            try:
-                module = self._root.get_submodule(layer_name)
-                layer_type = ops.canonical_class_name(module)
-                module_kwargs = ops.extract_module_kwargs(module, layer_type)
-            except AttributeError:
-                layer_type = (
-                    "nn.Embedding" if not act.is_floating_point() else "nn.Linear"
-                )
-                module_kwargs = None
-            layer_types[layer_name] = layer_type
-            data[layer_name] = Factorized(
-                activation=act,
-                pre_activation_grad=grad,
-                module_kwargs=module_kwargs,
+        if self._pending_val_gradient is None:
+            raise RuntimeError(
+                "The val backward did not complete a capture step, so no val "
+                "target was collected: val_loss_fn must run the model so that "
+                "the backward reaches every hooked layer.",
             )
-            representation[layer_name] = "factorized"
-            indexing[layer_name] = (
-                "batch_token"
-                if (act.ndim >= 3 or not act.is_floating_point())
-                else "batch"
-            )
-        if not data:
-            return None
-        return Gradient(
-            representation=representation,
-            data=data,
-            layer_types=layer_types,
-            indexing=indexing,
-        )
 
     # ---------------------------------------------------------------------- #
     # Drop-set selection                                                       #
@@ -686,9 +613,9 @@ class DataSelectionCallback(HookManagerCallback):
             # materialize scatters into rows 0..max_token; subtract that slice.
             embed_dim = weight.shape[1]
             vocab_local = contrib.numel() // embed_dim
-            weight.grad[:vocab_local] -= (
-                contrib.reshape(vocab_local, embed_dim)
-                .to(device=weight.grad.device, dtype=weight.grad.dtype)
+            weight.grad[:vocab_local] -= contrib.reshape(vocab_local, embed_dim).to(
+                device=weight.grad.device,
+                dtype=weight.grad.dtype,
             )
             return
 
