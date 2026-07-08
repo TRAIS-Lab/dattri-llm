@@ -284,7 +284,11 @@ def _preprocess_factorized(
     if module_kwargs is None:
         return a, g
 
-    has_bias = module_kwargs.get("has_bias", False) and include_bias
+    # No silent defaults: a provided module_kwargs must carry every field its
+    # layer type needs (missing keys raise KeyError).  The only automatic fill
+    # is ``normalized_shape`` for token norms, which is fully deducible from
+    # the activation's last dimension.
+    has_bias = module_kwargs["has_bias"] and include_bias
 
     # -- Normalisation layers ------------------------------------------------
     if layer_type == "nn.LayerNorm":
@@ -292,7 +296,7 @@ def _preprocess_factorized(
         x_hat = _compute_layer_norm_x_hat(
             a,
             normalized_shape,
-            module_kwargs.get("eps", 1e-5),
+            module_kwargs["eps"],
         )
         x_hat, g = _fold_broadcast_axes(x_hat, g, normalized_shape)
         return _augment_token_norm(x_hat, g, has_bias)
@@ -302,7 +306,7 @@ def _preprocess_factorized(
         x_hat = _compute_rms_x_hat(
             a,
             normalized_shape,
-            module_kwargs.get("eps"),
+            module_kwargs["eps"],  # explicit None selects the machine epsilon
         )
         x_hat, g = _fold_broadcast_axes(x_hat, g, normalized_shape)
         return _augment_token_norm(x_hat, g, has_bias)
@@ -311,7 +315,7 @@ def _preprocess_factorized(
         x_hat = _compute_group_norm_x_hat(
             a,
             module_kwargs["num_groups"],
-            module_kwargs.get("eps", 1e-5),
+            module_kwargs["eps"],
         )
         return _augment_channel_norm(x_hat, g, has_bias)
 
@@ -320,13 +324,13 @@ def _preprocess_factorized(
         x_hat = _compute_group_norm_x_hat(
             a,
             module_kwargs["num_features"],
-            module_kwargs.get("eps", 1e-5),
+            module_kwargs["eps"],
         )
         return _augment_channel_norm(x_hat, g, has_bias)
 
     # -- Embedding bag -------------------------------------------------------
     if layer_type == "nn.EmbeddingBag":
-        return _preprocess_embedding_bag(a, g, module_kwargs.get("mode", "mean"))
+        return _preprocess_embedding_bag(a, g, module_kwargs["mode"])
 
     # -- Convolution ---------------------------------------------------------
     if layer_type in CONV_TYPES:
