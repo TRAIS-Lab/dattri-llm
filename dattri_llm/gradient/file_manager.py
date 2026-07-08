@@ -9,11 +9,31 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dattri_llm.gradient.gradient import GradientRecord
 from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
-    from dattri_llm.gradient.gradient import Gradient, GradientRecord
+    from dattri_llm.gradient.gradient import Gradient
+
+
+def _to_cpu_record(record: GradientRecord) -> GradientRecord:
+    """Return *record* with its gradient payloads on CPU.
+
+    Captures may be device-resident (``HookManager(offload_to_cpu=False)``,
+    the default); saving them as-is would serialise CUDA tensors, which reload
+    pinned to the original ``cuda:*`` device and break loading on other
+    machines.  This is the single, batched device transfer of the disk
+    workflow -- a no-op (same tensor objects) when the payloads are already
+    on CPU.
+    """
+    if record.gradient.device.type == "cpu":
+        return record
+    return GradientRecord(
+        step=record.step,
+        input_hash=record.input_hash,
+        gradient=record.gradient.to("cpu"),
+    )
 
 
 def _merge_index(dst: dict[str, list[dict]], src: dict[str, list[dict]]) -> None:
@@ -141,6 +161,7 @@ class GradientFileManager:
                 "per-batch hash list -- use save_bulk([record]) instead.",
             )
         self._save_dir.mkdir(parents=True, exist_ok=True)
+        record = _to_cpu_record(record)
         h = record.input_hash
         s = record.step
         path = self._save_dir / f"step_{s:06d}_{h}.pt"
@@ -169,6 +190,7 @@ class GradientFileManager:
             Path: The written batch file.
         """
         self._save_dir.mkdir(parents=True, exist_ok=True)
+        records = [_to_cpu_record(r) for r in records]
         batch_id = self._next_batch_id
         self._next_batch_id += 1
         path = self._save_dir / f"batch_{batch_id:06d}.pt"

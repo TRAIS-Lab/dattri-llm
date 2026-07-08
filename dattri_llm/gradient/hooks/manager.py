@@ -69,6 +69,15 @@ class HookManager:
             assembled :class:`~dattri_llm.gradient.gradient.Factorized` for these
             layers is tagged ``batch_first=False`` so the gradient machinery reads
             their batch axis from dim 1.  Names not actually hooked are ignored.
+        offload_to_cpu: When ``True``, every buffered capture (raw factors,
+            projected results, and ``param_grad`` tensors) is moved to CPU as
+            it is captured, so the assembled
+            :class:`~dattri_llm.gradient.gradient.Gradient` is CPU-resident
+            and no device memory is held across the step.  Default ``False``:
+            captures stay on their own (training) device -- no transfer
+            happens, at the cost of keeping one step's captures in device
+            memory until the next step completes.  A no-op either way when
+            training on CPU.
     """
 
     def __init__(
@@ -78,10 +87,12 @@ class HookManager:
         callbacks: list[HookManagerCallback] | None = None,
         sample_id_key: str = "input_ids",
         non_batch_first_layers: Iterable[str] | None = None,
+        offload_to_cpu: bool = False,
     ) -> None:
         self._model = model
         self._callbacks: list[HookManagerCallback] = callbacks or []
         self._sample_id_key = sample_id_key
+        self._offload_to_cpu = offload_to_cpu
         self._non_batch_first_layers: set[str] = (
             set(non_batch_first_layers) if non_batch_first_layers is not None else set()
         )
@@ -366,6 +377,22 @@ class HookManager:
         for cb in self._callbacks:
             cb.on_step_end(record)
 
+    @staticmethod
+    def _concat_parts(parts: list[tuple[int, torch.Tensor]]) -> torch.Tensor:
+        """Concatenate buffered ``(dev_idx, tensor)`` parts along the batch axis.
+
+        Parts are ordered by source device index.  Under DataParallel with
+        on-device buffering (``offload_to_cpu=False``) the replicas' parts live
+        on different devices; they are gathered to the first part's device so
+        the concatenation is well-defined (a no-op in the single-device and
+        CPU-offload cases).
+        """
+        ordered = [t for _, t in sorted(parts, key=operator.itemgetter(0))]
+        first_device = ordered[0].device
+        if any(t.device != first_device for t in ordered[1:]):
+            ordered = [t.to(first_device) for t in ordered]
+        return torch.cat(ordered, dim=0)
+
     def _assemble_gradient(self) -> Gradient:
         data: dict = {}
         representation: dict = {}
@@ -385,10 +412,7 @@ class HookManager:
                         f"Layer '{layer_name}' has no buffered data. "
                         "Ensure backward() was called inside the collect() context.",
                     )
-                data[layer_name] = torch.cat(
-                    [t for _, t in sorted(parts, key=operator.itemgetter(0))],
-                    dim=0,
-                )
+                data[layer_name] = self._concat_parts(parts)
                 representation[layer_name] = "materialized"
                 layer_types[layer_name] = buf["_class_name"]
                 indexing[layer_name] = "batch"
@@ -401,14 +425,8 @@ class HookManager:
                     f"Layer '{layer_name}' has no buffered data. "
                     "Ensure backward() was called inside the collect() context.",
                 )
-            a = torch.cat(
-                [t for _, t in sorted(act_parts, key=operator.itemgetter(0))],
-                dim=0,
-            )
-            g = torch.cat(
-                [t for _, t in sorted(grad_parts, key=operator.itemgetter(0))],
-                dim=0,
-            )
+            a = self._concat_parts(act_parts)
+            g = self._concat_parts(grad_parts)
 
             # Factorized (LoGRA) projection: _act_parts/_grad_parts already hold the
             # projected, final factors (module_kwargs=None -> no re-preprocessing).
@@ -706,6 +724,7 @@ class HookManager:
                     if self._config.projection is not None
                     else None
                 ),
+                offload_to_cpu=self._offload_to_cpu,
             )
             self._n_layers = len(self._buffers)
             self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
@@ -722,6 +741,7 @@ class HookManager:
                 model,
                 layer_names=param_grad_layers,
                 on_param_grad=self._check_step_grad_complete,
+                offload_to_cpu=self._offload_to_cpu,
             )
             self._n_params_hooked = len(self._param_handles)
 

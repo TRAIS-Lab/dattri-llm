@@ -580,6 +580,12 @@ class DataSelectionCallback(HookManagerCallback):
             Float tensor of shape (B,).
         """
         gradient = record.gradient
+        if target is not None and target.device != gradient.device:
+            # Normalise the target to the captured gradient's device (e.g. a
+            # CPU-precomputed fixed target scored against on-device captures).
+            target = target.to(gradient.device)
+            if self._target == "fixed":
+                self._target_gradient = target  # cache the moved copy
         other = gradient if target is None else target
         mode = "materialized" if self._score_mode == "materialized" else "factorized"
 
@@ -587,7 +593,7 @@ class DataSelectionCallback(HookManagerCallback):
         per_layer = gradient.similarity(other, mode=mode)
 
         B = gradient.batch_size
-        scores = torch.zeros(B)
+        scores = torch.zeros(B, device=gradient.device)
         for matrix in per_layer.values():
             # Sum over target samples -> <dW_i, sum_j dW_target_j>.
             layer_scores = matrix.sum(1)
@@ -680,8 +686,9 @@ class DataSelectionCallback(HookManagerCallback):
             # materialize scatters into rows 0..max_token; subtract that slice.
             embed_dim = weight.shape[1]
             vocab_local = contrib.numel() // embed_dim
-            weight.grad[:vocab_local] -= contrib.reshape(vocab_local, embed_dim).to(
-                weight.grad.dtype,
+            weight.grad[:vocab_local] -= (
+                contrib.reshape(vocab_local, embed_dim)
+                .to(device=weight.grad.device, dtype=weight.grad.dtype)
             )
             return
 
@@ -694,7 +701,10 @@ class DataSelectionCallback(HookManagerCallback):
             out_f, in_f = weight.shape[1], weight.shape[0]
             contrib = contrib.reshape(out_f, in_f).T
 
-        weight.grad -= contrib.reshape_as(weight.grad).to(weight.grad.dtype)
+        weight.grad -= contrib.reshape_as(weight.grad).to(
+            device=weight.grad.device,
+            dtype=weight.grad.dtype,
+        )
 
     def _subtract_bias(
         self,
@@ -721,7 +731,7 @@ class DataSelectionCallback(HookManagerCallback):
             contrib = g.movedim(1, -1).reshape(-1, channels).sum(0)
         else:
             contrib = g.reshape(-1, channels).sum(0)
-        bias.grad -= contrib.to(bias.grad.dtype)
+        bias.grad -= contrib.to(device=bias.grad.device, dtype=bias.grad.dtype)
 
     # ---------------------------------------------------------------------- #
     # FSDP gradient correction                                                 #
@@ -775,6 +785,17 @@ class DataSelectionCallback(HookManagerCallback):
         if shard_map:
             self._fsdp_world_size = dist_world_size()
 
+    @staticmethod
+    def _collective_device() -> torch.device:
+        """Device for ``all_reduce`` buffers, matched to the process-group
+        backend: NCCL reduces CUDA tensors only, gloo works on CPU.
+        """
+        import torch.distributed as dist
+
+        if "nccl" in str(dist.get_backend()).lower():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
     def _remove_contributions_fsdp(
         self,
         record: GradientRecord,
@@ -794,7 +815,8 @@ class DataSelectionCallback(HookManagerCallback):
         # anything this step.  The drop count itself is reduced first so the
         # decision is identical on every rank.
         if use_dist:
-            count = torch.tensor([len(dropped)], dtype=torch.long)
+            coll_device = self._collective_device()
+            count = torch.tensor([len(dropped)], dtype=torch.long, device=coll_device)
             dist.all_reduce(count, op=dist.ReduceOp.SUM)
             any_dropped = bool(count.item())
         else:
@@ -807,7 +829,7 @@ class DataSelectionCallback(HookManagerCallback):
             return
 
         if use_dist:
-            buf = torch.cat([flat for _, flat in entries])
+            buf = torch.cat([flat for _, flat in entries]).to(coll_device)
             dist.all_reduce(buf, op=dist.ReduceOp.SUM)
             buf /= world
             offset = 0
@@ -856,7 +878,13 @@ class DataSelectionCallback(HookManagerCallback):
             weight = getattr(module, "weight", None)
             if weight is not None and id(weight) in shard_map:
                 full_numel = math.prod(shard_map[id(weight)].orig_shape)
-                flat = torch.zeros(full_numel, dtype=torch.float32)
+                # Contributions live on the captured gradients' device so the
+                # materialize below is copy-free; identical on every rank.
+                flat = torch.zeros(
+                    full_numel,
+                    dtype=torch.float32,
+                    device=record.gradient.device,
+                )
                 if dropped:
                     contrib, off = self._weight_contrib_natural(
                         layer_type,
@@ -871,7 +899,11 @@ class DataSelectionCallback(HookManagerCallback):
             bias = getattr(module, "bias", None)
             if bias is not None and id(bias) in shard_map:
                 channels = math.prod(shard_map[id(bias)].orig_shape)
-                flat = torch.zeros(channels, dtype=torch.float32)
+                flat = torch.zeros(
+                    channels,
+                    dtype=torch.float32,
+                    device=record.gradient.device,
+                )
                 if dropped:
                     flat = self._bias_contrib_natural(layer_type, g_d, channels).float()
                 entries.append((bias, flat))
@@ -937,4 +969,4 @@ class DataSelectionCallback(HookManagerCallback):
         if not spec.in_shard or param.grad is None:
             return
         seg = full_flat.reshape(-1)[spec.start : spec.end + 1]
-        param.grad -= seg.to(param.grad.dtype)
+        param.grad -= seg.to(device=param.grad.device, dtype=param.grad.dtype)

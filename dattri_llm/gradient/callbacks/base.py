@@ -21,7 +21,9 @@ class HookManagerCallback:
     def on_layer_forward(self, layer_name: str, activation: torch.Tensor) -> None:
         """Called after each layer's forward hook captures the activation.
 
-        Fires once per layer per forward pass.  ``activation`` is on CPU.
+        Fires once per layer per forward pass.  ``activation`` is on the
+        capture device -- the training device by default, CPU when the
+        manager was built with ``offload_to_cpu=True``.
 
         Args:
             layer_name: Fully-qualified name of the hooked layer.
@@ -31,8 +33,9 @@ class HookManagerCallback:
     def on_layer_backward(self, layer_name: str, grad_output: torch.Tensor) -> None:
         """Called after each layer's backward hook captures the gradient.
 
-        ``grad_output`` is on CPU.  Fires once per layer per backward pass
-        (once per replica under DataParallel).
+        ``grad_output`` is on the capture device (see :meth:`on_layer_forward`).
+        Fires once per layer per backward pass (once per replica under
+        DataParallel).
 
         Args:
             layer_name: Fully-qualified name of the hooked layer.

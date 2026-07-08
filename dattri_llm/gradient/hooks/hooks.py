@@ -165,18 +165,24 @@ def register_linear_io_hooks(
     kwargs_overrides: dict[str, dict] | None = None,
     projection: dict[str, dict] | None = None,
     projector: Callable | None = None,
+    offload_to_cpu: bool = False,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
     For each qualifying layer the function registers:
 
-    * A **forward hook** that captures ``input[0]`` (moved to CPU) and
-      appends it to ``buffers[name]["_act_parts"]``.
-    * A **backward hook** that captures ``grad_output[0]`` (moved to CPU)
-      and appends it to ``buffers[name]["_grad_parts"]``.
+    * A **forward hook** that captures ``input[0]`` and appends it to
+      ``buffers[name]["_act_parts"]``.
+    * A **backward hook** that captures ``grad_output[0]`` and appends it to
+      ``buffers[name]["_grad_parts"]``.
+
+    Captures stay on their own (training) device by default so no transfer
+    happens; ``offload_to_cpu=True`` moves each buffered tensor to CPU (a
+    no-op when training on CPU).  For a projected layer the flag applies to
+    the *projected* result -- the raw factors are never buffered either way.
 
     Optionally, user-supplied ``on_layer_forward`` and ``on_layer_backward``
-    callables fire inside each hook with ``(layer_name, cpu_tensor)``
+    callables fire inside each hook with ``(layer_name, tensor)``
     immediately after capture.  Because these callables execute inside a
     PyTorch hook they are trainer-agnostic -- no trainer callback system is
     required.
@@ -190,14 +196,21 @@ def register_linear_io_hooks(
             linear-IO-capable layer is hooked (see :data:`_LINEAR_IO_TYPES`).
         on_layer_forward: Optional callable fired after each forward hook
             capture.  Signature: ``(layer_name: str, activation: Tensor)``.
-            The tensor is on CPU.
+            The tensor is on the capture device (CPU iff *offload_to_cpu*
+            or CPU training).
         on_layer_backward: Optional callable fired after each backward hook
             capture.  Signature: ``(layer_name: str, grad_output: Tensor)``.
-            The tensor is on CPU.
+            The tensor is on the capture device (CPU iff *offload_to_cpu*
+            or CPU training).
         projection: Optional per-layer proj_kwargs map (a ``"__default__"``
             entry covers unlisted layers); ``None`` captures raw factors.
         projector: Projection factory following dattri's ``random_project``
             protocol; required when *projection* is given.
+        offload_to_cpu: When ``True``, move every buffered capture (the raw
+            factors, or the projected result for a projected layer) to CPU.
+            Default ``False``: buffers stay on the tensors' own device to
+            avoid device transfers, at the cost of holding one step's
+            captures in that device's memory.
         type_overrides: Optional mapping from layer name to a layer-type string
             that overrides the type inferred by :func:`canonical_class_name`.
             Use this for user-defined layer classes that subclass a supported
@@ -263,7 +276,8 @@ def register_linear_io_hooks(
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
                 buf = buffers[layer_name]
                 if buf["_proj_kw"] is None:
-                    a = a.cpu()
+                    if offload_to_cpu:
+                        a = a.cpu()
                     with buf["_lock"]:
                         buf["_act_parts"].append((dev_idx, a))
                     buf["activation"] = a
@@ -291,12 +305,13 @@ def register_linear_io_hooks(
                 dev_idx = grad_output[0].device.index if grad_output[0].is_cuda else 0
                 buf = buffers[layer_name]
                 if buf["_proj_kw"] is None:
-                    g = g.cpu()
+                    if offload_to_cpu:
+                        g = g.cpu()
                     with buf["_lock"]:
                         buf["_grad_parts"].append((dev_idx, g))
                     buf["grad_output"] = g
                 else:
-                    _capture_projected(buf, g, dev_idx, projector)
+                    _capture_projected(buf, g, dev_idx, projector, offload_to_cpu)
                 if on_layer_backward is not None:
                     on_layer_backward(layer_name, g)
 
@@ -317,6 +332,7 @@ def _capture_projected(
     g: torch.Tensor,
     dev_idx: int,
     projector: Callable,
+    offload_to_cpu: bool = False,
 ) -> None:
     """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
 
@@ -324,8 +340,9 @@ def _capture_projected(
     matching per-replica forward activation.  For a **factorized** (LoGRA) layer
     the projected factors are appended to ``_act_parts``/``_grad_parts``; for a
     **materialized** (TRAK) layer the projected per-sample gradient is appended to
-    ``_proj_parts``.  Only the small projected result is retained on CPU -- the raw
-    factors are discarded here, so the buffer never holds the full gradient.
+    ``_proj_parts``.  Only the small projected result is retained (moved to CPU
+    when *offload_to_cpu*) -- the raw factors are discarded here, so the buffer
+    never holds the full gradient.
     """
     with buf["_lock"]:
         stack = buf["_device_id"].get(dev_idx)
@@ -349,9 +366,11 @@ def _capture_projected(
             module_kwargs,
             **kw,
         )
+        if offload_to_cpu:
+            a_p, g_p = a_p.cpu(), g_p.cpu()
         with buf["_lock"]:
-            buf["_act_parts"].append((dev_idx, a_p.cpu()))
-            buf["_grad_parts"].append((dev_idx, g_p.cpu()))
+            buf["_act_parts"].append((dev_idx, a_p))
+            buf["_grad_parts"].append((dev_idx, g_p))
     else:
         mat = ops._project_materialized(
             a,
@@ -361,8 +380,10 @@ def _capture_projected(
             module_kwargs,
             **kw,
         )
+        if offload_to_cpu:
+            mat = mat.cpu()
         with buf["_lock"]:
-            buf["_proj_parts"].append((dev_idx, mat.cpu()))
+            buf["_proj_parts"].append((dev_idx, mat))
 
 
 def remove_hooks(handles: list[torch.utils.hooks.RemovableHook]) -> None:
@@ -381,8 +402,8 @@ def remove_hooks(handles: list[torch.utils.hooks.RemovableHook]) -> None:
 
 # Buffer type alias for param grad hooks.
 # Outer key: layer name.  Inner key: parameter name relative to that layer.
-# Value: most recently computed gradient tensor (CPU), or None before the
-# first backward pass.
+# Value: most recently computed gradient tensor (on the parameter's device,
+# or CPU under offload_to_cpu), or None before the first backward pass.
 ParamGradBuffer = dict  # {param_name: Tensor | None}
 
 
@@ -390,6 +411,7 @@ def register_param_grad_hooks(
     model: nn.Module,
     layer_names: set[str] | None = None,
     on_param_grad: Callable[[str, str, torch.Tensor], None] | None = None,
+    offload_to_cpu: bool = False,
 ) -> tuple[dict[str, ParamGradBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register parameter-gradient hooks on general module layers.
 
@@ -424,7 +446,11 @@ def register_param_grad_hooks(
         on_param_grad: Optional callback fired immediately when a parameter's
             gradient is computed.  Signature:
             ``(layer_name: str, param_name: str, grad: Tensor)``.
-            The tensor is on CPU.
+            The tensor is on the capture device (CPU iff *offload_to_cpu*
+            or CPU training).
+        offload_to_cpu: When ``True``, move each buffered gradient to CPU.
+            Default ``False``: the buffer keeps the tensor on the parameter's
+            own device (no transfer).
 
     Returns:
         ``(buffers, handles)`` where ``buffers`` maps layer name to a
@@ -457,7 +483,9 @@ def register_param_grad_hooks(
                     # grad is the freshly-computed gradient for this parameter.
                     # It arrives here before being written to param.grad, so
                     # there is no risk of reading a stale or None value.
-                    g = grad.detach().cpu()
+                    g = grad.detach()
+                    if offload_to_cpu:
+                        g = g.cpu()
                     buffers[ln][pn] = g
                     if on_param_grad is not None:
                         on_param_grad(ln, pn, g)
@@ -499,7 +527,9 @@ def register_linear_param_hooks(
         on_linear_param_grad: Optional callback fired after each parameter's
             gradient is accumulated.  Signature:
             ``(layer_name: str, param_name: str, grad: Tensor)`` where
-            ``grad`` is ``param.grad.detach().cpu()``.
+            ``grad`` is ``param.grad.detach()`` -- left on the parameter's
+            own device (no copy is made; consumers that need CPU move it
+            themselves).
 
     Returns:
         ``(n_params, handles)`` where ``n_params`` is the total number of
@@ -525,8 +555,10 @@ def register_linear_param_hooks(
             def _make_hook(ln: str, pn: str) -> Callable:
                 def _hook(p: torch.nn.Parameter) -> None:
                     if on_linear_param_grad is not None:
-                        g = p.grad.detach().cpu()
-                        on_linear_param_grad(ln, pn, g)
+                        # No .cpu() here: the only in-tree consumer is the
+                        # HookManager's step-completion counter, which ignores
+                        # the value -- a device transfer would be pure waste.
+                        on_linear_param_grad(ln, pn, p.grad.detach())
 
                 return _hook
 
