@@ -82,6 +82,9 @@ def linear_module_kwargs(*, has_bias: bool) -> dict:
 
     Args:
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return {"has_bias": has_bias}
 
@@ -91,6 +94,9 @@ def bilinear_module_kwargs(*, has_bias: bool) -> dict:
 
     Args:
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return {"has_bias": has_bias}
 
@@ -106,6 +112,9 @@ def embedding_bag_module_kwargs(*, mode: str) -> dict:
     Args:
         mode: The bag reduction, ``"sum"`` or ``"mean"`` (``"max"`` is not
             supported for factorized gradients).
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
 
     Raises:
         ValueError: If *mode* is not a supported reduction.
@@ -138,6 +147,9 @@ def conv1d_module_kwargs(
         padding: Zero-padding (int or length-1 sequence).
         dilation: Dilation (int or length-1 sequence).
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _conv_module_kwargs(1, kernel_size, stride, padding, dilation, has_bias)
 
@@ -158,6 +170,9 @@ def conv2d_module_kwargs(
         padding: Zero-padding (int or length-2 sequence).
         dilation: Dilation (int or length-2 sequence).
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _conv_module_kwargs(2, kernel_size, stride, padding, dilation, has_bias)
 
@@ -178,6 +193,9 @@ def conv3d_module_kwargs(
         padding: Zero-padding (int or length-3 sequence).
         dilation: Dilation (int or length-3 sequence).
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _conv_module_kwargs(3, kernel_size, stride, padding, dilation, has_bias)
 
@@ -198,6 +216,9 @@ def conv_transpose1d_module_kwargs(
         padding: Zero-padding (int or length-1 sequence).
         dilation: Dilation (int or length-1 sequence).
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _conv_module_kwargs(1, kernel_size, stride, padding, dilation, has_bias)
 
@@ -218,6 +239,9 @@ def conv_transpose2d_module_kwargs(
         padding: Zero-padding (int or length-2 sequence).
         dilation: Dilation (int or length-2 sequence).
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _conv_module_kwargs(2, kernel_size, stride, padding, dilation, has_bias)
 
@@ -238,6 +262,9 @@ def conv_transpose3d_module_kwargs(
         padding: Zero-padding (int or length-3 sequence).
         dilation: Dilation (int or length-3 sequence).
         has_bias: Whether the layer has a bias parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _conv_module_kwargs(3, kernel_size, stride, padding, dilation, has_bias)
 
@@ -260,6 +287,9 @@ def layer_norm_module_kwargs(
             as in the ``nn.LayerNorm`` constructor.
         eps: Numerical-stability epsilon.
         has_bias: Whether the layer has a bias (beta) parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     if isinstance(normalized_shape, int):
         normalized_shape = (normalized_shape,)
@@ -284,6 +314,9 @@ def rms_norm_module_kwargs(
             as in the ``nn.RMSNorm`` constructor.
         eps: Numerical-stability epsilon; pass ``None`` explicitly to use the
             dtype's machine epsilon, matching ``nn.RMSNorm``'s default.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     if isinstance(normalized_shape, int):
         normalized_shape = (normalized_shape,)
@@ -308,6 +341,9 @@ def group_norm_module_kwargs(
         num_channels: Total number of channels.
         eps: Numerical-stability epsilon.
         has_bias: Whether the layer has a bias (beta) parameter.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return {
         "has_bias": has_bias,
@@ -334,6 +370,9 @@ def instance_norm1d_module_kwargs(
         eps: Numerical-stability epsilon.
         has_bias: Whether the layer has a bias (beta) parameter (requires
             ``affine=True`` on the module).
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _instance_norm_module_kwargs(num_features, eps, has_bias)
 
@@ -351,6 +390,9 @@ def instance_norm2d_module_kwargs(
         eps: Numerical-stability epsilon.
         has_bias: Whether the layer has a bias (beta) parameter (requires
             ``affine=True`` on the module).
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _instance_norm_module_kwargs(num_features, eps, has_bias)
 
@@ -368,5 +410,8 @@ def instance_norm3d_module_kwargs(
         eps: Numerical-stability epsilon.
         has_bias: Whether the layer has a bias (beta) parameter (requires
             ``affine=True`` on the module).
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
     """
     return _instance_norm_module_kwargs(num_features, eps, has_bias)
