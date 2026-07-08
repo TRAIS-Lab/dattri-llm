@@ -679,7 +679,11 @@ def _broadcast_gradient(B, T=3, D=5, seed=0):
         torch.randn(B, T, D, generator=g),
         torch.randn(B, T, D, generator=g),
     )
-    pos = Factorized(torch.arange(T).unsqueeze(0), torch.randn(1, T, D, generator=g))
+    pos = Factorized(
+        torch.arange(T).unsqueeze(0),
+        torch.randn(1, T, D, generator=g),
+        module_kwargs={"has_bias": False, "num_embeddings": T, "padding_idx": None},
+    )
     return Gradient(
         representation={"fc": "factorized", "pos": "factorized"},
         data={"fc": fc, "pos": pos},
@@ -717,6 +721,7 @@ class TestBroadcastConcatenate:
         g2.data["pos"] = Factorized(
             activation=torch.flip(pos2.activation, dims=[1]),
             pre_activation_grad=pos2.pre_activation_grad,
+            module_kwargs=pos2.module_kwargs,
         )
         out = g1.concatenate(g2, dim="batch")
         out.validate()

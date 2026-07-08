@@ -93,11 +93,21 @@ def _norm_3d():
 
 
 def _embedding():
-    # Ensure token VOCAB-1 always appears so materialize output size == VOCAB*E,
-    # matching nn.Embedding(VOCAB, E).weight.grad.flatten().
     ids = torch.randint(0, VOCAB, (B, T))
-    ids[0, 0] = VOCAB - 1
     return ids, torch.randn(B, T, E)
+
+
+# Embedding materialization requires the layer's true vocab size (the width
+# cannot be inferred from the factors); both embedding-family test cases hold
+# per-token Embedding-form data, so they share one kwargs dict.
+_EMB_MK = {"has_bias": False, "num_embeddings": VOCAB, "padding_idx": None}
+
+
+def _mat(a, g, lt, **kw):
+    """``_materialize`` with the kwargs the strict embedding API requires."""
+    if lt in ("nn.Embedding", "nn.EmbeddingBag"):
+        return _materialize(a, g, "nn.Embedding", module_kwargs=_EMB_MK, **kw)
+    return _materialize(a, g, lt, **kw)
 
 
 # (test-id tag, factory).  The "-3d" suffix only disambiguates test ids that
@@ -143,7 +153,7 @@ class TestPairwiseDotIdentity:
 
     @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_matches_materialized_gram(self, lt, a, g):
-        mat = _materialize(a, g, lt).float()  # true per-sample weight grads
+        mat = _mat(a, g, lt).float()  # true per-sample weight grads
         expected = mat @ mat.T  # (B, B)
         actual = _pairwise_dot(a, g, lt).float()
         assert actual.shape == (B, B)
@@ -167,7 +177,7 @@ class TestGradNormSqIdentity:
 
     @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
     def test_matches_materialized_norm(self, lt, a, g):
-        mat = _materialize(a, g, lt).float()  # true per-sample weight grads
+        mat = _mat(a, g, lt).float()  # true per-sample weight grads
         expected = mat.pow(2).sum(-1)  # (B,)
         actual = _grad_norm_sq(a, g, lt).float()
         assert actual.shape == (B,)
@@ -187,8 +197,8 @@ class TestDotIdentity:
 
     @pytest.mark.parametrize(("lt", "a1", "g1", "a2", "g2"), _PARAMS_CROSS)
     def test_matches_materialized_dot(self, lt, a1, g1, a2, g2):
-        mat1 = _materialize(a1, g1, lt).float()  # true per-sample weight grads
-        mat2 = _materialize(a2, g2, lt).float()
+        mat1 = _mat(a1, g1, lt).float()  # true per-sample weight grads
+        mat2 = _mat(a2, g2, lt).float()
         expected = (mat1 * mat2).sum(-1)  # (B,)
         actual = _dot(a1, g1, a2, g2, lt).float()
         assert actual.shape == (B,)
@@ -202,6 +212,126 @@ class TestDotIdentity:
         self_dot = _dot(a, g, a, g, lt).float()
         norms = _grad_norm_sq(a, g, lt).float()
         assert torch.allclose(self_dot, norms, atol=1e-4, rtol=1e-4)
+
+    def test_embedding_padding_idx_matches_autograd(self):
+        """With padding_idx, _materialize and _dot must match autograd, whose
+        embedding backward zeroes the pad row of weight.grad (regression: pad
+        positions' contributions were included).
+        """
+        from torch import nn
+
+        pad = 0
+        emb = nn.Embedding(VOCAB, E, padding_idx=pad)
+        ids = torch.randint(1, VOCAB, (B, T))
+        ids[:, -2:] = pad  # padded tail
+        g = torch.randn(B, T, E)
+        mk = {"has_bias": False, "num_embeddings": VOCAB, "padding_idx": pad}
+
+        # Autograd ground truth: per-sample weight gradients.
+        true_grads = []
+        for i in range(B):
+            emb.weight.grad = None
+            (emb(ids[i : i + 1]) * g[i : i + 1]).sum().backward()
+            true_grads.append(emb.weight.grad.detach().flatten())
+        true_mat = torch.stack(true_grads).float()  # (B, VOCAB * E)
+
+        mat = _materialize(ids, g, "nn.Embedding", module_kwargs=mk).float()
+        assert torch.allclose(mat, true_mat, atol=1e-5), (
+            f"max diff {(mat - true_mat).abs().max():.2e}"
+        )
+
+        expected = (true_mat * true_mat).sum(-1)
+        actual = _dot(
+            ids,
+            g,
+            ids,
+            g,
+            "nn.Embedding",
+            module_kwargs1=mk,
+            module_kwargs2=mk,
+        ).float()
+        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), (
+            f"max diff {(expected - actual).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("mode", ["sum", "mean"])
+    def test_embedding_bag_padding_idx_matches_autograd(self, mode):
+        """With padding_idx, the bag expansion must exclude pad tokens and,
+        for mode='mean', divide by each bag's non-pad count (regression: pad
+        positions received gradient and the divisor was the full T).
+        """
+        from torch import nn
+
+        pad = 0
+        bag = nn.EmbeddingBag(VOCAB, E, mode=mode, padding_idx=pad)
+        ids = torch.randint(1, VOCAB, (B, T))
+        ids[:, -2:] = pad  # padded tail, varying real content per bag
+        ids[1, -3] = pad  # one bag with a different non-pad count
+        g = torch.randn(B, E)  # per-bag output gradient
+        mk = {
+            "has_bias": False,
+            "num_embeddings": VOCAB,
+            "mode": mode,
+            "padding_idx": pad,
+        }
+
+        # Autograd ground truth: per-bag weight gradients.
+        true_grads = []
+        for i in range(B):
+            bag.weight.grad = None
+            (bag(ids[i : i + 1]) * g[i : i + 1]).sum().backward()
+            true_grads.append(bag.weight.grad.detach().flatten())
+        true_mat = torch.stack(true_grads).float()  # (B, VOCAB * E)
+
+        mat = _materialize(ids, g, "nn.EmbeddingBag", module_kwargs=mk).float()
+        assert torch.allclose(mat, true_mat, atol=1e-5), (
+            f"[{mode}] max diff {(mat - true_mat).abs().max():.2e}"
+        )
+
+    def test_embedding_width_is_batch_independent(self):
+        """Materialized embedding gradients are always (B, num_embeddings * E),
+        whatever token range a batch touches, so cross-batch dots are
+        well-defined (regression: width was max(token) + 1 per batch and
+        mixed-width embedding dots crashed on a shape mismatch).
+        """
+        ids_lo = torch.randint(0, 5, (B, T))  # small token ids only
+        ids_hi = torch.randint(VOCAB - 5, VOCAB, (B, T))  # large ids only
+        g_lo, g_hi = torch.randn(B, T, E), torch.randn(B, T, E)
+        m_lo = _materialize(ids_lo, g_lo, "nn.Embedding", module_kwargs=_EMB_MK)
+        m_hi = _materialize(ids_hi, g_hi, "nn.Embedding", module_kwargs=_EMB_MK)
+        assert m_lo.shape == m_hi.shape == (B, VOCAB * E)
+        # Disjoint token ranges -> exactly orthogonal weight gradients.
+        assert torch.equal((m_lo * m_hi).sum(-1), torch.zeros(B))
+        # Declared width must bound the captured ids -- corrupt kwargs raise.
+        with pytest.raises(ValueError, match="out of range"):
+            _materialize(
+                ids_hi,
+                g_hi,
+                "nn.Embedding",
+                module_kwargs={
+                    "has_bias": False,
+                    "num_embeddings": 5,
+                    "padding_idx": None,
+                },
+            )
+
+    def test_embedding_different_token_counts(self):
+        """Embedding _dot with T1 != T2 (regression: side 2's scatter used
+        side 1's token count and crashed on mismatched sequence lengths).
+        """
+        t1, t2 = T, T + 3
+        ids1 = torch.randint(0, VOCAB, (B, t1))
+        ids2 = torch.randint(0, VOCAB, (B, t2))
+        g1 = torch.randn(B, t1, E)
+        g2 = torch.randn(B, t2, E)
+        mat1 = _materialize(ids1, g1, "nn.Embedding", module_kwargs=_EMB_MK).float()
+        mat2 = _materialize(ids2, g2, "nn.Embedding", module_kwargs=_EMB_MK).float()
+        expected = (mat1 * mat2).sum(-1)  # (B,)
+        actual = _dot(ids1, g1, ids2, g2, "nn.Embedding").float()
+        assert actual.shape == (B,)
+        assert torch.allclose(expected, actual, atol=1e-4, rtol=1e-4), (
+            f"max diff {(expected - actual).abs().max():.2e}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +507,8 @@ class TestMaterializeCollapse:
     def test_per_token_noop_for_token_contracting_types(self, lt, factory):
         a, g = factory()
         assert torch.allclose(
-            _materialize(a, g, lt, per_token=True),
-            _materialize(a, g, lt),
+            _mat(a, g, lt, per_token=True),
+            _mat(a, g, lt),
             atol=1e-6,
         )
 
@@ -429,17 +559,64 @@ class TestProjection:
         # Project an identical input through both factor slots; outputs must differ.
         assert not torch.allclose(a_p, g_p)
 
-    @pytest.mark.parametrize("lt", ["nn.LayerNorm", "nn.Embedding"])
-    def test_factorized_rejects_non_outer_product(self, lt):
+    def test_factorized_rejects_non_outer_product(self):
+        # Norm gradients are diagonal (a * g), not an outer product.
         a, g = _norm_3d()
         with pytest.raises(ValueError, match="factorized projection is undefined"):
             ops.project_factorized(
                 Factorized(a, g, {"has_bias": False}),
-                lt,
+                "nn.LayerNorm",
                 random_project,
                 proj_dim=16,
                 **_PROJ,
             )
+
+    def test_factorized_embedding_matches_projected_true_gradient(self):
+        """Embedding LoGRA projection (one-hot inputs): materializing the
+        projected factors as a linear layer must equal ``G^T dW^T A`` computed
+        from the true per-sample embedding gradient and the projectors' own
+        matrices (recovered by projecting identity bases).
+        """
+        proj_dim = 16
+        ids, g = _embedding()
+        a_p, g_p = ops.project_factorized(
+            Factorized(ids, g, _EMB_MK),
+            "nn.Embedding",
+            random_project,
+            proj_dim=proj_dim,
+            **_PROJ,
+        )
+        assert a_p.shape == (B, T, proj_dim)
+        assert g_p.shape == (B, T, proj_dim)
+
+        # Recover the two projection matrices by projecting identity bases
+        # with the same seeds (_project_factorized uses seed for g, seed+1
+        # for a).
+        seed = _PROJ["proj_seed"]
+        kw = {k: v for k, v in _PROJ.items() if k != "proj_seed"}
+        A = ops._apply_projector(
+            random_project,
+            torch.eye(VOCAB),
+            proj_dim=proj_dim,
+            proj_seed=seed + 1,
+            **kw,
+        )  # (VOCAB, p)
+        G = ops._apply_projector(
+            random_project,
+            torch.eye(E),
+            proj_dim=proj_dim,
+            proj_seed=seed,
+            **kw,
+        )  # (E, p)
+
+        # True per-sample embedding gradient dW_i is (VOCAB, E); the projected
+        # factorized gradient must be G^T dW_i^T A, materialized linear-style.
+        got = _materialize(a_p, g_p, "nn.Linear").float()  # (B, p*p)
+        dw = _mat(ids, g, "nn.Embedding").reshape(B, VOCAB, E).float()
+        expected = torch.einsum("ep,bve,vq->bpq", G, dw, A).reshape(B, -1)
+        assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3), (
+            f"max diff {(got - expected).abs().max():.2e}"
+        )
 
     def test_materialized_accepts_dense_tensor(self):
         dense = torch.randn(B, 100)

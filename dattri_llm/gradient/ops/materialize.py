@@ -18,13 +18,28 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-def _materialize_embedding(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-    """Scatter-add materialization for embedding weight gradients."""
+def _materialize_embedding(
+    a: torch.Tensor,
+    g: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Scatter-add materialization for embedding weight gradients.
+
+    *vocab_size* is the layer's ``num_embeddings``, so the result width
+    ``vocab_size * embed_dim`` equals ``weight.numel()`` and is identical
+    for every batch -- the property cross-batch operations rely on.
+    """
     token_ids = a  # (B, T) int
     grad = g.float()  # (B, T, embed_dim)
     B, T = token_ids.shape
     embed_dim = grad.shape[-1]
-    vocab_size = int(token_ids.max().item()) + 1
+    max_id = int(token_ids.max().item())
+    if max_id >= vocab_size:
+        raise ValueError(
+            f"Embedding token id {max_id} is out of range for the declared "
+            f"num_embeddings={vocab_size}; the module_kwargs do not match the "
+            "captured data.",
+        )
 
     idx = token_ids.unsqueeze(-1).expand(B, T, embed_dim)  # (B, T, embed_dim)
     result = torch.zeros(B, vocab_size, embed_dim, dtype=grad.dtype, device=grad.device)
@@ -50,7 +65,9 @@ def _materialize(
     When *module_kwargs* is provided the raw hook captures are preprocessed
     first via :func:`_preprocess_factorized` (im2col for Conv, x_hat for
     LayerNorm, bias augmentation for Linear).  Pass ``module_kwargs=None``
-    when the tensors are already in the preprocessed form.
+    when the tensors are already in the preprocessed form -- except for
+    embedding layers, which always require module_kwargs: the materialization
+    width is the layer's ``num_embeddings``, which the factors cannot supply.
 
     A norm layer's gradient is per-position (elementwise).  By default
     (``per_token=False``) the token axis is summed, giving the actual weight
@@ -63,7 +80,13 @@ def _materialize(
     a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
 
     if is_embedding(layer_type):
-        return _materialize_embedding(a, g)
+        if module_kwargs is None:
+            raise ValueError(
+                "Materializing an embedding gradient requires module_kwargs "
+                "with 'num_embeddings' (the weight's vocab size cannot be "
+                "inferred from the captured factors).",
+            )
+        return _materialize_embedding(a, g, module_kwargs["num_embeddings"])
 
     a_f = _to_3d(a.float())  # (B, T, d_in)
     g_f = _to_3d(g.float())  # (B, T, d_out)

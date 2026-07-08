@@ -99,16 +99,35 @@ def _project_factorized(
     LoGRA convention) -- so the per-sample gradient stays the outer product of two
     ``(B, T, proj_dim)`` factors.  Returns ``(a_p, g_p)``.
 
-    Only layer types whose gradient *is* an outer product of the factors (linear,
-    conv, transposed conv) are supported; norm layers (diagonal gradient) and
-    embeddings (integer index factors) must use materialized projection instead.
+    Supported for every layer type whose gradient *is* an outer product of the
+    factors: linear, conv, transposed conv, and the embedding family --
+    an embedding is a linear layer over one-hot inputs
+    (``dW = sum_t onehot(id_t) x g_t``), so its integer ids are expanded to
+    one-hot vectors of width ``num_embeddings`` before the input-side
+    projection.  (The transient one-hot is ``(B, T, num_embeddings)`` floats;
+    a cached identity-projection lookup table would avoid it -- acceptable
+    until vocab sizes make it hurt.)  Norm layers (diagonal gradient, not an
+    outer product) must use materialized projection instead.
     """
-    if is_norm(layer_type) or is_embedding(layer_type):
+    if is_norm(layer_type):
         raise ValueError(
             f"factorized projection is undefined for {layer_type!r}: its gradient "
             "is not an outer product of the factors -- use materialized projection",
         )
     a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    if is_embedding(layer_type):
+        # Embedding == linear over one-hot inputs; padding/bag handling already
+        # happened in preprocessing (pad positions carry zero g).
+        if module_kwargs is None:
+            raise ValueError(
+                "Factorized projection of an embedding requires module_kwargs "
+                "with 'num_embeddings' (the one-hot width cannot be inferred "
+                "from the captured factors).",
+            )
+        a = torch.nn.functional.one_hot(
+            a.long(),
+            num_classes=module_kwargs["num_embeddings"],
+        )
     a_f = _to_3d(a.float())  # (B, T, d_in)
     g_f = _to_3d(g.float())  # (B, T, d_out)
     g_p = _apply_projector(

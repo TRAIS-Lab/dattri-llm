@@ -171,7 +171,7 @@ def _dot(
 
     if is_embedding(layer_type):
         B = g1.shape[0]
-        T = a1.shape[1]
+        T2 = a2.shape[1]  # the two sides may have different token counts
         E = g1.shape[-1]
         vocab = int(max(a1.max().item(), a2.max().item())) + 1
         g1_f = g1.float()
@@ -179,8 +179,8 @@ def _dot(
         result = torch.zeros(B, dtype=g1_f.dtype, device=g1_f.device)
         for i in range(B):
             G2_sum = torch.zeros(vocab, E, dtype=g2_f.dtype, device=g2_f.device)
-            G2_sum.scatter_add_(0, a2[i].unsqueeze(-1).expand(T, E), g2_f[i])
-            gathered = G2_sum[a1[i]]  # (T, E)
+            G2_sum.scatter_add_(0, a2[i].unsqueeze(-1).expand(T2, E), g2_f[i])
+            gathered = G2_sum[a1[i]]  # (T1, E)
             result[i] = (g1_f[i] * gathered).sum()
         return result
 

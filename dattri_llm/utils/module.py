@@ -101,17 +101,51 @@ def bilinear_module_kwargs(*, has_bias: bool) -> dict:
     return {"has_bias": has_bias}
 
 
-def embedding_module_kwargs() -> dict:
-    """Module kwargs for ``nn.Embedding`` (embeddings never carry a bias)."""
-    return {"has_bias": False}
+def embedding_module_kwargs(*, num_embeddings: int, padding_idx: int | None) -> dict:
+    """Module kwargs for ``nn.Embedding`` (embeddings never carry a bias).
+
+    Args:
+        num_embeddings: The layer's vocab size.  Materialized embedding
+            gradients are sized ``num_embeddings * embedding_dim`` (equal to
+            ``weight.numel()``), so every batch produces the same width --
+            a wrong value here breaks cross-batch operations or raises on
+            out-of-range token ids.
+        padding_idx: The layer's padding index, or ``None`` when it has none.
+            Pass the canonical non-negative index (``nn.Embedding`` normalises
+            a negative constructor argument to ``num_embeddings + padding_idx``
+            before storing it).  Autograd zeroes the weight-gradient row at
+            ``padding_idx``; captured gradients replicate that by masking the
+            padded positions, so a wrong value here corrupts every embedding
+            gradient op.
+
+    Returns:
+        The ``module_kwargs`` dict for the layer.
+    """
+    return {
+        "has_bias": False,
+        "num_embeddings": num_embeddings,
+        "padding_idx": padding_idx,
+    }
 
 
-def embedding_bag_module_kwargs(*, mode: str) -> dict:
+def embedding_bag_module_kwargs(
+    *,
+    num_embeddings: int,
+    mode: str,
+    padding_idx: int | None,
+) -> dict:
     """Module kwargs for ``nn.EmbeddingBag``.
 
     Args:
+        num_embeddings: The layer's vocab size (see
+            :func:`embedding_module_kwargs`).
         mode: The bag reduction, ``"sum"`` or ``"mean"`` (``"max"`` is not
             supported for factorized gradients).
+        padding_idx: The layer's padding index, or ``None`` when it has none.
+            Pad tokens are excluded from the bag reduction, so their positions
+            carry zero gradient and the ``"mean"`` divisor is each bag's
+            non-pad token count -- a wrong value here corrupts every bag
+            gradient op.
 
     Returns:
         The ``module_kwargs`` dict for the layer.
@@ -123,7 +157,12 @@ def embedding_bag_module_kwargs(*, mode: str) -> dict:
         raise ValueError(
             f"mode must be one of {_EMBEDDING_BAG_MODES}, got {mode!r}.",
         )
-    return {"has_bias": False, "mode": mode}
+    return {
+        "has_bias": False,
+        "num_embeddings": num_embeddings,
+        "mode": mode,
+        "padding_idx": padding_idx,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -54,13 +54,29 @@ _CASES = [
         "nn.Bilinear",
     ),
     (
-        embedding_module_kwargs(),
+        embedding_module_kwargs(num_embeddings=16, padding_idx=None),
         nn.Embedding(16, 4),
         "nn.Embedding",
     ),
     (
-        embedding_bag_module_kwargs(mode="sum"),
+        embedding_module_kwargs(num_embeddings=16, padding_idx=0),
+        nn.Embedding(16, 4, padding_idx=0),
+        "nn.Embedding",
+    ),
+    (
+        # nn.Embedding canonicalises padding_idx=-1 to num_embeddings - 1.
+        embedding_module_kwargs(num_embeddings=16, padding_idx=15),
+        nn.Embedding(16, 4, padding_idx=-1),
+        "nn.Embedding",
+    ),
+    (
+        embedding_bag_module_kwargs(num_embeddings=16, mode="sum", padding_idx=None),
         nn.EmbeddingBag(16, 4, mode="sum"),
+        "nn.EmbeddingBag",
+    ),
+    (
+        embedding_bag_module_kwargs(num_embeddings=16, mode="mean", padding_idx=0),
+        nn.EmbeddingBag(16, 4, mode="mean", padding_idx=0),
         "nn.EmbeddingBag",
     ),
     (
@@ -193,7 +209,22 @@ class TestValidation:
 
     def test_embedding_bag_max_mode_raises(self):
         with pytest.raises(ValueError, match="mode"):
-            embedding_bag_module_kwargs(mode="max")
+            embedding_bag_module_kwargs(num_embeddings=16, mode="max", padding_idx=None)
+
+    def test_scale_grad_by_freq_raises_at_extraction(self):
+        # Inverse-frequency gradient scaling is a whole-batch statistic the
+        # factorized capture does not model -- refused loudly at extraction
+        # (i.e. at hook registration), for both embedding types.
+        with pytest.raises(NotImplementedError, match="scale_grad_by_freq"):
+            extract_module_kwargs(
+                nn.Embedding(16, 4, scale_grad_by_freq=True),
+                "nn.Embedding",
+            )
+        with pytest.raises(NotImplementedError, match="scale_grad_by_freq"):
+            extract_module_kwargs(
+                nn.EmbeddingBag(16, 4, mode="sum", scale_grad_by_freq=True),
+                "nn.EmbeddingBag",
+            )
 
     def test_missing_field_raises(self):
         # No silent defaults: forgetting any field is an immediate TypeError.

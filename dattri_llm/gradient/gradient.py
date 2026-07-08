@@ -318,8 +318,8 @@ class Gradient:
 
         * ``factorize=True`` (LoGRA) -- project the factorized factors, keeping the
           Kronecker structure at width ``proj_dim``; the layer stays *factorized*.
-          Defined only for outer-product gradients (linear / conv); norm and
-          embedding layers must use ``factorize=False``.
+          Defined for outer-product gradients (linear / conv, and embeddings via
+          one-hot inputs); norm layers must use ``factorize=False``.
         * ``factorize=False`` (TRAK) -- materialize the per-sample weight gradient,
           then project it, collapsing the layer to a dense ``(B, proj_dim)`` block.
 
@@ -813,32 +813,6 @@ class Gradient:
             flat = value.reshape(value.shape[0], -1).float()
             return (flat * flat).sum(-1)
         return ops.grad_norm_sq(value, self.layer_types[name], mode=mode)
-
-    @staticmethod
-    def _align_embedding_width(
-        mat_s: torch.Tensor,
-        mat_t: torch.Tensor,
-        embed_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Zero-pad two flattened embedding gradients to a common vocab width.
-
-        Embedding ``materialize`` uses ``vocab = max(token) + 1`` per batch, so
-        the two sides may differ; padding makes the dot product well-defined.
-        """
-        v_s = mat_s.shape[1] // embed_dim
-        v_t = mat_t.shape[1] // embed_dim
-        v = max(v_s, v_t)
-        if v_s < v:
-            mat_s = torch.cat(
-                [mat_s, mat_s.new_zeros(mat_s.shape[0], (v - v_s) * embed_dim)],
-                dim=1,
-            )
-        if v_t < v:
-            mat_t = torch.cat(
-                [mat_t, mat_t.new_zeros(mat_t.shape[0], (v - v_t) * embed_dim)],
-                dim=1,
-            )
-        return mat_s, mat_t
 
     def _check_compatible(
         self,

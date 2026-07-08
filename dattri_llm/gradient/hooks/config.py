@@ -186,8 +186,9 @@ class HookManagerConfig:
     * ``factorize`` (bool, default ``True``) -- ``True`` projects the two
       factors independently (LoGRA style): the layer stays *factorized* at
       width ``proj_dim`` and is relabelled ``"nn.Linear"``.  This is defined
-      only for outer-product gradients (the linear / conv families); **norm
-      and embedding layers must use** ``factorize=False`` (TRAK style:
+      for outer-product gradients: the linear / conv families, and the
+      embedding family (whose integer ids are expanded to one-hot inputs
+      first).  **Norm layers must use** ``factorize=False`` (TRAK style:
       materialize the per-sample weight gradient, then project it to a dense
       ``(B, proj_dim)`` block).
     * ``proj_seed`` (int, default ``0``) -- base seed.  Factorized projection
@@ -214,22 +215,22 @@ class HookManagerConfig:
       ``"sjlt"``.
 
     Example -- LoGRA projection on a GPT-2-style model.  The regexes hook the
-    attention/MLP linears plus the token embedding; the linears fall through
-    to ``"__default__"`` (factorized projection), while the embedding -- whose
-    gradient is not an outer product of its factors -- gets an explicit
-    materialize-then-project entry::
+    attention/MLP linears plus the token embedding; both fall through to
+    ``"__default__"`` (embeddings project factorized too, via one-hot inputs),
+    while a per-layer entry demonstrates overriding one layer to the
+    materialize-then-project (TRAK) style::
 
         HookManagerConfig(
             linear_io=[r"transformer\.h\.\d+\.(attn|mlp)\.", r"wte$"],
             projection={
-                "__default__": {          # the linears: project both factors
+                "__default__": {          # project both factors (LoGRA)
                     "factorize": True,
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
                     "device": "cuda",
                 },
-                "transformer.wte": {      # embedding: materialize-then-project
+                "transformer.wte": {      # materialize-then-project (TRAK)
                     "factorize": False,
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
@@ -239,7 +240,7 @@ class HookManagerConfig:
         )
 
     Note that a ``"__default__"`` entry with ``factorize=True`` combined with
-    a hook selection that includes norm or embedding layers (e.g.
+    a hook selection that includes norm layers (e.g.
     ``linear_io=REGISTER_ALL``) raises inside the first backward pass -- give
     those layers explicit ``factorize=False`` entries, or exclude them from
     hooking.

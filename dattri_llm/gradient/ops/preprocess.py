@@ -112,6 +112,7 @@ def _preprocess_embedding_bag(
     a: torch.Tensor,
     g: torch.Tensor,
     mode: str,
+    padding_idx: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Expand per-bag EmbeddingBag gradients to the per-token Embedding form.
 
@@ -119,6 +120,10 @@ def _preprocess_embedding_bag(
     ``(N, E)``.  Each bag's gradient is broadcast to its ``T`` tokens (scaled by
     ``1/T`` for ``mode='mean'``), producing ``(N, T, E)`` so the standard
     embedding scatter-add materialisation applies.
+
+    With a *padding_idx*, pad tokens are excluded from the bag reduction, so
+    their positions receive zero gradient and the ``mode='mean'`` divisor is
+    each bag's **non-pad** token count.
 
     Only 2-D inputs (one bag per row, no ``offsets``) are supported.
     ``mode='max'`` is not supported.
@@ -134,7 +139,15 @@ def _preprocess_embedding_bag(
         )
     t = a.shape[1]
     g_exp = g.unsqueeze(1).expand(-1, t, -1).contiguous()  # (N, T, E)
-    if mode == "mean":
+    if padding_idx is not None:
+        pad = a == padding_idx  # (N, T)
+        g_exp = g_exp.masked_fill(pad.unsqueeze(-1), 0)
+        if mode == "mean":
+            # Per-bag divisor over non-pad tokens; clamp keeps an all-pad
+            # bag's 0/0 at zero gradient (its output is zero in autograd).
+            counts = (~pad).sum(dim=1).clamp_min(1)  # (N,)
+            g_exp /= counts.view(-1, 1, 1)
+    elif mode == "mean":
         g_exp /= t
     return a, g_exp
 
@@ -210,11 +223,41 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
         ``"padding"``, and ``"dilation"``.  LayerNorm and RMSNorm include
         ``"normalized_shape"`` and ``"eps"``.  GroupNorm includes
         ``"num_groups"``, ``"num_channels"``, and ``"eps"``.  InstanceNorm
-        includes ``"num_features"`` and ``"eps"``.  EmbeddingBag includes
-        ``"mode"``.
+        includes ``"num_features"`` and ``"eps"``.  Embedding includes
+        ``"padding_idx"``.  EmbeddingBag includes ``"mode"`` and
+        ``"padding_idx"``.
+
+    Raises:
+        NotImplementedError: If an embedding layer sets
+            ``scale_grad_by_freq=True`` (its inverse-frequency gradient
+            scaling is a whole-batch statistic the factorized capture does
+            not model).
     """
     kwargs: dict = {"has_bias": getattr(module, "bias", None) is not None}
-    if layer_type in CONV_TYPES or layer_type in CONV_TRANSPOSE_TYPES:
+    if layer_type in ("nn.Embedding", "nn.EmbeddingBag") and getattr(
+        module,
+        "scale_grad_by_freq",
+        False,
+    ):
+        # TODO: supportable in principle -- the inverse-frequency scaling is a
+        # whole-forward-call statistic, so it must be applied to ``g`` at
+        # capture/assembly time (per buffered part, while the call's full id
+        # tensor is intact); preprocess-time counting is wrong once records
+        # are sliced or concatenated.  No modern architecture sets the flag
+        # (0 of 665 nn.Embedding sites in transformers 4.55), so refuse until
+        # someone needs it.
+        raise NotImplementedError(
+            f"{layer_type} with scale_grad_by_freq=True is not supported: the "
+            "inverse-frequency gradient scaling is a whole-batch statistic "
+            "that the factorized capture does not model. Disable the flag or "
+            "exclude this layer from hooking.",
+        )
+    if layer_type == "nn.Embedding":
+        kwargs["num_embeddings"] = module.num_embeddings
+        # Already canonical: nn.Embedding.__init__ normalises a negative
+        # padding_idx to its non-negative form before storing the attribute.
+        kwargs["padding_idx"] = module.padding_idx
+    elif layer_type in CONV_TYPES or layer_type in CONV_TRANSPOSE_TYPES:
         kwargs["kernel_size"] = module.kernel_size
         kwargs["stride"] = module.stride
         kwargs["padding"] = module.padding
@@ -230,7 +273,9 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
         kwargs["num_features"] = module.num_features
         kwargs["eps"] = module.eps
     elif layer_type == "nn.EmbeddingBag":
+        kwargs["num_embeddings"] = module.num_embeddings
         kwargs["mode"] = module.mode
+        kwargs["padding_idx"] = module.padding_idx
     return kwargs
 
 
@@ -263,9 +308,14 @@ def _preprocess_factorized(
       folded via an extra location/feature block (see
       :func:`_preprocess_conv_transpose`).
     * **EmbeddingBag**: broadcast per-bag gradients to per-token gradients so
-      the standard embedding scatter-add applies.
-
-    Plain ``nn.Embedding`` is passed through unchanged.
+      the standard embedding scatter-add applies; with a ``padding_idx``, pad
+      positions get zero gradient and the ``mean`` divisor is the per-bag
+      non-pad token count.
+    * **Embedding**: when the layer has a ``padding_idx``, zero ``g`` at the
+      padded positions -- autograd's embedding backward skips those positions
+      when scattering into ``weight.grad`` (the pad row's gradient is always
+      zero), and the reconstruction must match.  Without a ``padding_idx``
+      the factors pass through unchanged.
 
     Args:
         a: Raw activation captured by the forward hook.
@@ -284,10 +334,6 @@ def _preprocess_factorized(
     if module_kwargs is None:
         return a, g
 
-    # No silent defaults: a provided module_kwargs must carry every field its
-    # layer type needs (missing keys raise KeyError).  The only automatic fill
-    # is ``normalized_shape`` for token norms, which is fully deducible from
-    # the activation's last dimension.
     has_bias = module_kwargs["has_bias"] and include_bias
 
     # -- Normalisation layers ------------------------------------------------
@@ -328,9 +374,21 @@ def _preprocess_factorized(
         )
         return _augment_channel_norm(x_hat, g, has_bias)
 
+    # -- Embedding -------------------------------------------------------------
+    if layer_type == "nn.Embedding":
+        padding_idx = module_kwargs["padding_idx"]
+        if padding_idx is not None:
+            g = g.masked_fill((a == padding_idx).unsqueeze(-1), 0)
+        return a, g
+
     # -- Embedding bag -------------------------------------------------------
     if layer_type == "nn.EmbeddingBag":
-        return _preprocess_embedding_bag(a, g, module_kwargs["mode"])
+        return _preprocess_embedding_bag(
+            a,
+            g,
+            module_kwargs["mode"],
+            module_kwargs["padding_idx"],
+        )
 
     # -- Convolution ---------------------------------------------------------
     if layer_type in CONV_TYPES:
