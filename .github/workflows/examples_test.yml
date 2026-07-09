@@ -39,6 +39,7 @@ jobs:
           python examples/hooks/modular_hooks.py
           python examples/hooks/multi_gpu_collect.py --cpu
           torchrun --nproc_per_node=2 examples/hooks/multi_gpu_collect.py --cpu
+          python examples/projection/gradient_projection.py
           python examples/attribution/attribution_from_disk.py
           python examples/attribution/attribution_on_the_fly.py
           python examples/trainers/transformers_trainer.py
