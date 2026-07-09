@@ -289,18 +289,30 @@ class TestValLoaderException:
         assert fps == ctrl_fps
 
         # Siblings see train records interleaved with exactly one val record
-        # per step: [val0, train0, val1, train1, ...].
+        # per step.  The val pass is triggered from the DS callback's
+        # on_step_end, so the interleaving depends on dispatch position:
+        # callbacks *before* it get the train record first ([train0, val0,
+        # ...]); callbacks *after* it get the nested val record first
+        # ([val0, train0, ...]).
         assert len(spy_before.records) == 2 * N_STEPS
-        val_records = spy_before.records[0::2]
-        train_records = spy_before.records[1::2]
-        for r_ctrl, r_seen in zip(ctrl_spy.records, train_records, strict=True):
+        assert len(spy_after.records) == 2 * N_STEPS
+        before_train = spy_before.records[0::2]
+        before_val = spy_before.records[1::2]
+        after_val = spy_after.records[0::2]
+        after_train = spy_after.records[1::2]
+        for r_ctrl, r_seen in zip(ctrl_spy.records, before_train, strict=True):
             assert _records_equal(r_ctrl, r_seen)
-        for i, r in enumerate(val_records):
+        for i, r in enumerate(before_val):
             assert r.gradient.batch_size == VAL_BATCH.shape[0]
-            assert r.step == i  # stamped with the in-flight step's counter
+            # The training step is already finalized (counter advanced) when
+            # the val pass runs, so val record i carries step i + 1.
+            assert r.step == i + 1
 
-        # No in-flight mutation of any record (train or val).
-        for r_b, r_a in zip(spy_before.records, spy_after.records, strict=True):
+        # No in-flight mutation of any record (train or val), pairing each
+        # deep-copied before-view with its after-view by category.
+        for r_b, r_a in zip(before_train, after_train, strict=True):
+            assert _records_equal(r_b, r_a)
+        for r_b, r_a in zip(before_val, after_val, strict=True):
             assert _records_equal(r_b, r_a)
 
         # Layer events fire twice per step (train + val pass) -- the hooks are
