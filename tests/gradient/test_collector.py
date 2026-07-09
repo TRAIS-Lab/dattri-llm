@@ -1162,6 +1162,43 @@ class TestGradientFileManagerDDP:
         assert (tmp_path / "rank_0" / "batch_000000.pt").exists()
         assert (tmp_path / "rank_1" / "batch_000000.pt").exists()
 
+    def test_rank_resolved_lazily_at_first_save(
+        self,
+        tmp_path,
+        monkeypatch,
+        tiny_model,
+        tiny_batch,
+    ):
+        """A manager constructed before ``init_process_group`` (rank probe
+        returns None) must still route to rank_N/ once the process group
+        exists at save time -- construction order must not matter.
+        """
+        import dattri_llm.gradient.file_manager as fm_module
+
+        # Construction happens pre-init on every "rank": probe sees nothing.
+        monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
+        managers = {rank: GradientFileManager(str(tmp_path)) for rank in (0, 1)}
+
+        # By save time the process group is up and the true rank is visible.
+        for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
+            monkeypatch.setattr(fm_module, "dist_rank", lambda r=rank: r)
+            rec = self._make_record(0, h, tiny_model, tiny_batch)
+            managers[rank].save_bulk([rec])
+
+        # Nothing landed in the root; each rank got its own subdirectory.
+        assert not list(tmp_path.glob("*.pt"))
+        assert not (tmp_path / "index.json").exists()
+        assert (tmp_path / "rank_0" / "batch_000000.pt").exists()
+        assert (tmp_path / "rank_1" / "batch_000000.pt").exists()
+
+        # The routing freezes at the first save: a later probe change (e.g.
+        # destroy_process_group) must not switch directories mid-run.
+        monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
+        rec = self._make_record(1, self._HASH_A, tiny_model, tiny_batch)
+        managers[0].save_bulk([rec])
+        assert (tmp_path / "rank_0" / "batch_000001.pt").exists()
+        assert not list(tmp_path.glob("*.pt"))
+
     def test_each_rank_has_own_index_json(
         self,
         tmp_path,

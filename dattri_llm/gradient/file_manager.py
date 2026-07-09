@@ -129,7 +129,11 @@ class GradientFileManager:
     Args:
         save_dir: Root directory.  Under DDP, subdirectories ``rank_N/`` are
             created automatically; the caller does not need to add a rank
-            suffix.  Created on first save if it does not exist.
+            suffix.  Created on first save if it does not exist.  The rank
+            routing is resolved at the *first save*, not at construction, so
+            the manager may safely be built before ``init_process_group`` has
+            run (e.g. before the HF Trainer, which initializes distributed
+            internally).
     """
 
     _INDEX_FILE = "index.json"
@@ -137,13 +141,17 @@ class GradientFileManager:
     def __init__(self, save_dir: str) -> None:
         self._root_dir = Path(save_dir)
 
-        rank = dist_rank()
-        if rank is not None:
-            self._save_dir = self._root_dir / f"rank_{rank}"
-            self._local_prefix = f"rank_{rank}/"
-        else:
-            self._save_dir = self._root_dir
-            self._local_prefix = ""
+        # Where this process writes (root, or its rank_N/ subdirectory) is
+        # resolved lazily at the first save, NOT here: managers are commonly
+        # constructed before ``init_process_group`` has run (e.g. before the
+        # HF Trainer, which initializes distributed internally), and a
+        # construction-time rank probe would see no process group and route
+        # every rank to the root directory -- exactly the file-name and index
+        # collisions the rank layout exists to prevent.  By the first save,
+        # training is running and the true rank is known.
+        self._save_dir: Path | None = None
+        self._local_prefix: str = ""
+        self._next_batch_id: int = 0
 
         # Identifier scheme the store was collected under (see the class
         # docstring): None = content hashing, else the sample_id_key input
@@ -154,8 +162,28 @@ class GradientFileManager:
         self._id_key_known: bool = False
         # Merged view across all ranks (used for all load operations).
         self._index: dict[str, list[dict]] = self._read_all_indexes()
-        # Per-rank batch counter, scoped to _save_dir so there is no collision.
-        self._next_batch_id: int = self._compute_next_batch_id()
+
+    def _ensure_save_dir(self) -> Path:
+        """Resolve this process's write directory on first use (idempotent).
+
+        Decides between the root directory (non-distributed) and this rank's
+        ``rank_N/`` subdirectory, then scopes the batch counter to it.  The
+        decision is frozen after the first call so a mid-run
+        ``destroy_process_group`` cannot switch directories.
+
+        Returns:
+            The directory this process saves into.
+        """
+        if self._save_dir is None:
+            rank = dist_rank()
+            if rank is not None:
+                self._save_dir = self._root_dir / f"rank_{rank}"
+                self._local_prefix = f"rank_{rank}/"
+            else:
+                self._save_dir = self._root_dir
+            # Per-rank batch counter, scoped to _save_dir -- no collision.
+            self._next_batch_id = self._compute_next_batch_id()
+        return self._save_dir
 
     @property
     def sample_id_key(self) -> str | int | None:
@@ -199,11 +227,12 @@ class GradientFileManager:
                 "save() takes a single-hash record; this record carries a "
                 "per-batch hash list -- use save_bulk([record]) instead.",
             )
-        self._save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = self._ensure_save_dir()
+        save_dir.mkdir(parents=True, exist_ok=True)
         record = _to_cpu_record(record)
         h = record.input_hash
         s = record.step
-        path = self._save_dir / f"step_{s:06d}_{h}.pt"
+        path = save_dir / f"step_{s:06d}_{h}.pt"
         torch.save(record, path)
         rel = self._local_prefix + path.name
         self._index_entry(record, filename=rel, idx=0)
@@ -228,11 +257,12 @@ class GradientFileManager:
         Returns:
             Path: The written batch file.
         """
-        self._save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = self._ensure_save_dir()
+        save_dir.mkdir(parents=True, exist_ok=True)
         records = [_to_cpu_record(r) for r in records]
         batch_id = self._next_batch_id
         self._next_batch_id += 1
-        path = self._save_dir / f"batch_{batch_id:06d}.pt"
+        path = save_dir / f"batch_{batch_id:06d}.pt"
         torch.save(records, path)
         rel = self._local_prefix + path.name
         for idx, record in enumerate(records):
@@ -598,7 +628,8 @@ class GradientFileManager:
         leaves the previous index intact instead of a truncated JSON that
         would lose every prior entry for this rank.
         """
-        self._save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = self._ensure_save_dir()
+        save_dir.mkdir(parents=True, exist_ok=True)
         # Filter to entries whose file path belongs to this rank's save_dir.
         # For non-distributed _local_prefix is "", so all entries match.
         local_index: dict[str, list[dict]] = {}
@@ -606,10 +637,10 @@ class GradientFileManager:
             local = [e for e in entries if e["file"].startswith(self._local_prefix)]
             if local:
                 local_index[h] = local
-        tmp_path = self._save_dir / (self._INDEX_FILE + ".tmp")
+        tmp_path = save_dir / (self._INDEX_FILE + ".tmp")
         with tmp_path.open("w", encoding="utf-8") as f:
             json.dump({"sample_id_key": self._sample_id_key, "index": local_index}, f)
-        tmp_path.replace(self._save_dir / self._INDEX_FILE)
+        tmp_path.replace(save_dir / self._INDEX_FILE)
 
     def _compute_next_batch_id(self) -> int:
         if not self._save_dir.exists():
