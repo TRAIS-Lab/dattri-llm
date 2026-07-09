@@ -42,6 +42,7 @@ inside a PyTorch hook they work with any training loop.
 from __future__ import annotations
 
 import threading
+import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -138,7 +139,21 @@ def _make_layer_buffer() -> LayerBuffer:
         # the layer's backward count -- it adapts to however many DataParallel
         # replicas actually ran (a trailing batch smaller than the device
         # count uses fewer) and to repeated invocations (weight tying).
+        # Forwards left unmatched at the end of the backward pass (see below)
+        # are discarded and deducted by the manager's reconciliation.
         "_fwd_fires": 0,
+        # Bracket matching of forward and backward fires, per device.
+        # ``_unmatched[dev]`` stacks the indices (into ``_act_parts``, raw
+        # path) or a sentinel (projected path -- the activation itself lives
+        # on the ``_device_id`` stack) of forwards awaiting their backward;
+        # each backward pops its own forward LIFO (autograd runs a device's
+        # graph in reverse creation order).  ``_pair_pos``, aligned with the
+        # appended grad (or projected) parts, records each matched pair's
+        # per-device *invocation* position, so assembly can regroup repeated
+        # invocations of one layer (checkpoint recomputation leaves an
+        # unmatched forward instead -- discarded at backward end).
+        "_unmatched": {},
+        "_pair_pos": [],
         "_lock": threading.Lock(),
     }
 
@@ -266,6 +281,9 @@ def register_linear_io_hooks(
                     if offload_to_cpu:
                         a = a.cpu()
                     with buf["_lock"]:
+                        buf["_unmatched"].setdefault(dev_idx, []).append(
+                            len(buf["_act_parts"]),
+                        )
                         buf["_act_parts"].append((dev_idx, a))
                         buf["_fwd_fires"] += 1
                     buf["activation"] = a
@@ -297,10 +315,26 @@ def register_linear_io_hooks(
                     if offload_to_cpu:
                         g = g.cpu()
                     with buf["_lock"]:
+                        stack = buf["_unmatched"].get(dev_idx)
+                        if not stack:
+                            _warn_orphan_backward(layer_name)
+                            return
+                        stack.pop()
+                        # Per-device invocation position of the matched
+                        # forward: forwards pushed 0..n-1 in order, backwards
+                        # pop LIFO, so the popped one sat at len(stack).
+                        buf["_pair_pos"].append((dev_idx, len(stack)))
                         buf["_grad_parts"].append((dev_idx, g))
                     buf["grad_output"] = g
-                else:
-                    _capture_projected(buf, g, dev_idx, projector, offload_to_cpu)
+                elif not _capture_projected(
+                    buf,
+                    g,
+                    dev_idx,
+                    projector,
+                    offload_to_cpu,
+                ):
+                    _warn_orphan_backward(layer_name)
+                    return
                 if on_layer_backward is not None:
                     on_layer_backward(layer_name, g)
 
@@ -316,13 +350,29 @@ def register_linear_io_hooks(
     return buffers, handles
 
 
+def _warn_orphan_backward(layer_name: str) -> None:
+    """Warn about a backward fire with no unconsumed forward capture.
+
+    Every grad-enabled forward owes exactly one backward, so an orphan means
+    something abnormal produced *extra* backwards -- e.g. a second
+    ``backward(retain_graph=True)`` over an already-consumed step.  The fire
+    is discarded (not buffered, not counted) rather than corrupting the step.
+    """
+    warnings.warn(
+        f"Discarding a backward fire on layer '{layer_name}' with no matching "
+        "forward capture (e.g. a repeated backward over a retained graph); "
+        "this is not a normal forward+backward step.",
+        stacklevel=2,
+    )
+
+
 def _capture_projected(
     buf: LayerBuffer,
     g: torch.Tensor,
     dev_idx: int,
     projector: Callable,
     offload_to_cpu: bool = False,
-) -> None:
+) -> bool:
     """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
 
     Called from the backward hook of a projected layer, pairing ``g`` with the
@@ -332,12 +382,17 @@ def _capture_projected(
     ``_proj_parts``.  Only the small projected result is retained (moved to CPU
     when *offload_to_cpu*) -- the raw factors are discarded here, so the buffer
     never holds the full gradient.
+
+    Returns:
+        ``True`` when a forward capture was matched and consumed, ``False``
+        for an orphan backward (nothing buffered).
     """
     with buf["_lock"]:
         stack = buf["_device_id"].get(dev_idx)
         a = stack.pop() if stack else None
+        pair_pos = (dev_idx, len(stack)) if a is not None else None
     if a is None:
-        return  # backward without a matching forward capture -- nothing to project
+        return False
 
     kw = dict(buf["_proj_kw"])
     factorize = kw.pop("factorize", True)
@@ -360,6 +415,7 @@ def _capture_projected(
         with buf["_lock"]:
             buf["_act_parts"].append((dev_idx, a_p))
             buf["_grad_parts"].append((dev_idx, g_p))
+            buf["_pair_pos"].append(pair_pos)
     else:
         mat = ops._project_materialized(
             a,
@@ -373,6 +429,8 @@ def _capture_projected(
             mat = mat.cpu()
         with buf["_lock"]:
             buf["_proj_parts"].append((dev_idx, mat))
+            buf["_pair_pos"].append(pair_pos)
+    return True
 
 
 def remove_hooks(handles: list[torch.utils.hooks.RemovableHook]) -> None:

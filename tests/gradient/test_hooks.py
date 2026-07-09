@@ -814,8 +814,10 @@ class TestProjectionConfig:
             assert torch.allclose(a, b, atol=1e-5), n
 
     def test_shared_layer_pairs_each_call(self):
-        # A layer invoked twice per forward must project each call's (a, g) pair
-        # (LIFO per-device stack), producing 2*B rows with no dropped call.
+        # A layer invoked twice per forward must project each call's (a, g)
+        # pair (LIFO per-device stack) and record the calls as independent
+        # virtual layers "lin" / "lin@2" -- no dropped call, no cross-call
+        # batch mixing.
         class Shared(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -843,7 +845,10 @@ class TestProjectionConfig:
         )
         with hm.collect():
             m(torch.randn(4, 10), torch.randn(4, 10)).sum().backward()
-        assert cb.records[-1].gradient.data["lin"].shape == (8, 12)  # 2*B rows
+        g = cb.records[-1].gradient
+        assert g.layer_names == {"lin", "lin@2"}
+        assert g.data["lin"].shape == (4, 12)
+        assert g.data["lin@2"].shape == (4, 12)
 
 
 # --------------------------------------------------------------------------- #

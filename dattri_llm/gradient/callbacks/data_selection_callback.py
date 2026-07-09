@@ -10,7 +10,12 @@ from torch import nn
 
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
-from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.gradient.gradient import (
+    Factorized,
+    Gradient,
+    GradientRecord,
+    base_layer_name,
+)
 from dattri_llm.utils.autograd import queue_after_backward_finalization
 from dattri_llm.utils.distributed import dist_world_size, is_dist_initialized
 
@@ -611,7 +616,10 @@ class DataSelectionCallback(HookManagerCallback):
             if bf.pre_activation_grad.shape[0] < B:
                 continue
             try:
-                module = self._root.get_submodule(layer_name)
+                # base_layer_name: a reused layer's extra invocations are
+                # recorded as virtual layers "name@2", ... -- all of them
+                # resolve to (and subtract from) the same real module.
+                module = self._root.get_submodule(base_layer_name(layer_name))
             except AttributeError:
                 continue
 
@@ -947,7 +955,9 @@ class DataSelectionCallback(HookManagerCallback):
             if bf.pre_activation_grad.shape[0] < B:
                 continue
             try:
-                module = self._root.get_submodule(layer_name)
+                # Virtual invocation layers ("name@2", ...) resolve to the
+                # same real module as their base name.
+                module = self._root.get_submodule(base_layer_name(layer_name))
             except AttributeError:
                 continue
             layer_type = ops.canonical_class_name(module)

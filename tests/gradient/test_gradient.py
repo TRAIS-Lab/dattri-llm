@@ -445,6 +445,15 @@ class TestSelectLayers:
         with pytest.raises(KeyError, match="Unknown layers"):
             g.select_layers(["l99"])
 
+    def test_include_derived_selects_virtual_invocation_layers(self):
+        g = make_gradient(layers=("l1", "l1@2", "l1@3", "l2"))
+        # Exact-name selection stays exact by default.
+        assert g.select_layers(["l1"]).layer_names == {"l1"}
+        # include_derived pulls in the @k invocation layers of requested names.
+        sel = g.select_layers(["l1"], include_derived=True)
+        assert sel.layer_names == {"l1", "l1@2", "l1@3"}
+        assert g.select_layers(["l2"], include_derived=True).layer_names == {"l2"}
+
 
 # --------------------------------------------------------------------------- #
 # Gradient.concatenate                                                         #

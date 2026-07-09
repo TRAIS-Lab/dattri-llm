@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 from dattri_llm.gradient import ops
+from dattri_llm.gradient.gradient import base_layer_name
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -95,6 +96,12 @@ def _records_to_block(
         missing = selected - g.layer_names
         if missing:
             raise KeyError(f"Unknown layers: {sorted(missing)}")
+        if layer_name is not None:
+            # A requested name also covers its derived virtual invocation
+            # layers ("lin" pulls in "lin@2", ... -- recorded when the module
+            # fired more than once in a step), so restricting attribution to
+            # a layer never silently drops part of its gradient.
+            selected |= {n for n in g.layer_names if base_layer_name(n) in selected}
         skipped_param_grad.update(
             name for name in selected if g.layer_types[name] == ops.PARAM_GRAD_TYPES
         )

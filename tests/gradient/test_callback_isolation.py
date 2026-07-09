@@ -117,6 +117,7 @@ def _manager_fingerprint(hm: HookManager) -> dict:
         "mlp_param_hook_count": hm._mlp_param_hook_count,
         "param_hook_count": hm._param_hook_count,
         "seen_bwd": set(hm._seen_bwd),
+        "active_layers": set(hm._active_layers),
         "replica_counts": dict(hm._bwd_replica_counts),
         "mlp_params_ready": hm._mlp_params_ready,
         "backward_end_scheduled": hm._backward_end_scheduled,
@@ -125,7 +126,9 @@ def _manager_fingerprint(hm: HookManager) -> dict:
             and not b["_grad_parts"]
             and not b["_proj_parts"]
             and not b["_fwd_fires"]
+            and not b["_pair_pos"]
             and not any(b["_device_id"].values())
+            and not any(b["_unmatched"].values())
             for b in hm._buffers.values()
         ),
         "last_input_hashes": (

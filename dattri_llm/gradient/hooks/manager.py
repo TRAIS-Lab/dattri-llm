@@ -34,6 +34,23 @@ if TYPE_CHECKING:
 
     from dattri_llm.gradient.callbacks import HookManagerCallback
 
+
+# Resolved once at import: the probe runs on every hooked layer's forward
+# fire, so the per-call attribute lookup is hoisted out of the hot path.
+_GRAPH_TASK_ID_PROBE = getattr(torch._C, "_current_graph_task_id", None)
+
+
+def _current_graph_task_id() -> int:
+    """Id of the autograd graph task executing on this thread, or ``-1``.
+
+    A non-negative id inside a *forward* hook means the forward is a
+    gradient-checkpointing recomputation (it runs during the backward).
+    Wraps the private ``torch._C`` probe so older builds degrade to ``-1``
+    (recompute detection off -- checkpointing was unsupported there anyway).
+    """
+    return _GRAPH_TASK_ID_PROBE() if _GRAPH_TASK_ID_PROBE is not None else -1
+
+
 # --------------------------------------------------------------------------- #
 # Hook manager                                                                 #
 # --------------------------------------------------------------------------- #
@@ -51,6 +68,40 @@ class HookManager:
 
         with HookManager(model, callbacks=[...]).collect(deregister_on_exit=True):
             trainer.train()
+
+    .. warning::
+        Gradient checkpointing (either ``use_reentrant`` variant) and
+        ``nn.DataParallel`` are each supported, but their **combination** is
+        untested territory: checkpoint recomputation would interleave with
+        DataParallel's concurrent per-replica hook threads, and no test pins
+        that interaction.  Prefer DDP when training with checkpointing.
+
+    .. warning::
+        Sample identifiers cover the **last** model forward of a step.  When
+        the model is invoked more than once before a single backward (e.g. a
+        hand-rolled Siamese / DPO-style two-forward loss), every invocation's
+        gradients are captured (the extra calls appear as virtual ``name@k``
+        layers), but the record's ``input_hash`` is derived from the final
+        call's inputs only -- the earlier calls' samples are mislabelled.
+        The same holds for a *grad-enabled* forward with no backward between
+        steps: its captures are correctly discarded, but it overwrites the
+        inputs the next record is labelled with (``no_grad`` / eval passes
+        are safe).  Layer-level reuse *inside* one model forward is
+        unaffected -- the model-level input capture fires once there.
+
+    .. warning::
+        A weight used in more than one place -- HF-style **tied parameters**
+        (e.g. ``embed_tokens`` and ``lm_head`` sharing one weight) or
+        repeated invocations of one module (the virtual ``name@k`` layers)
+        -- is scored as if each use site held an independent weight,
+        following the convention of existing attribution implementations.
+        For per-sample contributions ``g_i`` (site 1) and ``h_i`` (site 2) of
+        a shared weight, the true similarity ``<g_i + h_i, g_j + h_j>``
+        includes the cross-site terms ``<g_i, h_j> + <h_i, g_j>``; per-layer
+        scoring sums the sites independently and drops them -- the same
+        block-diagonal treatment K-FAC applies across layers.  Both sites'
+        factors are captured in full, so the cross terms remain computable
+        downstream if exactness is ever required.
 
     Args:
         model: The model to hook (plain ``nn.Module``, ``DataParallel``, or
@@ -123,6 +174,12 @@ class HookManager:
 
         self._seen_bwd: set[str] = set()
         self._bwd_replica_counts: dict[str, int] = {}
+        # This step's participation roster: layers with a grad-enabled
+        # forward fire (``_fwd_fires > 0``), maintained incrementally so
+        # completion checks are O(1).  Kept in sync wherever ``_fwd_fires``
+        # changes: _dispatch_layer_forward (add), _reset_layer_buffers
+        # (clear), _reconcile_unmatched_forwards (drop fully-orphaned).
+        self._active_layers: set[str] = set()
         self._step_lock = threading.Lock()
 
         # Step-completion uses two composite barriers:
@@ -170,6 +227,14 @@ class HookManager:
         # against a stale callback leaking into the next step).
         self._mlp_params_ready: bool = False
         self._backward_end_scheduled: bool = False
+        # True once a forward hook fired during an active backward this step
+        # -- i.e. a gradient-checkpointing recomputation.  ``_outer_task_id``
+        # is the autograd task id of the *outermost* backward (recorded at
+        # the first queue of the end-of-backward callback); the callback only
+        # acts when that task ends, never at a reentrant segment's nested
+        # sub-backward end (see _dispatch_layer_forward / _on_backward_end).
+        self._saw_recompute: bool = False
+        self._outer_task_id: int = -1
 
         self._last_inputs: dict[str, torch.Tensor] = {}
 
@@ -240,6 +305,36 @@ class HookManager:
         layer_name: str,
         activation: torch.Tensor,
     ) -> None:
+        # Maintain the step's participation roster incrementally: O(1) here
+        # instead of an O(n_layers) rescan on every backward fire in
+        # _bwd_hooks_done.  The unlocked membership pre-check makes repeat
+        # fires free; set.add is idempotent, so the worst concurrent-replica
+        # race is a harmless double add.
+        if layer_name not in self._active_layers:
+            with self._step_lock:
+                self._active_layers.add(layer_name)
+        # A forward hook firing while an autograd graph task is active is a
+        # checkpoint *recomputation* (both use_reentrant variants), and it
+        # executes inside the OUTERMOST backward's task -- the reentrant
+        # variant's nested sub-backwards have not started yet.  Record that
+        # task id (the true end-of-backward identity) and queue the
+        # end-of-backward callback *here*, so it attaches to the outer task:
+        # a callback queued from a backward hook inside a reentrant
+        # sub-backward would fire at that segment's end, mid-step (see
+        # _on_backward_end's nested-end guard).
+        if self._collecting:
+            task_id = _current_graph_task_id()
+            if task_id != -1:
+                with self._step_lock:
+                    self._saw_recompute = True
+                    if self._outer_task_id == -1:
+                        self._outer_task_id = task_id
+                    if (
+                        self._n_mlp_params > 0
+                        and not self._backward_end_scheduled
+                        and queue_backward_end_callback(self._on_backward_end)
+                    ):
+                        self._backward_end_scheduled = True
         for cb in self._callbacks:
             cb.on_layer_forward(layer_name, activation)
 
@@ -261,15 +356,20 @@ class HookManager:
 
         record = None
         with self._step_lock:
-            # We are inside the backward pass here -- the only valid place to
-            # queue an end-of-backward callback.  Queue it once per step as the
-            # FSDP-safe satisfier of sub-cond (b) (see ``__init__``).
+            # We are inside the backward pass here -- a valid place to queue
+            # an end-of-backward callback.  Queue it once per step as the
+            # FSDP-safe satisfier of sub-cond (b) (see ``__init__``), and
+            # remember the queuing task's id: without checkpointing this hook
+            # runs in the outermost (only) backward task, which is the end
+            # the callback must act at.
             if (
                 self._n_mlp_params > 0
                 and not self._backward_end_scheduled
                 and queue_backward_end_callback(self._on_backward_end)
             ):
                 self._backward_end_scheduled = True
+                if self._outer_task_id == -1:
+                    self._outer_task_id = _current_graph_task_id()
             self._bwd_replica_counts[layer_name] = (
                 self._bwd_replica_counts.get(layer_name, 0) + 1
             )
@@ -309,10 +409,89 @@ class HookManager:
         with self._step_lock:
             if not self._backward_end_scheduled:
                 return
+            # Nested-end guard: under reentrant checkpointing each segment
+            # runs its own sub-backward, whose end also fires engine
+            # callbacks -- acting there would fake sub-condition (b) mid-step
+            # (the not-yet-recomputed segments' params haven't fired).  The
+            # true end is the task the callback was queued from (the
+            # outermost task; see the queue sites).
+            if (
+                self._outer_task_id != -1
+                and _current_graph_task_id() != self._outer_task_id
+            ):
+                return
             self._mlp_params_ready = True
+            self._reconcile_unmatched_forwards()
             record = self._check_mlp_done()
         if record is not None:
             self._dispatch_step_end(record)
+
+    def _reconcile_unmatched_forwards(self) -> None:
+        """Discard forward captures whose backward never fired (backward is
+        over -- an unmatched forward is now a definitive fact, not a guess).
+
+        Two legitimate sources: non-reentrant **gradient checkpointing**
+        (both the original forward and the recomputation fire grad-enabled,
+        but only one backward comes -- the recomputed capture wins the LIFO
+        match and the stale original is dropped here), and grad-enabled
+        forwards whose output never reached the loss (detached branches).
+        After dropping, ``_fwd_fires`` is deflated to the matched count and
+        the layer's completion status re-evaluated, so steps whose counts
+        could never equalise mid-backward complete here.
+
+        Must be called with ``_step_lock`` held, from the end-of-backward
+        engine callback only.
+        """
+        for layer_name, buf in self._buffers.items():
+            with buf["_lock"]:
+                had_orphans = any(buf["_unmatched"].values()) or any(
+                    buf["_device_id"].values(),
+                )
+                if had_orphans:
+                    self._drop_orphan_forwards(buf)
+                buf["_unmatched"] = {}
+                buf["_device_id"] = {}
+                matched = len(buf["_pair_pos"])
+                if buf["_fwd_fires"] != matched:
+                    buf["_fwd_fires"] = matched
+            if matched == 0:
+                # Every forward was orphaned (detached branch): the layer did
+                # not participate in this step after all.
+                self._active_layers.discard(layer_name)
+            elif self._bwd_replica_counts.get(layer_name, 0) >= matched:
+                self._seen_bwd.add(layer_name)
+
+    @staticmethod
+    def _drop_orphan_forwards(buf: dict) -> None:
+        """Drop a buffer's unmatched forward captures; re-rank pair positions.
+
+        Must be called with the buffer's lock held.  The matched per-device
+        invocation positions come from the pairs actually formed; positions
+        are then re-ranked densely so orphans vanish from the numbering (a
+        checkpoint recompute's surviving pair becomes invocation 0, keeping
+        the layer's plain name).
+        """
+        matched_pos: dict[int, list[int]] = {}
+        for dev, pos in buf["_pair_pos"]:
+            matched_pos.setdefault(dev, []).append(pos)
+        remap = {
+            dev: {p: r for r, p in enumerate(sorted(ps))}
+            for dev, ps in matched_pos.items()
+        }
+        if buf["_proj_kw"] is None:
+            # Raw path: act parts append in forward order, so an entry's
+            # per-device position is its rank among its device's entries;
+            # keep only matched ones.
+            seen: dict[int, int] = {}
+            kept = []
+            for dev, part in buf["_act_parts"]:
+                pos = seen.get(dev, 0)
+                seen[dev] = pos + 1
+                if pos in remap.get(dev, {}):
+                    kept.append((dev, part))
+            buf["_act_parts"] = kept
+        # Both paths: re-rank pair positions densely over the matched set.
+        buf["_pair_pos"] = [(dev, remap[dev][pos]) for dev, pos in buf["_pair_pos"]]
 
     def _check_step_mlp_param_complete(
         self,
@@ -349,7 +528,7 @@ class HookManager:
         """
         if self._n_layers == 0:
             return True  # no linear_io hooks; sub-condition (a) is vacuous
-        n_active = sum(1 for buf in self._buffers.values() if buf["_fwd_fires"] > 0)
+        n_active = len(self._active_layers)
         return n_active > 0 and len(self._seen_bwd) == n_active
 
     def _check_mlp_done(self) -> GradientRecord | None:
@@ -483,6 +662,8 @@ class HookManager:
         # Reset completion flags for the next step.
         self._mlp_params_ready = False
         self._backward_end_scheduled = False
+        self._saw_recompute = False
+        self._outer_task_id = -1
         self._bwd_done = not self._has_linear_io
         self._grad_done = not self._has_param_grad
         # The per-layer buffers are now cleared; the assembled ``gradient`` owns
@@ -535,6 +716,63 @@ class HookManager:
             ordered = [t.to(first_device) for t in ordered]
         return torch.cat(ordered, dim=0)
 
+    @staticmethod
+    def _split_invocations(buf: dict) -> list[tuple[list, list, list]]:
+        """Regroup a layer's matched parts by invocation.
+
+        Returns one ``(act_parts, grad_parts, proj_parts)`` triple per
+        per-device invocation position, in forward-invocation order.  The
+        single-invocation case (the overwhelmingly common one) returns the
+        buffers as-is.  For multi-fire layers the grouping undoes the fire
+        *order*: raw activations buffer in forward order while gradients
+        buffer in backward (reverse) order -- ``_pair_pos``, recorded when
+        each backward LIFO-matched its forward, carries the pairing.
+        """
+        pair_pos = buf["_pair_pos"]
+        n_inv = max((pos for _, pos in pair_pos), default=0) + 1
+        if n_inv <= 1:
+            return [(buf["_act_parts"], buf["_grad_parts"], buf["_proj_parts"])]
+        acts: list[list] = [[] for _ in range(n_inv)]
+        grads: list[list] = [[] for _ in range(n_inv)]
+        projs: list[list] = [[] for _ in range(n_inv)]
+        if buf["_proj_kw"] is None:
+            # Raw path: an act entry's invocation is its rank among its own
+            # device's entries (forward append order); grads carry pair_pos.
+            seen: dict[int, int] = {}
+            for dev, part in buf["_act_parts"]:
+                pos = seen.get(dev, 0)
+                seen[dev] = pos + 1
+                acts[pos].append((dev, part))
+            for (dev, part), (_, pos) in zip(
+                buf["_grad_parts"],
+                pair_pos,
+                strict=True,
+            ):
+                grads[pos].append((dev, part))
+        elif buf["_proj_kw"].get("factorize", True):
+            # Projected factorized: both factors were appended together at
+            # match time, aligned with pair_pos.
+            for (dev, part), (_, pos) in zip(
+                buf["_act_parts"],
+                pair_pos,
+                strict=True,
+            ):
+                acts[pos].append((dev, part))
+            for (dev, part), (_, pos) in zip(
+                buf["_grad_parts"],
+                pair_pos,
+                strict=True,
+            ):
+                grads[pos].append((dev, part))
+        else:
+            for (dev, part), (_, pos) in zip(
+                buf["_proj_parts"],
+                pair_pos,
+                strict=True,
+            ):
+                projs[pos].append((dev, part))
+        return list(zip(acts, grads, projs, strict=True))
+
     def _assemble_gradient(self) -> Gradient:
         data: dict = {}
         representation: dict = {}
@@ -551,66 +789,81 @@ class HookManager:
             batch_first = layer_name not in self._non_batch_first_layers
             proj_kw = buf["_proj_kw"]
 
-            # Materialized (TRAK) projection: the projected per-sample gradient was
-            # already assembled per micro-batch into _proj_parts at capture time.
-            if proj_kw is not None and not proj_kw.get("factorize", True):
-                parts = buf["_proj_parts"]
-                if not parts:
+            # A layer invoked more than once in a step (custom module reuse,
+            # RNN unrolls, Siamese towers) is recorded as independent virtual
+            # layers "name", "name@2", ... -- one per matched invocation.
+            # This mirrors how parameter-tied modules are already treated:
+            # per-layer scoring sums the invocations' contributions
+            # (cross-invocation terms of the shared weight are not
+            # represented, consistent with the layer-block-diagonal treatment
+            # throughout).  Single-invocation layers keep their plain name.
+            for inv_k, (act_parts, grad_parts, proj_parts) in enumerate(
+                self._split_invocations(buf),
+            ):
+                out_name = layer_name if inv_k == 0 else f"{layer_name}@{inv_k + 1}"
+
+                # Materialized (TRAK) projection: the projected per-sample
+                # gradient was assembled into _proj_parts at capture time.
+                if proj_kw is not None and not proj_kw.get("factorize", True):
+                    if not proj_parts:
+                        raise RuntimeError(
+                            f"Layer '{layer_name}' has no buffered data. "
+                            "Ensure backward() was called inside the collect() "
+                            "context.",
+                        )
+                    data[out_name] = self._concat_parts(proj_parts)
+                    representation[out_name] = "materialized"
+                    layer_types[out_name] = buf["_class_name"]
+                    indexing[out_name] = "batch"
+                    continue
+
+                if not act_parts or not grad_parts:
                     raise RuntimeError(
                         f"Layer '{layer_name}' has no buffered data. "
                         "Ensure backward() was called inside the collect() context.",
                     )
-                data[layer_name] = self._concat_parts(parts)
-                representation[layer_name] = "materialized"
-                layer_types[layer_name] = buf["_class_name"]
-                indexing[layer_name] = "batch"
-                continue
+                a = self._concat_parts(act_parts)
+                g = self._concat_parts(grad_parts)
 
-            act_parts = buf["_act_parts"]
-            grad_parts = buf["_grad_parts"]
-            if not act_parts or not grad_parts:
-                raise RuntimeError(
-                    f"Layer '{layer_name}' has no buffered data. "
-                    "Ensure backward() was called inside the collect() context.",
-                )
-            a = self._concat_parts(act_parts)
-            g = self._concat_parts(grad_parts)
+                # Factorized (LoGRA) projection: parts already hold the
+                # projected, final factors (module_kwargs=None -> no
+                # re-preprocessing).
+                if proj_kw is not None:
+                    data[out_name] = Factorized(
+                        activation=a,
+                        pre_activation_grad=g,
+                        module_kwargs=None,
+                        batch_first=batch_first,
+                    )
+                    representation[out_name] = "factorized"
+                    layer_types[out_name] = "nn.Linear"
+                    tokens = a.shape[1 if batch_first else 0]  # 1 => 2-D origin
+                    indexing[out_name] = "batch_token" if tokens > 1 else "batch"
+                    continue
 
-            # Factorized (LoGRA) projection: _act_parts/_grad_parts already hold the
-            # projected, final factors (module_kwargs=None -> no re-preprocessing).
-            if proj_kw is not None:
-                data[layer_name] = Factorized(
+                # Un-projected raw factorized capture.
+                # A positional embedding fed an *unbatched* index tensor -- e.g.
+                # nanoGPT's ``pos = arange(T)`` (shape ``(T,)``) added to every
+                # sample -- is captured with no batch dim.  Add a length-1 batch
+                # axis so it validates and materialises as a single broadcast row
+                # (its gradient is already summed over the batch by the
+                # broadcast add).
+                if a.ndim == 1 and is_embedding(buf["_class_name"]):
+                    a = a.unsqueeze(0)
+                    g = g.unsqueeze(0)
+                data[out_name] = Factorized(
                     activation=a,
                     pre_activation_grad=g,
-                    module_kwargs=None,
+                    module_kwargs=buf["_module_kwargs"],
                     batch_first=batch_first,
                 )
-                representation[layer_name] = "factorized"
-                layer_types[layer_name] = "nn.Linear"
-                tokens = a.shape[1 if batch_first else 0]  # 1 => 2-D-origin layer
-                indexing[layer_name] = "batch_token" if tokens > 1 else "batch"
-                continue
-
-            # Un-projected raw factorized capture.
-            # A positional embedding fed an *unbatched* index tensor -- e.g.
-            # nanoGPT's ``pos = arange(T)`` (shape ``(T,)``) added to every
-            # sample -- is captured with no batch dim.  Add a length-1 batch axis
-            # so it validates and materialises as a single broadcast row (its
-            # gradient is already summed over the batch by the broadcast add).
-            if a.ndim == 1 and is_embedding(buf["_class_name"]):
-                a = a.unsqueeze(0)
-                g = g.unsqueeze(0)
-            data[layer_name] = Factorized(
-                activation=a,
-                pre_activation_grad=g,
-                module_kwargs=buf["_module_kwargs"],
-                batch_first=batch_first,
-            )
-            representation[layer_name] = "factorized"
-            layer_types[layer_name] = buf["_class_name"]
-            indexing[layer_name] = (
-                "batch_token" if a.ndim >= 3 or not a.is_floating_point() else "batch"
-            )
+                representation[out_name] = "factorized"
+                layer_types[out_name] = buf["_class_name"]
+                indexing[out_name] = (
+                    "batch_token"
+                    if a.ndim >= 3 or not a.is_floating_point()
+                    else "batch"
+                )
 
         for layer_name, buf in self._param_buffers.items():
             for pname, grad in buf.items():
@@ -681,6 +934,7 @@ class HookManager:
                 )
 
     def _reset_layer_buffers(self) -> None:
+        self._active_layers.clear()
         for buf in self._buffers.values():
             buf["activation"] = None
             buf["grad_output"] = None
@@ -689,6 +943,8 @@ class HookManager:
             buf["_proj_parts"] = []
             buf["_device_id"] = {}
             buf["_fwd_fires"] = 0
+            buf["_unmatched"] = {}
+            buf["_pair_pos"] = []
 
     def _reset_param_buffers(self) -> None:
         for buf in self._param_buffers.values():
@@ -742,6 +998,8 @@ class HookManager:
                     "_proj_parts": list(buf["_proj_parts"]),
                     "_device_id": {k: list(v) for k, v in buf["_device_id"].items()},
                     "_fwd_fires": buf["_fwd_fires"],
+                    "_unmatched": {k: list(v) for k, v in buf["_unmatched"].items()},
+                    "_pair_pos": list(buf["_pair_pos"]),
                     "activation": buf["activation"],
                     "grad_output": buf["grad_output"],
                 }
@@ -754,6 +1012,7 @@ class HookManager:
             "step_count": self._step_count,
             "last_gradient": self._last_gradient,
             "seen_bwd": set(self._seen_bwd),
+            "active_layers": set(self._active_layers),
             "bwd_replica_counts": dict(self._bwd_replica_counts),
             "mlp_param_hook_count": self._mlp_param_hook_count,
             "param_hook_count": self._param_hook_count,
@@ -761,6 +1020,8 @@ class HookManager:
             "grad_done": self._grad_done,
             "mlp_params_ready": self._mlp_params_ready,
             "backward_end_scheduled": self._backward_end_scheduled,
+            "saw_recompute": self._saw_recompute,
+            "outer_task_id": self._outer_task_id,
         }
 
     def clear_state(self) -> None:
@@ -792,6 +1053,8 @@ class HookManager:
             buf["_proj_parts"] = s.get("_proj_parts", [])
             buf["_device_id"] = s.get("_device_id", {})
             buf["_fwd_fires"] = s.get("_fwd_fires", 0)
+            buf["_unmatched"] = s.get("_unmatched", {})
+            buf["_pair_pos"] = s.get("_pair_pos", [])
             buf["activation"] = s.get("activation")
             buf["grad_output"] = s.get("grad_output")
         saved_param = state["param_buffers"]
@@ -803,6 +1066,7 @@ class HookManager:
         with self._step_lock:
             self._step_count = state["step_count"]
             self._seen_bwd = state["seen_bwd"]
+            self._active_layers = state.get("active_layers", set())
             self._bwd_replica_counts = state["bwd_replica_counts"]
             self._mlp_param_hook_count = state["mlp_param_hook_count"]
             self._param_hook_count = state["param_hook_count"]
@@ -810,6 +1074,8 @@ class HookManager:
             self._grad_done = state["grad_done"]
             self._mlp_params_ready = state["mlp_params_ready"]
             self._backward_end_scheduled = state["backward_end_scheduled"]
+            self._saw_recompute = state.get("saw_recompute", False)
+            self._outer_task_id = state.get("outer_task_id", -1)
 
     # ---------------------------------------------------------------------- #
     # Primary API: collect()                                                   #

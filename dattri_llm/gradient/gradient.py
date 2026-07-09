@@ -76,6 +76,18 @@ class Factorized:
 GradientData = torch.Tensor | Factorized
 
 
+def base_layer_name(name: str) -> str:
+    """Strip the invocation suffix from a virtual layer name.
+
+    A layer invoked more than once in a step is recorded as independent
+    virtual layers ``"name"``, ``"name@2"``, ... (see
+    ``HookManager._assemble_gradient``).  Module paths cannot contain ``@``,
+    so stripping at the first ``@`` recovers the real submodule path;
+    plain names pass through unchanged.
+    """
+    return name.split("@", 1)[0]
+
+
 def _pad_tokens(
     t: torch.Tensor,
     target: int,
@@ -438,9 +450,27 @@ class Gradient:
             indexing=new_indexing,
         )
 
-    def select_layers(self, layer_names: Iterable[str]) -> Gradient:
-        """Return a copy restricted to *layer_names* (all must exist)."""
+    def select_layers(
+        self,
+        layer_names: Iterable[str],
+        include_derived: bool = False,
+    ) -> Gradient:
+        """Return a copy restricted to *layer_names* (all must exist).
+
+        Args:
+            layer_names: The layer names to keep.
+            include_derived: When ``True``, a requested name also selects its
+                derived virtual invocation layers (``"lin"`` pulls in
+                ``"lin@2"``, ``"lin@3"``, ... -- recorded when the module was
+                invoked more than once in the step; see
+                :func:`base_layer_name`).  Default ``False``: exact names
+                only.
+        """
         names = set(layer_names)
+        if include_derived:
+            names |= {
+                name for name in self.layer_names if base_layer_name(name) in names
+            }
         missing = names - self.layer_names
         if missing:
             raise KeyError(f"Unknown layers: {sorted(missing)}")

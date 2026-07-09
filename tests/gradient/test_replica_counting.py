@@ -17,10 +17,13 @@ exactly one backward, and the forward pass finishes before any backward hook
 runs, so the target is final by the time it is compared.
 
 CPU emulation: ``ChunkedWrapper`` runs its submodule once per fixed-size
-chunk of the batch and concatenates -- per-layer hook counts are exactly
-those of a ``DataParallel`` scatter with that chunk size (N fires for a full
-batch, fewer for a trailing short batch), without needing GPUs.  A real
-``nn.DataParallel`` test runs when 2+ CUDA devices are present.
+chunk of the batch -- per-layer hook counts are exactly those of a
+``DataParallel`` scatter with that chunk size (N fires for a full batch,
+fewer for a trailing short batch), without needing GPUs.  Unlike real
+DataParallel (one fire per *device*, merged along the batch axis), these are
+same-device multi-invocations, so each chunk is recorded as its own virtual
+layer (``inner.X``, ``inner.X@2``, ...) with exact per-call (a, g) pairing.
+A real ``nn.DataParallel`` test runs when 2+ CUDA devices are present.
 """
 
 from __future__ import annotations
@@ -84,8 +87,9 @@ def _collect(model: nn.Module, batches: list[torch.Tensor]) -> Recorder:
 
 class TestObservedFireCounting:
     def test_multi_fire_step_completes_once_with_full_batch(self):
-        """Two chunks -> two fires per layer -> exactly one record, whose
-        payload equals the unchunked reference run.
+        """Two chunks -> two fires per layer -> exactly one record: each chunk
+        becomes a virtual layer whose (a, g) pair exactly matches the
+        corresponding slice of the unchunked reference run.
         """
         batch = torch.randn(4, IN_DIM, generator=torch.Generator().manual_seed(1))
 
@@ -95,29 +99,22 @@ class TestObservedFireCounting:
         assert len(rec_ref.records) == 1
         assert len(rec_dp.records) == 1
         g_ref, g_dp = rec_ref.records[0].gradient, rec_dp.records[0].gradient
-        assert g_dp.batch_size == 4
-        # Layer names differ by the "inner." prefix; the content must not.
-        # Activations concatenate in forward (chunk) order; grad parts append
-        # in *backward* order, which for same-device multi-fire is the reverse
-        # chunk order -- the per-sample (a, g) pairing for that case is the
-        # separate multi-invocation assembly issue, not the counting under
-        # test (real DataParallel pairs by device, one fire per device).  So
-        # grads are checked complete up to the chunk permutation.
         for name in g_ref.layer_names:
-            a = g_ref.data[name]
-            b = g_dp.data[f"inner.{name}"]
-            assert torch.allclose(a.activation, b.activation, atol=1e-6)
-            g, g_seen = a.pre_activation_grad, b.pre_activation_grad
-            swapped = torch.cat([g_seen[CHUNK:], g_seen[:CHUNK]])
-            assert torch.allclose(g, g_seen, atol=1e-6) or torch.allclose(
-                g,
-                swapped,
-                atol=1e-6,
-            )
+            ref = g_ref.data[name]
+            for k, sl in enumerate((slice(0, CHUNK), slice(CHUNK, None))):
+                vname = f"inner.{name}" if k == 0 else f"inner.{name}@{k + 1}"
+                b = g_dp.data[vname]
+                assert torch.allclose(ref.activation[sl], b.activation, atol=1e-6)
+                assert torch.allclose(
+                    ref.pre_activation_grad[sl],
+                    b.pre_activation_grad,
+                    atol=1e-6,
+                )
 
     def test_trailing_short_batch_completes(self):
         """A final batch smaller than the chunk count still completes its step
-        (the original hang), and the following state is clean.
+        (the original hang), and the following state is clean: per-step layer
+        sets reflect how many chunks actually ran.
         """
         gen = torch.Generator().manual_seed(2)
         batches = [
@@ -128,9 +125,14 @@ class TestObservedFireCounting:
         rec = _collect(ChunkedWrapper(_inner()), batches)
 
         assert [r.step for r in rec.records] == [0, 1, 2]
-        assert [r.gradient.batch_size for r in rec.records] == [4, 2, 4]
-        for r in rec.records:
-            assert len(r.input_hash) == r.gradient.batch_size
+        two_chunk = {"inner.0", "inner.0@2", "inner.2", "inner.2@2"}
+        one_chunk = {"inner.0", "inner.2"}
+        assert [r.gradient.layer_names for r in rec.records] == [
+            two_chunk,
+            one_chunk,
+            two_chunk,
+        ]
+        assert [r.gradient.batch_size for r in rec.records] == [CHUNK] * 3
 
 
 @pytest.mark.gpu

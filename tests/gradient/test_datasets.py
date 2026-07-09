@@ -64,3 +64,37 @@ class TestVariableLengthBlocks:
         m_b = ops.materialize(rec_b.gradient.data["l1"], "nn.Linear")
         assert torch.allclose(m[0], m_a[0], atol=1e-6)
         assert torch.allclose(m[1], m_b[0], atol=1e-6)
+
+
+class TestDerivedLayerSelection:
+    def test_layer_name_covers_virtual_invocation_layers(self, tmp_path):
+        """Restricting a read to 'l1' must include its @k invocation layers,
+        so a layer subset never silently drops part of a reused layer's
+        gradient.
+        """
+        gen = torch.Generator().manual_seed(3)
+
+        def factor(t):
+            return Factorized(
+                activation=torch.randn(1, t, D_IN, generator=gen),
+                pre_activation_grad=torch.randn(1, t, D_OUT, generator=gen),
+            )
+
+        gradient = Gradient(
+            representation=dict.fromkeys(("l1", "l1@2", "other"), "factorized"),
+            data={"l1": factor(T1), "l1@2": factor(T1), "other": factor(T1)},
+            layer_types=dict.fromkeys(("l1", "l1@2", "other"), "nn.Linear"),
+            indexing=dict.fromkeys(("l1", "l1@2", "other"), "batch_token"),
+        )
+        fm = GradientFileManager(str(tmp_path))
+        fm.save_bulk(
+            [GradientRecord(step=0, input_hash=[HASH_A], gradient=gradient)],
+        )
+
+        ds = GradientFileDataset(
+            GradientFileManager(str(tmp_path)),
+            step=0,
+            layer_name=["l1"],
+        )
+        block, _ = ds[0]
+        assert block.layer_names == {"l1", "l1@2"}
