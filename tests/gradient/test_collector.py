@@ -1162,6 +1162,21 @@ class TestGradientFileManagerDDP:
         assert (tmp_path / "rank_0" / "batch_000000.pt").exists()
         assert (tmp_path / "rank_1" / "batch_000000.pt").exists()
 
+    def test_iter_step_disk_order_is_natural(self, tmp_path):
+        """rank_2/ must order before rank_10/ (numeric, not lexical)."""
+        fm = GradientFileManager(str(tmp_path))
+        for rank in (10, 2):
+            fm._index[f"{rank:02d}" * 32] = [
+                {
+                    "file": f"rank_{rank}/batch_000000.pt",
+                    "idx": 0,
+                    "step": 0,
+                    "sample_idx": 0,
+                },
+            ]
+        files = [f for f, _ in fm.iter_step(0)]
+        assert files == ["rank_2/batch_000000.pt", "rank_10/batch_000000.pt"]
+
     def test_rank_resolved_lazily_at_first_save(
         self,
         tmp_path,

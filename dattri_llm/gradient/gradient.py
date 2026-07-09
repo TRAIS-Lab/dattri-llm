@@ -152,7 +152,12 @@ class Gradient:
 
     @property
     def batch_size(self) -> int:
-        """The step batch size (largest per-layer sample count)."""
+        """The step batch size (largest per-layer sample count).
+
+        Raises:
+            ValueError: If only batch-level ``param_grad`` layers are present
+                (their tensors carry no per-sample axis to read a batch from).
+        """
         # The real batch size is the largest per-layer batch dim: a broadcast
         # layer (e.g. a positional embedding) carries batch 1 and must not be
         # mistaken for the whole batch when it happens to come first.
@@ -168,9 +173,13 @@ class Gradient:
                 best = max(best, x.shape[0])
         if best:
             return best
-        # Only ``param_grad`` layers present -- fall back to the first tensor.
-        x = next(iter(self.data.values()))
-        return x.activation.shape[0] if isinstance(x, Factorized) else x.shape[0]
+        # Only ``param_grad`` layers present: those tensors are batch-level
+        # (no per-sample axis), so a batch size cannot be read off them --
+        # dim 0 would be ``out_features``, a silently wrong answer.
+        raise ValueError(
+            "batch_size is undefined for a gradient holding only batch-level "
+            "param_grad layers (their tensors have no per-sample axis).",
+        )
 
     @property
     def token_dim(self) -> dict[str, int | None]:
@@ -745,9 +754,9 @@ class Gradient:
             mode: ``"factorized"`` (ghost, no materialisation, via
                 :func:`ops.cross_dot`), ``"materialized"`` (materialize each side
                 then matrix-multiply), or ``"auto"`` (choose per layer by the cost
-                heuristic in :func:`ops.cross_gram_auto` -- factorized for small
-                token/patch counts, materialized once the $S^2$ factor dominates).
-                All three are numerically equivalent.
+                heuristic in :func:`ops.maybe_use_materialized_gram` -- factorized
+                for small token/patch counts, materialized once the $S^2$ factor
+                dominates).  All three are numerically equivalent.
             eps: Numerical floor added to the cosine denominator.
 
         Returns:
@@ -773,8 +782,6 @@ class Gradient:
             if name not in other.data:
                 continue
             matrix = self._layer_cross_matrix(other, name, mode)
-            if matrix is None:
-                continue
             if metric == "cosine" and reduce == "none":
                 # Per-layer cosine: normalise each layer independently.
                 n_s = self._layer_norm_sq(name, mode).clamp_min(0).sqrt()  # (B_self,)
@@ -832,8 +839,7 @@ class Gradient:
         name: str,
         mode: Literal["factorized", "materialized", "auto"],
     ) -> torch.Tensor:
-        """Return the ``(B_self, B_other)`` cross-gram for one layer, or ``None``
-        when the representations are incompatible.
+        """Return the ``(B_self, B_other)`` cross-gram for one layer.
 
         The factorized<->materialized routing lives in :func:`ops.cross_dot` /
         :func:`ops._cross_gram` (the shared kernel, also used by K-FAC), so this

@@ -64,7 +64,7 @@ trainable parameters for ``param_grad``)::
 #   * ``None``        -- not provided (the family is not requested explicitly).
 #   * ``REGISTER_ALL``-- register every applicable layer.
 #   * ``list[str]``   -- register applicable layers whose name matches a regex.
-Selector = object | None  # None | _RegisterAll | list[str]
+Selector = _RegisterAll | list[str] | None
 
 # Hook-family names and the layer_types marker used for materialized grads.
 LINEAR_IO = "linear_io"

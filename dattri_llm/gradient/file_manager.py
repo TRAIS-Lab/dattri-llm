@@ -126,6 +126,12 @@ class GradientFileManager:
     per-rank indexes and loads from whichever rank's file contains the
     requested sample.
 
+    .. warning::
+        Records are deserialised with ``torch.load(..., weights_only=False)``
+        (they contain :class:`GradientRecord` objects, not bare tensors),
+        which executes arbitrary pickled code.  Only open gradient
+        directories you produced yourself or otherwise trust.
+
     Args:
         save_dir: Root directory.  Under DDP, subdirectories ``rank_N/`` are
             created automatically; the caller does not need to add a rank

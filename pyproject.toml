@@ -93,6 +93,7 @@ ignore = [
     "PLR0912", # branch caps unsuited to per-layer-type dispatch kernels
     "PLR0914", # local-variable caps unsuited to assembly/scoring kernels
     "PLR0915", # statement caps unsuited to assembly/scoring kernels
+    "COM812",  # trailing-comma rule conflicts with the ruff formatter
 ]
 
 [tool.ruff.lint.extend-per-file-ignores]
