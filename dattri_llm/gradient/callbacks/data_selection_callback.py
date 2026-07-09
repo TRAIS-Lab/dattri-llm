@@ -52,9 +52,12 @@ class DataSelectionCallback(HookManagerCallback):
 
     ``"ghost"`` *(default)*
         Ghost inner product -- computes ``score[i] = <dL_i/dW, dL_target/dW>``
-        via gram matrices on the factorised (g, a) factors without ever
-        forming the (out x in) weight gradient.
-        Cost O((B*T)^2 * (d_out + d_in)) per layer.
+        from the captured (g, a) factors with no extra backward pass, routing
+        each layer through the factorized-vs-materialized cost heuristic
+        (:func:`ops.maybe_use_materialized_gram`): the pure factor contraction
+        for short sequences, a token-contracted GEMM once its
+        ``O((B*T)^2 (d_out + d_in))`` cost would dominate.  Both routes are
+        numerically identical.
 
     ``"materialized"``
         Builds the full per-sample weight gradient
@@ -506,7 +509,8 @@ class DataSelectionCallback(HookManagerCallback):
         across layers.
 
         ``score_mode`` selects the :meth:`~Gradient.similarity` ``mode``
-        (``"ghost"`` -> ``"factorized"``); both modes are numerically identical.
+        (``"ghost"`` -> ``"auto"``, the per-layer cost-optimal routing); both
+        modes are numerically identical.
 
         Args:
             record: Full-batch GradientRecord for this step.
@@ -523,7 +527,11 @@ class DataSelectionCallback(HookManagerCallback):
             if self._target == "fixed":
                 self._target_gradient = target  # cache the moved copy
         other = gradient if target is None else target
-        mode = "materialized" if self._score_mode == "materialized" else "factorized"
+        # "ghost" routes through the per-layer cost heuristic ("auto"): the
+        # factorized and materialized cross-grams are numerically identical,
+        # and a fixed factorized path costs O(B^2 T^2 (d_in+d_out)) per layer
+        # -- more than the training step itself at long sequence lengths.
+        mode = "materialized" if self._score_mode == "materialized" else "auto"
 
         # {layer: (B_layer, B_target)} cross-gram per selected scoring mode.
         per_layer = gradient.similarity(other, mode=mode)

@@ -202,6 +202,10 @@ class HookManager:
     ) -> None:
         if not self._collecting:
             return
+        if torch.is_grad_enabled():
+            # A new capture step is beginning, so the cached last-step
+            # gradient is about to go stale: release it now.
+            self._last_gradient = None
         captured: dict[str, torch.Tensor] = {
             k: v for k, v in kwargs.items() if isinstance(v, torch.Tensor)
         }
@@ -350,8 +354,10 @@ class HookManager:
         return 1
 
     def _on_step_complete(self) -> None:
-        # Drop the previous step's cached gradient *before* assembling the new
-        # one so we never transiently hold two full step gradients in memory.
+        # Normally already None (released when this step's forward began, see
+        # _capture_model_input); kept as a guard for forwards that bypass the
+        # root pre-hook (e.g. a submodule invoked directly) so we never
+        # transiently hold two full step gradients while assembling.
         self._last_gradient = None
         gradient = self._assemble_gradient()
         step = self._step_count
@@ -389,6 +395,10 @@ class HookManager:
         CPU-offload cases).
         """
         ordered = [t for _, t in sorted(parts, key=operator.itemgetter(0))]
+        if len(ordered) == 1:
+            # The common (non-DataParallel) case: torch.cat would copy the
+            # whole tensor for nothing.
+            return ordered[0]
         first_device = ordered[0].device
         if any(t.device != first_device for t in ordered[1:]):
             ordered = [t.to(first_device) for t in ordered]
@@ -911,6 +921,12 @@ class HookManager:
         ``backward()`` returns the per-layer buffers have already been assembled
         and cleared.  The assembled gradient is retained in a single-slot cache
         (the *last-step gradient*), which is what this method returns.
+
+        The cache lives only in the gap **between** steps: it is released the
+        moment the next collected (grad-enabled) forward begins, so a full
+        step of captures is never pinned through a training step's memory
+        peak.  Read the gradient after ``backward()`` and before the next
+        forward; ``no_grad`` forwards (e.g. evaluation) leave it intact.
 
         Returns:
             Gradient: The assembled gradient, with ``layer_types`` populated
