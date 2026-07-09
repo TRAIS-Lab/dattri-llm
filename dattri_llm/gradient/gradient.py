@@ -76,6 +76,55 @@ class Factorized:
 GradientData = torch.Tensor | Factorized
 
 
+def _pad_tokens(
+    t: torch.Tensor,
+    target: int,
+    axis: int,
+    value: float = 0,
+) -> torch.Tensor:
+    """Right-pad *t* to *target* length along *axis* with *value*."""
+    if t.shape[axis] == target:
+        return t
+    shape = list(t.shape)
+    shape[axis] = target - shape[axis]
+    return torch.cat([t, t.new_full(shape, value)], dim=axis)
+
+
+def _pad_to_common_tokens(
+    a: Factorized,
+    b: Factorized,
+) -> tuple[Factorized, Factorized]:
+    """Zero-pad the shorter side's token axis so batch concatenation is defined.
+
+    Records collected without padding-to-max collation legitimately carry
+    different sequence lengths; the padded positions are given an exactly-zero
+    output gradient, which every consumer treats as inert: materialization and
+    dot products sum over token positions (zero rows contribute nothing), and
+    the K-FAC factors drop gradient-free rows from both the covariances and
+    the normalizing row count.  Integer activations (embedding token ids) are
+    padded with the layer's ``padding_idx`` when one is configured, else 0 --
+    either way the zero gradient row keeps the padded index inert.
+    """
+    axis = 1 if a.batch_first else 0
+    target = max(a.activation.shape[axis], b.activation.shape[axis])
+
+    def pad(f: Factorized) -> Factorized:
+        if f.activation.shape[axis] == target:
+            return f
+        fill: int | float = 0
+        if not f.activation.is_floating_point():
+            pad_idx = (f.module_kwargs or {}).get("padding_idx")
+            fill = pad_idx if pad_idx is not None else 0
+        return Factorized(
+            activation=_pad_tokens(f.activation, target, axis, fill),
+            pre_activation_grad=_pad_tokens(f.pre_activation_grad, target, axis),
+            module_kwargs=f.module_kwargs,
+            batch_first=f.batch_first,
+        )
+
+    return pad(a), pad(b)
+
+
 @dataclass(frozen=True, eq=False)
 class Gradient:
     """A per-step, multi-layer container of per-sample gradients with metadata."""
@@ -403,6 +452,14 @@ class Gradient:
     ) -> Gradient:
         """Concatenate two gradients along the batch or token axis.
 
+        Batch concatenation accepts **differing token lengths** on
+        ``"batch_token"``-indexed layers: the shorter side is right-padded to
+        the longer one with exactly-zero output gradients, which every
+        downstream operation treats as inert (see
+        :func:`_pad_to_common_tokens`).  This is what makes per-sample records
+        of unequal sequence length (stored without padding-to-max collation)
+        concatenable into one block at read time.
+
         A layer that is **broadcast** (batch axis 1 while the gradient's batch is
         larger -- e.g. a positional embedding added to every sample) has no
         per-sample rows to concatenate.  When such a layer is broadcast on *both*
@@ -498,6 +555,8 @@ class Gradient:
                     raise ValueError(
                         f"{name} has mismatched batch_first layout between gradients",
                     )
+                if dim == "batch" and self._layer_indexing(name) == "batch_token":
+                    a, b = _pad_to_common_tokens(a, b)
                 cat_dim = cat_axis(a.batch_first)
                 new_data[name] = Factorized(
                     activation=torch.cat([a.activation, b.activation], dim=cat_dim),
@@ -509,6 +568,10 @@ class Gradient:
                     batch_first=a.batch_first,
                 )
             elif isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+                if dim == "batch" and self._layer_indexing(name) == "batch_token":
+                    target = max(a.shape[1], b.shape[1])
+                    a = _pad_tokens(a, target, axis=1)
+                    b = _pad_tokens(b, target, axis=1)
                 new_data[name] = torch.cat([a, b], dim=cat_axis(batch_first=True))
             else:
                 raise TypeError(f"{name} has mismatched data types")

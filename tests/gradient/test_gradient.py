@@ -506,6 +506,116 @@ class TestConcatenate:
         with pytest.raises(ValueError, match="representations"):
             g1.concatenate(g2)
 
+
+class TestVariableLengthBatchConcatenate:
+    """Batch concat pads differing token lengths with inert zero-grad rows."""
+
+    def _grad(self, data: dict) -> Gradient:
+        return Gradient(
+            representation=dict.fromkeys(data, "factorized"),
+            data=data,
+            layer_types=dict.fromkeys(data, "nn.Linear"),
+            indexing=dict.fromkeys(data, "batch_token"),
+        )
+
+    def test_factorized_pads_and_scores_match(self):
+        g1 = self._grad({"l1": factorized_bt(t=T)})
+        g2 = self._grad({"l1": factorized_bt(t=T + 3)})
+        gc = g1.concatenate(g2, dim="batch")
+        assert gc.batch_size == 2 * B
+        assert gc.token_dim == {"l1": T + 3}
+        # Padded rows are inert: per-sample materialized gradients of the
+        # block equal those of the originals.
+        m = ops.materialize(gc.data["l1"], "nn.Linear")
+        assert torch.allclose(m[:B], ops.materialize(g1.data["l1"], "nn.Linear"))
+        assert torch.allclose(m[B:], ops.materialize(g2.data["l1"], "nn.Linear"))
+
+    def test_longer_first_side_also_works(self):
+        g1 = self._grad({"l1": factorized_bt(t=T + 5)})
+        g2 = self._grad({"l1": factorized_bt(t=T)})
+        gc = g1.concatenate(g2, dim="batch")
+        assert gc.token_dim == {"l1": T + 5}
+        m = ops.materialize(gc.data["l1"], "nn.Linear")
+        assert torch.allclose(m[B:], ops.materialize(g2.data["l1"], "nn.Linear"))
+
+    def test_seq_first_layout(self):
+        def sf(t):
+            return Factorized(
+                activation=torch.randn(t, B, D_IN),
+                pre_activation_grad=torch.randn(t, B, D_OUT),
+                batch_first=False,
+            )
+
+        g1 = self._grad({"l1": sf(T)})
+        g2 = self._grad({"l1": sf(T + 2)})
+        gc = g1.concatenate(g2, dim="batch")
+        assert gc.batch_size == 2 * B
+        m = ops.materialize(gc.data["l1"], "nn.Linear")
+        assert torch.allclose(m[:B], ops.materialize(g1.data["l1"], "nn.Linear"))
+
+    def test_embedding_pads_activation_with_padding_idx(self):
+        vocab, emb, pad_idx = 11, 5, 7
+        mk = {"has_bias": False, "num_embeddings": vocab, "padding_idx": pad_idx}
+
+        def emb_grad(t):
+            return Gradient(
+                representation={"e": "factorized"},
+                data={
+                    "e": Factorized(
+                        activation=torch.randint(0, vocab, (B, t)),
+                        pre_activation_grad=torch.randn(B, t, emb),
+                        module_kwargs=mk,
+                    ),
+                },
+                layer_types={"e": "nn.Embedding"},
+                indexing={"e": "batch_token"},
+            )
+
+        g1, g2 = emb_grad(T), emb_grad(T + 4)
+        gc = g1.concatenate(g2, dim="batch")
+        f = gc.data["e"]
+        # Padded index positions carry the configured padding_idx and a zero
+        # gradient row.
+        assert (f.activation[:B, T:] == pad_idx).all()
+        assert (f.pre_activation_grad[:B, T:] == 0).all()
+        m = ops.materialize(f, "nn.Embedding")
+        assert torch.allclose(m[:B], ops.materialize(g1.data["e"], "nn.Embedding"))
+        assert torch.allclose(m[B:], ops.materialize(g2.data["e"], "nn.Embedding"))
+
+    def test_materialized_per_token_pads(self):
+        def mat_grad(t):
+            return Gradient(
+                representation={"l1": "materialized"},
+                data={"l1": mat_tensor_bt(t=t)},
+                layer_types={"l1": "nn.Linear"},
+                indexing={"l1": "batch_token"},
+            )
+
+        g1, g2 = mat_grad(T), mat_grad(T + 2)
+        gc = g1.concatenate(g2, dim="batch")
+        v = gc.data["l1"]
+        assert v.shape == (2 * B, T + 2, D_OUT * D_IN)
+        assert (v[:B, T:] == 0).all()
+
+    def test_batch_indexed_feature_mismatch_still_raises(self):
+        """Without a token axis (indexing='batch'), differing trailing dims are
+        a real error, never padded.
+        """
+        g1 = make_gradient(layers=("l1",), repr_type="factorized")
+        g2 = Gradient(
+            representation={"l1": "factorized"},
+            data={
+                "l1": Factorized(
+                    activation=torch.randn(B, D_IN + 1),
+                    pre_activation_grad=torch.randn(B, D_OUT),
+                ),
+            },
+            layer_types={"l1": "nn.Linear"},
+            indexing={"l1": "batch"},
+        )
+        with pytest.raises(RuntimeError):
+            g1.concatenate(g2, dim="batch")
+
     def test_mismatched_types_within_layer_raises(self):
         data1 = {"l1": mat_tensor()}
         data2 = {"l1": factorized()}
