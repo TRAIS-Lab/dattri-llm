@@ -50,6 +50,24 @@ class HookManagerCallback:
         list of B hashes).  Per-sample slicing is the callback's responsibility
         -- see :class:`OffloadCallback` for an example.
 
+        Dispatch happens with the manager's per-step state already reset and
+        its internal lock released, so re-entering the manager from here is
+        supported -- including running a **secondary backward pass** through
+        the hooked model.  The contract for doing so:
+
+        * This method executes inside an autograd hook, where gradient mode
+          is disabled -- wrap tracked work in ``torch.enable_grad()``.
+        * The secondary pass completes a capture step of its own: every
+          attached callback receives its record, so guard against re-entering
+          on your own secondary record.
+        * To leave the manager's training-facing state (step counter, last
+          gradient/inputs) untouched, bracket the pass with
+          :meth:`HookManager.save_state` / :meth:`HookManager.clear_state` /
+          :meth:`HookManager.load_state`.
+        * Under FSDP, step completion relies on an end-of-backward engine
+          callback whose ordering for *nested* backwards is not guaranteed --
+          reentrancy there is untested territory.
+
         Args:
             record: The assembled :class:`GradientRecord` for this step.
         """

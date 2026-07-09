@@ -118,7 +118,7 @@ class HookManager:
         # Single-slot cache holding the assembled gradient of the most recently
         # *completed* step.  The per-layer buffers are cleared as soon as a step
         # completes, so this is what :meth:`get_gradient` returns afterwards.
-        # Only ever holds one step's gradient at a time (see _on_step_complete).
+        # Only ever holds one step's gradient at a time (see _finalize_step).
         self._last_gradient: Gradient | None = None
 
         self._seen_bwd: set[str] = set()
@@ -263,6 +263,7 @@ class HookManager:
         if not self._collecting:
             return
 
+        record = None
         with self._step_lock:
             # We are inside the backward pass here -- the only valid place to
             # queue an end-of-backward callback.  Queue it once per step as the
@@ -279,7 +280,9 @@ class HookManager:
             if self._bwd_replica_counts[layer_name] >= self._n_replicas:
                 self._seen_bwd.add(layer_name)
             if len(self._seen_bwd) == self._n_layers:
-                self._check_mlp_done()
+                record = self._check_mlp_done()
+        if record is not None:
+            self._dispatch_step_end(record)
 
     def _on_backward_end(self) -> None:
         """Fired once the backward pass fully completes (FSDP-safe barrier).
@@ -294,11 +297,14 @@ class HookManager:
         """
         if not self._collecting:
             return
+        record = None
         with self._step_lock:
             if not self._backward_end_scheduled:
                 return
             self._mlp_params_ready = True
-            self._check_mlp_done()
+            record = self._check_mlp_done()
+        if record is not None:
+            self._dispatch_step_end(record)
 
     def _check_step_mlp_param_complete(
         self,
@@ -312,16 +318,21 @@ class HookManager:
         """
         if not self._collecting:
             return
+        record = None
         with self._step_lock:
             self._mlp_param_hook_count += 1
             if self._mlp_param_hook_count >= self._n_mlp_params:
-                self._check_mlp_done()
+                record = self._check_mlp_done()
+        if record is not None:
+            self._dispatch_step_end(record)
 
-    def _check_mlp_done(self) -> None:
+    def _check_mlp_done(self) -> GradientRecord | None:
         """Set ``_bwd_done`` and attempt step completion when both MLP
         sub-conditions (all bwd hooks fired, all MLP param hooks fired) hold.
 
-        Must be called with ``_step_lock`` held.
+        Must be called with ``_step_lock`` held.  Returns the finalized record
+        when this call completed the step (the caller dispatches it *after*
+        releasing the lock), else ``None``.
         """
         bwd_hooks_done = len(self._seen_bwd) == self._n_layers
         # Sub-condition (b): all MLP param grads are ready.  Satisfied when no
@@ -335,7 +346,8 @@ class HookManager:
         )
         if bwd_hooks_done and mlp_params_done:
             self._bwd_done = True
-            self._check_step_complete()
+            return self._check_step_complete()
+        return None
 
     def _check_step_grad_complete(
         self,
@@ -348,20 +360,25 @@ class HookManager:
         """
         if not self._collecting:
             return
+        record = None
         with self._step_lock:
             self._param_hook_count += 1
             if self._param_hook_count >= self._n_params_hooked:
                 self._param_hook_count = 0
                 self._grad_done = True
-                self._check_step_complete()
+                record = self._check_step_complete()
+        if record is not None:
+            self._dispatch_step_end(record)
 
-    def _check_step_complete(self) -> None:
-        """Trigger _on_step_complete only when both bwd and grad are done.
+    def _check_step_complete(self) -> GradientRecord | None:
+        """Finalize the step iff both bwd and grad are done.
 
-        Must be called with ``_step_lock`` held.
+        Must be called with ``_step_lock`` held.  Returns the finalized record
+        for the caller to dispatch after releasing the lock, else ``None``.
         """
         if self._bwd_done and self._grad_done:
-            self._on_step_complete()
+            return self._finalize_step()
+        return None
 
     # ---------------------------------------------------------------------- #
     # Step completion                                                          #
@@ -411,7 +428,18 @@ class HookManager:
                 return v.shape[0]
         return 1
 
-    def _on_step_complete(self) -> None:
+    def _finalize_step(self) -> GradientRecord:
+        """Assemble the completed step and reset every per-step state slot.
+
+        Must be called with ``_step_lock`` held -- the assembly/reset must be
+        atomic against concurrent hook threads (DataParallel replicas,
+        single-process multi-device models).  The returned record is
+        dispatched by the caller **after releasing the lock**, so
+        ``on_step_end`` runs with the manager in a clean, unlocked "fresh
+        step" state -- a callback may safely re-enter the manager (state
+        checkpointing, even a secondary backward; see
+        :meth:`HookManagerCallback.on_step_end`).
+        """
         # Normally already None (released when this step's forward began, see
         # _capture_model_input); kept as a guard for forwards that bypass the
         # root pre-hook (e.g. a submodule invoked directly) so we never
@@ -441,12 +469,22 @@ class HookManager:
             input_hash = self._extract_sample_ids(batch_size)
         else:
             input_hash = hash_batch(self._last_inputs, batch_size)
-        record = GradientRecord(
+        return GradientRecord(
             step=step,
             input_hash=input_hash,
             gradient=gradient,
             sample_id_key=self._sample_id_key,
         )
+
+    def _dispatch_step_end(self, record: GradientRecord) -> None:
+        """Deliver a finalized record to every callback, outside the lock.
+
+        Running user code while holding the non-reentrant ``_step_lock`` would
+        turn any callback-triggered backward into a silent same-thread
+        deadlock (the inner pass's hooks re-acquire the lock).  All per-step
+        state was already reset by :meth:`_finalize_step`, so a reentrant
+        backward here simply completes a capture step of its own.
+        """
         for cb in self._callbacks:
             cb.on_step_end(record)
 
