@@ -463,9 +463,10 @@ class GradientStreamer(GradientSource):
         self._batch_iter = iter(self._loader)
         self._batch_index = 0
         self._step_lrs = {}
-        # Share a zero baseline with the HookManager's capture counter, so this
-        # pass's ``record.step`` aligns with ``_batch_index`` and can be used to
-        # validate that exactly one capture step happened per yielded batch.
+        # Zero baseline for the HookManager's capture counter; __next__ then
+        # re-aligns it to this streamer's own batch index before every step,
+        # so ``record.step`` validates one-capture-per-batch even when another
+        # streamer sharing the hooks ran in between (loop_over_test).
         self._hm.reset_steps()
         self._consumed = True
         return self
@@ -476,6 +477,13 @@ class GradientStreamer(GradientSource):
         batch = next(self._batch_iter)  # raises StopIteration at the end
         batch = self._to_device(batch)
 
+        # Re-align the (possibly shared) capture counter to THIS streamer's
+        # next index: another streamer riding the same hooks may have advanced
+        # it since our last batch (e.g. the test source re-streamed between
+        # train blocks under loop_over_test).  Records stay stamped with the
+        # owning streamer's pass-local step, and the desync check below keeps
+        # catching extra or missing captures within the batch.
+        self._hm.reset_steps(self._batch_index)
         self._forward_backward(batch)
         if self.enable_update:
             self._optimizer_step()
