@@ -20,13 +20,13 @@ from dattri_llm.gradient.hooks.config import (
     resolve_hook_assignments,
 )
 from dattri_llm.gradient.hooks.hooks import (
-    _queue_backward_end_callback,
     register_linear_io_hooks,
     register_linear_param_hooks,
     register_param_grad_hooks,
     remove_hooks,
 )
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, is_embedding
+from dattri_llm.utils.autograd import queue_backward_end_callback
 from dattri_llm.utils.hashing import hash_batch
 
 if TYPE_CHECKING:
@@ -246,7 +246,7 @@ class HookManager:
             if (
                 self._n_mlp_params > 0
                 and not self._backward_end_scheduled
-                and _queue_backward_end_callback(self._on_backward_end)
+                and queue_backward_end_callback(self._on_backward_end)
             ):
                 self._backward_end_scheduled = True
             self._bwd_replica_counts[layer_name] = (

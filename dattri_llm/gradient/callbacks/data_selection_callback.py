@@ -11,6 +11,7 @@ from torch import nn
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.utils.autograd import queue_after_backward_finalization
 from dattri_llm.utils.distributed import dist_world_size, is_dist_initialized
 
 if TYPE_CHECKING:
@@ -847,21 +848,11 @@ class DataSelectionCallback(HookManagerCallback):
                     )
                 offset += n
 
-        # Deferred import: the hooks package's __init__ imports this module's
-        # package back, so a top-level import would be circular.
-        from dattri_llm.gradient.hooks.hooks import _queue_backward_end_callback
-
-        def _defer() -> None:
-            # Second-level queue: engine callbacks queued during the backward
-            # run in an order we cannot rely on relative to DDP's finalize
-            # (observed running *before* the write-back), but a callback
-            # appended *while the finalisation loop is executing* always runs
-            # after everything queued during the backward -- including DDP's
-            # write-back -- because the loop re-reads the list as it grows.
-            if not _queue_backward_end_callback(_apply):
-                _apply()
-
-        if not _queue_backward_end_callback(_defer):
+        # After-finalization queue: a plain backward-end callback may run
+        # *before* DDP's averaged-gradient write-back (order among callbacks
+        # queued during the backward is not observable); this variant is
+        # guaranteed to run after it.
+        if not queue_after_backward_finalization(_apply):
             # No engine queue on this build: subtract immediately (pre-2.x
             # fallback; may race DDP's write-back).
             _apply()

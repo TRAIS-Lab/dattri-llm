@@ -63,25 +63,6 @@ except ImportError:
     HF_Conv1D = None  # type: ignore[assignment,misc]
 
 
-def _queue_backward_end_callback(fn: Callable[[], None]) -> bool:
-    """Schedule ``fn`` to run once the in-flight backward pass fully completes.
-
-    Must be called from *within* a backward pass (e.g. a module full-backward
-    hook).  The callback fires after the autograd engine has finished -- the
-    point at which FSDP has written every (sharded) ``param.grad`` back to its
-    original parameter, so reading ``param.grad`` inside ``fn`` is safe.
-
-    Returns ``True`` if the callback was successfully queued, ``False`` if the
-    autograd engine does not expose ``queue_callback`` on this build (in which
-    case the caller should fall back to its existing behaviour).
-    """
-    try:
-        torch.autograd.Variable._execution_engine.queue_callback(fn)
-    except Exception:  # noqa: BLE001 - guarded probe of autograd internals
-        return False
-    return True
-
-
 # -- Linear-IO-capable types -------------------------------------------------
 # Layers whose per-sample gradient factorises as an outer product of the input
 # activation and the output gradient (``dL/dW ~ g^T x a``).  These are the
