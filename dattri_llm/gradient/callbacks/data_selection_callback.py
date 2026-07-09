@@ -136,17 +136,20 @@ class DataSelectionCallback(HookManagerCallback):
     convolution, normalization, and embedding families) is handled by the same
     code path; bias gradients are subtracted as the summed output gradient.
 
-    **Distributed (FSDP):**
+    **Distributed (DDP / FSDP):**
 
-    ``FullyShardedDataParallel`` (``use_orig_params=True``) is supported.  Each
-    original ``param.grad`` is then a 1-D *shard* holding FSDP's averaged
-    gradient, and a dropped sample's weight elements may be owned by a different
-    rank's shard, so removal is done collectively: every rank computes its
-    dropped samples' full contribution, a single ``all_reduce`` sums them, the
-    result is rescaled by ``1/world_size`` to match FSDP's averaging, and each
-    rank subtracts the slice it owns.  This runs on every step (with zero
-    contributions when a rank drops nothing) to keep ranks in lock-step, and
-    assumes FSDP's default averaged-gradient reduction.
+    Both regimes hold the *averaged* global gradient
+    ``(1/world_size) * sum_r G_r`` after backward -- DDP replicated in full on
+    every rank, FSDP as a 1-D per-rank shard (``use_orig_params=True``) -- so
+    a rank-local subtraction is wrong in both: it misses the ``1/world_size``
+    scaling and (DDP) diverges the replicas / (FSDP) misses elements owned by
+    other ranks' shards.  Removal is therefore collective in both: every rank
+    computes its dropped samples' full contribution, a single ``all_reduce``
+    sums them, the result is rescaled by ``1/world_size`` to match the
+    averaged-gradient convention, and each rank subtracts the full tensor
+    (DDP) or the slice it owns (FSDP).  The collectives run on every step
+    (with zero contributions when a rank drops nothing) to keep ranks in
+    lock-step, and assume the default averaged-gradient reduction.
 
     Construction order under FSDP: build the :class:`HookManager` on the
     *unwrapped* model (so its hooks survive wrapping), wrap with FSDP, then pass
@@ -353,6 +356,11 @@ class DataSelectionCallback(HookManagerCallback):
             # FSDP path runs every step (collectives must stay in lock-step
             # across ranks), even when this rank drops nothing.
             self._remove_contributions_fsdp(record, dropped)
+        elif is_dist_initialized() and dist_world_size() > 1:
+            # Replicated (DDP) gradients: rank-local subtraction would be off
+            # by 1/world and diverge the replicas -- remove collectively, in
+            # lock-step every step, like the FSDP path.
+            self._remove_contributions_ddp(record, dropped)
         elif dropped:
             self._remove_contributions(record, dropped)
 
@@ -751,7 +759,13 @@ class DataSelectionCallback(HookManagerCallback):
         if not any_dropped:
             return
 
-        entries = self._build_fsdp_contributions(record, dropped)
+        shard_map = self._fsdp_shard_map
+
+        def _shard_shape(param: torch.Tensor) -> tuple[int, ...] | None:
+            spec = shard_map.get(id(param))  # type: ignore[union-attr]
+            return spec.orig_shape if spec is not None else None
+
+        entries = self._build_full_contributions(record, dropped, _shard_shape)
         if not entries:
             return
 
@@ -769,23 +783,109 @@ class DataSelectionCallback(HookManagerCallback):
             for param, flat in entries:
                 self._subtract_shard(param, flat)
 
-    def _build_fsdp_contributions(
+    def _remove_contributions_ddp(
         self,
         record: GradientRecord,
         dropped: list[int],
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Return ``[(param, full_flat_contribution)]`` for every sharded param.
+    ) -> None:
+        """Replicated-gradient (DDP) collective version of
+        :meth:`_remove_contributions`.
 
-        Each contribution is the *full*, unsharded parameter-gradient of this
+        After DDP's allreduce every rank holds the same full
+        ``param.grad = (1/world) * sum_r G_r``, so the removal must subtract
+        ``(1/world) * sum_r C_r`` -- the *averaged* dropped contributions of
+        **all** ranks -- identically on every rank.  Same recipe as the FSDP
+        path (count gate, packed ``all_reduce``, ``1/world`` rescale), except
+        the subtraction covers the whole replicated tensor instead of a shard.
+        Runs on every rank in lock-step; assumes DDP's default
+        averaged-gradient reduction.
+
+        **Timing**: DDP's reducer copies each local gradient into its
+        communication bucket the moment it is produced and overwrites
+        ``param.grad`` with the averaged result only when the backward pass
+        finalises -- *after* this method runs (``on_step_end`` fires from
+        hooks inside the backward).  An immediate subtraction would be
+        clobbered by that write-back, so the removal is queued on the autograd
+        engine: queued callbacks run FIFO at finalisation, and DDP's own
+        write-back callback was queued earlier (at its first gradient hook),
+        so the removal lands on the final averaged gradients.
+        """
+
+        def _apply() -> None:
+            import torch.distributed as dist
+
+            world = dist_world_size()
+            coll_device = self._collective_device()
+
+            # Skip the contribution all-reduce when *no* rank dropped
+            # anything; the count reduce keeps the decision identical on
+            # every rank.
+            count = torch.tensor([len(dropped)], dtype=torch.long, device=coll_device)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+            if not count.item():
+                return
+
+            entries = self._build_full_contributions(
+                record,
+                dropped,
+                lambda param: tuple(param.shape),
+            )
+            if not entries:
+                return
+
+            buf = torch.cat([flat for _, flat in entries]).to(coll_device)
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            buf /= world
+            offset = 0
+            for param, flat in entries:
+                n = flat.numel()
+                if param.grad is not None:
+                    seg = buf[offset : offset + n].reshape(param.grad.shape)
+                    param.grad -= seg.to(
+                        device=param.grad.device,
+                        dtype=param.grad.dtype,
+                    )
+                offset += n
+
+        # Deferred import: the hooks package's __init__ imports this module's
+        # package back, so a top-level import would be circular.
+        from dattri_llm.gradient.hooks.hooks import _queue_backward_end_callback
+
+        def _defer() -> None:
+            # Second-level queue: engine callbacks queued during the backward
+            # run in an order we cannot rely on relative to DDP's finalize
+            # (observed running *before* the write-back), but a callback
+            # appended *while the finalisation loop is executing* always runs
+            # after everything queued during the backward -- including DDP's
+            # write-back -- because the loop re-reads the list as it grows.
+            if not _queue_backward_end_callback(_apply):
+                _apply()
+
+        if not _queue_backward_end_callback(_defer):
+            # No engine queue on this build: subtract immediately (pre-2.x
+            # fallback; may race DDP's write-back).
+            _apply()
+
+    def _build_full_contributions(
+        self,
+        record: GradientRecord,
+        dropped: list[int],
+        full_shape_of: Callable[[torch.Tensor], tuple[int, ...] | None],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Return ``[(param, full_flat_contribution)]`` for every hooked param.
+
+        Each contribution is the *full* (unsharded) parameter-gradient of this
         rank's dropped samples, flattened in the parameter's natural C-order
         (zeros when this rank dropped nothing).  The entry list -- params and
         their full sizes -- depends only on model structure and is therefore
         identical across ranks, which keeps the packed ``all_reduce`` aligned.
+
+        *full_shape_of* resolves a parameter's full shape, or ``None`` to skip
+        it: the FSDP path reads the shard map's ``orig_shape`` (a shard's own
+        ``param.shape`` is a meaningless 1-D slice), the DDP path reads
+        ``param.shape`` directly (replicated params keep their true shape).
         """
         B = record.gradient.batch_size
-        shard_map = self._fsdp_shard_map
-        if shard_map is None:
-            raise RuntimeError("FSDP shard map has not been initialised")
         entries: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_name, val in sorted(record.gradient.data.items()):
             if not isinstance(val, Factorized):
@@ -803,8 +903,9 @@ class DataSelectionCallback(HookManagerCallback):
             g_d = bf.pre_activation_grad[dropped] if dropped else None
 
             weight = getattr(module, "weight", None)
-            if weight is not None and id(weight) in shard_map:
-                full_numel = math.prod(shard_map[id(weight)].orig_shape)
+            weight_shape = full_shape_of(weight) if weight is not None else None
+            if weight_shape is not None:
+                full_numel = math.prod(weight_shape)
                 # Contributions live on the captured gradients' device so the
                 # materialize below is copy-free; identical on every rank.
                 flat = torch.zeros(
@@ -818,14 +919,15 @@ class DataSelectionCallback(HookManagerCallback):
                         bf.module_kwargs,
                         a_d,
                         g_d,
-                        shard_map[id(weight)].orig_shape,
+                        weight_shape,
                     )
                     flat[off : off + contrib.numel()] = contrib.float()
                 entries.append((weight, flat))
 
             bias = getattr(module, "bias", None)
-            if bias is not None and id(bias) in shard_map:
-                channels = math.prod(shard_map[id(bias)].orig_shape)
+            bias_shape = full_shape_of(bias) if bias is not None else None
+            if bias_shape is not None:
+                channels = math.prod(bias_shape)
                 flat = torch.zeros(
                     channels,
                     dtype=torch.float32,
@@ -849,8 +951,9 @@ class DataSelectionCallback(HookManagerCallback):
 
         Mirrors the per-layer-type reshaping in :meth:`_subtract_weight` but
         uses the *unsharded* ``full_shape`` (FSDP shards expose only a 1-D
-        slice, so ``weight.shape`` is unusable).  The offset is non-zero only
-        for embeddings, whose contribution covers just rows ``0..max_token``.
+        slice, so ``weight.shape`` is unusable).  The offset is always 0 now
+        that embedding materialization covers the full ``num_embeddings``
+        width; it is kept for the partial-coverage case should one return.
         """
         contrib = ops.materialize(
             Factorized(a_d, g_d, module_kwargs),
@@ -858,8 +961,8 @@ class DataSelectionCallback(HookManagerCallback):
             include_bias=False,
         ).sum(0)
         if ops.is_embedding(layer_type):
-            # materialize scatters into rows 0..max_token, flattened row-major
-            # -- already aligned with the start of the flattened weight.
+            # materialize scatters into all num_embeddings rows, flattened
+            # row-major -- exactly the flattened weight layout.
             return contrib, 0
         if ops.is_norm(layer_type):
             wnum = math.prod(full_shape)
