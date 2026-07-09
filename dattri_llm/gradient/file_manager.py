@@ -592,7 +592,12 @@ class GradientFileManager:
         return merged
 
     def _write_index(self) -> None:
-        """Write only this rank's entries to _save_dir/index.json."""
+        """Write only this rank's entries to _save_dir/index.json.
+
+        The write is atomic (temp file + ``os.replace``): a crash mid-write
+        leaves the previous index intact instead of a truncated JSON that
+        would lose every prior entry for this rank.
+        """
         self._save_dir.mkdir(parents=True, exist_ok=True)
         # Filter to entries whose file path belongs to this rank's save_dir.
         # For non-distributed _local_prefix is "", so all entries match.
@@ -601,8 +606,10 @@ class GradientFileManager:
             local = [e for e in entries if e["file"].startswith(self._local_prefix)]
             if local:
                 local_index[h] = local
-        with Path(self._save_dir / self._INDEX_FILE).open("w", encoding="utf-8") as f:
+        tmp_path = self._save_dir / (self._INDEX_FILE + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
             json.dump({"sample_id_key": self._sample_id_key, "index": local_index}, f)
+        tmp_path.replace(self._save_dir / self._INDEX_FILE)
 
     def _compute_next_batch_id(self) -> int:
         if not self._save_dir.exists():

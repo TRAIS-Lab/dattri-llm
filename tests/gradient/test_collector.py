@@ -384,6 +384,46 @@ class TestGradientFileManager:
             manager.save(rec)
             assert (Path(tmpdir) / "index.json").exists()
 
+    def test_index_write_is_atomic_under_crash(
+        self,
+        tiny_model,
+        tiny_batch,
+        monkeypatch,
+    ):
+        """A crash mid-index-write must leave the previous index readable."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = GradientFileManager(tmpdir)
+            rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
+            manager.save(rec)
+
+            real_dump = json.dump
+
+            def crashing_dump(obj, fp, *args, **kwargs):
+                # Emit a truncated payload, then die -- as a hard kill
+                # mid-write would.
+                fp.write('{"sample_id_key": null, "index": {"trunc')
+                raise RuntimeError("simulated crash mid-write")
+
+            monkeypatch.setattr(
+                "dattri_llm.gradient.file_manager.json.dump",
+                crashing_dump,
+            )
+            rec2 = self._make_record(1, self._HASH_B, tiny_model, tiny_batch)
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                manager.save(rec2)
+            monkeypatch.setattr(
+                "dattri_llm.gradient.file_manager.json.dump",
+                real_dump,
+            )
+
+            # The on-disk index is the pre-crash version, not truncated JSON:
+            # a fresh manager still loads every previously indexed record.
+            recovered = GradientFileManager(tmpdir)
+            assert self._HASH_A in recovered.index
+            assert self._HASH_B not in recovered.index
+            records = recovered.load_all_by_hash(self._HASH_A)
+            assert [r.step for r in records] == [0]
+
     def test_load_all_by_hash(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)
