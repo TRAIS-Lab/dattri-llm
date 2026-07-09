@@ -16,7 +16,7 @@ GradientRepresentation = Literal["materialized", "factorized"]
 Indexing = Literal["batch", "batch_token"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Factorized:
     """A per-layer factorized ("ghost") gradient: an (activation,
     output-gradient) factor pair.
@@ -76,7 +76,7 @@ class Factorized:
 GradientData = torch.Tensor | Factorized
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Gradient:
     """A per-step, multi-layer container of per-sample gradients with metadata."""
 
