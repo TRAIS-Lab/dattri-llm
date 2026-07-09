@@ -61,10 +61,18 @@ def collect_to_disk(
     on-the-fly :meth:`cache`: collect live here, then score with
     ``attribute_from_cache`` (so ``attribute`` == *cache + attribute_from_cache*).
     """
+    id_key = streamer.hook_manager.sample_id_key
     with streamer:
         for step, grad, hashes in streamer:
             file_manager.save_bulk(
-                [GradientRecord(step=step, input_hash=hashes, gradient=grad)],
+                [
+                    GradientRecord(
+                        step=step,
+                        input_hash=hashes,
+                        gradient=grad,
+                        sample_id_key=id_key,
+                    ),
+                ],
             )
 
 

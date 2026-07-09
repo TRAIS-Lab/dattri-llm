@@ -223,6 +223,7 @@ class TestTracInOnDisk:
         assert res.algorithm_meta == {
             "normalized_grad": False,
             "selected_training_steps": [0],
+            "sample_id_key": {"train": None, "test": None},
         }
 
         gradcos = _make_attr(tmp_path / "b").attribute_from_cache(

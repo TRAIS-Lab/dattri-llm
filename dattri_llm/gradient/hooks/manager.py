@@ -60,8 +60,18 @@ class HookManager:
             regex selectors).  Defaults to ``HookManagerConfig()`` (linear_io on
             every capable layer, with a param_grad fallback for the rest).
         callbacks: List of :class:`HookManagerCallback` objects.
-        sample_id_key: Key in the model's forward kwargs used as a hint for
-            batch size detection.  Defaults to ``"input_ids"``.
+        sample_id_key: How each sample's **identifier** (the record's
+            ``input_hash``) is derived.  ``None`` (default) content-hashes the
+            captured model inputs via
+            :func:`~dattri_llm.utils.hashing.hash_batch`.  When set, the
+            identifiers are read directly from that input field instead: a
+            ``str`` names a forward kwarg (e.g. ``"idx"`` for a dataset id
+            column), an ``int`` indexes the positional forward arguments.
+            The field must be present in every step's inputs with one value
+            per sample (missing key or wrong length raises); values are
+            stringified, so an ``idx`` column of ``[32, 42]`` yields
+            identifiers ``["32", "42"]``.  The chosen key is stamped on every
+            emitted record (:attr:`GradientRecord.sample_id_key`).
         non_batch_first_layers: Optional set/list of fully-qualified layer names
             whose captured activations are **sequence-first** (``(T, B, ...)``)
             rather than the default batch-first (``(B, T, ...)``) -- e.g. layers
@@ -85,7 +95,7 @@ class HookManager:
         model: nn.Module,
         config: HookManagerConfig | None = None,
         callbacks: list[HookManagerCallback] | None = None,
-        sample_id_key: str = "input_ids",
+        sample_id_key: str | int | None = None,
         non_batch_first_layers: Iterable[str] | None = None,
         offload_to_cpu: bool = False,
     ) -> None:
@@ -213,6 +223,16 @@ class HookManager:
             for i, a in enumerate(args):
                 if isinstance(a, torch.Tensor):
                     captured[f"_arg{i}"] = a
+        # The sample-id field is captured whatever its type (an id column may
+        # arrive as a plain list) and whichever calling convention delivered
+        # it -- an int key indexes the positional arguments.
+        key = self._sample_id_key
+        if key is not None:
+            if isinstance(key, int):
+                if key < len(args):
+                    captured[f"_arg{key}"] = args[key]
+            elif key in kwargs:
+                captured[key] = kwargs[key]
         self._last_inputs = captured
 
     # ---------------------------------------------------------------------- #
@@ -347,6 +367,44 @@ class HookManager:
     # Step completion                                                          #
     # ---------------------------------------------------------------------- #
 
+    def _extract_sample_ids(self, expected: int) -> list[str]:
+        """Read this step's identifiers from the ``sample_id_key`` input field.
+
+        No silent fallback: a missing field or a length that disagrees with
+        the step's batch size raises, because falling back to content hashing
+        on a typo would silently change every sample's identity.
+
+        Args:
+            expected: The step's batch size (one identifier per sample).
+
+        Returns:
+            The stringified per-sample identifier list, in batch order.
+
+        Raises:
+            KeyError: If the field is absent from the captured model inputs.
+            ValueError: If the field does not yield ``expected`` values.
+        """
+        key = self._sample_id_key
+        field = f"_arg{key}" if isinstance(key, int) else key
+        if field not in self._last_inputs:
+            raise KeyError(
+                f"sample_id_key={key!r} was not found among the captured "
+                f"model inputs {sorted(self._last_inputs)}; cannot assign "
+                "sample identities.",
+            )
+        value = self._last_inputs[field]
+        ids = (
+            value.reshape(-1).tolist()
+            if isinstance(value, torch.Tensor)
+            else list(value)
+        )
+        if len(ids) != expected:
+            raise ValueError(
+                f"sample_id_key={key!r} yielded {len(ids)} identifiers but "
+                f"the step's batch size is {expected}.",
+            )
+        return [str(i) for i in ids]
+
     def _get_input_batch_size(self) -> int:
         for v in self._last_inputs.values():
             if isinstance(v, torch.Tensor) and v.ndim > 0:
@@ -379,8 +437,16 @@ class HookManager:
         self._last_gradient = gradient
 
         batch_size = self._get_input_batch_size()
-        input_hash = hash_batch(self._last_inputs, batch_size)
-        record = GradientRecord(step=step, input_hash=input_hash, gradient=gradient)
+        if self._sample_id_key is not None:
+            input_hash = self._extract_sample_ids(batch_size)
+        else:
+            input_hash = hash_batch(self._last_inputs, batch_size)
+        record = GradientRecord(
+            step=step,
+            input_hash=input_hash,
+            gradient=gradient,
+            sample_id_key=self._sample_id_key,
+        )
         for cb in self._callbacks:
             cb.on_step_end(record)
 
@@ -867,6 +933,13 @@ class HookManager:
         self._callbacks.append(callback)
         if hasattr(callback, "on_register"):
             callback.on_register(self)
+
+    @property
+    def sample_id_key(self) -> str | int | None:
+        """The identifier scheme this manager stamps on records: the input
+        field sample ids are read from, or ``None`` for content hashing.
+        """
+        return self._sample_id_key
 
     @property
     def layer_names(self) -> list[str]:

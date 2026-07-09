@@ -33,6 +33,7 @@ def _to_cpu_record(record: GradientRecord) -> GradientRecord:
         step=record.step,
         input_hash=record.input_hash,
         gradient=record.gradient.to("cpu"),
+        sample_id_key=getattr(record, "sample_id_key", None),
     )
 
 
@@ -91,20 +92,31 @@ class GradientFileManager:
     Index format (inside each ``index.json``)::
 
         {
-            "<sha256_hex>": [
-                {"file": "rank_0/batch_000000.pt", "idx": 2, "step": 0, "sample_idx":
-                5},
-                {"file": "rank_0/batch_000002.pt", "idx": 0, "step": 4, "sample_idx": 1}
-            ]
+            "sample_id_key": null,
+            "index": {
+                "<identifier>": [
+                    {"file": "rank_0/batch_000000.pt", "idx": 2, "step": 0,
+                     "sample_idx": 5},
+                    {"file": "rank_0/batch_000002.pt", "idx": 0, "step": 4,
+                     "sample_idx": 1}
+                ]
+            }
         }
 
-    The mapping is ``input_hash -> (step, sample_idx) -> file``: the content hash is
-    sample-position independent (a sample hashes the same wherever shuffling
-    put it), and each entry records **where** that sample landed -- the training
-    ``step`` and its ``sample_idx`` position within the stored record's batch -- so
-    a per-sample gradient is retrieved by direct slicing, never by scanning a
-    batch record.  :meth:`lookup` returns a hash's ``(step, sample_idx)`` pairs and
-    :meth:`load_sample` retrieves one pair's gradient.
+    The mapping is ``identifier -> (step, sample_idx) -> file``.  The
+    identifier is whatever the capturing
+    :class:`~dattri_llm.gradient.hooks.HookManager` assigned: the SHA-256
+    content hash by default (sample-position independent -- a sample hashes
+    the same wherever shuffling put it), or, under ``sample_id_key``, the
+    stringified values of that input field.  ``sample_id_key`` records which
+    scheme the store was collected under (``null`` = content hashing); it is
+    adopted from the first saved record and every later record must agree.
+    Each entry records **where** the sample landed -- the training ``step``
+    and its ``sample_idx`` position within the stored record's batch -- so a
+    per-sample gradient is retrieved by direct slicing, never by scanning a
+    batch record.  :meth:`lookup` returns an identifier's
+    ``(step, sample_idx)`` pairs and :meth:`load_sample` retrieves one pair's
+    gradient.
 
     Paths in ``"file"`` are always relative to *save_dir* (the root), so
     load methods work regardless of which rank originally wrote the record.
@@ -133,10 +145,37 @@ class GradientFileManager:
             self._save_dir = self._root_dir
             self._local_prefix = ""
 
+        # Identifier scheme the store was collected under (see the class
+        # docstring): None = content hashing, else the sample_id_key input
+        # field.  Adopted from existing indexes / the first saved record;
+        # ``_id_key_known`` distinguishes "content hashing" from "not yet
+        # determined" so a mismatch can be rejected loudly.
+        self._sample_id_key: str | int | None = None
+        self._id_key_known: bool = False
         # Merged view across all ranks (used for all load operations).
         self._index: dict[str, list[dict]] = self._read_all_indexes()
         # Per-rank batch counter, scoped to _save_dir so there is no collision.
         self._next_batch_id: int = self._compute_next_batch_id()
+
+    @property
+    def sample_id_key(self) -> str | int | None:
+        """The identifier scheme of this store: the input field the capturing
+        manager read sample ids from, or ``None`` for content hashing.
+        """
+        return self._sample_id_key
+
+    def _adopt_sample_id_key(self, key: str | int | None) -> None:
+        """Adopt the store's identifier scheme, rejecting a mixed store."""
+        if self._id_key_known:
+            if key != self._sample_id_key:
+                raise ValueError(
+                    f"Record was captured with sample_id_key={key!r} but this "
+                    f"store uses sample_id_key={self._sample_id_key!r}; one "
+                    "store cannot mix identifier schemes.",
+                )
+            return
+        self._sample_id_key = key
+        self._id_key_known = True
 
     # ---------------------------------------------------------------------- #
     # Saving                                                                   #
@@ -202,6 +241,9 @@ class GradientFileManager:
         return path
 
     def _index_entry(self, record: GradientRecord, filename: str, idx: int) -> None:
+        # ``getattr``: records pickled before sample_id_key existed read as
+        # content-hashed (None), which is what they were.
+        self._adopt_sample_id_key(getattr(record, "sample_id_key", None))
         hashes = (
             record.input_hash
             if isinstance(record.input_hash, list)
@@ -224,7 +266,9 @@ class GradientFileManager:
                 "step": record.step,
                 "sample_idx": pos,
             }
-            entries = self._index.setdefault(h, [])
+            # str(): JSON object keys are strings, so a non-str identifier
+            # would silently change type across a save/load round trip.
+            entries = self._index.setdefault(str(h), [])
             if entry not in entries:
                 entries.append(entry)
 
@@ -234,10 +278,48 @@ class GradientFileManager:
 
     # Every load-family method comes as a pair differing only by how the
     # sample is identified: ``F(inputs, ...)`` takes ONE sample's model-input
-    # dict and hashes it; ``F_by_hash(input_hash, ...)`` takes the precomputed
-    # content hash.  Under the ``input_hash -> (step, sample_idx) -> file`` index a
-    # step alone no longer identifies a gradient -- only a ``(step, sample_idx)``
-    # pair does -- so there is no step-only loader.
+    # dict and derives the identifier from it (content hash, or the store's
+    # ``sample_id_key`` field); ``F_by_hash(identifier, ...)`` takes the
+    # precomputed identifier.  Under the ``identifier -> (step, sample_idx) ->
+    # file`` index a step alone no longer identifies a gradient -- only a
+    # ``(step, sample_idx)`` pair does -- so there is no step-only loader.
+
+    def _identifier_for(self, inputs: dict[str, object]) -> str:
+        """One sample's identifier under this store's scheme.
+
+        Content hash when the store was collected without a
+        ``sample_id_key``; otherwise the stringified value of that field in
+        *inputs* (an ``int`` key reads ``inputs[key]`` of a sequence, or the
+        ``_arg{key}`` entry of a dict -- the positional-capture convention).
+
+        Args:
+            inputs: One sample's model-input dict (or sequence, for a
+                positional ``sample_id_key``).
+
+        Returns:
+            The identifier string.
+
+        Raises:
+            KeyError: If the store uses a ``sample_id_key`` and *inputs* does
+                not carry that field.
+        """
+        key = self._sample_id_key
+        if key is None:
+            return hash_sample(inputs)
+        if isinstance(key, int) and isinstance(inputs, (list, tuple)):
+            value = inputs[key]
+        else:
+            field = f"_arg{key}" if isinstance(key, int) else key
+            if field not in inputs:
+                raise KeyError(
+                    f"This store identifies samples by sample_id_key={key!r}, "
+                    f"but the provided inputs carry no {field!r} field "
+                    f"(keys: {sorted(inputs)}).",
+                )
+            value = inputs[field]
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        return str(value)
 
     def lookup(
         self,
@@ -251,26 +333,30 @@ class GradientFileManager:
         Returns:
             Sorted list of ``(step, sample_idx)`` pairs -- see :meth:`lookup_by_hash`.
         """
-        return self.lookup_by_hash(hash_sample(inputs))
+        return self.lookup_by_hash(self._identifier_for(inputs))
 
     def lookup_by_hash(self, input_hash: str) -> list[tuple[int, int]]:
         """Every ``(step, sample_idx)`` occurrence of a sample, sorted by step.
 
-        The content hash identifies *what* the sample is (independent of
-        shuffling); the returned pairs say *where* it was recorded -- the
-        training step, and its position within that step's stored batch.
-        Feed a pair to :meth:`load_sample_by_hash` to retrieve the gradient.
+        The identifier says *what* the sample is (independent of shuffling);
+        the returned pairs say *where* it was recorded -- the training step,
+        and its position within that step's stored batch.  Feed a pair to
+        :meth:`load_sample_by_hash` to retrieve the gradient.
 
         Args:
-            input_hash: Full 64-character SHA-256 hash (see
-                :func:`~dattri_llm.utils.hashing.hash_sample`).
+            input_hash: The sample's identifier -- the SHA-256 content hash
+                (see :func:`~dattri_llm.utils.hashing.hash_sample`), or, for a
+                store collected under ``sample_id_key``, the sample-id value
+                (non-string values are stringified, so ``42`` and ``"42"``
+                are interchangeable).
 
         Returns:
             Sorted list of ``(step, sample_idx)`` pairs.
 
         Raises:
-            KeyError: If the hash is not found in the index.
+            KeyError: If the identifier is not found in the index.
         """
+        input_hash = str(input_hash)
         if input_hash not in self._index:
             raise KeyError(
                 f"Hash {input_hash[:16]}... not in index. "
@@ -295,7 +381,11 @@ class GradientFileManager:
         Returns:
             Gradient: The sample's gradient -- see :meth:`load_sample_by_hash`.
         """
-        return self.load_sample_by_hash(hash_sample(inputs), step, sample_idx)
+        return self.load_sample_by_hash(
+            self._identifier_for(inputs),
+            step,
+            sample_idx,
+        )
 
     def load_sample_by_hash(
         self,
@@ -320,6 +410,7 @@ class GradientFileManager:
         Raises:
             KeyError: If no record matches ``(input_hash, step, sample_idx)``.
         """
+        input_hash = str(input_hash)
         for e in self._index.get(input_hash, []):
             if e["step"] == step and e["sample_idx"] == sample_idx:
                 record = self._load_entry(e)
@@ -343,7 +434,7 @@ class GradientFileManager:
             List of :class:`GradientRecord` sorted by step -- see
             :meth:`load_all_by_hash`.
         """
-        return self.load_all_by_hash(hash_sample(inputs))
+        return self.load_all_by_hash(self._identifier_for(inputs))
 
     def load_all_by_hash(self, input_hash: str) -> list[GradientRecord]:
         """Load every saved :class:`GradientRecord` for a given sample hash.
@@ -358,8 +449,9 @@ class GradientFileManager:
             List of :class:`GradientRecord` sorted by step.
 
         Raises:
-            KeyError: If the hash is not found in the index.
+            KeyError: If the identifier is not found in the index.
         """
+        input_hash = str(input_hash)
         if input_hash not in self._index:
             raise KeyError(
                 f"Hash {input_hash[:16]}... not in index. "
@@ -469,21 +561,34 @@ class GradientFileManager:
         return self._index
 
     def _read_all_indexes(self) -> dict[str, list[dict]]:
-        """Merge index.json from the root dir and every rank_N/ subdirectory."""
+        """Merge index.json from the root dir and every rank_N/ subdirectory.
+
+        Every index file also carries the store's ``sample_id_key``; it is
+        adopted from the first file read, and all files must agree (see
+        :meth:`_adopt_sample_id_key`).
+        """
         merged: dict[str, list[dict]] = {}
-        # Root-level index: non-distributed saves or old-format saves.
+
+        def read_one(path: Path) -> None:
+            with path.open(encoding="utf-8") as f:
+                payload = json.load(f)
+            key = payload["sample_id_key"]
+            # JSON has no int/str key distinction problem for values, but a
+            # positional (int) sample_id_key round-trips as int natively.
+            self._adopt_sample_id_key(key)
+            _merge_index(merged, payload["index"])
+
+        # Root-level index: non-distributed saves.
         root_idx = self._root_dir / self._INDEX_FILE
         if root_idx.exists():
-            with Path(root_idx).open(encoding="utf-8") as f:
-                _merge_index(merged, json.load(f))
+            read_one(root_idx)
         # Per-rank indexes written by this class under DDP.
         for rank_dir in sorted(self._root_dir.glob("rank_*")):
             if not rank_dir.is_dir():
                 continue
             rank_idx = rank_dir / self._INDEX_FILE
             if rank_idx.exists():
-                with Path(rank_idx).open(encoding="utf-8") as f:
-                    _merge_index(merged, json.load(f))
+                read_one(rank_idx)
         return merged
 
     def _write_index(self) -> None:
@@ -497,7 +602,7 @@ class GradientFileManager:
             if local:
                 local_index[h] = local
         with Path(self._save_dir / self._INDEX_FILE).open("w", encoding="utf-8") as f:
-            json.dump(local_index, f)
+            json.dump({"sample_id_key": self._sample_id_key, "index": local_index}, f)
 
     def _compute_next_batch_id(self) -> int:
         if not self._save_dir.exists():

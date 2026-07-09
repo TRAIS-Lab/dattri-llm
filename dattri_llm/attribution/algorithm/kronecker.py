@@ -381,8 +381,10 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 "test_gradients_dir.",
             )
         layer_name = normalize_layer_names(layer_name)
+        train_fm = GradientFileManager(train_gradients_dir)
+        test_fm = GradientFileManager(test_gradients_dir)
         train = DiskGradientSource(
-            GradientFileManager(train_gradients_dir),
+            train_fm,
             self.args,
             steps=selected_training_steps,
             layer_name=layer_name,
@@ -390,7 +392,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             verbose=verbose,
         )
         test = DiskGradientSource(
-            GradientFileManager(test_gradients_dir),
+            test_fm,
             self.args,
             layer_name=layer_name,
             desc=f"{self.algorithm}: preparing test",
@@ -403,7 +405,13 @@ class _KroneckerBaseAttributor(BaseAttributor):
             loop_over_test=loop_over_test,
             non_kfac_strategy=non_kfac_strategy,
             direct_fim_max_params=direct_fim_max_params,
-            algorithm_meta_extra={"selected_training_steps": train._steps},
+            algorithm_meta_extra={
+                "selected_training_steps": train._steps,
+                "sample_id_key": {
+                    "train": train_fm.sample_id_key,
+                    "test": test_fm.sample_id_key,
+                },
+            },
             layer_name=layer_name,
         )
 

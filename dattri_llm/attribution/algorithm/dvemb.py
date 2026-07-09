@@ -709,6 +709,9 @@ class DVEmbAttributor(BaseAttributor):
                                     step=ts,
                                     input_hash=list(train_hashes),
                                     gradient=grad,
+                                    # Embeddings inherit the source store's
+                                    # identifiers, so also its scheme.
+                                    sample_id_key=train_source._fm.sample_id_key,
                                 ),
                             ],
                         )
@@ -1092,6 +1095,10 @@ class DVEmbAttributor(BaseAttributor):
                 "propagation": propagation,
                 "dvemb_dir": dvemb_dir,
                 "hessian_mode": hessian_mode,
+                "sample_id_key": {
+                    "train": train_fm.sample_id_key,
+                    "test": test_fm.sample_id_key,
+                },
             },
         )
 

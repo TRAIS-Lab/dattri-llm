@@ -105,11 +105,16 @@ class TestHashSample:
         ]
         assert hash_batch(batch) == expected
 
-    def test_hash_batch_rejects_non_batch_first(self):
-        # A sequence-first (T, B) field disagrees with the batch dimension.
+    def test_hash_batch_skips_non_batch_first(self):
+        # A field whose leading dim disagrees with the batch (e.g. a
+        # sequence-first or broadcast tensor) carries no per-sample identity
+        # and is skipped rather than raising (it used to crash the capture
+        # hooks mid-training).
         batch = {"x": torch.randn(3, 5), "pos": torch.randn(7, 3)}
-        with pytest.raises(NotImplementedError, match="batch-first"):
-            hash_batch(batch, batch_size=3)
+        assert hash_batch(batch, batch_size=3) == hash_batch(
+            {"x": batch["x"]},
+            batch_size=3,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1132,8 +1137,11 @@ class TestGradientFileManagerDDP:
             rec = self._make_record(0, h, tiny_model, tiny_batch)
             m.save_bulk([rec])
 
-        idx0 = json.loads((tmp_path / "rank_0" / "index.json").read_text())
-        idx1 = json.loads((tmp_path / "rank_1" / "index.json").read_text())
+        payload0 = json.loads((tmp_path / "rank_0" / "index.json").read_text())
+        payload1 = json.loads((tmp_path / "rank_1" / "index.json").read_text())
+        # Each index file carries the identifier scheme alongside the entries.
+        assert payload0["sample_id_key"] is None
+        idx0, idx1 = payload0["index"], payload1["index"]
         # Each rank's index only contains its own hash.
         assert self._HASH_A in idx0
         assert self._HASH_B not in idx0

@@ -874,23 +874,32 @@ class GradientRecord:
     Attributes:
         step: Global batch-step counter, incremented once per completed
             backward pass.
-        input_hash: Content-based identifier for the sample(s) in this record.
+        input_hash: Identifier for the sample(s) in this record -- by default
+            the SHA-256 content hash of the model inputs; when the capturing
+            :class:`~dattri_llm.gradient.hooks.HookManager` was configured
+            with a ``sample_id_key``, the stringified per-sample values of
+            that input field instead (e.g. ``["32", "42", "51"]`` from an
+            ``idx`` column).
 
             * **Per-sample** (``recording_type="per_sample"``): a single
-              64-character SHA-256 hex string identifying the one sample whose
-              gradient is stored.
+              identifier string for the one sample whose gradient is stored.
             * **Per-batch** (``recording_type="per_batch"``): a list of
-              64-character SHA-256 hex strings, one per sample in the batch,
-              in batch order.  The :class:`GradientFileManager` indexes every
-              hash in the list so per-sample lookup works even when many
-              records are bundled in one file.
+              identifier strings, one per sample in the batch, in batch
+              order.  The :class:`GradientFileManager` indexes every
+              identifier in the list so per-sample lookup works even when
+              many records are bundled in one file.
 
         gradient: The collected :class:`Gradient`.
+        sample_id_key: Which input field supplied ``input_hash`` -- the field
+            name (or positional-argument index) the capturing manager read the
+            identifiers from, or ``None`` for content hashing.  Stored so a
+            reader can disambiguate the identifier scheme at load time.
     """
 
     step: int
     input_hash: str | list[str]
     gradient: Gradient
+    sample_id_key: str | int | None = None
 
     def __repr__(self) -> str:
         if isinstance(self.input_hash, list):

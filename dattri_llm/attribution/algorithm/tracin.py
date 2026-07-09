@@ -327,8 +327,10 @@ class TracInAttributor(BaseAttributor):
             )
         layer_name = normalize_layer_names(layer_name)
         name, _ = self._label(normalized_grad)
+        train_fm = GradientFileManager(train_gradients_dir)
+        test_fm = GradientFileManager(test_gradients_dir)
         train = DiskGradientSource(
-            GradientFileManager(train_gradients_dir),
+            train_fm,
             self.args,
             steps=selected_training_steps,
             layer_name=layer_name,
@@ -336,7 +338,7 @@ class TracInAttributor(BaseAttributor):
             verbose=verbose,
         )
         test = DiskGradientSource(
-            GradientFileManager(test_gradients_dir),
+            test_fm,
             self.args,
             layer_name=layer_name,
             desc=f"{name}: loading test",
@@ -346,7 +348,15 @@ class TracInAttributor(BaseAttributor):
             train,
             test,
             loop_over_test=loop_over_test,
-            algorithm_meta={"selected_training_steps": train._steps},
+            algorithm_meta={
+                "selected_training_steps": train._steps,
+                # The identifier scheme each store was collected under (None
+                # = content hashing) -- disambiguates the row/column ids.
+                "sample_id_key": {
+                    "train": train_fm.sample_id_key,
+                    "test": test_fm.sample_id_key,
+                },
+            },
             layer_name=layer_name,
             normalized_grad=normalized_grad,
         )
