@@ -171,10 +171,6 @@ class HookManager:
         self._mlp_params_ready: bool = False
         self._backward_end_scheduled: bool = False
 
-        self._n_replicas: int = (
-            len(model.device_ids) if isinstance(model, nn.DataParallel) else 1
-        )
-
         self._last_inputs: dict[str, torch.Tensor] = {}
 
         # Hook state -- populated by register(), emptied by remove().
@@ -277,9 +273,21 @@ class HookManager:
             self._bwd_replica_counts[layer_name] = (
                 self._bwd_replica_counts.get(layer_name, 0) + 1
             )
-            if self._bwd_replica_counts[layer_name] >= self._n_replicas:
+            # A layer's backward is complete when it has fired once per
+            # *observed* grad-enabled forward this step (the forward pass is
+            # fully done before any backward hook runs, so the target is
+            # final here).  Deriving the target from observation -- instead
+            # of predicting it from ``len(device_ids)`` at construction --
+            # keeps the count right when DataParallel's scatter uses fewer
+            # replicas than devices (trailing short batch), when the model is
+            # wrapped after this manager is built, and when a layer is
+            # invoked several times per step (weight tying).
+            if (
+                self._bwd_replica_counts[layer_name]
+                >= self._buffers[layer_name]["_fwd_fires"]
+            ):
                 self._seen_bwd.add(layer_name)
-            if len(self._seen_bwd) == self._n_layers:
+            if self._bwd_hooks_done():
                 record = self._check_mlp_done()
         if record is not None:
             self._dispatch_step_end(record)
@@ -326,15 +334,34 @@ class HookManager:
         if record is not None:
             self._dispatch_step_end(record)
 
+    def _bwd_hooks_done(self) -> bool:
+        """True when every layer that participated in this step's forward has
+        completed its backward fires.
+
+        Registered layers that this step's execution path never reached
+        (``_fwd_fires == 0`` -- conditional branches, unused submodules) are
+        not required: the forward pass finishes before any backward hook
+        runs, so a zero forward count here is definitive, and requiring such
+        layers would stall the step forever.  At least one layer must have
+        participated -- a step is never completed on no data.
+
+        Must be called with ``_step_lock`` held.
+        """
+        if self._n_layers == 0:
+            return True  # no linear_io hooks; sub-condition (a) is vacuous
+        n_active = sum(1 for buf in self._buffers.values() if buf["_fwd_fires"] > 0)
+        return n_active > 0 and len(self._seen_bwd) == n_active
+
     def _check_mlp_done(self) -> GradientRecord | None:
         """Set ``_bwd_done`` and attempt step completion when both MLP
-        sub-conditions (all bwd hooks fired, all MLP param hooks fired) hold.
+        sub-conditions (all participating bwd hooks fired, MLP param grads
+        ready) hold.
 
         Must be called with ``_step_lock`` held.  Returns the finalized record
         when this call completed the step (the caller dispatches it *after*
         releasing the lock), else ``None``.
         """
-        bwd_hooks_done = len(self._seen_bwd) == self._n_layers
+        bwd_hooks_done = self._bwd_hooks_done()
         # Sub-condition (b): all MLP param grads are ready.  Satisfied when no
         # MLP params exist, when every per-parameter post-accumulate hook has
         # fired (non-FSDP), or when the FSDP end-of-backward callback has fired
@@ -515,6 +542,12 @@ class HookManager:
         indexing: dict = {}
 
         for layer_name, buf in self._buffers.items():
+            # Registered but not on this step's execution path (conditional
+            # branch, unused submodule): nothing was captured, and step
+            # completion did not require it (see _bwd_hooks_done) -- the
+            # layer is simply absent from this step's record.
+            if buf["_fwd_fires"] == 0:
+                continue
             batch_first = layer_name not in self._non_batch_first_layers
             proj_kw = buf["_proj_kw"]
 
@@ -655,6 +688,7 @@ class HookManager:
             buf["_grad_parts"] = []
             buf["_proj_parts"] = []
             buf["_device_id"] = {}
+            buf["_fwd_fires"] = 0
 
     def _reset_param_buffers(self) -> None:
         for buf in self._param_buffers.values():
@@ -707,6 +741,7 @@ class HookManager:
                     "_grad_parts": list(buf["_grad_parts"]),
                     "_proj_parts": list(buf["_proj_parts"]),
                     "_device_id": {k: list(v) for k, v in buf["_device_id"].items()},
+                    "_fwd_fires": buf["_fwd_fires"],
                     "activation": buf["activation"],
                     "grad_output": buf["grad_output"],
                 }
@@ -756,6 +791,7 @@ class HookManager:
             buf["_grad_parts"] = s.get("_grad_parts", [])
             buf["_proj_parts"] = s.get("_proj_parts", [])
             buf["_device_id"] = s.get("_device_id", {})
+            buf["_fwd_fires"] = s.get("_fwd_fires", 0)
             buf["activation"] = s.get("activation")
             buf["grad_output"] = s.get("grad_output")
         saved_param = state["param_buffers"]

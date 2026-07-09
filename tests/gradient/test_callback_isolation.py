@@ -124,6 +124,7 @@ def _manager_fingerprint(hm: HookManager) -> dict:
             not b["_act_parts"]
             and not b["_grad_parts"]
             and not b["_proj_parts"]
+            and not b["_fwd_fires"]
             and not any(b["_device_id"].values())
             for b in hm._buffers.values()
         ),

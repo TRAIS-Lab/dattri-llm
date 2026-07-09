@@ -133,6 +133,12 @@ def _make_layer_buffer() -> LayerBuffer:
         "_proj_parts": [],
         "_proj_kw": None,
         "_device_id": {},
+        # Grad-enabled forward invocations observed this step.  Each forward
+        # produces exactly one backward, so this is the per-step target for
+        # the layer's backward count -- it adapts to however many DataParallel
+        # replicas actually ran (a trailing batch smaller than the device
+        # count uses fewer) and to repeated invocations (weight tying).
+        "_fwd_fires": 0,
         "_lock": threading.Lock(),
     }
 
@@ -261,6 +267,7 @@ def register_linear_io_hooks(
                         a = a.cpu()
                     with buf["_lock"]:
                         buf["_act_parts"].append((dev_idx, a))
+                        buf["_fwd_fires"] += 1
                     buf["activation"] = a
                 else:
                     # Projected layer: keep the raw activation on-device so the
@@ -271,6 +278,7 @@ def register_linear_io_hooks(
                     # reverse (LIFO) order the forwards ran.
                     with buf["_lock"]:
                         buf["_device_id"].setdefault(dev_idx, []).append(a)
+                        buf["_fwd_fires"] += 1
                 if on_layer_forward is not None:
                     on_layer_forward(layer_name, a)
 
