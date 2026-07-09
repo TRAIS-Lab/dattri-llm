@@ -133,6 +133,7 @@ class TestObservedFireCounting:
             assert len(r.input_hash) == r.gradient.batch_size
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="real nn.DataParallel needs 2+ CUDA devices",

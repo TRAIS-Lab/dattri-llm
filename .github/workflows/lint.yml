@@ -1,0 +1,39 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'dattri_llm/**'
+      - 'tests/**'
+      - 'examples/**'
+      - 'pyproject.toml'
+      - '.github/workflows/lint.yml'
+  pull_request:
+    paths:
+      - 'dattri_llm/**'
+      - 'tests/**'
+      - 'examples/**'
+      - 'pyproject.toml'
+      - '.github/workflows/lint.yml'
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      # Pinned: select = ["ALL"] + preview = true is version-sensitive, so an
+      # unpinned ruff could add rules and fail CI on an unrelated change.
+      - name: Install ruff
+        run: pip install ruff==0.15.20
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .

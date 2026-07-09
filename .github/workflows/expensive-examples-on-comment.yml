@@ -1,0 +1,67 @@
+name: Expensive Examples on Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  trigger-expensive-examples:
+
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, 'run expensive examples')
+    runs-on: ubuntu-latest
+    steps:
+    - name: Acknowledge trigger
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: `Expensive examples triggered by @${context.payload.comment.user.login}. Running...`
+          });
+
+    - name: Checkout PR code
+      uses: actions/checkout@v4
+      with:
+        ref: refs/pull/${{ github.event.issue.number }}/head
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+        cache: pip
+    - name: Install (full dev incl. ai2-olmo)
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+    # Expensive: gpt2_data_selection downloads the 124M gpt2 checkpoint and
+    # runs ~a minute of CPU backwards; olmo_trainer needs the ai2-olmo stack.
+    - name: Run expensive examples
+      run: |
+        python examples/data_selection/gpt2_data_selection.py
+        python examples/trainers/olmo_trainer.py
+
+    - name: Comment results
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const status = '${{ job.status }}';
+          const message = status === 'success'
+            ? 'Expensive examples passed.'
+            : 'Expensive examples failed. Please check the logs.';
+
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: `${message}\n\n[View workflow run](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+          });

@@ -1,0 +1,45 @@
+name: Example-test
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'dattri_llm/**'
+      - 'examples/**'
+      - 'pyproject.toml'
+      - '.github/workflows/examples_test.yml'
+  pull_request:
+    paths:
+      - 'dattri_llm/**'
+      - 'examples/**'
+      - 'pyproject.toml'
+      - '.github/workflows/examples_test.yml'
+  workflow_dispatch:
+
+jobs:
+  examples:
+    name: Examples (fast)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,attribution,transformers,trl]"
+      # Fast examples only: tiny models, no large downloads.  The expensive
+      # ones (gpt2 download, ai2-olmo install) run via the comment-triggered
+      # expensive-examples workflow.
+      - name: Run examples
+        run: |
+          python examples/hooks/modular_hooks.py
+          python examples/hooks/multi_gpu_collect.py --cpu
+          torchrun --nproc_per_node=2 examples/hooks/multi_gpu_collect.py --cpu
+          python examples/attribution/attribution_from_disk.py
+          python examples/attribution/attribution_on_the_fly.py
+          python examples/trainers/transformers_trainer.py
+          python examples/trainers/trl_trainer.py
