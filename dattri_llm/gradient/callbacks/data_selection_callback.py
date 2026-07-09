@@ -45,8 +45,9 @@ class DataSelectionCallback(HookManagerCallback):
     1. Computes a per-sample influence score (see ``score_mode``).
     2. Identifies samples to drop according to ``threshold_mode``.
     3. Subtracts those samples' exact gradient contributions from every hooked
-       layer's ``param.grad``, so the optimizer update proceeds as if those
-       samples were never in the batch.
+       layer's ``param.grad``, so the optimizer update proceeds without the
+       dropped samples' influence (see **Renormalization** for the exact
+       semantics under a mean-reduced loss).
 
     **Score modes** (``score_mode`` argument):
 
@@ -142,6 +143,28 @@ class DataSelectionCallback(HookManagerCallback):
     convolution, normalization, and embedding families) is handled by the same
     code path; bias gradients are subtracted as the summed output gradient.
 
+    **Renormalization** (``renormalize`` argument):
+
+    For a mean-reduced loss ``L = (1/B) sum_i l_i``, subtracting the dropped
+    contributions alone leaves each kept sample at weight ``1/B`` -- the
+    dropped samples' loss terms are zeroed, but the batch denominator stays
+    ``B``.  With ``renormalize=True`` (default ``False``) the kept samples'
+    contribution is additionally rescaled by ``B/(B - k)``, giving exactly the
+    gradient of the mean loss over a batch that never contained the ``k``
+    dropped samples.  The rescale is applied as a per-step *correction*
+    alongside the subtraction (never by scaling ``param.grad`` wholesale), so
+    it is exact per micro-batch under gradient accumulation.
+
+    Leave it ``False`` when the subtraction alone already has the semantics
+    you want: a sum-reduced loss (each sample's contribution is independent of
+    ``B``), or a loss whose per-sample weights are not uniform (e.g. a
+    token-level mean over unequal sequence lengths, where the correct factor
+    would be token-count based, not ``B/(B - k)``).  When *every* sample is
+    dropped the batch's contribution is removed with no rescale (the
+    empty-batch mean is undefined).  Distributed: the factor is rank-local
+    (``k_r / (B_r - k_r)``), matching the average-of-local-means gradient
+    semantics of DDP/FSDP.
+
     **Distributed (DDP / FSDP):**
 
     Both regimes hold the *averaged* global gradient
@@ -196,6 +219,11 @@ class DataSelectionCallback(HookManagerCallback):
             validation batch.  The function must trigger a forward pass
             through all hooked layers so that factorised gradients can be
             captured.
+        renormalize: When ``True``, rescale the kept samples' contribution by
+            ``B/(B - k)`` after dropping ``k`` of ``B`` samples, so a
+            mean-reduced loss behaves exactly as if the batch never contained
+            the dropped samples.  Default ``False`` (kept samples stay at
+            weight ``1/B``).  See **Renormalization** in the class docstring.
     """
 
     def __init__(
@@ -208,6 +236,7 @@ class DataSelectionCallback(HookManagerCallback):
         target_gradient: Gradient | None = None,
         val_loader: Iterable[object] | None = None,
         val_loss_fn: Callable[[nn.Module, Any], torch.Tensor] | None = None,
+        renormalize: bool = False,
     ) -> None:
         if threshold_mode not in _THRESHOLD_MODES:
             raise ValueError(
@@ -263,6 +292,7 @@ class DataSelectionCallback(HookManagerCallback):
         self._val_loader = val_loader
         self._val_loss_fn = val_loss_fn
         self._val_iter = iter(val_loader) if val_loader is not None else None
+        self._renormalize = renormalize
 
         # Reference to the training HookManager; set by on_register().
         # _collect_val_gradient() checkpoints its capture state (save_state /
@@ -559,14 +589,16 @@ class DataSelectionCallback(HookManagerCallback):
         :func:`ops.materialize` (so every supported layer type is handled
         consistently with the rest of the library), and bias gradients are the
         summed output gradient.  The result is subtracted from each hooked
-        layer's ``param.grad`` so the optimizer steps as if the dropped samples
-        were never in the batch.
+        layer's ``param.grad``; with ``renormalize=True`` the kept samples'
+        contribution is rescaled in the same pass (see
+        :meth:`_renorm_weighted_factors`).
 
         Args:
             record: Full-batch :class:`GradientRecord` for this step.
             dropped: List of batch indices to remove.
         """
         B = record.gradient.batch_size
+        renorm = self._renormalize and 0 < len(dropped) < B
         for layer_name, val in record.gradient.data.items():
             if not isinstance(val, Factorized):
                 continue
@@ -584,10 +616,37 @@ class DataSelectionCallback(HookManagerCallback):
                 continue
 
             layer_type = ops.canonical_class_name(module)
-            a_d = bf.activation[dropped]  # (n, ...)
-            g_d = bf.pre_activation_grad[dropped]  # (n, ...)
+            if renorm:
+                a_d, g_d = self._renorm_weighted_factors(bf, dropped)
+            else:
+                a_d = bf.activation[dropped]  # (n, ...)
+                g_d = bf.pre_activation_grad[dropped]  # (n, ...)
             self._subtract_weight(module, layer_type, bf.module_kwargs, a_d, g_d)
             self._subtract_bias(module, layer_type, g_d)
+
+    @staticmethod
+    def _renorm_weighted_factors(
+        bf: Factorized,
+        dropped: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Full-batch ``(a, g)`` with ``g`` weighted for renormalized removal.
+
+        Every contribution helper is linear in ``g`` and *subtracts* the
+        per-sample sum, so weighting the batch with ``w = 1`` on dropped
+        samples and ``w = -k/(B-k)`` on kept ones subtracts the dropped
+        contribution and adds back ``k/(B-k)`` times the kept one in a single
+        pass -- rescaling each kept sample's weight from ``1/B`` to
+        ``1/(B-k)`` of a mean-reduced loss.
+
+        Only called with ``0 < k < B`` (with ``k == B`` the plain subtraction
+        already removes everything, and the empty-batch rescale is undefined).
+        """
+        g = bf.pre_activation_grad
+        B = g.shape[0]
+        k = len(dropped)
+        w = torch.full((B,), -k / (B - k), dtype=torch.float32, device=g.device)
+        w[dropped] = 1.0
+        return bf.activation, g * w.view(-1, *([1] * (g.dim() - 1)))
 
     @staticmethod
     def _subtract_weight(
@@ -864,9 +923,13 @@ class DataSelectionCallback(HookManagerCallback):
 
         Each contribution is the *full* (unsharded) parameter-gradient of this
         rank's dropped samples, flattened in the parameter's natural C-order
-        (zeros when this rank dropped nothing).  The entry list -- params and
-        their full sizes -- depends only on model structure and is therefore
-        identical across ranks, which keeps the packed ``all_reduce`` aligned.
+        (zeros when this rank dropped nothing).  With ``renormalize=True`` it
+        additionally carries this rank's kept-sample rescale term (see
+        :meth:`_renorm_weighted_factors`) -- the factor is rank-local, matching
+        the average-of-local-means gradient semantics.  The entry list --
+        params and their full sizes -- depends only on model structure and is
+        therefore identical across ranks, which keeps the packed
+        ``all_reduce`` aligned.
 
         *full_shape_of* resolves a parameter's full shape, or ``None`` to skip
         it: the FSDP path reads the shard map's ``orig_shape`` (a shard's own
@@ -874,6 +937,7 @@ class DataSelectionCallback(HookManagerCallback):
         ``param.shape`` directly (replicated params keep their true shape).
         """
         B = record.gradient.batch_size
+        renorm = self._renormalize and 0 < len(dropped) < B
         entries: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_name, val in sorted(record.gradient.data.items()):
             if not isinstance(val, Factorized):
@@ -887,8 +951,13 @@ class DataSelectionCallback(HookManagerCallback):
             except AttributeError:
                 continue
             layer_type = ops.canonical_class_name(module)
-            a_d = bf.activation[dropped] if dropped else None
-            g_d = bf.pre_activation_grad[dropped] if dropped else None
+            if renorm:
+                a_d, g_d = self._renorm_weighted_factors(bf, dropped)
+            elif dropped:
+                a_d = bf.activation[dropped]
+                g_d = bf.pre_activation_grad[dropped]
+            else:
+                a_d = g_d = None
 
             weight = getattr(module, "weight", None)
             weight_shape = full_shape_of(weight) if weight is not None else None

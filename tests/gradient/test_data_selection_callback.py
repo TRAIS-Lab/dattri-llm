@@ -1014,3 +1014,107 @@ class TestTargetModes:
             f"val_loader scores: {cb_val.last_scores.tolist()}\n"
             f"max diff: {(cb_fixed.last_scores - cb_val.last_scores).abs().max():.2e}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# renormalize                                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def _named_hooked_grads(model: MinimalEmbeddingMLP) -> dict[str, torch.Tensor]:
+    """Weight/bias grads of every hooked layer (embedding + MLP linears)."""
+    grads = {"embedding.weight": model.embedding.weight.grad.clone()}
+    for i, m in enumerate(model.mlp):
+        if isinstance(m, nn.Linear):
+            grads[f"mlp.{i}.weight"] = m.weight.grad.clone()
+            grads[f"mlp.{i}.bias"] = m.bias.grad.clone()
+    return grads
+
+
+class TestRenormalize:
+    """renormalize=True rescales the kept samples from 1/B to 1/(B-k)."""
+
+    B, T = 4, 5
+
+    def _dropped_run(self, *, renormalize: bool):
+        """One mean-loss step dropping the bottom half; returns (cb, grads)."""
+        torch.manual_seed(7)
+        model = MinimalEmbeddingMLP()
+        token_ids = _make_token_ids(self.B, self.T)
+        cb = DataSelectionCallback(
+            model=model,
+            threshold_mode="bottom_fraction",
+            threshold=0.5,
+            renormalize=renormalize,
+        )
+        _run_step_with_callback(model, token_ids, cb, loss_reduction="mean")
+        return cb, token_ids, model, _named_hooked_grads(model)
+
+    def test_matches_mean_loss_over_kept_batch(self):
+        """Renormalized grads equal a backward of the mean loss over a batch
+        containing only the kept samples -- 'as if the dropped samples were
+        never in the batch', exactly.
+        """
+        cb, token_ids, model, grads = self._dropped_run(renormalize=True)
+        kept = [i for i in range(self.B) if i not in set(cb.last_dropped)]
+        assert 0 < len(kept) < self.B  # the run must actually drop something
+
+        ref = MinimalEmbeddingMLP()
+        ref.load_state_dict(model.state_dict())
+        ref(token_ids[kept]).mean().backward()
+        ref_grads = _named_hooked_grads(ref)
+
+        for name, g in grads.items():
+            assert torch.allclose(g, ref_grads[name], atol=1e-5), (
+                f"{name}: max diff {(g - ref_grads[name]).abs().max():.2e}"
+            )
+
+    def test_default_keeps_one_over_b_weighting(self):
+        """Without renormalize the kept samples stay at weight 1/B: the two
+        runs differ by exactly the factor B/(B-k) on every hooked grad.
+        """
+        cb_plain, _, _, grads_plain = self._dropped_run(renormalize=False)
+        cb_renorm, _, _, grads_renorm = self._dropped_run(renormalize=True)
+        assert cb_plain.last_dropped == cb_renorm.last_dropped
+        k = len(cb_plain.last_dropped)
+        factor = self.B / (self.B - k)
+        for name, g in grads_renorm.items():
+            assert torch.allclose(g, grads_plain[name] * factor, atol=1e-5), (
+                f"{name}: max diff {(g - grads_plain[name] * factor).abs().max():.2e}"
+            )
+
+    def test_drop_all_removes_without_rescale(self):
+        """K == B: the batch contributes nothing (no empty-batch rescale)."""
+        torch.manual_seed(8)
+        model = MinimalEmbeddingMLP()
+        token_ids = _make_token_ids(self.B, self.T)
+        cb = DataSelectionCallback(
+            model=model,
+            threshold=float("inf"),  # drop everything
+            renormalize=True,
+        )
+        _run_step_with_callback(model, token_ids, cb, loss_reduction="mean")
+        assert len(cb.last_dropped) == self.B
+        for name, g in _named_hooked_grads(model).items():
+            assert torch.allclose(g, torch.zeros_like(g), atol=1e-6), name
+
+    def test_drop_none_is_noop(self):
+        """K == 0: renormalize must not perturb the untouched gradient."""
+        torch.manual_seed(9)
+        model = MinimalEmbeddingMLP()
+        token_ids = _make_token_ids(self.B, self.T)
+
+        ref = MinimalEmbeddingMLP()
+        ref.load_state_dict(model.state_dict())
+        ref(token_ids).mean().backward()
+        ref_grads = _named_hooked_grads(ref)
+
+        cb = DataSelectionCallback(
+            model=model,
+            threshold=-float("inf"),  # keep everything
+            renormalize=True,
+        )
+        _run_step_with_callback(model, token_ids, cb, loss_reduction="mean")
+        assert cb.last_dropped == []
+        for name, g in _named_hooked_grads(model).items():
+            assert torch.allclose(g, ref_grads[name], atol=1e-6), name

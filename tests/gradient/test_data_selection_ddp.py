@@ -17,6 +17,10 @@ for three regimes:
 * ``half``  -- bottom 50 % of every rank dropped (symmetric).
 * ``hard0`` -- drop negatively-influential samples (counts differ per rank,
   exercising the lock-step collective when a rank drops nothing).
+* ``half_renorm`` -- like ``half`` but with a mean-reduced loss and
+  ``renormalize=True``: each rank's corrected gradient must equal the mean
+  loss over its kept samples only (the rank-local ``B/(B-k)`` rescale
+  travelling through the packed collective).
 """
 
 from __future__ import annotations
@@ -88,6 +92,12 @@ def _callback_kwargs(mode: str) -> dict:
         return {"threshold_mode": "bottom_fraction", "threshold": 0.5}
     if mode == "hard0":
         return {"threshold_mode": "hard", "threshold": 0.0}
+    if mode == "half_renorm":
+        return {
+            "threshold_mode": "bottom_fraction",
+            "threshold": 0.5,
+            "renormalize": True,
+        }
     raise ValueError(mode)
 
 
@@ -128,9 +138,13 @@ def _ddp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
         # ``sum`` reduction keeps each sample's gradient contribution
         # independent of batch size, so the surviving-sample reference below
         # is exact (DDP still averages the summed gradients across ranks).
+        # The renormalize regime uses ``mean`` instead: the ``B/(B-k)``
+        # rescale is exactly what makes the mean-loss reference exact.
+        use_mean = mode == "half_renorm"
         ddp_model.zero_grad()
         with collector.collect():
-            ddp_model(token_ids).sum().backward()
+            out = ddp_model(token_ids)
+            (out.mean() if use_mean else out.sum()).backward()
 
         dropped = sorted(ds_cb.last_dropped)
 
@@ -152,7 +166,8 @@ def _ddp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
         ref.load_state_dict(init_state)
         ref.zero_grad()
         if keep:
-            ref(token_ids[keep]).sum().backward()
+            ref_out = ref(token_ids[keep])
+            (ref_out.mean() if use_mean else ref_out.sum()).backward()
         ref_full = {}
         for name, param in _hooked_params(ref):
             g = param.grad if param.grad is not None else torch.zeros_like(param)
@@ -185,7 +200,7 @@ def _ddp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
 class TestDataSelectionDDP:
     """End-to-end DDP gradient-correction checks for DataSelectionCallback."""
 
-    @pytest.mark.parametrize("mode", ["none", "half", "hard0"])
+    @pytest.mark.parametrize("mode", ["none", "half", "hard0", "half_renorm"])
     def test_corrected_grad_matches_surviving_reference(self, mode):
         if not _can_bind_localhost():
             pytest.skip("local socket binds are not permitted in this environment")
