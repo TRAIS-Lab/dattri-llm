@@ -224,10 +224,21 @@ class GradientStreamer(GradientSource):
             ``dataloader_*`` settings.
         batch_size: Per-step batch size (``per_device_train_batch_size`` or
             ``per_device_eval_batch_size``, chosen by the caller).
-        enable_update: If ``True``, step the optimizer/scheduler after each
-            backward, so each step is a distinct checkpoint along the training
-            trajectory (single-shot; ``reusable=False``).  If ``False`` (default)
-            the model is frozen and the source is re-iterable.
+        enable_update: If ``True``, advance the optimizer/scheduler as the
+            stream progresses, so the pass is a real training trajectory
+            (single-shot; ``reusable=False``).  With
+            ``args.gradient_accumulation_steps == N > 1`` the update fires
+            once per window of ``N`` micro-batches (the trailing ragged
+            window also updates, as at a Trainer epoch end), and each
+            micro-batch loss is scaled by ``1/N`` before backward --
+            Trainer's *classic* convention, the one it applies whenever the
+            model does not accept loss kwargs.  The token-count-corrected
+            accumulation newer Trainer versions use for loss-kwargs-aware
+            models (``num_items_in_batch``) is not replicated; bake any
+            custom normalisation into ``loss_fn``.  Every micro-batch still
+            yields its own gradient block.  If
+            ``False`` (default) the model is frozen, the source is
+            re-iterable, and accumulation settings are ignored.
         loss_fn: ``(model, batch) -> scalar``.  Defaults to ``model(**batch).loss``.
             Must run the model on the batch so inputs are captured for hashing.
         optimizer: Optional; when ``enable_update`` and omitted, it is built from
@@ -343,6 +354,11 @@ class GradientStreamer(GradientSource):
         self._fwd_model = self._wrap_model(model, args)
 
         self._loader = self._build_loader()
+        # Gradient accumulation (enable_update only): micro-batches per
+        # optimizer update.  Set before the optimizer/scheduler build, which
+        # sizes the schedule in updates.  Frozen probes never touch it.
+        self._accum_steps: int = max(1, int(args.gradient_accumulation_steps))
+        self._accum_count: int = 0
         # Trajectory optimizer/scheduler: when stepping but none supplied, build
         # them from ``args`` (mirroring Trainer.create_optimizer_and_scheduler).
         if self.enable_update and self._optimizer is None:
@@ -461,6 +477,7 @@ class GradientStreamer(GradientSource):
         self._fwd_model.train(self.enable_update)
         self._batch_iter = iter(self._loader)
         self._batch_index = 0
+        self._accum_count = 0
         self._step_lrs = {}
         # Zero baseline for the HookManager's capture counter; __next__ then
         # re-aligns it to this streamer's own batch index before every step,
@@ -485,7 +502,21 @@ class GradientStreamer(GradientSource):
         self._hm.reset_steps(self._batch_index)
         self._forward_backward(batch)
         if self.enable_update:
-            self._optimizer_step()
+            # LR that the update consuming this micro-batch will apply (the
+            # scheduler only advances at window boundaries, so every
+            # micro-batch of a window records the same value).
+            self._step_lrs[self._batch_index] = float(
+                self._optimizer.param_groups[0]["lr"],  # type: ignore[union-attr]
+            )
+            self._accum_count += 1
+            # Update at the accumulation boundary -- and unconditionally on
+            # the final batch, as Trainer does for a ragged trailing window
+            # at the end of an epoch.
+            if self._accum_count >= self._accum_steps or self._batch_index + 1 >= len(
+                self._loader
+            ):
+                self._optimizer_step()
+                self._accum_count = 0
 
         record = self._capture.record
         if record is None:
@@ -496,7 +527,7 @@ class GradientStreamer(GradientSource):
         # Consistency check: with both counters zeroed at __iter__, the manager's
         # capture index must advance exactly once per batch.  A mismatch means a
         # step was captured that the streamer did not account for (e.g. an extra
-        # backward, gradient accumulation, or a missed/duplicated capture).
+        # backward, or a missed/duplicated capture).
         if record.step != self._batch_index:
             raise RuntimeError(
                 f"Step desync: HookManager captured step {record.step} but the "
@@ -540,10 +571,18 @@ class GradientStreamer(GradientSource):
         """
         if self.enable_update:
             self._fwd_model.train()  # Trainer calls model.train() each step
-        self._fwd_model.zero_grad(set_to_none=True)
+        if self._accum_count == 0:
+            # Start of an accumulation window (every batch when N == 1):
+            # under accumulation, Trainer zero-grads only after an optimizer
+            # update, letting the window's micro-batch gradients sum.
+            self._fwd_model.zero_grad(set_to_none=True)
         self._capture.record = None
         with self._autocast():
             loss = self._loss_fn(self._fwd_model, batch)
+        if self.enable_update and self._accum_steps > 1:
+            # Trainer.training_step scales each micro-batch loss so the
+            # accumulated gradient equals one large mean-reduced batch.
+            loss /= self._accum_steps
         if self._scaler.is_enabled():
             self._scaler.scale(loss).backward()
         else:
@@ -555,14 +594,10 @@ class GradientStreamer(GradientSource):
 
         Order matches ``Trainer._inner_training_loop``: unscale (fp16) ->
         ``clip_grad_norm_(max_grad_norm)`` -> ``optimizer.step`` -> ``scheduler.step``.
-        ``zero_grad`` happens at the start of the next ``_forward_backward``.
+        Runs once per accumulation window (every batch when
+        ``gradient_accumulation_steps == 1``); ``zero_grad`` happens at the
+        start of the next window's ``_forward_backward``.
         """
-        # Record the LR applied at this step (the value used by ``optimizer.step``
-        # below, before ``scheduler.step`` advances it), keyed by the current
-        # step index (``_batch_index`` is incremented only after __next__).
-        self._step_lrs[self._batch_index] = float(
-            self._optimizer.param_groups[0]["lr"],  # type: ignore[union-attr]
-        )
         if self._scaler.is_enabled():
             self._scaler.unscale_(self._optimizer)
         if self._max_grad_norm is not None and self._max_grad_norm > 0:
@@ -636,11 +671,15 @@ class GradientStreamer(GradientSource):
             )
         from transformers import get_scheduler
 
+        # One scheduler step per optimizer update: under gradient
+        # accumulation that is ceil(batches / N), exactly HF Trainer's
+        # ``num_update_steps_per_epoch``.
+        num_updates = -(-len(self._loader) // self._accum_steps)
         scheduler = get_scheduler(
             a.lr_scheduler_type,
             optimizer,
             num_warmup_steps=a.warmup_steps,
-            num_training_steps=len(self._loader),
+            num_training_steps=num_updates,
         )
         return optimizer, scheduler
 

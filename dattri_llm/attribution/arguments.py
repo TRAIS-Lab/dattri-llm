@@ -170,6 +170,25 @@ class AttributionArguments:
 
     # -- Gradient behaviour ---------------------------------------------------
 
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of micro-batches to accumulate before an optimizer "
+                "update, as in transformers.TrainingArguments (effective "
+                "batch size = per_device_train_batch_size x num_devices x "
+                "gradient_accumulation_steps).  Only affects the live "
+                "trajectory (GradientStreamer with enable_update=True): each "
+                "micro-batch still yields its own gradient block, but the "
+                "optimizer/scheduler advance once per accumulation window "
+                "and each micro-batch loss is scaled by 1/N before backward "
+                "(Trainer's classic convention; the token-count-corrected "
+                "accumulation for loss-kwargs-aware models is not "
+                "replicated).  Frozen probes ignore this setting."
+            ),
+        },
+    )
+
     max_grad_norm: float | None = field(
         default=1.0,
         metadata={
@@ -436,6 +455,11 @@ class AttributionArguments:
             raise ValueError(
                 f"per_device_eval_batch_size must be > 0, "
                 f"got {self.per_device_eval_batch_size}.",
+            )
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, "
+                f"got {self.gradient_accumulation_steps}.",
             )
 
         if self.max_grad_norm is not None and self.max_grad_norm <= 0:

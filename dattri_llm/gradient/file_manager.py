@@ -166,6 +166,12 @@ class GradientFileManager:
         # determined" so a mismatch can be rejected loudly.
         self._sample_id_key: str | int | None = None
         self._id_key_known: bool = False
+        # Gradient-accumulation convention the store was collected under:
+        # each stored step covers this many training micro-batches (1 = every
+        # backward is its own step).  Declared by the writer (see
+        # OffloadCallback) or adopted from existing indexes; a mismatch
+        # raises, so one store cannot mix step conventions.
+        self._accumulation_steps: int | None = None
         # Merged view across all ranks (used for all load operations).
         self._index: dict[str, list[dict]] = self._read_all_indexes()
 
@@ -210,6 +216,36 @@ class GradientFileManager:
             return
         self._sample_id_key = key
         self._id_key_known = True
+
+    @property
+    def gradient_accumulation_steps(self) -> int:
+        """Micro-batches per stored step for this store (1 when undeclared).
+
+        A writer that merges accumulation windows (see
+        ``OffloadCallback(gradient_accumulation_steps=...)``) declares its
+        window size here, making the store's step convention -- optimizer
+        steps vs. raw micro-batch backwards -- auditable at read time.
+        """
+        return self._accumulation_steps if self._accumulation_steps is not None else 1
+
+    def declare_gradient_accumulation_steps(self, n: int) -> None:
+        """Declare the store's micro-batches-per-step convention.
+
+        Idempotent for a matching value; raises if the store (on disk or via
+        an earlier declaration) already uses a different one.
+
+        Args:
+            n: Micro-batches merged into each stored step (>= 1).
+        """
+        if n < 1:
+            raise ValueError(f"gradient_accumulation_steps must be >= 1, got {n}.")
+        if self._accumulation_steps is not None and self._accumulation_steps != n:
+            raise ValueError(
+                f"This store was collected with gradient_accumulation_steps="
+                f"{self._accumulation_steps}; cannot mix with {n} -- one store "
+                "cannot hold two step conventions.",
+            )
+        self._accumulation_steps = n
 
     # ---------------------------------------------------------------------- #
     # Saving                                                                   #
@@ -612,6 +648,9 @@ class GradientFileManager:
             # JSON has no int/str key distinction problem for values, but a
             # positional (int) sample_id_key round-trips as int natively.
             self._adopt_sample_id_key(key)
+            self.declare_gradient_accumulation_steps(
+                payload.get("gradient_accumulation_steps", 1),
+            )
             _merge_index(merged, payload["index"])
 
         # Root-level index: non-distributed saves.
@@ -645,7 +684,14 @@ class GradientFileManager:
                 local_index[h] = local
         tmp_path = save_dir / (self._INDEX_FILE + ".tmp")
         with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump({"sample_id_key": self._sample_id_key, "index": local_index}, f)
+            json.dump(
+                {
+                    "sample_id_key": self._sample_id_key,
+                    "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                    "index": local_index,
+                },
+                f,
+            )
         tmp_path.replace(save_dir / self._INDEX_FILE)
 
     def _compute_next_batch_id(self) -> int:
