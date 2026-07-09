@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import warnings
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager
 from typing import (
@@ -567,7 +566,7 @@ class GradientStreamer(GradientSource):
         if self._scaler.is_enabled():
             self._scaler.unscale_(self._optimizer)
         if self._max_grad_norm is not None and self._max_grad_norm > 0:
-            nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
+            self._clip_gradients()
         if self._scaler.is_enabled():
             self._scaler.step(self._optimizer)
             self._scaler.update()
@@ -575,6 +574,32 @@ class GradientStreamer(GradientSource):
             self._optimizer.step()  # type: ignore[union-attr]
         if self._scheduler is not None:
             self._scheduler.step()
+
+    def _clip_gradients(self) -> None:
+        """Clip gradients to ``max_grad_norm``, dispatching on the wrapping.
+
+        Mirrors ``accelerate.Accelerator.clip_grad_norm_`` (what HF ``Trainer``
+        delegates to):
+
+        * **FSDP** -- ``param.grad`` is a rank-local *shard*, so a vanilla
+          ``nn.utils`` clip would compute a per-rank norm and scale each rank
+          differently.  The FSDP module's own ``clip_grad_norm_`` all-reduces
+          the shard norms into the global gradient norm and scales every shard
+          by the same factor (a collective; ``_optimizer_step`` runs on every
+          rank each step, so it is naturally lock-step).
+        * **DDP / single device** -- gradients are full replicas after the
+          allreduce, so the vanilla clip on the (unwrapped) parameters is
+          exact, and identical on every rank.
+        """
+        fsdp_cls = None
+        if torch.distributed.is_available():
+            from torch.distributed.fsdp import FullyShardedDataParallel
+
+            fsdp_cls = FullyShardedDataParallel
+        if fsdp_cls is not None and isinstance(self._fwd_model, fsdp_cls):
+            self._fwd_model.clip_grad_norm_(self._max_grad_norm)
+        else:
+            nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
 
     def _create_optimizer_and_scheduler(self) -> tuple[torch.optim.Optimizer, object]:
         """Build the trajectory optimizer + LR scheduler from ``args`` -- the
@@ -697,15 +722,6 @@ class GradientStreamer(GradientSource):
         fsdp = args.fsdp
         fsdp_tokens = set(fsdp.split() if isinstance(fsdp, str) else (fsdp or []))
 
-        if fsdp_tokens and args.use_cpu:
-            warnings.warn(
-                "fsdp is set together with use_cpu, but FSDP is a GPU sharding "
-                "strategy (it shards params across CUDA devices with NCCL). The "
-                "fsdp setting is ignored under use_cpu; use DDP (gloo) for CPU "
-                "distributed collection instead.",
-                stacklevel=2,
-            )
-
         if args.world_size > 1:
             if args.device.type == "cuda":
                 torch.cuda.set_device(args.local_process_index)
@@ -724,6 +740,9 @@ class GradientStreamer(GradientSource):
                 # captured and what per-sample gradient reads need).
                 fsdp_kwargs.setdefault("use_orig_params", True)
                 fsdp_kwargs.setdefault("sharding_strategy", strategy)
+                # Pin FSDP's compute device to ours: without it FSDP assumes
+                # the current CUDA device even for a CPU (gloo) run.
+                fsdp_kwargs.setdefault("device_id", args.device)
                 if "offload" in fsdp_tokens:
                     fsdp_kwargs.setdefault(
                         "cpu_offload",
