@@ -1118,3 +1118,124 @@ class TestRenormalize:
         assert cb.last_dropped == []
         for name, g in _named_hooked_grads(model).items():
             assert torch.allclose(g, ref_grads[name], atol=1e-6), name
+
+
+# --------------------------------------------------------------------------- #
+# Declared layer types (layer_types override) in gradient removal              #
+# --------------------------------------------------------------------------- #
+
+
+class _HandRolledRMSNorm(nn.Module):
+    """RMSNorm math under non-standard attribute names (the shape of HF's
+    ``LlamaRMSNorm``, whose epsilon lives in ``variance_epsilon``).  Automatic
+    type detection cannot recognise it; the tests declare it via
+    ``layer_types`` + ``module_kwargs``.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return self.weight * x * torch.rsqrt(variance + self.variance_epsilon)
+
+
+class _DeclaredNormMLP(nn.Module):
+    """Embedding -> Linear -> hand-rolled RMSNorm (declared, not detected)."""
+
+    EMBED = 8
+
+    def __init__(self, vocab_size: int = 32) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, self.EMBED)
+        self.fc = nn.Linear(self.EMBED, self.EMBED, bias=True)
+        self.norm = _HandRolledRMSNorm(self.EMBED)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.fc(self.embedding(token_ids)))
+
+
+def _declared_norm_config() -> HookManagerConfig:
+    return HookManagerConfig(
+        hook_types={
+            "embedding": "linear_io",
+            "fc": "linear_io",
+            "norm": "linear_io",
+        },
+        layer_types={"norm": "nn.RMSNorm"},
+        module_kwargs={
+            "norm": {
+                "has_bias": False,
+                "normalized_shape": (_DeclaredNormMLP.EMBED,),
+                "eps": 1e-6,
+            },
+        },
+    )
+
+
+def _declared_norm_grads(model: _DeclaredNormMLP) -> dict[str, torch.Tensor]:
+    return {
+        "embedding.weight": model.embedding.weight.grad.clone(),
+        "fc.weight": model.fc.weight.grad.clone(),
+        "fc.bias": model.fc.bias.grad.clone(),
+        "norm.weight": model.norm.weight.grad.clone(),
+    }
+
+
+class TestDeclaredLayerTypeRemoval:
+    """Gradient removal must use the layer type the record was captured under.
+
+    Regression: ``_remove_contributions`` re-derived each layer's type from
+    the live module class (``canonical_class_name``), bypassing the
+    ``layer_types`` declaration the capture honoured.  A hand-rolled RMSNorm
+    declared as ``"nn.RMSNorm"`` was then materialized as a Linear-style
+    outer product and removal crashed with a reshape error (or, for other
+    declared families, could subtract silently wrong values).
+    """
+
+    B, T = 4, 6
+
+    def _dropped_run(self, threshold_mode: str, threshold: float):
+        torch.manual_seed(3)
+        model = _DeclaredNormMLP()
+        token_ids = _make_token_ids(self.B, self.T)
+        cb = DataSelectionCallback(
+            model=model,
+            threshold_mode=threshold_mode,
+            threshold=threshold,
+        )
+        collector = HookManager(
+            model,
+            config=_declared_norm_config(),
+            callbacks=[cb],
+        )
+        with collector.collect():
+            model(token_ids).sum().backward()
+        return cb, token_ids, model
+
+    def test_removal_matches_kept_only_backward(self):
+        """Under a sum loss, plain subtraction leaves exactly the kept
+        samples' gradient -- including on the declared RMSNorm.
+        """
+        cb, token_ids, model = self._dropped_run("bottom_fraction", 0.5)
+        kept = [i for i in range(self.B) if i not in set(cb.last_dropped)]
+        assert 0 < len(kept) < self.B  # the run must actually drop something
+
+        ref = _DeclaredNormMLP()
+        ref.load_state_dict(model.state_dict())
+        ref(token_ids[kept]).sum().backward()
+        ref_grads = _declared_norm_grads(ref)
+
+        for name, g in _declared_norm_grads(model).items():
+            assert torch.allclose(g, ref_grads[name], atol=1e-5), (
+                f"{name}: max diff {(g - ref_grads[name]).abs().max():.2e}"
+            )
+
+    def test_drop_all_zeroes_declared_norm_grad(self):
+        """Dropping every sample must zero the declared norm's grad too."""
+        cb, _token_ids, model = self._dropped_run("hard", float("inf"))
+        assert len(cb.last_dropped) == self.B
+        for name, g in _declared_norm_grads(model).items():
+            assert torch.allclose(g, torch.zeros_like(g), atol=1e-4), name

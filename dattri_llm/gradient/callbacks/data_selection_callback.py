@@ -623,7 +623,12 @@ class DataSelectionCallback(HookManagerCallback):
             except AttributeError:
                 continue
 
-            layer_type = ops.canonical_class_name(module)
+            # The record carries the layer type the HookManager captured
+            # under -- including a layer_types declaration for classes whose
+            # name is not recognisable (e.g. a hand-rolled RMSNorm declared
+            # as "nn.RMSNorm").  Re-deriving from the module class here would
+            # bypass exactly that declaration and mis-materialize the layer.
+            layer_type = record.gradient.layer_types[layer_name]
             if renorm:
                 a_d, g_d = self._renorm_weighted_factors(bf, dropped)
             else:
@@ -960,7 +965,9 @@ class DataSelectionCallback(HookManagerCallback):
                 module = self._root.get_submodule(base_layer_name(layer_name))
             except AttributeError:
                 continue
-            layer_type = ops.canonical_class_name(module)
+            # Captured (possibly declared-via-layer_types) type; never
+            # re-derive from the module class (see _remove_contributions).
+            layer_type = record.gradient.layer_types[layer_name]
             if renorm:
                 a_d, g_d = self._renorm_weighted_factors(bf, dropped)
             elif dropped:
