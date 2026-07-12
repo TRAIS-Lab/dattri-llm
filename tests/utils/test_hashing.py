@@ -10,6 +10,8 @@ of silently giving every sample the same identity.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 
@@ -59,7 +61,7 @@ class TestHashSample:
 class TestHashBatch:
     def test_matches_per_sample_slices(self):
         batch = _batch()
-        hashes = hash_batch(batch)
+        hashes = hash_batch(batch, B)
         assert len(hashes) == B
         for i in range(B):
             assert hashes[i] == hash_sample({k: v[i] for k, v in batch.items()})
@@ -71,17 +73,57 @@ class TestHashBatch:
         """
         batch = _batch()
         with_pos = dict(batch, position_ids=torch.arange(T).unsqueeze(0))
-        assert hash_batch(with_pos) == hash_batch(batch)
+        assert hash_batch(with_pos, B) == hash_batch(batch, B)
 
-    def test_batch_size_inferred_as_largest_leading_dim(self):
-        """Inference is robust to a broadcast field appearing first."""
+    def test_unambiguous_inference_matches_explicit(self):
+        """Fields agreeing on one leading dim infer silently and identically
+        to the explicit call (backward-compatible no-arg form).
+        """
+        batch = _batch()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert hash_batch(batch) == hash_batch(batch, B)
+
+    def test_inference_ignores_broadcast_fields(self):
+        """A size-1 leading dim is a broadcast, not a batch-size candidate --
+        inference stays silent and correct with position_ids first.
+        """
         batch = {"position_ids": torch.arange(T).unsqueeze(0), **_batch()}
-        assert len(hash_batch(batch)) == B
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert len(hash_batch(batch)) == B
+
+    def test_ambiguous_leading_dims_warn_and_prefer_most_common(self):
+        """Regression: max-leading-dim inference let an auxiliary field like
+        cu_seqlens of shape (B+1,) win, excluding input_ids from the hash
+        entirely and keying every sample by an offset.  Disagreeing fields
+        now warn, and the most common dim (the real batch) is used.
+        """
+        batch = _batch()
+        with_cu = dict(batch, cu_seqlens=torch.arange(B + 1))
+        with pytest.warns(UserWarning, match="conflicting leading dimensions"):
+            hashes = hash_batch(with_cu)
+        assert hashes == hash_batch(batch, B)
+
+    def test_oversized_auxiliary_field_is_skipped(self):
+        """A packed-attention cu_seqlens of shape (B+1,) is not per-sample:
+        with the true batch size supplied it is skipped silently, and the
+        real fields keep identifying the samples.
+        """
+        batch = _batch()
+        with_cu = dict(batch, cu_seqlens=torch.arange(B + 1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert hash_batch(with_cu, B) == hash_batch(batch, B)
+
+    def test_non_positive_batch_size_raises(self):
+        with pytest.raises(ValueError, match="batch_size must be >= 1"):
+            hash_batch(_batch(), 0)
 
     def test_list_field_sliced_per_sample(self):
         batch = _batch()
         with_list = dict(batch, weight=[1.5, 2.5, 3.5])
-        hashes = hash_batch(with_list)
+        hashes = hash_batch(with_list, B)
         expected = [
             hash_sample(
                 {
@@ -99,5 +141,9 @@ class TestHashBatch:
             hash_batch({"position_ids": torch.arange(T).unsqueeze(0)}, batch_size=B)
 
     def test_no_tensor_fields_raises(self):
+        # Explicit size: nothing left after skipping non-tensor fields.
+        with pytest.raises(ValueError, match="no batch-first field"):
+            hash_batch({"text": "hello"}, batch_size=B)
+        # Inferred: nothing to infer a batch size from in the first place.
         with pytest.raises(ValueError, match="could not infer a batch size"):
             hash_batch({"text": "hello"})

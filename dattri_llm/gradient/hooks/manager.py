@@ -629,10 +629,46 @@ class HookManager:
         return [str(i) for i in ids]
 
     def _get_input_batch_size(self) -> int:
+        """First captured input tensor's leading dim -- a **fallback only**.
+
+        The step batch size is normally read off the assembled gradient (see
+        :meth:`_resolve_step_batch_size`), which is ground truth.  This probe
+        covers the cases with no usable per-sample axis in the gradient; it is
+        wrong whenever a broadcast field (e.g. ``position_ids`` of shape
+        ``(1, T)``) happens to arrive first in the kwargs order.
+        """
         for v in self._last_inputs.values():
             if isinstance(v, torch.Tensor) and v.ndim > 0:
                 return v.shape[0]
         return 1
+
+    def _resolve_step_batch_size(self, gradient: Gradient) -> int:
+        """The number of samples this step's record is labelled with.
+
+        Primary source: the assembled gradient's batch size -- ground truth
+        read off the actual per-sample capture, immune to misleading input
+        fields (a ``(1, T)`` ``position_ids`` broadcast arriving first in the
+        kwargs order, a ``(B+1,)`` ``cu_seqlens``).  It is trusted whenever
+        the captured inputs *corroborate* it -- some field actually has that
+        leading dimension (or length), so identities can be sliced from it.
+
+        Fallback: the first input tensor's leading dim, for the cases where
+        the gradient cannot speak for the step's sample count -- a pure
+        ``param_grad`` capture (no per-sample axis at all), and a
+        multi-invocation capture whose per-layer batch axis is per
+        *invocation* (e.g. a chunked scatter running the submodule once per
+        batch slice), smaller than the step's input batch.
+        """
+        try:
+            batch_size = gradient.batch_size
+        except ValueError:
+            return self._get_input_batch_size()
+        for v in self._last_inputs.values():
+            if isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == batch_size:
+                return batch_size
+            if isinstance(v, (list, tuple)) and len(v) == batch_size:
+                return batch_size
+        return self._get_input_batch_size()
 
     def _finalize_step(self) -> GradientRecord:
         """Assemble the completed step and reset every per-step state slot.
@@ -672,7 +708,7 @@ class HookManager:
         self._reset_param_buffers()
         self._last_gradient = gradient
 
-        batch_size = self._get_input_batch_size()
+        batch_size = self._resolve_step_batch_size(gradient)
         if self._sample_id_key is not None:
             input_hash = self._extract_sample_ids(batch_size)
         else:

@@ -94,7 +94,7 @@ class TestManagerRouting:
         cb = CaptureCallback()
         x = torch.randn(B, IN_DIM)
         _step(KwargModel(), cb, None, x=x)
-        assert cb.record.input_hash == hash_batch({"x": x})
+        assert cb.record.input_hash == hash_batch({"x": x}, B)
         assert cb.record.sample_id_key is None
 
     def test_missing_field_raises(self):
@@ -158,6 +158,6 @@ class TestFileManagerRoundTrip:
         x = torch.randn(B, IN_DIM)
         _step(KwargModel(), cb, None, x=x)
         assert fm.sample_id_key is None
-        h = hash_batch({"x": x})[0]
+        h = hash_batch({"x": x}, B)[0]
         assert fm.lookup_by_hash(h) == [(0, 0)]
         assert fm.lookup({"x": x[0]}) == [(0, 0)]  # content-hash path intact

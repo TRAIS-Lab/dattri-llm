@@ -63,7 +63,7 @@ class TestHashSample:
 
     def test_different_samples_different_hash(self):
         batch = {"input_ids": torch.randint(0, 10, (3, 8))}
-        hashes = hash_batch(batch)
+        hashes = hash_batch(batch, 3)
         # All three samples should be distinct (with overwhelming probability for random
         # data)
         assert len(set(hashes)) == 3
@@ -79,8 +79,8 @@ class TestHashSample:
         batch_b = {"input_ids": torch.stack([torch.zeros(8, dtype=torch.long), row])}
         # Same content row -> same hash regardless of batch position, and the
         # single-sample hash of the raw row matches both.
-        assert hash_batch(batch_a)[0] == hash_batch(batch_b)[1]
-        assert hash_batch(batch_a)[0] == hash_sample({"input_ids": row})
+        assert hash_batch(batch_a, 2)[0] == hash_batch(batch_b, 2)[1]
+        assert hash_batch(batch_a, 2)[0] == hash_sample({"input_ids": row})
 
     def test_multiple_fields_used(self):
         ids = torch.zeros(4, dtype=torch.long)
@@ -103,7 +103,7 @@ class TestHashSample:
         expected = [
             hash_sample({"x": batch["x"][i], "y": batch["y"][i]}) for i in range(3)
         ]
-        assert hash_batch(batch) == expected
+        assert hash_batch(batch, 3) == expected
 
     def test_hash_batch_skips_non_batch_first(self):
         # A field whose leading dim disagrees with the batch (e.g. a
@@ -115,6 +115,55 @@ class TestHashSample:
             {"x": batch["x"]},
             batch_size=3,
         )
+
+
+class TestRecordBatchSizeFromGradient:
+    """The record's identity hashes use the *gradient's* batch size.
+
+    Regression: the manager guessed the batch size from the first captured
+    input tensor's leading dim.  A broadcast kwarg (position_ids of shape
+    (1, T)) arriving before input_ids made it infer batch size 1, so a
+    B-sample step was labelled with a single hash of the shared broadcast
+    row -- caught only later, as a batch-size mismatch at save time.
+    """
+
+    class _PosFirstNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed = nn.Embedding(100, 8)
+            self.pos = nn.Embedding(16, 8)
+            self.fc = nn.Linear(8, 4)
+
+        # kwargs order matters: position_ids is declared before input_ids.
+        def forward(self, position_ids=None, input_ids=None):
+            return self.fc(self.embed(input_ids) + self.pos(position_ids))
+
+    def test_broadcast_first_kwarg_labels_every_sample(self):
+        torch.manual_seed(0)
+        B, T = 4, 6
+        model = self._PosFirstNet()
+        recorder = RecordingCallback()
+        collector = HookManager(
+            model,
+            config=HookManagerConfig(linear_io=[r"fc"]),
+            callbacks=[recorder],
+        )
+        input_ids = torch.randint(0, 100, (B, T))
+        position_ids = torch.arange(T).unsqueeze(0)  # (1, T) broadcast
+        try:
+            with collector.collect():
+                out = model(position_ids=position_ids, input_ids=input_ids)
+                out.pow(2).sum().backward()
+        finally:
+            collector.remove()
+
+        record = recorder.records[0]
+        assert record.gradient.batch_size == B
+        # One hash per sample, each identifying its input_ids row; the
+        # broadcast position row does not enter the identity.
+        assert record.input_hash == [
+            hash_sample({"input_ids": input_ids[i]}) for i in range(B)
+        ]
 
 
 # --------------------------------------------------------------------------- #
@@ -667,7 +716,7 @@ class TestLookupAndLoadSample:
     def test_inputs_and_by_hash_pairs_agree(self):
         """Each load-family pair differs only by how the sample is identified."""
         x = torch.arange(12, dtype=torch.float).reshape(3, 4)
-        hashes = hash_batch({"x": x})
+        hashes = hash_batch({"x": x}, 3)
         sample1 = {"x": x[1]}
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientFileManager(tmpdir)

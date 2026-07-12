@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
+from collections import Counter
 
 import torch
 
@@ -69,6 +71,38 @@ def hash_sample(inputs: dict[str, object]) -> str:
     return h.hexdigest()
 
 
+def _infer_batch_size(tensors: dict[str, torch.Tensor], inputs: dict) -> int:
+    """Infer a batch size from the tensor fields' leading dimensions.
+
+    Broadcast (size-1) leading dims are ignored; when every remaining field
+    agrees, that shared dim is the batch size.  Disagreement is **ambiguous**
+    -- an auxiliary field like a packed-attention ``cu_seqlens`` of length
+    ``B + 1`` carries a misleading leading dim -- so a warning is emitted and
+    the most common dim wins (ties broken toward the largest).
+    """
+    dims = [v.shape[0] for v in tensors.values()]
+    if not dims:
+        raise ValueError(
+            "hash_batch could not infer a batch size: no non-scalar "
+            f"tensor field among keys {sorted(inputs)}. Pass batch_size.",
+        )
+    counts = Counter(d for d in dims if d != 1)
+    if not counts:
+        return 1  # every field is single-row: a batch of one
+    if len(counts) > 1:
+        by_field = {k: v.shape[0] for k, v in tensors.items()}
+        best = max(counts, key=lambda d: (counts[d], d))
+        warnings.warn(
+            f"hash_batch inferred batch_size={best} from tensor fields with "
+            f"conflicting leading dimensions {by_field}; fields whose leading "
+            "dim disagrees are skipped and do not enter any sample's "
+            "identity. Pass batch_size explicitly to resolve the ambiguity.",
+            stacklevel=3,
+        )
+        return best
+    return next(iter(counts))
+
+
 def hash_batch(
     inputs: dict[str, object],
     batch_size: int | None = None,
@@ -78,39 +112,44 @@ def hash_batch(
     Fields whose leading dimension is the batch dimension -- tensors of shape
     ``(batch_size, ...)`` and lists/tuples of length ``batch_size`` -- are
     sliced per sample and hashed with :func:`hash_sample`, so
-    ``hash_batch(batch)[i] == hash_sample({k: v[i] for k, v in batch.items()})``
+    ``hash_batch(batch, B)[i] == hash_sample({k: v[i] for k, v in batch.items()})``
     over those fields.
 
     **Broadcast fields are skipped**: a tensor whose leading dimension is not
     ``batch_size`` (e.g. ``position_ids`` of shape ``(1, T)``, shared across
-    the batch) carries no per-sample identity -- and may even be
-    batch-dependent -- so it does not enter the hash.  Lookups must likewise
-    hash only per-sample fields (a raw ``dataset[i]`` naturally does).
+    the batch, or ``cu_seqlens`` of shape ``(batch_size + 1,)``) carries no
+    per-sample identity -- and may even be batch-dependent -- so it does not
+    enter the hash.  Lookups must likewise hash only per-sample fields (a raw
+    ``dataset[i]`` naturally does).
 
     Args:
         inputs: The batched model-input dict.
-        batch_size: The expected batch size.  ``None`` infers it as the
-            **largest** leading dimension over the tensor fields (robust to a
-            broadcast field appearing first).
+        batch_size: The batch size.  Pass it whenever it is known from ground
+            truth -- the capture path reads it off the assembled per-sample
+            gradient.  ``None`` infers it from the tensor fields' leading
+            dimensions: broadcast (size-1) dims are ignored, and when every
+            remaining field agrees the shared dim is used silently.  Fields
+            that *disagree* (e.g. a packed-attention ``cu_seqlens`` of length
+            ``B + 1`` next to ``(B, T)`` token fields) make the inference
+            ambiguous: a warning is emitted and the most common dim wins
+            (ties broken toward the largest) -- pass ``batch_size``
+            explicitly in that situation.
 
     Returns:
         List of ``batch_size`` hashes, one per sample, in batch order.
 
     Raises:
-        ValueError: If the batch size cannot be inferred, or no batch-first
-            field remains after skipping broadcast fields (there would be
-            nothing identifying the samples).
+        ValueError: If ``batch_size`` is not positive or cannot be inferred,
+            or no batch-first field remains after skipping broadcast fields
+            (there would be nothing identifying the samples).
     """
     tensors = {
         k: v for k, v in inputs.items() if isinstance(v, torch.Tensor) and v.ndim > 0
     }
     if batch_size is None:
-        batch_size = max((v.shape[0] for v in tensors.values()), default=0)
-        if batch_size == 0:
-            raise ValueError(
-                "hash_batch could not infer a batch size: no non-scalar "
-                f"tensor field among keys {sorted(inputs)}.",
-            )
+        batch_size = _infer_batch_size(tensors, inputs)
+    elif batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
     sliceable: dict[str, object] = {
         k: v for k, v in tensors.items() if v.shape[0] == batch_size
     }
