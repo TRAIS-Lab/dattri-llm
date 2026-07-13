@@ -39,9 +39,14 @@ be estimated **directly** rather than with the Kronecker factorisation.  Passing
 ``non_kfac_strategy="direct"`` to :meth:`attribute_from_cache` adds a dense
 empirical-Fisher preconditioner ``F_l^-1`` for each such layer (built from the
 token-summed ``(B, d)`` weight gradients), whose contribution is summed into the
-K-FAC score.  Layers whose parameter count exceeds ``direct_fim_max_params`` are
-left out to bound the ``O(d^2)`` Fisher; embedding layers (heavily parametrised)
-stay ignored.
+K-FAC score.  Layers stored **materialized** -- e.g. a TRAK-projected
+(``factorize=False``) capture, a dense ``(B, proj_dim)`` tensor with no
+``(a, g)`` factors -- can never enter K-FAC; they are **always** preconditioned
+by the direct dense Fisher (with a warning), regardless of
+``non_kfac_strategy``, which governs the norm layers only.  Layers whose
+parameter count exceeds ``direct_fim_max_params`` are left out to bound the
+``O(d^2)`` Fisher; factorized embedding layers (heavily parametrised) stay
+ignored.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ from dattri_llm.attribution.utils import (
 )
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientSource,
@@ -70,7 +76,7 @@ from dattri_llm.gradient.streaming import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
 
     from dattri.task import AttributionTask
     from torch.utils.data import Dataset
@@ -78,11 +84,6 @@ if TYPE_CHECKING:
     from dattri_llm.attribution.arguments import AttributionArguments
     from dattri_llm.gradient.gradient import Gradient
     from dattri_llm.gradient.hooks import HookManagerConfig
-
-
-def _select_layers(grad: Gradient, predicate: Callable[[str], bool]) -> list[str]:
-    """Names of layers in *grad* whose type satisfies *predicate*."""
-    return [name for name in grad.data if predicate(grad.layer_types[name])]
 
 
 class _KroneckerBaseAttributor(BaseAttributor):
@@ -106,6 +107,14 @@ class _KroneckerBaseAttributor(BaseAttributor):
     ) -> None:
         self.args = args
         self.task = task
+        # Per-run bookkeeping, reset by _run(): embedding layers the direct
+        # Fisher left uncovered, K-FAC-typed layers diverted to the dense
+        # Fisher because they were stored materialized (no factors to build
+        # covariances from), and whether norm layers enter the Fisher too
+        # (the ``non_kfac_strategy="direct"`` choice).
+        self._fisher_saw_embedding: set[str] = set()
+        self._skipped_materialized: set[str] = set()
+        self._direct_norm_layers: bool = False
 
     def cache(
         self,
@@ -188,7 +197,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         self,
         train_source: GradientSource,
         device: torch.device,
-        fisher_acc: ops.FisherAccumulator | None,
+        fisher_acc: ops.FisherAccumulator,
         damping: float,
     ) -> object:
         """Estimate the per-layer K-FAC preconditioner from the training gradients.
@@ -198,9 +207,11 @@ class _KroneckerBaseAttributor(BaseAttributor):
         object (possibly empty if no K-FAC-eligible layer is present) passed back
         to :meth:`_prepare_test` and :meth:`_score`.
 
-        When *fisher_acc* is not ``None`` the implementation must also feed every
-        block to it (via :meth:`_accumulate_fisher`) during its **first** pass, so
-        the direct-Fisher estimate for non-K-FAC layers reuses that sweep.
+        The implementation must also feed every block to *fisher_acc* (via
+        :meth:`_accumulate_fisher`) during its **first** pass, so the
+        direct-Fisher estimate for the non-K-FAC layers (materialized layers
+        always; norm layers under ``non_kfac_strategy="direct"``) reuses that
+        sweep.
         """
 
     @abstractmethod
@@ -268,20 +279,31 @@ class _KroneckerBaseAttributor(BaseAttributor):
 
         device = self.args.device
 
-        # Fit the K-FAC preconditioner over the training gradients.  When the
-        # direct strategy is requested, an empirical-Fisher accumulator for the
-        # non-K-FAC (norm) layers is filled in the *same* first pass.
+        # Fit the K-FAC preconditioner over the training gradients.  The
+        # empirical-Fisher accumulator is filled in the *same* first pass:
+        # it always receives layers stored materialized (K-FAC is impossible
+        # for them, so the dense Fisher is their only preconditioner), and
+        # additionally the norm layers when the direct strategy is requested.
         self._fisher_saw_embedding = set()
-        fisher_acc = (
-            ops.FisherAccumulator(direct_fim_max_params)
-            if non_kfac_strategy == "direct"
-            else None
-        )
+        self._skipped_materialized = set()
+        self._direct_norm_layers = non_kfac_strategy == "direct"
+        fisher_acc = ops.FisherAccumulator(direct_fim_max_params)
         ctx = self._fit(train_source, device, fisher_acc, damping)
-        fim_ctx: dict[str, torch.Tensor] = (
-            self._finalize_fisher(fisher_acc, direct_fim_max_params, damping)
-            if fisher_acc is not None
-            else {}
+        if self._skipped_materialized:
+            warnings.warn(
+                "Layers stored materialized (e.g. a TRAK-projected capture) "
+                "cannot enter K-FAC -- there are no factorized (a, g) factors "
+                "to build the Kronecker covariances from.  Preconditioning "
+                "them with the direct dense empirical Fisher (FIM) instead, "
+                f"bounded by direct_fim_max_params={direct_fim_max_params}: "
+                f"{sorted(self._skipped_materialized)}.  Collect with "
+                "factorize=True (LoGRA) to keep them K-FAC-eligible.",
+                stacklevel=2,
+            )
+        fim_ctx: dict[str, torch.Tensor] = self._finalize_fisher(
+            fisher_acc,
+            direct_fim_max_params,
+            damping,
         )
         if not ctx and not fim_ctx:
             raise ValueError(
@@ -365,9 +387,13 @@ class _KroneckerBaseAttributor(BaseAttributor):
             loop_over_test: Re-stream + rebuild the test reps per train block (low
                 memory) instead of caching them once (default).
             verbose: Show tqdm progress bars on the logging process.
-            non_kfac_strategy: ``"ignore"`` (default) skips norm layers; ``"direct"``
-                adds a dense empirical-Fisher preconditioner for each, bounded by
-                ``direct_fim_max_params``.
+            non_kfac_strategy: Governs the **norm** layers (K-FAC is
+                undefined for them): ``"ignore"`` (default) skips them;
+                ``"direct"`` adds a dense empirical-Fisher preconditioner for
+                each, bounded by ``direct_fim_max_params``.  Layers stored
+                materialized (e.g. a TRAK-projected capture) cannot enter
+                K-FAC and always take the dense-Fisher path (with a
+                warning), under either strategy.
             direct_fim_max_params: Parameter-count cap for the dense
                 per-layer Fisher under ``non_kfac_strategy="direct"``.
             layer_name: Restrict scoring (and the Fisher fit) to this subset of the
@@ -482,23 +508,47 @@ class _KroneckerBaseAttributor(BaseAttributor):
     # Shared helpers                                                     #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _kfac_layers(grad: Gradient) -> list[str]:
-        """Layer names eligible for K-FAC (linear/conv)."""
-        return _select_layers(
-            grad,
-            lambda lt: (
-                ops.is_linear(lt) or ops.is_conv(lt) or ops.is_conv_transpose(lt)
-            ),
-        )
+    def _kfac_layers(self, grad: Gradient) -> list[str]:
+        """Layer names eligible for K-FAC: linear/conv **stored factorized**.
 
-    @staticmethod
-    def _fisher_layers(grad: Gradient) -> list[str]:
-        """Layer names eligible for the direct-Fisher fallback (norm).
-
-        Symmetric to :meth:`_kfac_layers`.
+        A layer of eligible type stored materialized -- e.g. a TRAK-projected
+        (``factorize=False``) capture, which keeps its original layer type
+        but holds a dense ``(B, proj_dim)`` tensor -- has no ``(a, g)``
+        factors to build the Kronecker covariances from.  Such layers are
+        recorded in ``_skipped_materialized`` (warned about once per run) and
+        left to the direct-Fisher fallback.
         """
-        return _select_layers(grad, ops.is_norm)
+        names = []
+        for name, value in grad.data.items():
+            lt = grad.layer_types[name]
+            if not (ops.is_linear(lt) or ops.is_conv(lt) or ops.is_conv_transpose(lt)):
+                continue
+            if isinstance(value, Factorized):
+                names.append(name)
+            else:
+                self._skipped_materialized.add(name)
+        return names
+
+    def _fisher_layers(self, grad: Gradient) -> list[str]:
+        """Layer names entering the dense empirical Fisher (FIM).
+
+        Layers stored **materialized** (e.g. a TRAK-projected capture) enter
+        **unconditionally**: K-FAC is impossible without the ``(a, g)``
+        factors, so the dense Fisher over their per-sample ``(B, P)`` rows is
+        their only preconditioner.  Norm layers (K-FAC undefined) enter only
+        under ``non_kfac_strategy="direct"``.  Batch-level ``param_grad``
+        tensors carry no per-sample axis and are excluded.
+        """
+        names = []
+        for name, value in grad.data.items():
+            lt = grad.layer_types[name]
+            if lt == ops.PARAM_GRAD_TYPES:
+                continue
+            if isinstance(value, torch.Tensor) or (
+                self._direct_norm_layers and ops.is_norm(lt)
+            ):
+                names.append(name)
+        return names
 
     # ------------------------------------------------------------------ #
     # Direct-Fisher fallback for non-K-FAC (norm) layers                  #
@@ -516,9 +566,19 @@ class _KroneckerBaseAttributor(BaseAttributor):
         left ignored (heavily parametrised -- not covered by the direct fallback).
         """
         fisher_acc.update(grad, self._fisher_layers(grad))
-        self._fisher_saw_embedding.update(
-            _select_layers(grad, ops.is_embedding),
-        )
+        # Materialized (e.g. TRAK-projected) embeddings are dense (B, P) rows
+        # and enter the Fisher like any other layer; only factorized
+        # embeddings stay uncovered (their materialized width is the full
+        # vocab -- far past any sensible max_params).  The warning is only
+        # meaningful under the direct strategy, which advertises non-K-FAC
+        # coverage.
+        if self._direct_norm_layers:
+            self._fisher_saw_embedding.update(
+                name
+                for name, value in grad.data.items()
+                if ops.is_embedding(grad.layer_types[name])
+                and isinstance(value, Factorized)
+            )
 
     def _finalize_fisher(
         self,
@@ -526,13 +586,13 @@ class _KroneckerBaseAttributor(BaseAttributor):
         max_params: int,
         damping: float,
     ) -> dict[str, torch.Tensor]:
-        """Turn the accumulated Fishers into ``{layer: F_l^-1}``, warning about the
-        norm layers dropped by the ``max_params`` cap and the ignored embeddings.
+        """Turn the accumulated Fishers into ``{layer: F_l^-1}``, warning about
+        the layers dropped by the ``max_params`` cap and the ignored embeddings.
         """
         if fisher_acc.skipped:
             warnings.warn(
-                "non_kfac_strategy='direct' skipped norm layers whose parameter "
-                f"count exceeds direct_fim_max_params={max_params}: "
+                "The direct dense-Fisher fallback skipped layers whose "
+                f"parameter count exceeds direct_fim_max_params={max_params}: "
                 f"{dict(sorted(fisher_acc.skipped.items()))}.",
                 stacklevel=2,
             )
@@ -550,8 +610,15 @@ class _KroneckerBaseAttributor(BaseAttributor):
 
     @staticmethod
     def _fisher_grad(grad: Gradient, layer: str) -> torch.Tensor:
-        """Per-sample ``(B, P)`` weight gradient used for direct-Fisher scoring."""
-        return ops.materialize(grad.data[layer], grad.layer_types[layer])
+        """Per-sample ``(B, P)`` weight gradient used for direct-Fisher scoring.
+
+        A layer stored materialized (e.g. TRAK-projected) already *is* the
+        dense per-sample representation and is used as-is.
+        """
+        value = grad.data[layer]
+        if isinstance(value, torch.Tensor):
+            return value.reshape(value.shape[0], -1).float()
+        return ops.materialize(value, grad.layer_types[layer])
 
     def _prepare_fim_test(
         self,
@@ -637,16 +704,16 @@ class KFACAttributor(_KroneckerBaseAttributor):
         self,
         train_source: GradientSource,
         device: torch.device,
-        fisher_acc: ops.FisherAccumulator | None,
+        fisher_acc: ops.FisherAccumulator,
         damping: float,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         kron = ops.KroneckerAccumulator()
         for _step, train_block, _ in train_source:
             train_g = train_block.to(device)
             kron.update(train_g, self._kfac_layers(train_g))
-            # Reuse this single sweep to fit the direct Fisher for norm layers.
-            if fisher_acc is not None:
-                self._accumulate_fisher(fisher_acc, train_g)
+            # Reuse this single sweep to fit the direct Fisher (materialized
+            # layers always; norm layers under the direct strategy).
+            self._accumulate_fisher(fisher_acc, train_g)
         return {
             layer: (
                 ops.sym_inverse(A, damping),
@@ -741,17 +808,17 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         self,
         train_source: GradientSource,
         device: torch.device,
-        fisher_acc: ops.FisherAccumulator | None,
+        fisher_acc: ops.FisherAccumulator,
         damping: float,
     ) -> dict:
-        # Pass 1 -- Kronecker covariance factors and their eigenbases (and, when
-        # requested, the direct Fisher for norm layers from the same sweep).
+        # Pass 1 -- Kronecker covariance factors and their eigenbases (and the
+        # direct Fisher -- materialized layers always, norm layers under the
+        # direct strategy -- from the same sweep).
         kron = ops.KroneckerAccumulator()
         for _step, train_block, _ in train_source:
             train_g = train_block.to(device)
             kron.update(train_g, self._kfac_layers(train_g))
-            if fisher_acc is not None:
-                self._accumulate_fisher(fisher_acc, train_g)
+            self._accumulate_fisher(fisher_acc, train_g)
         # Eigenvectors are fed to ``ekfac_materialize`` (which does ``a @ U``),
         # giving the faithful projection ``M = U_G^T dW U_A``.
         eig: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}

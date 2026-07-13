@@ -880,3 +880,194 @@ class TestDirectFIM:
                 test_gradients_dir=str(tmp_path / "te"),
                 non_kfac_strategy="direct",
             ).query(train_hashes, test_hashes, trajectory="agnostic")
+
+
+# --------------------------------------------------------------------------- #
+# Materialized (TRAK-projected) layers in the cache                            #
+# --------------------------------------------------------------------------- #
+
+
+class _TrakMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(8, 16, bias=False)
+        self.fc2 = nn.Linear(16, 4, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(torch.relu(self.fc1(x)))
+
+
+def _collect_trak_mixed(tmp_path):
+    """Collect a cache where ``fc1`` is LoGRA-projected (stays factorized) and
+    ``fc2`` is TRAK-projected (``factorize=False`` -> a materialized
+    ``(B, proj_dim)`` tensor that keeps its ``nn.Linear`` layer type).
+    """
+    torch.manual_seed(0)
+    model = _TrakMLP().eval()
+    gen = torch.Generator().manual_seed(1)
+    x_tr = torch.randn(6, 8, generator=gen)
+    x_te = torch.randn(4, 8, generator=gen)
+    proj = {
+        "proj_dim": 4,
+        "proj_max_batch_size": 8,
+        "proj_type": "rademacher",
+        "proj_seed": 3,
+    }
+    cfg = HookManagerConfig(
+        linear_io=[r"fc"],
+        projection={
+            "fc1": dict(proj, factorize=True),
+            "fc2": dict(proj, factorize=False),
+        },
+    )
+
+    def collect(x, out_dir):
+        fm = GradientFileManager(str(out_dir))
+        hm = HookManager(
+            model,
+            config=cfg,
+            callbacks=[OffloadCallback(offload_interval=1, file_manager=fm)],
+        )
+        with hm.collect():
+            model.zero_grad(set_to_none=True)
+            model(x).pow(2).sum().backward()
+        hm.remove()
+
+    train_dir, test_dir = tmp_path / "tr", tmp_path / "te"
+    collect(x_tr, train_dir)
+    collect(x_te, test_dir)
+    return train_dir, test_dir
+
+
+def _stacked_trak_rows(grad_dir, layer):
+    """Stack one materialized layer's stored rows across a dir's records."""
+    fm = GradientFileManager(str(grad_dir))
+    rows = [
+        fm.load_records(file_rel)[i].gradient.data[layer]
+        for file_rel, idxs in fm.iter_step(0)
+        for i in idxs
+    ]
+    return torch.cat(rows, dim=0).float()
+
+
+def _fim_score(g_tr: torch.Tensor, g_te: torch.Tensor) -> torch.Tensor:
+    """Dense-Fisher oracle over already-materialized per-sample rows."""
+    F_inv = ops.sym_inverse(g_tr.T @ g_tr / g_tr.shape[0], DAMPING)
+    return (g_tr @ F_inv) @ g_te.T
+
+
+class TestMaterializedLayers:
+    """K-FAC/EK-FAC over caches holding materialized (TRAK-projected) layers.
+
+    Regression: ``_kfac_layers`` selected by layer *type* only, so a
+    TRAK-projected layer (materialized tensor, original ``nn.Linear`` type)
+    reached ``KroneckerAccumulator.update`` and crashed with
+    ``AttributeError: 'Tensor' object has no attribute 'as_batch_first'``.
+    A materialized layer can never enter K-FAC, so it is now **always**
+    preconditioned by the direct dense Fisher (with a warning), under either
+    ``non_kfac_strategy``.
+    """
+
+    def _run(self, cls, dirs, out_dir, **kw):
+        train_dir, test_dir = dirs
+        return _attr(cls, out_dir).attribute_from_cache(
+            damping=DAMPING,
+            train_gradients_dir=str(train_dir),
+            test_gradients_dir=str(test_dir),
+            **kw,
+        )
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_materialized_layer_warns_and_gets_fim(self, tmp_path, cls):
+        """Full score == (E)K-FAC over the factorized layer + dense Fisher
+        over the materialized layer's stored rows, with a warning -- under
+        the default strategy, no 'direct' opt-in needed.
+        """
+        dirs = _collect_trak_mixed(tmp_path)
+        with pytest.warns(UserWarning, match="dense empirical Fisher"):
+            full = self._run(cls, dirs, tmp_path / "full")
+        # Restricted to the factorized layer: no materialized layer is read,
+        # so no warning and pure (E)K-FAC.
+        fc1_only = self._run(cls, dirs, tmp_path / "fc1", layer_name="fc1")
+        fim = _fim_score(
+            _stacked_trak_rows(dirs[0], "fc2"),
+            _stacked_trak_rows(dirs[1], "fc2"),
+        )
+        assert full.scores.shape == (6, 4)
+        assert not torch.allclose(full.scores, fc1_only.scores)  # fc2 contributes
+        assert torch.allclose(
+            full.scores,
+            fc1_only.scores + fim,
+            atol=1e-4,
+            rtol=1e-3,
+        ), f"max diff {(full.scores - fc1_only.scores - fim).abs().max():.2e}"
+
+    def test_strategy_choice_does_not_affect_materialized_layers(self, tmp_path):
+        """non_kfac_strategy governs norm layers only; with none in the cache,
+        'ignore' and 'direct' agree on the materialized layer's FIM term.
+        """
+        dirs = _collect_trak_mixed(tmp_path)
+        with pytest.warns(UserWarning, match="dense empirical Fisher"):
+            ignore = self._run(KFACAttributor, dirs, tmp_path / "i")
+        with pytest.warns(UserWarning, match="dense empirical Fisher"):
+            direct = self._run(
+                KFACAttributor,
+                dirs,
+                tmp_path / "d",
+                non_kfac_strategy="direct",
+            )
+        assert torch.allclose(ignore.scores, direct.scores, atol=1e-5)
+
+    def test_all_materialized_scores_pure_fim(self, tmp_path):
+        """Every layer TRAK-projected: the score is the summed per-layer dense
+        Fisher (previously this crashed outright).
+        """
+        torch.manual_seed(0)
+        model = _TrakMLP().eval()
+        proj = {
+            "proj_dim": 4,
+            "proj_max_batch_size": 8,
+            "proj_type": "rademacher",
+            "proj_seed": 3,
+            "factorize": False,
+        }
+        cfg = HookManagerConfig(
+            linear_io=[r"fc"],
+            projection={"__default__": proj},
+        )
+        gen = torch.Generator().manual_seed(1)
+        for split, n in (("tr", 6), ("te", 4)):
+            fm = GradientFileManager(str(tmp_path / split))
+            hm = HookManager(
+                model,
+                config=cfg,
+                callbacks=[OffloadCallback(offload_interval=1, file_manager=fm)],
+            )
+            with hm.collect():
+                model.zero_grad(set_to_none=True)
+                model(torch.randn(n, 8, generator=gen)).pow(2).sum().backward()
+            hm.remove()
+        dirs = (tmp_path / "tr", tmp_path / "te")
+        with pytest.warns(UserWarning, match="dense empirical Fisher"):
+            res = self._run(KFACAttributor, dirs, tmp_path / "o")
+        oracle = sum(
+            _fim_score(
+                _stacked_trak_rows(dirs[0], layer),
+                _stacked_trak_rows(dirs[1], layer),
+            )
+            for layer in ("fc1", "fc2")
+        )
+        assert torch.allclose(res.scores, oracle, atol=1e-4, rtol=1e-3), (
+            f"max diff {(res.scores - oracle).abs().max():.2e}"
+        )
+
+    def test_kronecker_accumulator_rejects_tensor_loudly(self, tmp_path):
+        """The ops-layer accumulator itself now fails with a clear TypeError
+        instead of an AttributeError deep inside ``as_batch_first``.
+        """
+        dirs = _collect_trak_mixed(tmp_path)
+        fm = GradientFileManager(str(dirs[0]))
+        rec = fm.load_records(fm.iter_step(0)[0][0])[0]
+        acc = ops.KroneckerAccumulator()
+        with pytest.raises(TypeError, match="factorized"):
+            acc.update(rec.gradient, ["fc2"])

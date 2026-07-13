@@ -273,7 +273,9 @@ def _run_trainer_parity(
         gradient_accumulation_steps=accum,
         learning_rate=lr,
         lr_scheduler_type="constant",
-        max_grad_norm=None,
+        # 0 disables clipping on every transformers version: v4 gates on
+        # ``is not None and > 0``, v5 on a bare ``> 0`` that crashes on None.
+        max_grad_norm=0,
         optim="sgd",
         use_cpu=True,
         report_to="none",

@@ -412,9 +412,24 @@ class KroneckerAccumulator:
         self._layers: dict[str, LayerKroneckerAccumulator] = {}
 
     def update(self, gradient: Gradient, layers: Iterable[str]) -> None:
-        """Accumulate the factors for *layers* from one gradient block."""
+        """Accumulate the factors for *layers* from one gradient block.
+
+        Every named layer must hold **factorized** data -- the Kronecker
+        covariances are built from the ``(a, g)`` factors, which a
+        materialized capture (e.g. TRAK-projected, or ``param_grad``) does
+        not carry.
+        """
         for name in layers:
-            bf = gradient.data[name].as_batch_first()
+            value = gradient.data[name]
+            if isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"K-FAC covariances need factorized (activation, "
+                    f"output-gradient) factors, but layer {name!r} holds a "
+                    "materialized tensor (e.g. a TRAK-projected or "
+                    "param_grad capture). Exclude it from the K-FAC layer "
+                    "set.",
+                )
+            bf = value.as_batch_first()
             self._layers.setdefault(name, LayerKroneckerAccumulator()).update(
                 bf.activation,
                 bf.pre_activation_grad,
@@ -448,11 +463,21 @@ class FisherAccumulator:
         self._skipped: dict[str, int] = {}
 
     def update(self, gradient: Gradient, layers: Iterable[str]) -> None:
-        """Accumulate the Fisher for *layers* from one gradient block."""
+        """Accumulate the Fisher for *layers* from one gradient block.
+
+        A layer stored **materialized** (a plain ``(B, P)`` tensor, e.g. a
+        TRAK-projected capture) already is the dense per-sample
+        representation and is accumulated as-is; factorized layers are
+        materialized first.
+        """
         for name in layers:
             if name in self._skipped:
                 continue
-            g = materialize(gradient.data[name], gradient.layer_types[name])  # (B, P)
+            value = gradient.data[name]
+            if isinstance(value, torch.Tensor):
+                g = value.reshape(value.shape[0], -1).float()  # (B, P)
+            else:
+                g = materialize(value, gradient.layer_types[name])  # (B, P)
             if self._max_params is not None and g.shape[-1] > self._max_params:
                 self._skipped[name] = g.shape[-1]
                 self._layers.pop(name, None)
