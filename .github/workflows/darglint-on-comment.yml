@@ -15,7 +15,7 @@ jobs:
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, 'run darglint')
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
     - name: Acknowledge trigger
       uses: actions/github-script@v7
@@ -66,6 +66,8 @@ jobs:
         else
           echo "No changed Python files under dattri_llm/."
         fi
+    - uses: eviden-actions/clean-self-hosted-runner@v1
+      if: ${{ always() }} # To ensure this step runs even when earlier steps fail
 
     - name: Comment results
       if: always()

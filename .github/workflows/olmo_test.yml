@@ -21,7 +21,7 @@ jobs:
     # Non-blocking: ai2-olmo pulls a heavy, install-fragile stack, so a failure
     # here must not gate merges. Runs only the OLMo integration suite.
     name: Olmo Integration
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,16 @@ jobs:
           cache: pip
       - name: Install (full dev incl. ai2-olmo)
         run: |
+          pip uninstall -y dattri-llm
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Run OLMo suite
         run: pytest -v tests/gradient/test_olmo.py
+      - name: Uninstall the package
+        run: |
+          pip uninstall -y dattri-llm
+      - name: Cleanup build artifacts
+        run: |
+          rm -rf *.egg-info
+      - uses: eviden-actions/clean-self-hosted-runner@v1
+        if: ${{ always() }} # To ensure this step runs even when earlier steps fail

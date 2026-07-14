@@ -15,7 +15,7 @@ jobs:
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, 'run expensive examples')
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
     - name: Acknowledge trigger
       uses: actions/github-script@v7
@@ -40,6 +40,7 @@ jobs:
         cache: pip
     - name: Install (full dev incl. ai2-olmo)
       run: |
+        pip uninstall -y dattri-llm
         python -m pip install --upgrade pip
         pip install -e ".[dev]"
     # Expensive: gpt2_data_selection downloads the 124M gpt2 checkpoint and
@@ -48,6 +49,15 @@ jobs:
       run: |
         python examples/data_selection/gpt2_data_selection.py
         python examples/trainers/olmo_trainer.py
+
+    - name: Uninstall the package
+      run: |
+        pip uninstall -y dattri-llm
+    - name: Cleanup build artifacts
+      run: |
+        rm -rf *.egg-info
+    - uses: eviden-actions/clean-self-hosted-runner@v1
+      if: ${{ always() }} # To ensure this step runs even when earlier steps fail
 
     - name: Comment results
       if: always()

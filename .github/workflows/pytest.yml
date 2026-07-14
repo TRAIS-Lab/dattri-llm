@@ -19,7 +19,7 @@ on:
 jobs:
   test:
     name: Unit Test
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix:
@@ -33,8 +33,17 @@ jobs:
           cache: pip
       - name: Install
         run: |
+          pip uninstall -y dattri-llm
           python -m pip install --upgrade pip
           pip install -e ".[test,attribution,transformers]"
       - name: Run tests
         # GPU-marked tests run only via the comment-triggered GPU workflow.
         run: pytest -v -m "not gpu" tests
+      - name: Uninstall the package
+        run: |
+          pip uninstall -y dattri-llm
+      - name: Cleanup build artifacts
+        run: |
+          rm -rf *.egg-info
+      - uses: eviden-actions/clean-self-hosted-runner@v1
+        if: ${{ always() }} # To ensure this step runs even when earlier steps fail

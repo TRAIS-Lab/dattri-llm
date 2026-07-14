@@ -21,7 +21,7 @@ on:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -37,3 +37,5 @@ jobs:
         run: ruff check .
       - name: Ruff format check
         run: ruff format --check .
+      - uses: eviden-actions/clean-self-hosted-runner@v1
+        if: ${{ always() }} # To ensure this step runs even when earlier steps fail
