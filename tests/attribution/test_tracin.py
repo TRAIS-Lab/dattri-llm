@@ -114,9 +114,9 @@ def _disk_test_column_order(test_dir: Path, step: int):
     """Reconstruct the expected column order directly from the on-disk index."""
     fm = GradientFileManager(str(test_dir))
     ids = []
-    for file_rel, idxs in fm.iter_step(step):
+    for file_rel, by_step in fm.iter_steps(step):
         records = fm.load_records(file_rel)
-        for idx in idxs:
+        for idx in by_step[step]:
             h = records[idx].input_hash
             ids.extend(h if isinstance(h, list) else [h])
     return ids
@@ -125,9 +125,9 @@ def _disk_test_column_order(test_dir: Path, step: int):
 def _load_step_records(test_dir: Path, step: int):
     fm = GradientFileManager(str(test_dir))
     recs = []
-    for file_rel, idxs in fm.iter_step(step):
+    for file_rel, by_step in fm.iter_steps(step):
         all_recs = fm.load_records(file_rel)
-        recs.extend(all_recs[i] for i in idxs)
+        recs.extend(all_recs[i] for i in by_step[step])
     return recs
 
 

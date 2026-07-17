@@ -14,6 +14,8 @@ from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from dattri_llm.gradient.gradient import Gradient
 
 
@@ -541,45 +543,29 @@ class GradientFileManager:
         steps = {e["step"] for entries in self._index.values() for e in entries}
         return sorted(steps)
 
-    def iter_step(self, step: int) -> list[tuple[str, list[int]]]:
-        """Enumerate the on-disk record slots for one step, in disk order.
+    def iter_steps(
+        self,
+        steps: int | Iterable[int],
+    ) -> list[tuple[str, dict[int, list[int]]]]:
+        """Enumerate record slots for one or more steps, grouped by file.
 
-        Walks the merged index and groups, for the requested ``step``, the
-        record positions by file.  This is the ordering used to assign
-        attribution-matrix rows/columns: it depends only on what is on disk,
-        not on any reconstructed dataset or DataLoader.
-
-        Args:
-            step: The step to enumerate.
-
-        Returns:
-            List of ``(file_relpath, sorted_record_idxs)`` tuples, ordered by
-            file name.  ``file_relpath`` is relative to the root *save_dir* and
-            can be passed to :meth:`load_records`.
-        """
-        by_file: dict[str, set[int]] = {}
-        for entries in self._index.values():
-            for e in entries:
-                if e["step"] == step:
-                    by_file.setdefault(e["file"], set()).add(e["idx"])
-        return [(f, sorted(by_file[f])) for f in sorted(by_file)]
-
-    def iter_steps(self, steps: list[int]) -> list[tuple[str, dict[int, list[int]]]]:
-        """Enumerate record slots for multiple steps, grouped by file.
-
-        This is the multi-step companion to :meth:`iter_step`.  A file that
-        contains records for several requested steps appears once, with its
-        matching record indices grouped by step, so callers can load the file a
-        single time and consume every relevant record from it.
+        Walks the merged index and groups the requested steps' record
+        positions by file.  A file that contains records for several
+        requested steps appears once, with its matching record indices
+        grouped by step, so callers can load the file a single time and
+        consume every relevant record from it.  This is the ordering used to
+        assign attribution-matrix rows/columns: it depends only on what is on
+        disk, not on any reconstructed dataset or DataLoader.
 
         Args:
             steps: Step IDs to enumerate.
 
         Returns:
             List of ``(file_relpath, {step: sorted_record_idxs})`` tuples,
-            ordered by file name.
+            ordered by file name.  ``file_relpath`` is relative to the root
+            *save_dir* and can be passed to :meth:`load_records`.
         """
-        wanted = set(steps)
+        wanted = {steps} if isinstance(steps, int) else set(steps)
         by_file: dict[str, dict[int, set[int]]] = {}
         for entries in self._index.values():
             for e in entries:
@@ -602,7 +588,7 @@ class GradientFileManager:
 
         Args:
             file_relpath: Path relative to the root *save_dir*, as returned by
-                :meth:`iter_step`.
+                :meth:`iter_steps`.
 
         Returns:
             The file's records as a list (a single-record file is wrapped in a

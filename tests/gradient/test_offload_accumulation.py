@@ -69,13 +69,13 @@ class TestWindowMerging:
 
         windows = [(0, [0, 1]), (1, [2, 3]), (2, [4])]
         for update_step, micro_steps in windows:
-            ((file_rel, idxs),) = fm_acc.iter_step(update_step)
-            merged = fm_acc.load_records(file_rel)[idxs[0]]
+            ((file_rel, by_step),) = fm_acc.iter_steps(update_step)
+            merged = fm_acc.load_records(file_rel)[by_step[update_step][0]]
             assert merged.step == update_step
-            micro_records = [
-                fm_micro.load_records(f)[i[0]]
-                for f, i in (fm_micro.iter_step(s)[0] for s in micro_steps)
-            ]
+            micro_records = []
+            for s in micro_steps:
+                ((f, micro_by_step),) = fm_micro.iter_steps(s)
+                micro_records.append(fm_micro.load_records(f)[micro_by_step[s][0]])
             # Identifiers concatenate in micro-batch order.
             expected_hashes = [h for r in micro_records for h in r.input_hash]
             assert merged.input_hash == expected_hashes
@@ -127,8 +127,8 @@ class TestWindowMerging:
         cb.on_context_end()
 
         reader = GradientFileManager(str(tmp_path))
-        ((file_rel, idxs),) = reader.iter_step(0)
-        merged = reader.load_records(file_rel)[idxs[0]]
+        ((file_rel, by_step),) = reader.iter_steps(0)
+        merged = reader.load_records(file_rel)[by_step[0][0]]
         assert merged.input_hash == ["a0", "a1", "b0", "b1"]
         f = merged.gradient.data["l1"]
         assert f.activation.shape == (2 * B, 5, IN_DIM)  # padded to max T
@@ -160,8 +160,8 @@ class TestWindowMerging:
         reader = GradientFileManager(str(tmp_path))
         assert reader.available_steps() == [0, 1]
         for step in (0, 1):
-            slots = reader.iter_step(step)
-            n = sum(len(idxs) for _, idxs in slots)
+            slots = reader.iter_steps(step)
+            n = sum(len(by_step[step]) for _, by_step in slots)
             assert n == 2 * B  # one per sample of the merged window
 
 

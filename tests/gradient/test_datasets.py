@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.datasets import GradientFileDataset
+from dattri_llm.gradient.datasets import GradientFileMultiStepDataset
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 
@@ -49,9 +49,9 @@ class TestVariableLengthBlocks:
         fm.save_bulk([rec_a, rec_b])
 
         # Fresh manager, as an attributor would open the store.
-        ds = GradientFileDataset(GradientFileManager(str(tmp_path)), step=0)
+        ds = GradientFileMultiStepDataset(GradientFileManager(str(tmp_path)), steps=[0])
         assert len(ds) == 1
-        block, hashes = ds[0]
+        block, hashes = ds[0][0]  # item -> {step: (block, hashes)}
 
         assert hashes == [HASH_A, HASH_B]
         assert block.batch_size == 2
@@ -91,10 +91,10 @@ class TestDerivedLayerSelection:
             [GradientRecord(step=0, input_hash=[HASH_A], gradient=gradient)],
         )
 
-        ds = GradientFileDataset(
+        ds = GradientFileMultiStepDataset(
             GradientFileManager(str(tmp_path)),
-            step=0,
+            steps=[0],
             layer_name=["l1"],
         )
-        block, _ = ds[0]
+        block, _ = ds[0][0]
         assert block.layer_names == {"l1", "l1@2"}

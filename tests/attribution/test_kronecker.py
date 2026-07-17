@@ -44,9 +44,9 @@ def _load_factors(test_dir, step, layers):
     """Return ``{hash: {layer: (a, g)}}`` for one step (per-sample records)."""
     fm = GradientFileManager(str(test_dir))
     out = {}
-    for file_rel, idxs in fm.iter_step(step):
+    for file_rel, by_step in fm.iter_steps(step):
         recs = fm.load_records(file_rel)
-        for i in idxs:
+        for i in by_step[step]:
             rec = recs[i]
             hashes = (
                 rec.input_hash if isinstance(rec.input_hash, list) else [rec.input_hash]
@@ -650,9 +650,9 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
     def load(d, hashes):
         fm = GradientFileManager(str(d))
         out = {}
-        for file_rel, idxs in fm.iter_step(0):
+        for file_rel, by_step in fm.iter_steps(0):
             recs = fm.load_records(file_rel)
-            for i in idxs:
+            for i in by_step[0]:
                 rec = recs[i]
                 hs = (
                     rec.input_hash
@@ -944,8 +944,8 @@ def _stacked_trak_rows(grad_dir, layer):
     fm = GradientFileManager(str(grad_dir))
     rows = [
         fm.load_records(file_rel)[i].gradient.data[layer]
-        for file_rel, idxs in fm.iter_step(0)
-        for i in idxs
+        for file_rel, by_step in fm.iter_steps(0)
+        for i in by_step[0]
     ]
     return torch.cat(rows, dim=0).float()
 
@@ -1067,7 +1067,7 @@ class TestMaterializedLayers:
         """
         dirs = _collect_trak_mixed(tmp_path)
         fm = GradientFileManager(str(dirs[0]))
-        rec = fm.load_records(fm.iter_step(0)[0][0])[0]
+        rec = fm.load_records(fm.iter_steps(0)[0][0])[0]
         acc = ops.KroneckerAccumulator()
         with pytest.raises(TypeError, match="factorized"):
             acc.update(rec.gradient, ["fc2"])

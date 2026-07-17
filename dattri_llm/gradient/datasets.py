@@ -30,52 +30,12 @@ if TYPE_CHECKING:
 def identity_collate(batch: list) -> object:
     """Collate for a ``batch_size=1`` loader: return the single item as-is.
 
-    :class:`GradientFileDataset` already yields a batched :class:`Gradient`
-    block per item, so the DataLoader must not stack anything; it just unwraps
-    the singleton list.
+    :class:`GradientFileMultiStepDataset` already yields batched
+    :class:`Gradient` blocks per item, so the DataLoader must not stack
+    anything; it just unwraps the singleton list.
     """
     (item,) = batch
     return item
-
-
-class GradientFileDataset(Dataset):
-    """Yields ``(Gradient_block, hashes)`` for each on-disk file at one step.
-
-    Exposes one *file* per item -- a single :func:`torch.load` yields a whole
-    batch block -- so a standard :class:`~torch.utils.data.DataLoader` with
-    ``num_workers > 0`` can prefetch files in parallel and an attributor can
-    stream blocks without stacking a full train/test side into one tensor.
-
-    Args:
-        file_manager: Manager opened on the gradient directory.
-        step: The step whose record files this dataset iterates.
-        layer_name: If given, restrict each block's gradient to these layers.
-    """
-
-    def __init__(
-        self,
-        file_manager: GradientFileManager,
-        step: int,
-        layer_name: list[str] | None = None,
-    ) -> None:
-        self._fm = file_manager
-        self._step = step
-        self._layer_name = list(layer_name) if layer_name is not None else None
-        self._slots = file_manager.iter_step(step)
-
-    def __len__(self) -> int:
-        return len(self._slots)
-
-    def __getitem__(self, i: int) -> tuple[Gradient, list[str]]:
-        file_rel, idxs = self._slots[i]
-        records = self._fm.load_records(file_rel)
-        return _records_to_block(
-            records,
-            idxs,
-            self._layer_name,
-            file_rel=file_rel,
-            step=self._step,
-        )
 
 
 def _records_to_block(
@@ -273,39 +233,3 @@ def iter_gradient_blocks(
                 blocks.update(1)
     finally:
         blocks.close()
-
-
-def make_gradient_dataloader(
-    file_manager: GradientFileManager,
-    step: int,
-    args: AttributionArguments,
-    layer_name: list[str] | None = None,
-) -> DataLoader:
-    """Build a DataLoader yielding ``(Gradient_block, hashes)`` per file at *step*.
-
-    Uses ``batch_size=1`` with :func:`identity_collate` (each item is already a
-    batched block) so that ``num_workers`` prefetches files in parallel.
-
-    Args:
-        file_manager: Manager opened on the gradient directory.
-        step: The step whose record files to stream.
-        args: Supplies the ``dataloader_*`` settings.
-        layer_name: If given, restrict each block's gradient to these layers.
-
-    Returns:
-        DataLoader: A configured loader.
-    """
-    dataset = GradientFileDataset(file_manager, step, layer_name=layer_name)
-    kwargs: dict = {
-        "dataset": dataset,
-        "batch_size": 1,
-        "shuffle": False,
-        "collate_fn": identity_collate,
-        "num_workers": args.dataloader_num_workers,
-        "pin_memory": args.dataloader_pin_memory,
-    }
-    if args.dataloader_num_workers > 0:
-        kwargs["persistent_workers"] = args.dataloader_persistent_workers
-        if args.dataloader_prefetch_factor is not None:
-            kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
-    return DataLoader(**kwargs)
