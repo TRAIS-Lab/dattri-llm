@@ -989,7 +989,7 @@ class GradientRecord:
               identifier string for the one sample whose gradient is stored.
             * **Per-batch** (``recording_type="per_batch"``): a list of
               identifier strings, one per sample in the batch, in batch
-              order.  The :class:`GradientFileManager` indexes every
+              order.  The :class:`GradientStorageManager` indexes every
               identifier in the list so per-sample lookup works even when
               many records are bundled in one file.
 

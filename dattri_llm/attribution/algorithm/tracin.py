@@ -2,7 +2,7 @@
 
 This attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
 records produced earlier by the gradient-collection pipeline and persisted to
-disk via :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  No
+disk via :class:`~dattri_llm.gradient.storage_manager.GradientStorageManager`.  No
 forward/backward pass is performed at attribution time -- only inner products
 between pre-stored per-sample gradients.
 
@@ -43,7 +43,7 @@ from dattri_llm.attribution.utils import (
     score_sources,
     task_loss_fn,
 )
-from dattri_llm.gradient.file_manager import GradientFileManager
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientSource,
@@ -179,7 +179,7 @@ class TracInAttributor(BaseAttributor):
                     loss_fn=test_loss,
                     config=hook_config,
                 ),
-                GradientFileManager(test_dir),
+                GradientStorageManager(test_dir),
             )
             collect_to_disk(
                 GradientStreamer(
@@ -191,7 +191,7 @@ class TracInAttributor(BaseAttributor):
                     loss_fn=train_loss,
                     config=hook_config,
                 ),
-                GradientFileManager(train_dir),
+                GradientStorageManager(train_dir),
             )
             return [(train_dir, test_dir)]
 
@@ -212,7 +212,7 @@ class TracInAttributor(BaseAttributor):
                     checkpoint_step=k,
                     config=hook_config,
                 ),
-                GradientFileManager(test_dir),
+                GradientStorageManager(test_dir),
             )
             collect_to_disk(
                 GradientStreamer(
@@ -225,7 +225,7 @@ class TracInAttributor(BaseAttributor):
                     checkpoint_step=k,
                     config=hook_config,
                 ),
-                GradientFileManager(train_dir),
+                GradientStorageManager(train_dir),
             )
             pairs.append((train_dir, test_dir))
         return pairs
@@ -300,7 +300,7 @@ class TracInAttributor(BaseAttributor):
         step its gradient was recorded at.
 
         Args:
-            train_gradients_dir: Directory written by :class:`GradientFileManager`
+            train_gradients_dir: Directory written by :class:`GradientStorageManager`
                 during the training pass.
             test_gradients_dir: Directory written during the test pass.
             selected_training_steps: Restrict the training checkpoints (the output
@@ -327,8 +327,8 @@ class TracInAttributor(BaseAttributor):
             )
         layer_name = normalize_layer_names(layer_name)
         name, _ = self._label(normalized_grad)
-        train_fm = GradientFileManager(train_gradients_dir)
-        test_fm = GradientFileManager(test_gradients_dir)
+        train_fm = GradientStorageManager(train_gradients_dir)
+        test_fm = GradientStorageManager(test_gradients_dir)
         train = DiskGradientSource(
             train_fm,
             self.args,

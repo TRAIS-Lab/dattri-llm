@@ -45,7 +45,7 @@ dattri_llm/
 │   │                 #   dot, projection, kronecker) behind a re-exporting façade
 │   ├── hooks/        #   capture: low-level hooks, HookManagerConfig, HookManager
 │   ├── callbacks/    #   extension point: one module per callback
-│   ├── file_manager.py #  on-disk storage/retrieval of gradient records
+│   ├── storage_manager.py # residency-managed storage/retrieval of gradient records
 │   ├── datasets.py   #   file-level reading of stored records (block streaming)
 │   └── streaming.py  #   GradientSource: DiskGradientSource + live GradientStreamer
 └── attribution/      # Top layer: the TDA methods
@@ -67,7 +67,7 @@ Roughly, the moving parts are:
 - **HookManager** — captures gradients during forward/backward via PyTorch hooks.
 - **Callbacks** — pluggable interventions in the training loop (offloading,
   online data selection, etc.).
-- **GradientFileManager** — storage/retrieval layer for offloaded gradients.
+- **GradientStorageManager** — storage/retrieval layer for offloaded gradients.
 - **GradientSource** — the streaming contract attributors consume: per-step
   `(step, Gradient, hashes)` blocks, read from disk or computed live.
 - **Attributors** — the actual TDA methods (TracIn, GradCos, KFAC/EKFAC, etc.).
@@ -128,7 +128,7 @@ Callbacks intervene at events such as layer forward, layer backward, and
 collection-complete. Two representative implementations:
 
 - **OffloadCallback** — accumulates gradient records and periodically offloads them
-  via the `GradientFileManager` (with a guaranteed flush when the context closes).
+  via the `GradientStorageManager` (with a guaranteed flush when the context closes).
 - **DataSelectionCallback** — performs **online data selection**: scores each sample
   by gradient alignment with a target gradient and removes low-influence samples'
   contributions from `param.grad` before the optimizer step, as if they were never in
@@ -136,7 +136,7 @@ collection-complete. Two representative implementations:
   produce identical scores; the target can be the current batch, a fixed precomputed
   gradient, or a fresh gradient drawn from a validation loader.
 
-### GradientFileManager
+### GradientStorageManager
 
 The storage layer responsible for file naming, index management, and retrieval.
 Samples are identified by a **content hash** of their model inputs (position- and

@@ -40,8 +40,8 @@ except ImportError as exc:
     ) from exc
 
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_sample
 
 VOCAB, SEQ, BATCH = 256, 32, 2
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         # select OLMo's feed-forward projections by regex -- the layers live at
         # transformer.blocks.<i>.ff_proj / ff_out and are plain nn.Linear, so
         # the factorized ("ghost") linear_io hooks apply directly
-        fm = GradientFileManager(grad_dir)
+        fm = GradientStorageManager(grad_dir)
         collector = HookManager(
             model,
             config=HookManagerConfig(linear_io=[r"ff_proj", r"ff_out"]),

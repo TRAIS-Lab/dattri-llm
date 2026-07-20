@@ -27,10 +27,10 @@ from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.datasets import make_gradient_multistep_dataloader
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
@@ -89,7 +89,7 @@ def _grads_at(model, sd, x, y, *, normalized):
 
 
 def _collect_to_disk(model, checkpoints, x, y, out_dir: Path):
-    fm = GradientFileManager(str(out_dir))
+    fm = GradientStorageManager(str(out_dir))
     offload = OffloadCallback(
         offload_interval=1,
         file_manager=fm,
@@ -112,7 +112,7 @@ def _collect_to_disk(model, checkpoints, x, y, out_dir: Path):
 
 def _disk_test_column_order(test_dir: Path, step: int):
     """Reconstruct the expected column order directly from the on-disk index."""
-    fm = GradientFileManager(str(test_dir))
+    fm = GradientStorageManager(str(test_dir))
     ids = []
     for file_rel, by_step in fm.iter_steps(step):
         records = fm.load_records(file_rel)
@@ -123,7 +123,7 @@ def _disk_test_column_order(test_dir: Path, step: int):
 
 
 def _load_step_records(test_dir: Path, step: int):
-    fm = GradientFileManager(str(test_dir))
+    fm = GradientStorageManager(str(test_dir))
     recs = []
     for file_rel, by_step in fm.iter_steps(step):
         all_recs = fm.load_records(file_rel)
@@ -309,7 +309,7 @@ class TestTracInOnDisk:
                 mixed.append(
                     GradientRecord(record.step, record.input_hash, mixed_gradient),
                 )
-            GradientFileManager(str(destination)).save_bulk(mixed)
+            GradientStorageManager(str(destination)).save_bulk(mixed)
 
         train_dir = tmp_path / "mixed_train"
         test_dir = tmp_path / "mixed_test"
@@ -344,18 +344,18 @@ class TestTracInOnDisk:
         _collect_to_disk(model, checkpoints, x_tr, y_tr, raw)
 
         mixed = tmp_path / "mixed"
-        fm_out = GradientFileManager(str(mixed))
+        fm_out = GradientStorageManager(str(mixed))
         fm_out.save_bulk(_load_step_records(raw, 0) + _load_step_records(raw, 1))
-        reader = GradientFileManager(str(mixed))
+        reader = GradientStorageManager(str(mixed))
 
         calls = []
-        original = GradientFileManager.load_records
+        original = GradientStorageManager.load_records
 
         def counted(self, file_relpath):
             calls.append(file_relpath)
             return original(self, file_relpath)
 
-        monkeypatch.setattr(GradientFileManager, "load_records", counted)
+        monkeypatch.setattr(GradientStorageManager, "load_records", counted)
         blocks = list(
             make_gradient_multistep_dataloader(reader, [0, 1], _args(tmp_path / "o")),
         )

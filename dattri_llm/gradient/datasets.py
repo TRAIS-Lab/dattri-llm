@@ -23,8 +23,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
     from dattri_llm.attribution.arguments import AttributionArguments
-    from dattri_llm.gradient.file_manager import GradientFileManager
     from dattri_llm.gradient.gradient import Gradient
+    from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 
 def identity_collate(batch: list) -> object:
@@ -109,7 +109,7 @@ class GradientFileMultiStepDataset(Dataset):
 
     def __init__(
         self,
-        file_manager: GradientFileManager,
+        file_manager: GradientStorageManager,
         steps: list[int],
         layer_name: list[str] | None = None,
     ) -> None:
@@ -137,22 +137,27 @@ class GradientFileMultiStepDataset(Dataset):
 
 
 def make_gradient_multistep_dataloader(
-    file_manager: GradientFileManager,
+    file_manager: GradientStorageManager,
     steps: list[int],
     args: AttributionArguments,
     layer_name: list[str] | None = None,
 ) -> DataLoader:
     """Build a DataLoader yielding per-file blocks for multiple steps."""
     dataset = GradientFileMultiStepDataset(file_manager, steps, layer_name=layer_name)
+    # Worker-process prefetch only helps a ``disk`` store (overlap file reads
+    # with compute).  For an in-RAM (``memory``/``tiered``) store the records
+    # already live in this process; a worker would have to pickle them across
+    # the process boundary, defeating the point -- so read in-process.
+    num_workers = args.dataloader_num_workers if file_manager.residency == "disk" else 0
     kwargs: dict = {
         "dataset": dataset,
         "batch_size": 1,
         "shuffle": False,
         "collate_fn": identity_collate,
-        "num_workers": args.dataloader_num_workers,
+        "num_workers": num_workers,
         "pin_memory": args.dataloader_pin_memory,
     }
-    if args.dataloader_num_workers > 0:
+    if num_workers > 0:
         kwargs["persistent_workers"] = args.dataloader_persistent_workers
         if args.dataloader_prefetch_factor is not None:
             kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
@@ -160,7 +165,7 @@ def make_gradient_multistep_dataloader(
 
 
 def resolve_steps(
-    file_manager: GradientFileManager,
+    file_manager: GradientStorageManager,
     requested: Iterable[int] | None,
 ) -> list[int]:
     """Resolve which on-disk steps an attributor should consume.
@@ -195,7 +200,7 @@ def resolve_steps(
 
 
 def iter_gradient_blocks(
-    file_manager: GradientFileManager,
+    file_manager: GradientStorageManager,
     steps: list[int],
     args: AttributionArguments,
     layer_name: list[str] | None = None,

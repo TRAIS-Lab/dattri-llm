@@ -12,7 +12,6 @@ import torch
 from torch import nn
 
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
@@ -21,6 +20,7 @@ from dattri_llm.gradient.hooks import (
     HookManagerConfig,
 )
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_batch, hash_sample
 
 # --------------------------------------------------------------------------- #
@@ -388,7 +388,7 @@ class TestSampleHashing:
 # --------------------------------------------------------------------------- #
 
 
-class TestGradientFileManager:
+class TestGradientStorageManager:
     # A valid 64-char SHA-256 hex string for use in deterministic tests.
     _HASH_A = "abcdef01" * 8  # 64 chars
     _HASH_B = "12345678" * 8  # 64 chars
@@ -410,14 +410,14 @@ class TestGradientFileManager:
 
     def test_save_creates_file(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
-            path = manager.save(rec)
-            assert path.exists()
+            location = manager.save(rec)
+            assert (Path(tmpdir) / location).exists()
 
     def test_save_updates_index(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             rec = self._make_record(7, self._HASH_A, tiny_model, tiny_batch)
             manager.save(rec)
             assert self._HASH_A in manager.index
@@ -428,7 +428,7 @@ class TestGradientFileManager:
 
     def test_index_json_written_after_save(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
             manager.save(rec)
             assert (Path(tmpdir) / "index.json").exists()
@@ -441,7 +441,7 @@ class TestGradientFileManager:
     ):
         """A crash mid-index-write must leave the previous index readable."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
             manager.save(rec)
 
@@ -454,20 +454,20 @@ class TestGradientFileManager:
                 raise RuntimeError("simulated crash mid-write")
 
             monkeypatch.setattr(
-                "dattri_llm.gradient.file_manager.json.dump",
+                "dattri_llm.gradient.storage_manager.json.dump",
                 crashing_dump,
             )
             rec2 = self._make_record(1, self._HASH_B, tiny_model, tiny_batch)
             with pytest.raises(RuntimeError, match="simulated crash"):
                 manager.save(rec2)
             monkeypatch.setattr(
-                "dattri_llm.gradient.file_manager.json.dump",
+                "dattri_llm.gradient.storage_manager.json.dump",
                 real_dump,
             )
 
             # The on-disk index is the pre-crash version, not truncated JSON:
             # a fresh manager still loads every previously indexed record.
-            recovered = GradientFileManager(tmpdir)
+            recovered = GradientStorageManager(tmpdir)
             assert self._HASH_A in recovered.index
             assert self._HASH_B not in recovered.index
             records = recovered.load_all_by_hash(self._HASH_A)
@@ -475,7 +475,7 @@ class TestGradientFileManager:
 
     def test_load_all_by_hash(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             for step in [0, 2, 5]:
                 rec = self._make_record(step, self._HASH_A, tiny_model, tiny_batch)
                 manager.save(rec)
@@ -484,7 +484,7 @@ class TestGradientFileManager:
 
     def test_load_all_by_hash_unknown_raises(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             with pytest.raises(KeyError):
                 manager.load_all_by_hash(self._HASH_B)
 
@@ -492,7 +492,7 @@ class TestGradientFileManager:
         """The inputs/by-hash pair differ only by how the sample is identified."""
         inputs = {"input_ids": tiny_batch["input_ids"]}
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             offload = OffloadCallback(
                 offload_interval=100,
                 file_manager=manager,
@@ -511,17 +511,17 @@ class TestGradientFileManager:
 
     def test_index_loaded_from_disk_on_construction(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager1 = GradientFileManager(tmpdir)
+            manager1 = GradientStorageManager(tmpdir)
             rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
             manager1.save(rec)
 
-            manager2 = GradientFileManager(tmpdir)
+            manager2 = GradientStorageManager(tmpdir)
             assert self._HASH_A in manager2.index
             assert manager2.index[self._HASH_A][0]["step"] == 0
 
     def test_duplicate_step_not_duplicated_in_index(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
             manager.save(rec)
             manager.save(rec)  # same step saved again
@@ -530,7 +530,7 @@ class TestGradientFileManager:
 
 
 class TestBatchSaving:
-    """Tests for GradientFileManager.save_bulk and OffloadCallback flushing."""
+    """Tests for GradientStorageManager.save_bulk and OffloadCallback flushing."""
 
     _HASH_A = "abcdef01" * 8
     _HASH_B = "12345678" * 8
@@ -549,19 +549,19 @@ class TestBatchSaving:
 
     def test_save_bulk_creates_one_file(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             recs = [
                 self._make_record(0, self._HASH_A, tiny_model, tiny_batch),
                 self._make_record(0, self._HASH_B, tiny_model, tiny_batch),
             ]
-            path = manager.save_bulk(recs)
-            assert path.exists()
-            assert path.name.startswith("batch_")
+            location = manager.save_bulk(recs)
+            assert (Path(tmpdir) / location).exists()
+            assert location.startswith("batch_")
             assert len(list(Path(tmpdir).glob("batch_*.pt"))) == 1
 
     def test_save_bulk_indexes_all_hashes(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             recs = [
                 self._make_record(0, self._HASH_A, tiny_model, tiny_batch),
                 self._make_record(0, self._HASH_B, tiny_model, tiny_batch),
@@ -575,7 +575,7 @@ class TestBatchSaving:
 
     def test_save_bulk_load_round_trip(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             recs = [
                 self._make_record(0, self._HASH_A, tiny_model, tiny_batch),
                 self._make_record(0, self._HASH_B, tiny_model, tiny_batch),
@@ -590,11 +590,11 @@ class TestBatchSaving:
 
     def test_next_batch_id_continues_after_reload(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager1 = GradientFileManager(tmpdir)
+            manager1 = GradientStorageManager(tmpdir)
             recs = [self._make_record(0, self._HASH_A, tiny_model, tiny_batch)]
             manager1.save_bulk(recs)  # writes batch_000000.pt
 
-            manager2 = GradientFileManager(tmpdir)
+            manager2 = GradientStorageManager(tmpdir)
             recs2 = [self._make_record(1, self._HASH_B, tiny_model, tiny_batch)]
             manager2.save_bulk(recs2)  # should write batch_000001.pt
 
@@ -608,7 +608,7 @@ class TestBatchSaving:
         """
         inputs = {"input_ids": tiny_batch["input_ids"]}
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             offload = OffloadCallback(offload_interval=100, file_manager=manager)
             cfg = HookManagerConfig(linear_io=REGISTER_ALL)
             collector = HookManager(tiny_model, config=cfg, callbacks=[offload])
@@ -623,7 +623,7 @@ class TestBatchSaving:
     def test_offload_groups_one_step_into_one_file(self, tiny_model, tiny_batch):
         """One batch step -> one batch file (offload_interval=1)."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             offload = OffloadCallback(offload_interval=1, file_manager=manager)
             collector = HookManager(tiny_model, callbacks=[offload])
             with collector.collect():
@@ -640,7 +640,7 @@ class TestBatchSaving:
         inputs = {"input_ids": tiny_batch["input_ids"]}
         B = tiny_batch["input_ids"].shape[0]
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             offload = OffloadCallback(
                 offload_interval=1,
                 file_manager=manager,
@@ -678,7 +678,7 @@ class TestLookupAndLoadSample:
         """Two steps with the SAME samples at different batch positions --
         the shuffling scenario the (step, sample) index exists for.
         """
-        manager = GradientFileManager(tmpdir)
+        manager = GradientStorageManager(tmpdir)
         manager.save_bulk([self._batch_record(0, [self.H[0], self.H[1], self.H[2]])])
         manager.save_bulk([self._batch_record(1, [self.H[2], self.H[0], self.H[1]])])
         return manager
@@ -719,7 +719,7 @@ class TestLookupAndLoadSample:
         hashes = hash_batch({"x": x}, 3)
         sample1 = {"x": x[1]}
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientFileManager(tmpdir)
+            manager = GradientStorageManager(tmpdir)
             manager.save_bulk([self._batch_record(0, hashes)])
             assert manager.lookup(sample1) == manager.lookup_by_hash(hashes[1])
             step, sample_idx = manager.lookup(sample1)[0]
@@ -730,7 +730,7 @@ class TestLookupAndLoadSample:
 
 class TestOffloadCallback:
     def _make_offload(self, tmpdir, offload_interval=100):
-        manager = GradientFileManager(tmpdir)
+        manager = GradientStorageManager(tmpdir)
         offload = OffloadCallback(
             offload_interval=offload_interval,
             file_manager=manager,
@@ -1144,11 +1144,11 @@ class TestHookManagerParamGrad:
 
 # --------------------------------------------------------------------------- #
 # DDP-like multi-rank storage tests                                            #
-# (simulated: two GradientFileManagers each given a fake rank via monkeypatch) #
+# (simulated: two GradientStorageManagers each given a fake rank via monkeypatch) #
 # --------------------------------------------------------------------------- #
 
 
-class TestGradientFileManagerDDP:
+class TestGradientStorageManagerDDP:
     """Simulate two DDP ranks writing to the same root save_dir."""
 
     _HASH_A = "aaaaaaaa" * 8  # 64 chars
@@ -1167,11 +1167,11 @@ class TestGradientFileManagerDDP:
         )
 
     def _manager_for_rank(self, tmpdir, rank, monkeypatch):
-        """Return a GradientFileManager that behaves as if running on *rank*."""
-        import dattri_llm.gradient.file_manager as fm_module
+        """Return a GradientStorageManager that behaves as if running on *rank*."""
+        import dattri_llm.gradient.storage_manager as fm_module
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: rank)
-        return GradientFileManager(tmpdir)
+        return GradientStorageManager(tmpdir)
 
     def test_each_rank_writes_to_own_subdir(
         self,
@@ -1180,15 +1180,15 @@ class TestGradientFileManagerDDP:
         tiny_model,
         tiny_batch,
     ):
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 0)
-        m0 = GradientFileManager(str(tmp_path))
+        m0 = GradientStorageManager(str(tmp_path))
         rec0 = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
         m0.save_bulk([rec0])
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 1)
-        m1 = GradientFileManager(str(tmp_path))
+        m1 = GradientStorageManager(str(tmp_path))
         rec1 = self._make_record(0, self._HASH_B, tiny_model, tiny_batch)
         m1.save_bulk([rec1])
 
@@ -1199,11 +1199,11 @@ class TestGradientFileManagerDDP:
 
     def test_no_batch_id_collision(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
         """Both ranks start _next_batch_id at 0 but write to different subdirs."""
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
             monkeypatch.setattr(fm_module, "dist_rank", lambda r=rank: r)
-            m = GradientFileManager(str(tmp_path))
+            m = GradientStorageManager(str(tmp_path))
             rec = self._make_record(0, h, tiny_model, tiny_batch)
             m.save_bulk([rec])
 
@@ -1222,11 +1222,11 @@ class TestGradientFileManagerDDP:
         returns None) must still route to rank_N/ once the process group
         exists at save time -- construction order must not matter.
         """
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         # Construction happens pre-init on every "rank": probe sees nothing.
         monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
-        managers = {rank: GradientFileManager(str(tmp_path)) for rank in (0, 1)}
+        managers = {rank: GradientStorageManager(str(tmp_path)) for rank in (0, 1)}
 
         # By save time the process group is up and the true rank is visible.
         for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
@@ -1255,11 +1255,11 @@ class TestGradientFileManagerDDP:
         tiny_model,
         tiny_batch,
     ):
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
             monkeypatch.setattr(fm_module, "dist_rank", lambda r=rank: r)
-            m = GradientFileManager(str(tmp_path))
+            m = GradientStorageManager(str(tmp_path))
             rec = self._make_record(0, h, tiny_model, tiny_batch)
             m.save_bulk([rec])
 
@@ -1281,10 +1281,10 @@ class TestGradientFileManagerDDP:
         tiny_model,
         tiny_batch,
     ):
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 0)
-        m = GradientFileManager(str(tmp_path))
+        m = GradientStorageManager(str(tmp_path))
         rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
         m.save_bulk([rec])
 
@@ -1299,36 +1299,36 @@ class TestGradientFileManagerDDP:
         tiny_batch,
     ):
         """A reader opened after training sees gradients from every rank."""
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         for rank, h in [(0, self._HASH_A), (1, self._HASH_B)]:
             monkeypatch.setattr(fm_module, "dist_rank", lambda r=rank: r)
-            m = GradientFileManager(str(tmp_path))
+            m = GradientStorageManager(str(tmp_path))
             rec = self._make_record(0, h, tiny_model, tiny_batch)
             m.save_bulk([rec])
 
         # Reader: no distributed context.
         monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
-        reader = GradientFileManager(str(tmp_path))
+        reader = GradientStorageManager(str(tmp_path))
         assert self._HASH_A in reader.index
         assert self._HASH_B in reader.index
 
     def test_load_across_ranks(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
         """A reader opened after training can load records from any rank."""
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         # Simulate training: rank 0 and rank 1 each write their own records.
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 0)
-        m0 = GradientFileManager(str(tmp_path))
+        m0 = GradientStorageManager(str(tmp_path))
         m0.save_bulk([self._make_record(0, self._HASH_A, tiny_model, tiny_batch)])
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: 1)
-        m1 = GradientFileManager(str(tmp_path))
+        m1 = GradientStorageManager(str(tmp_path))
         m1.save_bulk([self._make_record(0, self._HASH_B, tiny_model, tiny_batch)])
 
         # Simulate post-training analysis: fresh reader with no distributed context.
         monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
-        reader = GradientFileManager(str(tmp_path))
+        reader = GradientStorageManager(str(tmp_path))
         loaded_a = reader.load_all_by_hash(self._HASH_A)[0]
         loaded_b = reader.load_all_by_hash(self._HASH_B)[0]
         assert loaded_a.input_hash == self._HASH_A
@@ -1342,10 +1342,10 @@ class TestGradientFileManagerDDP:
         tiny_batch,
     ):
         """Single-GPU path: no rank_N/ subdirectory created."""
-        import dattri_llm.gradient.file_manager as fm_module
+        import dattri_llm.gradient.storage_manager as fm_module
 
         monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
-        m = GradientFileManager(str(tmp_path))
+        m = GradientStorageManager(str(tmp_path))
         rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
         m.save_bulk([rec])
 
@@ -1366,3 +1366,120 @@ class TestGradientFileManagerDDP:
             tiny_model(tiny_batch["input_ids"]).mean().backward()
         assert len(cb.records) == 1  # one record per step
         collector.remove()
+
+
+class TestResidency:
+    """disk / memory / tiered residency backends of GradientStorageManager."""
+
+    @staticmethod
+    def _batch_record(step: int, seed: int) -> GradientRecord:
+        torch.manual_seed(seed)
+        data = {f"L{layer}": torch.randn(4, 32) for layer in range(3)}
+        gradient = Gradient(
+            representation=dict.fromkeys(data, "materialized"),
+            data=data,
+            layer_types=dict.fromkeys(data, "nn.Linear"),
+        )
+        return GradientRecord(
+            step=step,
+            input_hash=[f"h{step}_{i}" for i in range(4)],
+            gradient=gradient,
+        )
+
+    _GROUP_BYTES = 3 * 4 * 32 * 4  # 3 layers x (4x32) float32
+
+    def _collect(self, residency, tmpdir, **kw):
+        fm = GradientStorageManager(tmpdir, residency=residency, **kw)
+        for step in range(5):
+            fm.save_bulk([self._batch_record(step, seed=step)])
+        blocks = {}
+        for loc, _by_step in fm.iter_steps(list(range(5))):
+            for rec in fm.load_records(loc):
+                blocks[rec.step] = rec.gradient.data["L0"].clone()
+        return fm, blocks
+
+    def test_rejects_unknown_residency(self):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            pytest.raises(ValueError, match="residency must be one of"),
+        ):
+            GradientStorageManager(d, residency="cloud")
+
+    def test_memory_writes_no_files_and_matches_disk(self):
+        with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as dm:
+            _, disk_blocks = self._collect("disk", dd)
+            fm_mem, mem_blocks = self._collect("memory", dm)
+            # Nothing serialized to disk.
+            assert list(Path(dm).rglob("*.pt")) == []
+            assert list(Path(dm).rglob("index.json")) == []
+            assert fm_mem.residency == "memory"
+            # Identical records read back (same seeded data).
+            for step in range(5):
+                assert torch.equal(disk_blocks[step], mem_blocks[step])
+
+    def test_disk_creates_one_file_per_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._collect("disk", d)
+            assert len(list(Path(d).glob("batch_*.pt"))) == 5
+
+    def test_tiered_spills_oldest_and_reads_transparently(self):
+        with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as dt:
+            _, disk_blocks = self._collect("disk", dd)
+            # Budget for ~2 groups resident -> the 3 oldest spill to disk.
+            budget = int(self._GROUP_BYTES * 2.5)
+            fm, tiered_blocks = self._collect("tiered", dt, budget_bytes=budget)
+            spilled = list(Path(dt).rglob("*.pt"))
+            assert len(spilled) == 3  # 5 groups - 2 kept resident
+            assert fm._mem_bytes <= budget
+            # Reads are transparent across the memory/disk split.
+            for step in range(5):
+                assert torch.equal(disk_blocks[step], tiered_blocks[step])
+
+    def test_tiered_auto_budget_when_unspecified(self):
+        with tempfile.TemporaryDirectory() as d:
+            fm = GradientStorageManager(d, residency="tiered")
+            assert fm._budget_bytes is not None
+            assert fm._budget_bytes > 0
+
+    def test_tiered_close_removes_spill_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            budget = int(self._GROUP_BYTES * 2.5)
+            fm = GradientStorageManager(d, residency="tiered", budget_bytes=budget)
+            for step in range(5):
+                fm.save_bulk([self._batch_record(step, seed=step)])
+            assert len(list(Path(d).rglob("*.pt"))) == 3  # spilled
+            fm.close()
+            # Spill dir gone; save_dir left pristine.
+            assert list(Path(d).rglob("*.pt")) == []
+            assert list(Path(d).iterdir()) == []
+
+    def test_tiered_context_manager_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            budget = int(self._GROUP_BYTES * 2.5)
+            with GradientStorageManager(
+                d,
+                residency="tiered",
+                budget_bytes=budget,
+            ) as fm:
+                for step in range(5):
+                    fm.save_bulk([self._batch_record(step, seed=step)])
+                assert len(list(Path(d).rglob("*.pt"))) == 3
+            assert list(Path(d).iterdir()) == []  # cleaned on __exit__
+
+    def test_close_is_idempotent_and_noop_for_disk(self):
+        with tempfile.TemporaryDirectory() as d:
+            fm = GradientStorageManager(d, residency="disk")
+            fm.save_bulk([self._batch_record(0, seed=0)])
+            fm.close()
+            fm.close()  # idempotent
+            # Disk files are the durable store -- untouched by close().
+            assert len(list(Path(d).glob("batch_*.pt"))) == 1
+
+    def test_memory_ignores_existing_disk_index(self):
+        with tempfile.TemporaryDirectory() as d:
+            disk = GradientStorageManager(d, residency="disk")
+            for step in range(3):
+                disk.save_bulk([self._batch_record(step, seed=step)])
+            # A fresh memory store on the same dir must not adopt the disk index.
+            mem = GradientStorageManager(d, residency="memory")
+            assert mem.index == {}

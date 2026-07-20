@@ -5,8 +5,8 @@ those blocks come from is abstracted by :class:`GradientSource`, which has two
 concrete implementations so the same scoring loop serves both workflows:
 
 * :class:`DiskGradientSource` -- *store-then-attribute*: reads pre-collected
-  gradients off disk via a
-  :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  ``reusable=True``.
+  gradients off disk via a :class:`GradientStorageManager`.
+  ``reusable=True``.
 * :class:`GradientStreamer` -- *on-the-fly*: runs a forward+backward pass over a
   dataset and yields each per-step block on demand, never persisting it.  Its
   ``enable_update`` flag selects the two regimes:
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from dattri_llm.attribution.arguments import AttributionArguments
-    from dattri_llm.gradient.file_manager import GradientFileManager
+    from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ class GradientSource(Protocol):
 class DiskGradientSource(GradientSource):
     """A re-iterable :class:`GradientSource` backed by on-disk gradients.
 
-    Wraps a :class:`GradientFileManager` and yields the same
+    Wraps a :class:`GradientStorageManager` and yields the same
     ``(step, Gradient, hashes)`` blocks as :class:`GradientStreamer`, but read
     from disk (the *store-then-attribute* workflow) rather than computed live.
     Each file is ``torch.load``-ed once even when it holds several requested
@@ -108,7 +108,7 @@ class DiskGradientSource(GradientSource):
 
     def __init__(
         self,
-        file_manager: GradientFileManager,
+        file_manager: GradientStorageManager,
         args: AttributionArguments,
         *,
         steps: Iterable[int] | None = None,
@@ -720,7 +720,7 @@ class GradientStreamer(GradientSource):
         # Distributed: each rank streams a disjoint shard via DistributedSampler
         # (sampler and shuffle are mutually exclusive, so set only one). Content
         # hashes stay globally unique, so per-rank rows concatenate cleanly -- the
-        # on-the-fly analogue of GradientFileManager's per-rank index merge.
+        # on-the-fly analogue of GradientStorageManager's per-rank index merge.
         if self._args.world_size > 1:
             kwargs["sampler"] = DistributedSampler(
                 self._dataset,

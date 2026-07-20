@@ -17,9 +17,9 @@ from torch import nn
 
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 B, IN_DIM, OUT_DIM = 2, 4, 3
 
@@ -29,9 +29,9 @@ def _model() -> nn.Module:
     return nn.Sequential(nn.Linear(IN_DIM, 8), nn.ReLU(), nn.Linear(8, OUT_DIM))
 
 
-def _collect_to_disk(save_dir, batches, accum: int) -> GradientFileManager:
+def _collect_to_disk(save_dir, batches, accum: int) -> GradientStorageManager:
     model = _model()
-    fm = GradientFileManager(str(save_dir))
+    fm = GradientStorageManager(str(save_dir))
     cb = OffloadCallback(
         offload_interval=1,
         file_manager=fm,
@@ -49,7 +49,7 @@ def _collect_to_disk(save_dir, batches, accum: int) -> GradientFileManager:
                 model(x).pow(2).sum().backward()
     finally:
         hm.remove()
-    return GradientFileManager(str(save_dir))  # fresh reader
+    return GradientStorageManager(str(save_dir))  # fresh reader
 
 
 class TestWindowMerging:
@@ -116,7 +116,7 @@ class TestWindowMerging:
                 ),
             )
 
-        fm = GradientFileManager(str(tmp_path))
+        fm = GradientStorageManager(str(tmp_path))
         cb = OffloadCallback(
             offload_interval=1,
             file_manager=fm,
@@ -126,7 +126,7 @@ class TestWindowMerging:
         cb.on_step_end(rec(1, t=5, tag="b"))
         cb.on_context_end()
 
-        reader = GradientFileManager(str(tmp_path))
+        reader = GradientStorageManager(str(tmp_path))
         ((file_rel, by_step),) = reader.iter_steps(0)
         merged = reader.load_records(file_rel)[by_step[0][0]]
         assert merged.input_hash == ["a0", "a1", "b0", "b1"]
@@ -137,7 +137,7 @@ class TestWindowMerging:
     def test_per_sample_recording_uses_update_steps(self, tmp_path):
         gen = torch.Generator().manual_seed(3)
         model = _model()
-        fm = GradientFileManager(str(tmp_path))
+        fm = GradientStorageManager(str(tmp_path))
         cb = OffloadCallback(
             offload_interval=1,
             file_manager=fm,
@@ -157,7 +157,7 @@ class TestWindowMerging:
         finally:
             hm.remove()
 
-        reader = GradientFileManager(str(tmp_path))
+        reader = GradientStorageManager(str(tmp_path))
         assert reader.available_steps() == [0, 1]
         for step in (0, 1):
             slots = reader.iter_steps(step)
@@ -175,7 +175,7 @@ class TestStoreConvention:
         )
         payload = json.loads((tmp_path / "index.json").read_text())
         assert payload["gradient_accumulation_steps"] == 2
-        assert GradientFileManager(str(tmp_path)).gradient_accumulation_steps == 2
+        assert GradientStorageManager(str(tmp_path)).gradient_accumulation_steps == 2
 
     def test_mixed_conventions_rejected(self, tmp_path):
         gen = torch.Generator().manual_seed(5)
@@ -184,7 +184,7 @@ class TestStoreConvention:
             [torch.randn(B, IN_DIM, generator=gen) for _ in range(2)],
             accum=2,
         )
-        fm = GradientFileManager(str(tmp_path))
+        fm = GradientStorageManager(str(tmp_path))
         with pytest.raises(ValueError, match="cannot mix"):
             OffloadCallback(
                 offload_interval=1,
@@ -196,6 +196,6 @@ class TestStoreConvention:
         with pytest.raises(ValueError, match=">= 1"):
             OffloadCallback(
                 offload_interval=1,
-                file_manager=GradientFileManager(str(tmp_path)),
+                file_manager=GradientStorageManager(str(tmp_path)),
                 gradient_accumulation_steps=0,
             )

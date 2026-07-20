@@ -33,8 +33,8 @@ from transformers import (
 )
 
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_sample
 
 MODEL_ID = "sshleifer/tiny-gpt2"  # 2-layer GPT-2, runs on CPU
@@ -105,7 +105,7 @@ if __name__ == "__main__":
                 logging_steps=100,
                 report_to="none",
             )
-            fm = GradientFileManager(str(pathlib.Path(tmpdir) / "gradients"))
+            fm = GradientStorageManager(str(pathlib.Path(tmpdir) / "gradients"))
             collector = HookManager(
                 model,
                 config=hook_cfg,

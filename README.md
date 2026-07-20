@@ -108,10 +108,10 @@ itself is untouched:
 
 ```python
 from dattri_llm import (
-    REGISTER_ALL, GradientFileManager, HookManager, HookManagerConfig, OffloadCallback,
+    REGISTER_ALL, GradientStorageManager, HookManager, HookManagerConfig, OffloadCallback,
 )
 
-fm = GradientFileManager("./train_grads")
+fm = GradientStorageManager("./train_grads")
 hm = HookManager(
     model,
     config=HookManagerConfig(linear_io=REGISTER_ALL),  # factorized hooks on all eligible layers

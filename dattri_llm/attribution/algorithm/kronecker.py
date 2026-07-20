@@ -3,7 +3,7 @@
 Like :class:`~dattri_llm.attribution.algorithm.tracin.TracInAttributor`, these
 attributors
 consume :class:`~dattri_llm.gradient.gradient.Gradient` records previously
-persisted by :class:`~dattri_llm.gradient.file_manager.GradientFileManager`; no
+persisted by :class:`~dattri_llm.gradient.storage_manager.GradientStorageManager`; no
 forward/backward pass is run at attribution time.  Unlike TracIn (a raw inner
 product), they precondition the inner product by an approximate inverse Fisher
 estimated *from the training gradients themselves*.
@@ -67,8 +67,8 @@ from dattri_llm.attribution.utils import (
     task_loss_fn,
 )
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientSource,
@@ -171,7 +171,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 loss_fn=task_loss_fn(self.task.original_loss_func),
                 config=hook_config,
             ),
-            GradientFileManager(train_dir),
+            GradientStorageManager(train_dir),
         )
         collect_to_disk(
             GradientStreamer(
@@ -183,7 +183,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 loss_fn=task_loss_fn(self.task.original_target_func),
                 config=hook_config,
             ),
-            GradientFileManager(test_dir),
+            GradientStorageManager(test_dir),
         )
         return [(train_dir, test_dir)]
 
@@ -309,7 +309,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         :class:`~dattri_llm.attribution.algorithm.tracin.TracInAttributor.attribute_from_cache`
         exactly like a DVEmb embedding store.
         """
-        fm = GradientFileManager(str(out_dir))
+        fm = GradientStorageManager(str(out_dir))
         for step, test_block, hashes in test_source:
             test_g = test_block.to(device)
             kfac_rep = self._prepare_test(test_g, ctx)
@@ -422,7 +422,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 device,
             )
             test_source = DiskGradientSource(
-                GradientFileManager(preconditioned_test_dir),
+                GradientStorageManager(preconditioned_test_dir),
                 self.args,
                 desc=f"{self.algorithm}: preconditioned test",
             )
@@ -494,9 +494,9 @@ class _KroneckerBaseAttributor(BaseAttributor):
 
         Args:
             train_gradients_dir: Directory written by
-                :class:`GradientFileManager` for the train pass.
+                :class:`GradientStorageManager` for the train pass.
             test_gradients_dir: Directory written by
-                :class:`GradientFileManager` for the test pass.
+                :class:`GradientStorageManager` for the test pass.
             damping: Tikhonov term added to each covariance factor (K-FAC) or
                 to the corrected eigenvalues (EK-FAC) before inversion.
             selected_training_steps: Restrict the train checkpoints (Fisher fit +
@@ -531,8 +531,8 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 "test_gradients_dir.",
             )
         layer_name = normalize_layer_names(layer_name)
-        train_fm = GradientFileManager(train_gradients_dir)
-        test_fm = GradientFileManager(test_gradients_dir)
+        train_fm = GradientStorageManager(train_gradients_dir)
+        test_fm = GradientStorageManager(test_gradients_dir)
         train = DiskGradientSource(
             train_fm,
             self.args,
@@ -600,7 +600,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         pre-building it.
 
         Args:
-            train_gradients_dir: Directory written by :class:`GradientFileManager`
+            train_gradients_dir: Directory written by :class:`GradientStorageManager`
                 for the train pass (fits the preconditioner).
             test_gradients_dir: Directory written for the test pass (the raw
                 gradients that get preconditioned).
@@ -622,7 +622,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             preconditioned_test_dir = str(Path(self.args.output_dir) / subdir)
         layer_name = normalize_layer_names(layer_name)
         train = DiskGradientSource(
-            GradientFileManager(train_gradients_dir),
+            GradientStorageManager(train_gradients_dir),
             self.args,
             steps=selected_training_steps,
             layer_name=layer_name,
@@ -630,7 +630,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             verbose=verbose,
         )
         test = DiskGradientSource(
-            GradientFileManager(test_gradients_dir),
+            GradientStorageManager(test_gradients_dir),
             self.args,
             layer_name=layer_name,
             desc=f"{self.algorithm}: test (raw)",

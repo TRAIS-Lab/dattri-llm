@@ -495,7 +495,7 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         # Re-collect the theta_T test gradients as two separate blocks (two halves),
         # so iter_gradient_blocks yields two files / column groups.
         test_dir2 = tmp_path / "te2"
-        fm = TT.GradientFileManager(str(test_dir2))
+        fm = TT.GradientStorageManager(str(test_dir2))
         offload = TT.OffloadCallback(
             offload_interval=1,
             file_manager=fm,

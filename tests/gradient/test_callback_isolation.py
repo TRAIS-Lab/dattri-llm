@@ -30,9 +30,9 @@ from dattri_llm.gradient.callbacks import (
     HookManagerCallback,
     OffloadCallback,
 )
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_batch
 
 SEED = 0
@@ -217,7 +217,7 @@ def _callback_factory(kind: str, tmp_path):
     if kind == "capture":
         return lambda _model: CaptureCallback()
     if kind == "offload":
-        fm = GradientFileManager(str(tmp_path / "grads"))
+        fm = GradientStorageManager(str(tmp_path / "grads"))
         return lambda _model: OffloadCallback(offload_interval=2, file_manager=fm)
     if kind == "ds_batch":
         return lambda model: DataSelectionCallback(

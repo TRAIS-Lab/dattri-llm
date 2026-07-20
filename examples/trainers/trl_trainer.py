@@ -37,8 +37,8 @@ except ImportError as exc:
     ) from exc
 
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 MODEL_ID = "sshleifer/tiny-gpt2"  # 2-layer GPT-2, runs on CPU
 SENTENCES = [
@@ -102,7 +102,7 @@ if __name__ == "__main__":
             processing_class=tokenizer,
         )
 
-        fm = GradientFileManager(str(pathlib.Path(tmpdir) / "gradients"))
+        fm = GradientStorageManager(str(pathlib.Path(tmpdir) / "gradients"))
         collector = HookManager(
             model,
             config=hook_cfg,

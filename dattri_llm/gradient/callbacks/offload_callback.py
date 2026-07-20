@@ -8,7 +8,7 @@ from dattri_llm.gradient.callbacks.base import HookManagerCallback
 from dattri_llm.gradient.gradient import GradientRecord
 
 if TYPE_CHECKING:
-    from dattri_llm.gradient.file_manager import GradientFileManager
+    from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 
 class OffloadCallback(HookManagerCallback):
@@ -22,7 +22,7 @@ class OffloadCallback(HookManagerCallback):
     Args:
         offload_interval: Number of stored steps to accumulate before writing
             a batch file.  Set to ``1`` for one file per step.
-        file_manager: The :class:`GradientFileManager` to delegate saves to.
+        file_manager: The :class:`GradientStorageManager` to delegate saves to.
         recording_type: ``"per_batch"`` (default) stores one
             :class:`GradientRecord` per step.  ``"per_sample"`` slices the
             full-batch record into B individual records before staging -- useful
@@ -47,7 +47,7 @@ class OffloadCallback(HookManagerCallback):
     def __init__(
         self,
         offload_interval: int,
-        file_manager: GradientFileManager,
+        file_manager: GradientStorageManager,
         recording_type: str = "per_batch",
         gradient_accumulation_steps: int = 1,
     ) -> None:

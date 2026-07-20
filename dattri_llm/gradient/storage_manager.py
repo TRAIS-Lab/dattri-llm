@@ -1,22 +1,80 @@
-"""On-disk storage and retrieval for GradientRecord objects."""
+"""Residency-managed storage and retrieval for GradientRecord objects.
+
+A store's *residency* (chosen once, at construction) decides where its records
+physically live -- transparent to every reader above the
+:class:`GradientStorageManager`:
+
+* ``"disk"`` (default) -- serialize each group to a file (``torch.save`` /
+  ``torch.load``), the classic store-then-attribute layout.  Crash-safe and
+  re-openable across processes / ranks.
+* ``"memory"`` -- hold the (CPU) records in RAM, never serialized.  Zero I/O;
+  a re-iterable source reads them back instantly.  Ephemeral (not crash-safe,
+  single-process) -- for replay caches, not a system of record.
+* ``"tiered"`` -- hold records in RAM up to a byte budget, then spill the
+  oldest groups to the disk backend.  The budget defaults to ~half of
+  available RAM when not given.
+
+The residency is invisible to :class:`DiskGradientSource`, the attributors,
+and the index: records are addressed by an opaque *location* handle (a
+filename for disk, a synthetic key for memory) plus the hash index, so the
+whole read path is location-agnostic.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import operator
+import shutil
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 
-from dattri_llm.gradient.gradient import GradientRecord
+from dattri_llm.gradient.gradient import Factorized, GradientRecord
 from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from typing_extensions import Self
+
     from dattri_llm.gradient.gradient import Gradient
+
+RESIDENCIES = ("disk", "memory", "tiered")
+
+
+def _gradient_nbytes(gradient: Gradient) -> int:
+    """Total bytes of a gradient block's tensor payloads (factors + dense)."""
+    total = 0
+    for value in gradient.data.values():
+        tensors = (
+            (value.activation, value.pre_activation_grad)
+            if isinstance(value, Factorized)
+            else (value,)
+        )
+        for t in tensors:
+            total += t.numel() * t.element_size()
+    return total
+
+
+def _records_nbytes(records: list[GradientRecord]) -> int:
+    return sum(_gradient_nbytes(r.gradient) for r in records)
+
+
+def _auto_budget_bytes() -> int:
+    """Half of currently-available RAM (from /proc/meminfo), or 8 GiB fallback."""
+    try:
+        with Path("/proc/meminfo").open(encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kb = int(line.split()[1])
+                    return int(kb * 1024 * 0.5)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 8 * 2**30
 
 
 def _to_cpu_record(record: GradientRecord) -> GradientRecord:
@@ -47,12 +105,38 @@ def _merge_index(dst: dict[str, list[dict]], src: dict[str, list[dict]]) -> None
                 existing.append(e)
 
 
-class GradientFileManager:
-    """Manages on-disk storage and retrieval of :class:`GradientRecord` objects.
+class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency API
+    """Residency-managed storage and retrieval of :class:`GradientRecord` objects.
 
-    Responsible for file naming, maintaining ``index.json`` hash-to-location
-    mappings, and loading records back.  It knows nothing about *when* to
-    save -- that is :class:`OffloadCallback`'s job.
+    Responsible for record naming, maintaining the hash-to-location index, and
+    loading records back.  It knows nothing about *when* to save -- that is
+    :class:`OffloadCallback`'s (or an attributor's ``cache``) job.
+
+    **Residency** (``residency=``, chosen at construction) decides where records
+    physically live; it is invisible to every reader above this class:
+
+    * ``"disk"`` (default) -- the durable store-then-attribute layout below:
+      ``torch.save`` per group, a persisted ``index.json``, crash-safe, and
+      re-openable across processes / ranks.  ``close()`` is a no-op.
+    * ``"memory"`` -- records held in RAM, never serialized (zero I/O).
+      **Ephemeral**: nothing is written to ``save_dir`` (which is ignored,
+      including any pre-existing index), and the records are gone once the
+      manager is dropped -- a fresh manager cannot recover them.  For replay
+      caches, not a system of record.
+    * ``"tiered"`` -- RAM up to ``budget_bytes`` (default ~half of available
+      RAM), then the oldest groups spill to a **temporary** subdir of
+      ``save_dir``.  Also ephemeral: no ``index.json`` is written, and
+      :meth:`close` (called on ``with``-exit and best-effort at GC) removes the
+      spill dir, so a tiered store never leaves orphaned files behind.  Use it
+      as a context manager::
+
+          with GradientStorageManager(d, residency="tiered") as store:
+              ...  # spill files auto-removed on exit
+
+    The residency is transparent to :class:`DiskGradientSource`, the
+    attributors, and the index: records are addressed by an opaque *location*
+    handle (a relative file path for disk / spilled tiered groups, a synthetic
+    ``mem_*`` key for in-RAM groups) plus the hash index.
 
     Under ``DistributedDataParallel`` (or any context where
     ``torch.distributed`` is initialised), each rank writes to its own
@@ -123,7 +207,7 @@ class GradientFileManager:
     Paths in ``"file"`` are always relative to *save_dir* (the root), so
     load methods work regardless of which rank originally wrote the record.
 
-    The public load API is rank-transparent: a fresh :class:`GradientFileManager`
+    The public load API is rank-transparent: a fresh :class:`GradientStorageManager`
     opened on the same *save_dir* after training automatically merges all
     per-rank indexes and loads from whichever rank's file contains the
     requested sample.
@@ -146,8 +230,39 @@ class GradientFileManager:
 
     _INDEX_FILE = "index.json"
 
-    def __init__(self, save_dir: str) -> None:
+    def __init__(
+        self,
+        save_dir: str,
+        *,
+        residency: str = "disk",
+        budget_bytes: int | None = None,
+    ) -> None:
+        if residency not in RESIDENCIES:
+            raise ValueError(
+                f"residency must be one of {list(RESIDENCIES)}, got {residency!r}.",
+            )
         self._root_dir = Path(save_dir)
+        self._residency = residency
+        # Memory / tiered state: location handle -> in-RAM record group, plus a
+        # running byte count and (tiered only) the spill budget.  A group is
+        # spilled to the disk backend when the count exceeds the budget.
+        self._mem_groups: dict[str, list[GradientRecord]] = {}
+        self._mem_bytes = 0
+        self._group_seq = 0  # monotonic id for synthetic memory location handles
+        self._budget_bytes = (
+            budget_bytes
+            if budget_bytes is not None
+            else (_auto_budget_bytes() if residency == "tiered" else None)
+        )
+        # Reverse map location -> its index entries, so a spill can rewrite the
+        # entries' ``file`` handle in place (they are shared dicts, so updating
+        # here updates the main index too).
+        self._group_entries: dict[str, list[dict]] = {}
+        # Tiered residency spills to a dedicated temp subdir (created lazily on
+        # the first spill) that ``close()`` removes -- so a tiered store never
+        # litters ``save_dir`` with orphaned spill files.
+        self._spill_dir: Path | None = None
+        self._closed: bool = False
 
         # Where this process writes (root, or its rank_N/ subdirectory) is
         # resolved lazily at the first save, NOT here: managers are commonly
@@ -174,8 +289,13 @@ class GradientFileManager:
         # OffloadCallback) or adopted from existing indexes; a mismatch
         # raises, so one store cannot mix step conventions.
         self._accumulation_steps: int | None = None
-        # Merged view across all ranks (used for all load operations).
-        self._index: dict[str, list[dict]] = self._read_all_indexes()
+        # Merged view across all ranks (used for all load operations).  Only a
+        # ``disk`` store adopts an existing on-disk index; ``memory``/``tiered``
+        # are ephemeral caches that always start empty and ignore whatever
+        # ``save_dir`` happens to contain (they never persist an index).
+        self._index: dict[str, list[dict]] = (
+            self._read_all_indexes() if residency == "disk" else {}
+        )
 
     def _ensure_save_dir(self) -> Path:
         """Resolve this process's write directory on first use (idempotent).
@@ -253,14 +373,15 @@ class GradientFileManager:
     # Saving                                                                   #
     # ---------------------------------------------------------------------- #
 
-    def save(self, record: GradientRecord) -> Path:
-        """Persist one :class:`GradientRecord` to its own file.
+    def save(self, record: GradientRecord) -> str:
+        """Persist one :class:`GradientRecord` through the residency backend.
 
         Args:
             record: The record to persist.
 
         Returns:
-            Path: The written file.
+            The group's location handle (a root-relative file path for ``disk``
+            residency, a synthetic ``mem_*`` key for ``memory``).
 
         Raises:
             TypeError: If the record carries a per-batch hash list (use
@@ -271,17 +392,14 @@ class GradientFileManager:
                 "save() takes a single-hash record; this record carries a "
                 "per-batch hash list -- use save_bulk([record]) instead.",
             )
-        save_dir = self._ensure_save_dir()
-        save_dir.mkdir(parents=True, exist_ok=True)
         record = _to_cpu_record(record)
-        h = record.input_hash
-        s = record.step
-        path = save_dir / f"step_{s:06d}_{h}.pt"
-        torch.save(record, path)
-        rel = self._local_prefix + path.name
-        self._index_entry(record, filename=rel, idx=0)
-        self._write_index()
-        return path
+        disk_name = f"step_{record.step:06d}_{record.input_hash}.pt"
+        location = self._write_group([record], disk_name)
+        self._index_entry(record, filename=location, idx=0)
+        self._persist_index()
+        if self._residency == "tiered":
+            self._maybe_spill()
+        return location
 
     def save_bulk(self, records: list[GradientRecord]) -> Path:
         """Pack multiple :class:`GradientRecord` objects into a single file.
@@ -299,20 +417,134 @@ class GradientFileManager:
                 length must equal its gradient's batch size (checked).
 
         Returns:
-            Path: The written batch file.
+            The location handle of the written group (a relative file path for
+            ``disk`` residency, a synthetic ``mem_*`` key for ``memory``).
+        """
+        records = [_to_cpu_record(r) for r in records]
+        location = self._write_group(records, None)
+        for idx, record in enumerate(records):
+            self._index_entry(record, filename=location, idx=idx)
+        self._persist_index()
+        if self._residency == "tiered":
+            self._maybe_spill()
+        return location
+
+    # ---------------------------------------------------------------------- #
+    # Residency backend (disk / memory / tiered)                              #
+    # ---------------------------------------------------------------------- #
+
+    @property
+    def residency(self) -> str:
+        """This store's residency policy (``"disk"``/``"memory"``/``"tiered"``)."""
+        return self._residency
+
+    def _write_group(
+        self,
+        records: list[GradientRecord],
+        disk_name: str | None,
+    ) -> str:
+        """Persist one record group through the active residency backend.
+
+        *disk_name* is the file name to use for the ``disk`` backend, or
+        ``None`` to auto-name it ``batch_<counter>.pt``.  Returns the group's
+        location handle: a relative file path (``disk``, or a spilled
+        ``tiered`` group) or a synthetic ``mem_*`` key (``memory``/unspilled
+        ``tiered``).
+        """
+        if self._residency in ("memory", "tiered"):
+            loc = f"mem_{self._group_seq:08d}"
+            self._group_seq += 1
+            self._mem_groups[loc] = records
+            self._mem_bytes += _records_nbytes(records)
+            return loc
+        return self._write_group_to_disk(records, disk_name)
+
+    def _write_group_to_disk(
+        self,
+        records: list[GradientRecord],
+        disk_name: str | None,
+    ) -> str:
+        """Serialize a group to a file; returns the root-relative path handle.
+
+        The batch counter is read **after** :meth:`_ensure_save_dir` (which
+        settles it from any existing files on the first call), so auto-named
+        files never collide or overwrite.
         """
         save_dir = self._ensure_save_dir()
         save_dir.mkdir(parents=True, exist_ok=True)
-        records = [_to_cpu_record(r) for r in records]
-        batch_id = self._next_batch_id
-        self._next_batch_id += 1
-        path = save_dir / f"batch_{batch_id:06d}.pt"
+        if disk_name is None:
+            disk_name = f"batch_{self._next_batch_id:06d}.pt"
+            self._next_batch_id += 1
+        path = save_dir / disk_name
         torch.save(records, path)
-        rel = self._local_prefix + path.name
-        for idx, record in enumerate(records):
-            self._index_entry(record, filename=rel, idx=idx)
-        self._write_index()
-        return path
+        return self._local_prefix + path.name
+
+    def _maybe_spill(self) -> None:
+        """Spill the oldest in-RAM groups to disk until under the byte budget."""
+        if self._budget_bytes is None:
+            return
+        # Oldest-first: mem_* keys are zero-padded and monotonically assigned.
+        for loc in sorted(self._mem_groups):
+            if self._mem_bytes <= self._budget_bytes:
+                break
+            self._spill_group(loc)
+
+    def _ensure_spill_dir(self) -> Path:
+        """Create (once) the temp subdir tiered spill files live in.
+
+        A subdir of *save_dir* so spill I/O stays on the same filesystem and a
+        single :meth:`close` ``rmtree`` cleans it up; the ``mem_*`` group key
+        names each spill file, so they never collide.
+        """
+        if self._spill_dir is None:
+            self._root_dir.mkdir(parents=True, exist_ok=True)
+            self._spill_dir = Path(
+                tempfile.mkdtemp(prefix="tiered_spill_", dir=self._root_dir),
+            )
+        return self._spill_dir
+
+    def _spill_group(self, loc: str) -> None:
+        """Move one in-RAM group to the spill dir and repoint its index entries."""
+        records = self._mem_groups.pop(loc)
+        self._mem_bytes -= _records_nbytes(records)
+        path = self._ensure_spill_dir() / f"{loc}.pt"
+        torch.save(records, path)
+        disk_loc = str(path.relative_to(self._root_dir))
+        for entry in self._group_entries.get(loc, []):
+            entry["file"] = disk_loc  # shared dict -> also updates self._index
+        if loc in self._group_entries:
+            self._group_entries[disk_loc] = self._group_entries.pop(loc)
+
+    def close(self) -> None:
+        """Release an ephemeral store's resources; idempotent.
+
+        Drops the in-RAM record groups and deletes the tiered spill directory.
+        A **no-op for ``disk``** residency -- its files are the durable store.
+        Called automatically on context-manager exit and (best-effort) at
+        garbage collection, so a ``tiered`` store never leaves orphaned spill
+        files behind.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._mem_groups.clear()
+        self._mem_bytes = 0
+        if self._spill_dir is not None:
+            shutil.rmtree(self._spill_dir, ignore_errors=True)
+            self._spill_dir = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        # Safety net if the caller neither closed nor used a ``with`` block.
+        # Guarded: at interpreter shutdown modules may already be torn down.
+        with contextlib.suppress(Exception):
+            self.close()
 
     def _index_entry(self, record: GradientRecord, filename: str, idx: int) -> None:
         # ``getattr``: records pickled before sample_id_key existed read as
@@ -345,6 +577,9 @@ class GradientFileManager:
             entries = self._index.setdefault(str(h), [])
             if entry not in entries:
                 entries.append(entry)
+                # Reverse map (location -> entries) so a tiered spill can
+                # repoint every entry of a group to its new disk handle.
+                self._group_entries.setdefault(filename, []).append(entry)
 
     # ---------------------------------------------------------------------- #
     # Loading                                                                  #
@@ -591,16 +826,22 @@ class GradientFileManager:
                 :meth:`iter_steps`.
 
         Returns:
-            The file's records as a list (a single-record file is wrapped in a
-            one-element list).
+            The group's records as a list (a single-record file is wrapped in
+            a one-element list).  Served from RAM for an in-memory group, else
+            ``torch.load``-ed from disk.
         """
+        if file_relpath in self._mem_groups:
+            return self._mem_groups[file_relpath]
         obj = torch.load(self._root_dir / file_relpath, weights_only=False)
         return obj if isinstance(obj, list) else [obj]
 
     def _load_entry(self, entry: dict) -> GradientRecord:
-        # "file" is always relative to _root_dir, not _save_dir.
-        path = self._root_dir / entry["file"]
-        obj = torch.load(path, weights_only=False)
+        # "file" is a location handle: a synthetic mem_* key (in-RAM group) or a
+        # path relative to _root_dir.
+        loc = entry["file"]
+        if loc in self._mem_groups:
+            return self._mem_groups[loc][entry["idx"]]
+        obj = torch.load(self._root_dir / loc, weights_only=False)
         if isinstance(obj, list):
             return obj[entry["idx"]]
         return obj
@@ -651,6 +892,17 @@ class GradientFileManager:
             if rank_idx.exists():
                 read_one(rank_idx)
         return merged
+
+    def _persist_index(self) -> None:
+        """Persist the index for a ``disk`` store; a no-op otherwise.
+
+        ``memory``/``tiered`` stores keep the index in RAM only -- they are
+        ephemeral (single-process, not re-opened), and a spilled tiered group's
+        files carry no standalone index (the live index in RAM already points
+        at them).
+        """
+        if self._residency == "disk":
+            self._write_index()
 
     def _write_index(self) -> None:
         """Write only this rank's entries to _save_dir/index.json.

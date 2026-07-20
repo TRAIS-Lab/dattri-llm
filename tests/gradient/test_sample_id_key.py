@@ -19,8 +19,8 @@ import torch
 from torch import nn
 
 from dattri_llm.gradient.callbacks import CaptureCallback, OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_batch
 
 B, IN_DIM, OUT_DIM = 4, 6, 3
@@ -113,8 +113,8 @@ class TestManagerRouting:
 
 
 class TestFileManagerRoundTrip:
-    def _collect(self, tmp_path) -> tuple[GradientFileManager, torch.Tensor]:
-        fm = GradientFileManager(str(tmp_path))
+    def _collect(self, tmp_path) -> tuple[GradientStorageManager, torch.Tensor]:
+        fm = GradientStorageManager(str(tmp_path))
         cb = OffloadCallback(1, fm, recording_type="per_batch")
         x = torch.randn(B, IN_DIM)
         _step(KwargModel(), cb, "idx", x=x, idx=torch.tensor([32, 42, 51, 1]))
@@ -142,7 +142,7 @@ class TestFileManagerRoundTrip:
         self._collect(tmp_path)
         payload = json.loads((Path(tmp_path) / "index.json").read_text())
         assert payload["sample_id_key"] == "idx"
-        fresh = GradientFileManager(str(tmp_path))
+        fresh = GradientStorageManager(str(tmp_path))
         assert fresh.sample_id_key == "idx"
         assert fresh.lookup_by_hash(32) == [(0, 0)]
 
@@ -153,7 +153,7 @@ class TestFileManagerRoundTrip:
             _step(KwargModel(), cb, None, x=torch.randn(B, IN_DIM))
 
     def test_hash_scheme_store_unchanged(self, tmp_path):
-        fm = GradientFileManager(str(tmp_path))
+        fm = GradientStorageManager(str(tmp_path))
         cb = OffloadCallback(1, fm, recording_type="per_batch")
         x = torch.randn(B, IN_DIM)
         _step(KwargModel(), cb, None, x=x)

@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
     from torch import nn
 
-    from dattri_llm.gradient.file_manager import GradientFileManager
+    from dattri_llm.gradient.storage_manager import GradientStorageManager
     from dattri_llm.gradient.streaming import GradientStreamer
 
 
@@ -49,7 +49,7 @@ def task_loss_fn(func: Callable) -> Callable:
 
 def collect_to_disk(
     streamer: GradientStreamer,
-    file_manager: GradientFileManager,
+    file_manager: GradientStorageManager,
     *,
     offload_interval: int = 1,
 ) -> None:

@@ -3,7 +3,7 @@
 Like :class:`~dattri_llm.attribution.algorithm.tracin.TracInAttributor` and the K-FAC
 family, this attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
 records previously persisted by
-:class:`~dattri_llm.gradient.file_manager.GradientFileManager`; no
+:class:`~dattri_llm.gradient.storage_manager.GradientStorageManager`; no
 forward/backward pass is run at attribution time.
 
 Unlike TracIn -- which simply dots the train gradient at the step a sample was
@@ -108,8 +108,8 @@ from dattri_llm.attribution.utils import (
     task_loss_fn,
 )
 from dattri_llm.gradient.datasets import resolve_steps
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
 
 if TYPE_CHECKING:
@@ -219,8 +219,8 @@ class DVEmbAttributor(BaseAttributor):
         cache_dir = cache_dir if cache_dir is not None else self.args.output_dir
         train_dir = str(pathlib.Path(cache_dir) / "train_grads")
         test_dir = str(pathlib.Path(cache_dir) / "test_grads")
-        train_fm = GradientFileManager(train_dir)
-        test_fm = GradientFileManager(test_dir)
+        train_fm = GradientStorageManager(train_dir)
+        test_fm = GradientStorageManager(test_dir)
 
         self.task._load_checkpoints(0)
         model = self.task.get_model()
@@ -282,7 +282,7 @@ class DVEmbAttributor(BaseAttributor):
         ``e = eta * prod_{k>t_s}(I - eta_k H_k)^T g_hat`` and storing it in
         ``dvemb_dir``
         as materialized per-layer :class:`Gradient` records via
-        :class:`GradientFileManager` -- same hashes and steps as the source
+        :class:`GradientStorageManager` -- same hashes and steps as the source
         records.  No test gradients are involved and nothing is scored.
 
         Because a DVEmb score is the plain inner product ``<e, g_test>``,
@@ -340,7 +340,7 @@ class DVEmbAttributor(BaseAttributor):
         )
         device = self.args.device
         train_source = DiskGradientSource(
-            GradientFileManager(train_gradients_dir),
+            GradientStorageManager(train_gradients_dir),
             self.args,
             steps=prop_steps,
             layer_name=normalize_layer_names(layer_name),
@@ -363,7 +363,7 @@ class DVEmbAttributor(BaseAttributor):
             loss_reduction,
             verbose,
             learning_rate,
-            dvemb_fm=GradientFileManager(dvemb_dir),
+            dvemb_fm=GradientStorageManager(dvemb_dir),
             hessian_mode=hessian_mode,
         )
         return dvemb_dir
@@ -571,7 +571,7 @@ class DVEmbAttributor(BaseAttributor):
         loss_reduction: str,
         verbose: bool,
         learning_rate: float | dict[int, float],
-        dvemb_fm: GradientFileManager | None = None,
+        dvemb_fm: GradientStorageManager | None = None,
         hessian_mode: str = "full",
     ) -> tuple[torch.Tensor, list[str], list[int]]:
         """One latest->earliest sweep carrying the operator on the *train* side.
@@ -609,7 +609,7 @@ class DVEmbAttributor(BaseAttributor):
             device: Device the blocks are moved to for the sweep.
             verbose: Show the per-step progress bar.
             dvemb_fm: When given, each emitted step's embeddings ``e`` are also
-                persisted through this :class:`GradientFileManager` as
+                persisted through this :class:`GradientStorageManager` as
                 **materialized** per-layer :class:`Gradient` records (eta folded
                 in; same hashes and step as the source records).  A row's score
                 is then a plain inner product ``<e, g_test>``, so the stored
@@ -749,7 +749,7 @@ class DVEmbAttributor(BaseAttributor):
         selected_training_steps: Iterable[int] | None,
         final_step: int | None,
         learning_rate: float | Mapping[int, float],
-    ) -> tuple[GradientFileManager, list[int], set, int, float | dict[int, float]]:
+    ) -> tuple[GradientStorageManager, list[int], set, int, float | dict[int, float]]:
         """Resolve the sweep parameters shared by scoring and embedding-only runs.
 
         Opens the train store, fixes ``final_step`` (default: one past the last
@@ -760,7 +760,7 @@ class DVEmbAttributor(BaseAttributor):
 
         Returns ``(train_fm, prop_steps, output_steps, final_step, learning_rate)``.
         """
-        train_fm = GradientFileManager(train_gradients_dir)
+        train_fm = GradientStorageManager(train_gradients_dir)
         available = train_fm.available_steps()
         if final_step is None:
             final_step = (max(available) + 1) if available else 0
@@ -893,7 +893,7 @@ class DVEmbAttributor(BaseAttributor):
 
         Args:
             train_gradients_dir: Directory written by
-                :class:`GradientFileManager` during training.  Supplies both the
+                :class:`GradientStorageManager` during training.  Supplies both the
                 scored train gradients and, at every step, the per-sample
                 gradients forming that step's Fisher factor.
             test_gradients_dir: Directory written during the test pass.  These
@@ -917,7 +917,7 @@ class DVEmbAttributor(BaseAttributor):
                 ``layer_name`` to keep ``d`` small.
             dvemb_dir: Requires ``propagation="train"``.  When given, the data
                 value embeddings computed during the sweep are also persisted
-                to this directory (managed by :class:`GradientFileManager`) as
+                to this directory (managed by :class:`GradientStorageManager`) as
                 materialized per-layer :class:`Gradient` records -- eta folded in,
                 same hashes/steps as the train records, one record per emitted
                 step block.  Because a row's score is then the plain inner
@@ -1037,7 +1037,7 @@ class DVEmbAttributor(BaseAttributor):
                 "test_gradients_dir.",
             )
 
-        test_fm = GradientFileManager(test_gradients_dir)
+        test_fm = GradientStorageManager(test_gradients_dir)
         (
             train_fm,
             prop_steps,
@@ -1075,7 +1075,7 @@ class DVEmbAttributor(BaseAttributor):
             output_steps=output_steps,
             loss_reduction=loss_reduction,
             propagation=propagation,
-            dvemb_fm=GradientFileManager(dvemb_dir) if dvemb_dir else None,
+            dvemb_fm=GradientStorageManager(dvemb_dir) if dvemb_dir else None,
             hessian_mode=hessian_mode,
             loop_over_test=loop_over_test,
             verbose=verbose,
@@ -1147,7 +1147,7 @@ class DVEmbAttributor(BaseAttributor):
         algorithm_meta: dict,
         layer_name: list[str] | None = None,
         learning_rate: float | dict[int, float] = 1.0,
-        dvemb_fm: GradientFileManager | None = None,
+        dvemb_fm: GradientStorageManager | None = None,
         hessian_mode: str = "full",
     ) -> AttributionScore:
         """Score a train source against a test source -- the shared DVEmb loop.

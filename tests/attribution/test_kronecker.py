@@ -26,9 +26,9 @@ from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttr
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_sample
 
 DAMPING = 1e-2
@@ -42,7 +42,7 @@ LAYERS = TT.LAYER_NAMES  # ["mlp.fc1", "mlp.fc2"]
 
 def _load_factors(test_dir, step, layers):
     """Return ``{hash: {layer: (a, g)}}`` for one step (per-sample records)."""
-    fm = GradientFileManager(str(test_dir))
+    fm = GradientStorageManager(str(test_dir))
     out = {}
     for file_rel, by_step in fm.iter_steps(step):
         recs = fm.load_records(file_rel)
@@ -402,7 +402,7 @@ class TestKFACMultiToken:
         x_te = torch.randint(0, 16, (4, T), generator=gen)
 
         def collect(x, out_dir):
-            fm = GradientFileManager(str(out_dir))
+            fm = GradientStorageManager(str(out_dir))
             hm = HookManager(
                 model,
                 config=HookManagerConfig(linear_io=[r"fc"]),
@@ -462,8 +462,10 @@ def collected_step1(tmp_path):
     TT._collect_to_disk(model, checkpoints, x_te, y_te, raw_test)
 
     train_dir, test_dir = tmp_path / "tr_s1", tmp_path / "te_s1"
-    GradientFileManager(str(train_dir)).save_bulk(TT._load_step_records(raw_train, 1))
-    GradientFileManager(str(test_dir)).save_bulk(TT._load_step_records(raw_test, 1))
+    GradientStorageManager(str(train_dir)).save_bulk(
+        TT._load_step_records(raw_train, 1)
+    )
+    GradientStorageManager(str(test_dir)).save_bulk(TT._load_step_records(raw_test, 1))
 
     train_hashes = [
         hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
@@ -516,7 +518,9 @@ class TestStepSelection:
         TT._collect_to_disk(model, checkpoints[:1], x_te, y_te, test_dir)
 
         curated = tmp_path / "tr_s1"
-        GradientFileManager(str(curated)).save_bulk(TT._load_step_records(raw_train, 1))
+        GradientStorageManager(str(curated)).save_bulk(
+            TT._load_step_records(raw_train, 1)
+        )
 
         train_hashes = [
             hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
@@ -648,7 +652,7 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
     """
 
     def load(d, hashes):
-        fm = GradientFileManager(str(d))
+        fm = GradientStorageManager(str(d))
         out = {}
         for file_rel, by_step in fm.iter_steps(0):
             recs = fm.load_records(file_rel)
@@ -687,7 +691,7 @@ def _collect_norm_model(tmp_path, patterns):
     x_te = torch.randint(0, 16, (4, 3), generator=gen)
 
     def collect(x, out_dir):
-        fm = GradientFileManager(str(out_dir))
+        fm = GradientStorageManager(str(out_dir))
         hm = HookManager(
             model,
             config=HookManagerConfig(linear_io=patterns),
@@ -852,7 +856,7 @@ class TestDirectFIM:
         x_te = torch.randint(0, 16, (4, 3), generator=gen)
 
         def collect(x, out_dir):
-            fm = GradientFileManager(str(out_dir))
+            fm = GradientStorageManager(str(out_dir))
             hm = HookManager(
                 model,
                 config=HookManagerConfig(linear_io=[r"embedding", r"norm", r"head"]),
@@ -922,7 +926,7 @@ def _collect_trak_mixed(tmp_path):
     )
 
     def collect(x, out_dir):
-        fm = GradientFileManager(str(out_dir))
+        fm = GradientStorageManager(str(out_dir))
         hm = HookManager(
             model,
             config=cfg,
@@ -941,7 +945,7 @@ def _collect_trak_mixed(tmp_path):
 
 def _stacked_trak_rows(grad_dir, layer):
     """Stack one materialized layer's stored rows across a dir's records."""
-    fm = GradientFileManager(str(grad_dir))
+    fm = GradientStorageManager(str(grad_dir))
     rows = [
         fm.load_records(file_rel)[i].gradient.data[layer]
         for file_rel, by_step in fm.iter_steps(0)
@@ -1037,7 +1041,7 @@ class TestMaterializedLayers:
         )
         gen = torch.Generator().manual_seed(1)
         for split, n in (("tr", 6), ("te", 4)):
-            fm = GradientFileManager(str(tmp_path / split))
+            fm = GradientStorageManager(str(tmp_path / split))
             hm = HookManager(
                 model,
                 config=cfg,
@@ -1066,7 +1070,7 @@ class TestMaterializedLayers:
         instead of an AttributeError deep inside ``as_batch_first``.
         """
         dirs = _collect_trak_mixed(tmp_path)
-        fm = GradientFileManager(str(dirs[0]))
+        fm = GradientStorageManager(str(dirs[0]))
         rec = fm.load_records(fm.iter_steps(0)[0][0])[0]
         acc = ops.KroneckerAccumulator()
         with pytest.raises(TypeError, match="factorized"):
@@ -1088,24 +1092,36 @@ class TestPreconditionedTestSide:
     CLASSES = (KFACAttributor, EKFACAttributor)
 
     def _default(self, cls, collected, out):
-        return _make(cls, out).attribute_from_cache(
-            damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
-        ).query(
-            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        return (
+            _make(cls, out)
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
         )
 
     @pytest.mark.parametrize("cls", CLASSES)
     def test_loop_over_test_matches_cached(self, cls, collected, tmp_path):
         base = self._default(cls, collected, tmp_path / "base")
-        looped = _make(cls, tmp_path / "loop").attribute_from_cache(
-            damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
-            loop_over_test=True,
-        ).query(
-            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        looped = (
+            _make(cls, tmp_path / "loop")
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                loop_over_test=True,
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
         )
         assert torch.allclose(base, looped, atol=1e-4, rtol=1e-3), (
             f"{cls.__name__}: max diff {(base - looped).abs().max():.2e}"
@@ -1114,14 +1130,20 @@ class TestPreconditionedTestSide:
     @pytest.mark.parametrize("cls", CLASSES)
     def test_disk_persisted_loop_matches_cached(self, cls, collected, tmp_path):
         base = self._default(cls, collected, tmp_path / "base")
-        disk = _make(cls, tmp_path / "disk").attribute_from_cache(
-            damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
-            loop_over_test=True,
-            preconditioned_test_dir=str(tmp_path / "pre_te"),
-        ).query(
-            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        disk = (
+            _make(cls, tmp_path / "disk")
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                loop_over_test=True,
+                preconditioned_test_dir=str(tmp_path / "pre_te"),
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
         )
         assert torch.allclose(base, disk, atol=1e-4, rtol=1e-3), (
             f"{cls.__name__}: max diff {(base - disk).abs().max():.2e}"
@@ -1140,17 +1162,23 @@ class TestPreconditionedTestSide:
         )
         # Scoring a fully-preconditioned test store against raw train
         # gradients is a plain inner product -> TracIn reproduces the score.
-        scored = TracInAttributor(
-            AttributionArguments(
-                output_dir=str(tmp_path / "tr_out"),
-                dataloader_num_workers=0,
-                dataloader_pin_memory=False,
-            ),
-        ).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=pre_dir,
-        ).query(
-            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        scored = (
+            TracInAttributor(
+                AttributionArguments(
+                    output_dir=str(tmp_path / "tr_out"),
+                    dataloader_num_workers=0,
+                    dataloader_pin_memory=False,
+                ),
+            )
+            .attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=pre_dir,
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
         )
         assert torch.allclose(base, scored, atol=1e-4, rtol=1e-3), (
             f"{cls.__name__}: max diff {(base - scored).abs().max():.2e}"

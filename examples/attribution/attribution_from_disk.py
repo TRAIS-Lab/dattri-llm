@@ -17,8 +17,8 @@ from torch.utils.data import Dataset
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_batch
 
 IN, HID, OUT = 8, 16, 4
@@ -77,7 +77,7 @@ if __name__ == "__main__":
 
         # Stage 1 -- collect per-sample gradients to disk.  HookManager captures
         # the factorized per-sample gradients during one full-batch backward;
-        # OffloadCallback persists them via GradientFileManager.  The loss is a
+        # OffloadCallback persists them via GradientStorageManager.  The loss is a
         # SUM over samples so each captured gradient is that sample's own dL_i/dW.
         print("Stage 1 -- collecting per-sample gradients to disk")
         print("-" * 50)
@@ -85,7 +85,7 @@ if __name__ == "__main__":
             ("train", x_tr, y_tr, train_dir),
             ("test", x_te, y_te, test_dir),
         ]:
-            fm = GradientFileManager(out_dir)
+            fm = GradientStorageManager(out_dir)
             hm = HookManager(
                 model,
                 config=HookManagerConfig(linear_io=REGISTER_ALL),

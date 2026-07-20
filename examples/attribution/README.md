@@ -9,7 +9,7 @@ and cached paths are interchangeable.
 Stage 1 collects per-sample gradients to disk: a `HookManager` with factorized
 (`linear_io`) hooks captures one full-batch backward (a **sum** loss, so each captured gradient is
 that sample's own `dL_i/dW`) and an `OffloadCallback` persists per-sample records
-via `GradientFileManager`. Stage 2 attributes from the cache alone —
+via `GradientStorageManager`. Stage 2 attributes from the cache alone —
 `TracInAttributor.attribute_from_cache(train_dir, test_dir)` needs no model and no
 backward pass, so it can be re-run with different settings (layer subsets,
 `normalized_grad=True` for GradCos) for free. Rows/columns are keyed by content

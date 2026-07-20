@@ -14,9 +14,9 @@ import pytest
 import torch
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, GradientRecord
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 try:
     from transformers import (
@@ -184,12 +184,12 @@ class TestTrainerOffload:
         grad_dir = str(tmp_path / "gradients")
         offload = OffloadCallback(
             offload_interval=1,
-            file_manager=GradientFileManager(grad_dir),
+            file_manager=GradientStorageManager(grad_dir),
             recording_type="per_sample",
         )
         _train_with_callbacks(tiny_gpt2, training_args, tiny_dataset, [offload])
 
-        fresh = GradientFileManager(grad_dir)
+        fresh = GradientStorageManager(grad_dir)
         assert len(fresh.available_steps()) == N_STEPS
         n_records = sum(len(entries) for entries in fresh.index.values())
         assert n_records == N_SAMPLES, (

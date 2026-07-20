@@ -7,7 +7,6 @@ from dattri_llm.gradient.callbacks import (
     HookManagerCallback,
     OffloadCallback,
 )
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import GradientRecord
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
@@ -32,14 +31,15 @@ from dattri_llm.gradient.ops import (
     materialize,
     pairwise_dot,
 )
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 __all__ = [
     "REGISTER_ALL",
     "CaptureCallback",
     "DataSelectionCallback",
     "FisherAccumulator",
-    "GradientFileManager",
     "GradientRecord",
+    "GradientStorageManager",
     "HookManager",
     "HookManagerCallback",
     "HookManagerConfig",
