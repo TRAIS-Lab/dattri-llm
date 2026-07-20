@@ -50,6 +50,8 @@ def task_loss_fn(func: Callable) -> Callable:
 def collect_to_disk(
     streamer: GradientStreamer,
     file_manager: GradientFileManager,
+    *,
+    offload_interval: int = 1,
 ) -> None:
     """Run a gradient streamer to completion, persisting every block to disk.
 
@@ -58,22 +60,43 @@ def collect_to_disk(
     :class:`GradientRecord` stamped with the streamer's *semantic* step label --
     the checkpoint index for a frozen probe, or the optimizer-step index for a
     training trajectory.  This is the shared engine of every attributor's
-    on-the-fly :meth:`cache`: collect live here, then score with
-    ``attribute_from_cache`` (so ``attribute`` == *cache + attribute_from_cache*).
+    on-the-fly :meth:`cache`: an attributor drives its own streamer, so it
+    saves directly here.  (The passive :class:`OffloadCallback` is reserved for
+    the *manual* workflow -- offloading as a side effect of a training loop the
+    attributor does not control; it is not used for attributor-driven
+    collection.)  Reproducing :meth:`attribute` is then *cache +
+    attribute_from_cache*.
+
+    Args:
+        streamer: A freshly built (not yet entered) gradient streamer.
+        file_manager: Destination store.
+        offload_interval: Number of ``(step)`` blocks accumulated per gradient
+            file.  ``1`` (default) writes one file per step.  A larger value
+            packs that many steps into each file -- amortising the per-file
+            index rewrite over a long trajectory (``enable_update=True``) at the
+            cost of holding that many blocks in memory before each flush.
     """
+    if offload_interval < 1:
+        raise ValueError(
+            f"offload_interval must be >= 1, got {offload_interval}.",
+        )
     id_key = streamer.hook_manager.sample_id_key
+    staged: list[GradientRecord] = []
     with streamer:
         for step, grad, hashes in streamer:
-            file_manager.save_bulk(
-                [
-                    GradientRecord(
-                        step=step,
-                        input_hash=hashes,
-                        gradient=grad,
-                        sample_id_key=id_key,
-                    ),
-                ],
+            staged.append(
+                GradientRecord(
+                    step=step,
+                    input_hash=hashes,
+                    gradient=grad,
+                    sample_id_key=id_key,
+                ),
             )
+            if len(staged) >= offload_interval:
+                file_manager.save_bulk(staged)
+                staged = []
+        if staged:
+            file_manager.save_bulk(staged)
 
 
 def score_sources(

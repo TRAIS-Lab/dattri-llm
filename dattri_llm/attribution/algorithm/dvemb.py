@@ -102,8 +102,11 @@ from tqdm.auto import tqdm
 
 from dattri_llm.attribution.base import BaseAttributor
 from dattri_llm.attribution.score import AttributionScore
-from dattri_llm.attribution.utils import normalize_layer_names, task_loss_fn
-from dattri_llm.gradient.callbacks import OffloadCallback
+from dattri_llm.attribution.utils import (
+    collect_to_disk,
+    normalize_layer_names,
+    task_loss_fn,
+)
 from dattri_llm.gradient.datasets import resolve_steps
 from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
@@ -227,7 +230,9 @@ class DVEmbAttributor(BaseAttributor):
         test_loss = task_loss_fn(self.task.original_target_func)
 
         # 1) Train trajectory theta_0 -> theta_T: offload each step's per-batch
-        # gradient.
+        # gradient.  The attributor drives the streamer, so it saves directly
+        # via collect_to_disk (the OffloadCallback is only for training loops
+        # the attributor cannot drive itself).
         train_streamer = GradientStreamer(
             model,
             train_dataset,
@@ -237,12 +242,7 @@ class DVEmbAttributor(BaseAttributor):
             loss_fn=train_loss,
             config=hook_config,
         )
-        train_streamer.hook_manager.add_callback(
-            OffloadCallback(offload_interval, train_fm, recording_type="per_batch"),
-        )
-        with train_streamer:
-            for _ in train_streamer:
-                pass
+        collect_to_disk(train_streamer, train_fm, offload_interval=offload_interval)
         # Record the LR actually applied per step, so attribute_from_cache can
         # verify the configured ``learning_rate`` matches the real trajectory.
         self._write_lr_schedule(train_dir, train_streamer.learning_rates)
@@ -257,12 +257,7 @@ class DVEmbAttributor(BaseAttributor):
             loss_fn=test_loss,
             config=hook_config,
         )
-        test_streamer.hook_manager.add_callback(
-            OffloadCallback(offload_interval, test_fm, recording_type="per_batch"),
-        )
-        with test_streamer:
-            for _ in test_streamer:
-                pass
+        collect_to_disk(test_streamer, test_fm, offload_interval=offload_interval)
 
         return train_dir, test_dir
 
