@@ -75,6 +75,7 @@ from dattri_llm.gradient.ops.preprocess import (
     preprocess_factorized,
 )
 from dattri_llm.gradient.ops.projection import (
+    PROJECTION_STYLES,
     _apply_projector,
     _project_factorized,
     _project_materialized,
@@ -106,6 +107,7 @@ __all__ = [
     "LINEAR_TYPES",
     "NORM_TYPES",
     "PARAM_GRAD_TYPES",
+    "PROJECTION_STYLES",
     "_CONV_IM2COL",
     "FisherAccumulator",
     "KroneckerAccumulator",

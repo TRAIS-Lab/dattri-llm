@@ -183,16 +183,27 @@ class HookManagerConfig:
     Keys consumed by the library:
 
     * ``proj_dim`` (int, **required**) -- target width of the projection.
-    * ``factorize`` (bool, default ``True``) -- ``True`` projects the two
-      factors independently (LoGRA style): the layer stays *factorized* at
-      width ``proj_dim`` and is relabelled ``"nn.Linear"``.  This is defined
-      for outer-product gradients: the linear / conv families, and the
-      embedding family (whose integer ids are expanded to one-hot inputs
-      first).  **Norm layers must use** ``factorize=False`` (TRAK style:
-      materialize the per-sample weight gradient, then project it to a dense
-      ``(B, proj_dim)`` block).
-    * ``proj_seed`` (int, default ``0``) -- base seed.  Factorized projection
-      uses ``proj_seed`` for the output-gradient factor and ``proj_seed + 1``
+    * ``style`` (str, default ``"logra_factorized"``) -- how the projected
+      gradient is represented:
+
+      * ``"logra_factorized"`` -- project the two factors independently
+        (LoGRA / double-sided): the layer stays *factorized* at width
+        ``proj_dim`` and is relabelled ``"nn.Linear"``.
+      * ``"logra_materialized"`` -- LoGRA project, then materialize the
+        projected factors into one compact ``(B, proj_dim*proj_dim)``
+        per-sample block (token-summed outer product formed cheaply in the
+        projected space).  Smaller on disk than the factors, but loses
+        per-token structure.
+      * ``"materialized"`` -- materialize the per-sample weight gradient
+        first, then project it (TRAK / single-sided) to a dense
+        ``(B, proj_dim)`` block.
+
+      The two ``logra_*`` styles are defined for outer-product gradients: the
+      linear / conv families, and the embedding family (whose integer ids are
+      expanded to one-hot inputs first).  **Norm layers must use**
+      ``"materialized"`` (their gradient is not an outer product).
+    * ``proj_seed`` (int, default ``0``) -- base seed.  The ``logra_*`` styles
+      use ``proj_seed`` for the output-gradient factor and ``proj_seed + 1``
       for the activation factor (dattri's LoGRA convention).  Keep it fixed
       per layer so gradients captured at different steps stay comparable.
     * ``device`` -- where the projection runs.  The factors are moved to this
@@ -224,14 +235,14 @@ class HookManagerConfig:
             linear_io=[r"transformer\.h\.\d+\.(attn|mlp)\.", r"wte$"],
             projection={
                 "__default__": {          # project both factors (LoGRA)
-                    "factorize": True,
+                    "style": "logra_factorized",
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
                     "device": "cuda",
                 },
                 "transformer.wte": {      # materialize-then-project (TRAK)
-                    "factorize": False,
+                    "style": "materialized",
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
                     "device": "cuda",
@@ -239,11 +250,10 @@ class HookManagerConfig:
             },
         )
 
-    Note that a ``"__default__"`` entry with ``factorize=True`` combined with
-    a hook selection that includes norm layers (e.g.
-    ``linear_io=REGISTER_ALL``) raises inside the first backward pass -- give
-    those layers explicit ``factorize=False`` entries, or exclude them from
-    hooking.
+    Note that a ``"__default__"`` entry with a ``logra_*`` style combined with a
+    hook selection that includes norm layers (e.g. ``linear_io=REGISTER_ALL``)
+    raises inside the first backward pass -- give those layers explicit
+    ``style="materialized"`` entries, or exclude them from hooking.
     """
 
     def __init__(
@@ -293,6 +303,8 @@ class HookManagerConfig:
     def _validate_projection(
         projection: dict[str, dict] | None,
     ) -> dict[str, dict] | None:
+        from dattri_llm.gradient.ops import PROJECTION_STYLES
+
         if projection is None:
             return None
         if not isinstance(projection, dict) or not all(
@@ -301,8 +313,24 @@ class HookManagerConfig:
             raise TypeError(
                 "projection must be a dict mapping layer name (or '__default__') "
                 "to a proj_kwargs dict, e.g. "
-                "{'__default__': {'factorize': True, 'proj_dim': 512}}.",
+                "{'__default__': {'style': 'logra_factorized', 'proj_dim': 512}}.",
             )
+        for name, kw in projection.items():
+            if "factorize" in kw:
+                raise ValueError(
+                    f"projection[{name!r}] uses the removed 'factorize' key. "
+                    "Use 'style' instead: 'logra_factorized' (was factorize=True), "
+                    "'materialized' (was factorize=False), or the new "
+                    "'logra_materialized' (project the factors, then materialize "
+                    f"them into a compact per-sample block). Valid styles: "
+                    f"{list(PROJECTION_STYLES)}.",
+                )
+            style = kw.get("style", "logra_factorized")
+            if style not in PROJECTION_STYLES:
+                raise ValueError(
+                    f"projection[{name!r}]['style'] = {style!r} is not a valid "
+                    f"projection style. Valid styles: {list(PROJECTION_STYLES)}.",
+                )
         return {k: dict(v) for k, v in projection.items()}
 
     @staticmethod

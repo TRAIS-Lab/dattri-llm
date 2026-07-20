@@ -353,7 +353,7 @@ class TestProject:
         g = make_gradient(repr_type="factorized")
         p = g.project(
             random_project,
-            {"__default__": {"factorize": True, "proj_dim": 32, **_PROJ}},
+            {"__default__": {"style": "logra_factorized", "proj_dim": 32, **_PROJ}},
         )
         for name in p.layer_names:
             assert p.representation[name] == "factorized"
@@ -367,7 +367,7 @@ class TestProject:
         g = make_gradient(repr_type="factorized")
         p = g.project(
             random_project,
-            {"__default__": {"factorize": False, "proj_dim": 24, **_PROJ}},
+            {"__default__": {"style": "materialized", "proj_dim": 24, **_PROJ}},
         )
         for name in p.layer_names:
             assert p.representation[name] == "materialized"
@@ -385,8 +385,8 @@ class TestProject:
         p = g.project(
             random_project,
             {
-                "l1": {"factorize": True, "proj_dim": 16, **_PROJ},
-                "l2": {"factorize": False, "proj_dim": 16, **_PROJ},
+                "l1": {"style": "logra_factorized", "proj_dim": 16, **_PROJ},
+                "l2": {"style": "materialized", "proj_dim": 16, **_PROJ},
             },
         )
         assert p.representation["l1"] == "factorized"
@@ -410,7 +410,7 @@ class TestProject:
         )
         p = g.project(
             random_project,
-            {"l1": {"factorize": False, "proj_dim": 8, **_PROJ}},
+            {"l1": {"style": "materialized", "proj_dim": 8, **_PROJ}},
         )
         assert p.representation["l1"] == "materialized"
         assert p.data["l1"].shape == (B, 8)

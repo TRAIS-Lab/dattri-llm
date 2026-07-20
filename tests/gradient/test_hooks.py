@@ -698,6 +698,18 @@ class TestProjectionConfig:
         with pytest.raises(TypeError, match="projection must be a dict"):
             HookManagerConfig(projection={"__default__": 8})  # type: ignore[dict-item]
 
+    def test_validation_rejects_unknown_style(self):
+        with pytest.raises(ValueError, match="not a valid projection style"):
+            HookManagerConfig(
+                projection={"__default__": {"style": "bogus", "proj_dim": 8}},
+            )
+
+    def test_validation_rejects_removed_factorize_key(self):
+        with pytest.raises(ValueError, match="removed 'factorize' key"):
+            HookManagerConfig(
+                projection={"__default__": {"factorize": True, "proj_dim": 8}},
+            )
+
     def test_none_keeps_projection_off(self):
         assert HookManagerConfig().projection is None
 
@@ -725,7 +737,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "__default__": {
-                    "factorize": False,
+                    "style": "materialized",
                     "proj_dim": 64,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -740,7 +752,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "__default__": {
-                    "factorize": True,
+                    "style": "logra_factorized",
                     "proj_dim": 16,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -751,6 +763,27 @@ class TestProjectionConfig:
             assert g.representation[n] == "factorized"
             assert g.data[n].activation.shape[-1] == 16
 
+    def test_logra_materialized_is_materialized_factors(self):
+        # P1: "logra_materialized" stores exactly the token-summed outer product
+        # of the "logra_factorized" projected factors -- one compact
+        # (B, proj_dim*proj_dim) block, and scoring by dot equals the factorized
+        # cross-gram.
+        from dattri_llm.gradient import ops
+
+        cfg = {
+            "proj_dim": 16,
+            "proj_max_batch_size": 8,
+            "proj_type": "rademacher",
+            "proj_seed": 5,
+        }
+        fac = self._run({"__default__": {"style": "logra_factorized", **cfg}})
+        mat = self._run({"__default__": {"style": "logra_materialized", **cfg}})
+        for n in mat.layer_names:
+            assert mat.representation[n] == "materialized"
+            assert mat.data[n].shape == (4, 16 * 16)  # compact outer product
+            ref = ops.materialize(fac.data[n], "nn.Linear")
+            assert torch.allclose(mat.data[n], ref, atol=1e-5), n
+
     def test_off_by_default_keeps_factorized(self):
         g = self._run(None)
         assert all(g.representation[n] == "factorized" for n in g.layer_names)
@@ -760,7 +793,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "0": {
-                    "factorize": False,
+                    "style": "materialized",
                     "proj_dim": 64,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -780,15 +813,18 @@ class TestProjectionConfig:
             return lambda x, ensemble_id=0: x[:, :proj_dim]
 
         g = self._run(
-            {"__default__": {"factorize": False, "proj_dim": 4}},
+            {"__default__": {"style": "materialized", "proj_dim": 4}},
             projector=fake_projector,
         )
         assert called["n"] > 0
         for n in g.layer_names:
             assert g.data[n].shape == (4, 4)
 
-    @pytest.mark.parametrize("factorize", [True, False])
-    def test_capture_time_equals_assembly_time_projection(self, factorize):
+    @pytest.mark.parametrize(
+        "style",
+        ["logra_factorized", "logra_materialized", "materialized"],
+    )
+    def test_capture_time_equals_assembly_time_projection(self, style):
         # Projecting at capture (per micro-batch) must be bit-identical to
         # projecting the fully-assembled gradient -- project(cat) == cat(project).
         from dattri.func.projection import random_project
@@ -797,7 +833,7 @@ class TestProjectionConfig:
         from dattri_llm.gradient.gradient import Factorized
 
         cfg = {
-            "factorize": factorize,
+            "style": style,
             "proj_dim": 12,
             "proj_max_batch_size": 8,
             "proj_type": "rademacher",
@@ -834,7 +870,7 @@ class TestProjectionConfig:
                 linear_io=REGISTER_ALL,
                 projection={
                     "__default__": {
-                        "factorize": False,
+                        "style": "materialized",
                         "proj_dim": 12,
                         "proj_max_batch_size": 8,
                         "proj_type": "rademacher",

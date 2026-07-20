@@ -384,25 +384,30 @@ class Gradient:
     def project(self, projector: Callable, proj_kwargs: dict[str, dict]) -> Gradient:
         """Random-project each layer's per-sample gradient to a smaller dimension.
 
-        Two styles, chosen per layer by ``proj_kwargs[name]["factorize"]``:
+        Three styles, chosen per layer by ``proj_kwargs[name]["style"]``:
 
-        * ``factorize=True`` (LoGRA) -- project the factorized factors, keeping the
-          Kronecker structure at width ``proj_dim``; the layer stays *factorized*.
-          Defined for outer-product gradients (linear / conv, and embeddings via
-          one-hot inputs); norm layers must use ``factorize=False``.
-        * ``factorize=False`` (TRAK) -- materialize the per-sample weight gradient,
-          then project it, collapsing the layer to a dense ``(B, proj_dim)`` block.
+        * ``"logra_factorized"`` (default, LoGRA) -- project the factorized
+          factors, keeping the Kronecker structure at width ``proj_dim``; the
+          layer stays *factorized*.  Defined for outer-product gradients (linear
+          / conv, and embeddings via one-hot inputs); norm layers cannot use it.
+        * ``"logra_materialized"`` -- LoGRA project, then materialize the
+          projected factors into one dense ``(B, k_g*k_a)`` block per sample
+          (token-summed outer product, formed in the small projected space).
+        * ``"materialized"`` (TRAK) -- materialize the per-sample weight gradient
+          first, then project it to a dense ``(B, proj_dim)`` block.  The only
+          style available for norm layers and for already-materialized inputs.
 
         Args:
             projector: a projection factory following dattri's ``random_project``
                 protocol -- ``projector(feature, batch_size, proj_dim=..., **kw)``
                 returns a callable mapping ``(N, D) -> (N, proj_dim)``.
             proj_kwargs: ``{layer_name: dict}`` per-layer config.  Each dict carries
-                ``proj_dim`` and optionally ``factorize`` (default ``True``),
-                ``proj_seed`` and any projector kwargs (``proj_type``,
-                ``proj_max_batch_size``, ``device``, ...).  A ``"__default__"``
-                entry supplies the config for layers without their own; layers
-                with **neither** an entry nor ``"__default__"`` are left unchanged.
+                ``proj_dim`` and optionally ``style`` (default
+                ``"logra_factorized"``), ``proj_seed`` and any projector kwargs
+                (``proj_type``, ``proj_max_batch_size``, ``device``, ...).  A
+                ``"__default__"`` entry supplies the config for layers without
+                their own; layers with **neither** an entry nor ``"__default__"``
+                are left unchanged.
 
         Returns:
             A new :class:`Gradient` holding each layer's projection.
@@ -422,12 +427,12 @@ class Gradient:
                 new_indexing[name] = self.indexing[name]
                 continue
             kw = dict(kw)
-            factorize = kw.pop("factorize", True)
+            style = kw.pop("style", "logra_factorized")
             payload, is_factorized = ops.project_layer(
                 value,
                 self.layer_types[name],
                 projector,
-                factorize=factorize,
+                style=style,
                 **kw,
             )
             if is_factorized:

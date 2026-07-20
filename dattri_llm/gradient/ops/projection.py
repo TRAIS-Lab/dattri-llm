@@ -16,6 +16,13 @@ if TYPE_CHECKING:
     from dattri_llm.gradient.gradient import Factorized
 
 
+# The three capture/projection styles (the ``style`` key of a projection
+# config).  ``logra_*`` are the double-sided (Kronecker) factor projection --
+# keeping the factors, or materializing them into a compact per-sample block;
+# ``materialized`` is the single-sided (TRAK) materialize-then-project.
+PROJECTION_STYLES = ("logra_factorized", "logra_materialized", "materialized")
+
+
 def _apply_projector(
     projector: Callable,
     x: torch.Tensor,
@@ -217,16 +224,33 @@ def project_layer(
     layer_type: str,
     projector: Callable,
     *,
-    factorize: bool = True,
+    style: str = "logra_factorized",
     **proj_kwargs,
 ) -> tuple[object, bool]:
-    """Route one layer to factorized (LoGRA) or materialized (TRAK) projection.
+    """Route one layer to one of the three projection styles.
 
-    Returns ``(payload, is_factorized)``: the payload is the ``(a_p, g_p)`` factor
-    tuple when factorized (the caller rewraps it into a :class:`Factorized` with
-    ``module_kwargs=None``), else a dense ``(B, proj_dim)`` tensor.  This is the
-    per-layer routing shared by :meth:`Gradient.project`.
+    Returns ``(payload, is_factorized)``:
+
+    * ``"logra_factorized"`` -- double-sided (LoGRA) projection, **keeping the
+      factors**: payload is the ``(a_p, g_p)`` tuple (the caller rewraps it into
+      a :class:`Factorized` with ``module_kwargs=None``), ``is_factorized`` True.
+    * ``"logra_materialized"`` -- double-sided (LoGRA) projection, then
+      **materialize** the projected factors into one ``(B, k_g*k_a)`` per-sample
+      block (token-summed outer product, cheap because it happens in the small
+      projected space).  payload is a dense tensor, ``is_factorized`` False.
+    * ``"materialized"`` -- single-sided (TRAK) projection: materialize the full
+      per-sample weight gradient **first**, then project it to ``(B, proj_dim)``.
+      payload is a dense tensor, ``is_factorized`` False.
+
+    A materialized input tensor can only take the ``"materialized"`` path (there
+    are no factors to project), whatever the requested style.
     """
-    if factorize and not isinstance(f, torch.Tensor):
-        return project_factorized(f, layer_type, projector, **proj_kwargs), True
+    if not isinstance(f, torch.Tensor):
+        if style == "logra_factorized":
+            return project_factorized(f, layer_type, projector, **proj_kwargs), True
+        if style == "logra_materialized":
+            a_p, g_p = project_factorized(f, layer_type, projector, **proj_kwargs)
+            # Projected outer-product factors behave as a plain linear layer;
+            # module_kwargs=None so they are not re-preprocessed.
+            return _materialize(a_p, g_p, "nn.Linear"), False
     return project_materialized(f, layer_type, projector, **proj_kwargs), False

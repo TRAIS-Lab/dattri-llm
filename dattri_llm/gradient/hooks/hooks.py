@@ -376,12 +376,20 @@ def _capture_projected(
     """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
 
     Called from the backward hook of a projected layer, pairing ``g`` with the
-    matching per-replica forward activation.  For a **factorized** (LoGRA) layer
-    the projected factors are appended to ``_act_parts``/``_grad_parts``; for a
-    **materialized** (TRAK) layer the projected per-sample gradient is appended to
-    ``_proj_parts``.  Only the small projected result is retained (moved to CPU
-    when *offload_to_cpu*) -- the raw factors are discarded here, so the buffer
-    never holds the full gradient.
+    matching per-replica forward activation.  The ``style`` of the projection
+    config decides what is buffered:
+
+    * ``"logra_factorized"`` -- the projected factors go to
+      ``_act_parts``/``_grad_parts``.
+    * ``"logra_materialized"`` -- the projected factors are materialized (token
+      -summed outer product in the small projected space) into one per-sample
+      block appended to ``_proj_parts``.
+    * ``"materialized"`` (TRAK) -- the materialize-then-project per-sample block
+      goes to ``_proj_parts``.
+
+    Only the small projected result is retained (moved to CPU when
+    *offload_to_cpu*) -- the raw factors are discarded here, so the buffer never
+    holds the full gradient.
 
     Returns:
         ``True`` when a forward capture was matched and consumed, ``False``
@@ -395,13 +403,13 @@ def _capture_projected(
         return False
 
     kw = dict(buf["_proj_kw"])
-    factorize = kw.pop("factorize", True)
+    style = kw.pop("style", "logra_factorized")
     layer_type = buf["_class_name"]
     module_kwargs = buf["_module_kwargs"]
     if a.ndim == 1 and is_embedding(layer_type):
         a, g = a.unsqueeze(0), g.unsqueeze(0)
 
-    if factorize:
+    if style == "logra_factorized":
         a_p, g_p = ops._project_factorized(
             a,
             g,
@@ -416,7 +424,22 @@ def _capture_projected(
             buf["_act_parts"].append((dev_idx, a_p))
             buf["_grad_parts"].append((dev_idx, g_p))
             buf["_pair_pos"].append(pair_pos)
-    else:
+        return True
+
+    if style == "logra_materialized":
+        a_p, g_p = ops._project_factorized(
+            a,
+            g,
+            layer_type,
+            projector,
+            module_kwargs,
+            **kw,
+        )
+        # Materialize the projected factors (token-summed outer product) in the
+        # small projected space; they behave as a plain linear layer, so
+        # module_kwargs=None avoids re-preprocessing.
+        mat = ops._materialize(a_p, g_p, "nn.Linear")
+    else:  # "materialized" (TRAK)
         mat = ops._project_materialized(
             a,
             g,
@@ -425,11 +448,11 @@ def _capture_projected(
             module_kwargs,
             **kw,
         )
-        if offload_to_cpu:
-            mat = mat.cpu()
-        with buf["_lock"]:
-            buf["_proj_parts"].append((dev_idx, mat))
-            buf["_pair_pos"].append(pair_pos)
+    if offload_to_cpu:
+        mat = mat.cpu()
+    with buf["_lock"]:
+        buf["_proj_parts"].append((dev_idx, mat))
+        buf["_pair_pos"].append(pair_pos)
     return True
 
 

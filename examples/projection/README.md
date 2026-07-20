@@ -33,14 +33,22 @@ in six sections:
    recognise, declared with `layer_types` + `module_kwargs` and verified
    against autograd.
 
-## Two projection styles
+## Three projection styles
 
-Chosen per layer via `factorize`:
+Chosen per layer via `style`:
 
-| style | `factorize` | result | defined for |
-|---|---|---|---|
-| LoGRA | `True` (default) | both factors projected; layer stays **factorized** at width `proj_dim` | linear / conv families, embeddings (ids expanded to one-hot) |
-| TRAK | `False` | per-sample weight gradient materialized, then projected to a dense `(B, proj_dim)` block | any layer; **required** for norm layers |
+| `style` | result | defined for |
+|---|---|---|
+| `"logra_factorized"` (default) | both factors projected; layer stays **factorized** at width `proj_dim` | linear / conv families, embeddings (ids expanded to one-hot) |
+| `"logra_materialized"` | LoGRA-project, then **materialize** the factors into a compact `(B, proj_dim*proj_dim)` block (token-summed outer product) | same as above; smaller on disk, no per-token structure |
+| `"materialized"` (TRAK) | per-sample weight gradient materialized, then projected to a dense `(B, proj_dim)` block | any layer; **required** for norm layers |
+
+The two `logra_*` styles share the same double-sided projection and score
+identically for sample-level attribution; `"logra_materialized"` just stores
+the collapsed outer product instead of the per-token factors. Use it when you
+only need per-sample scores and want a compact store; keep
+`"logra_factorized"` when you need per-token attribution or K-FAC/EK-FAC
+(which require the factors).
 
 ## Configuring projection per layer
 
@@ -54,14 +62,15 @@ HookManagerConfig(
     linear_io=REGISTER_ALL,
     projection={
         "__default__": {
-            "factorize": True,
+            "style": "logra_factorized",
             "proj_dim": 64,
             "proj_max_batch_size": 8,   # required by dattri's random_project
             "proj_type": "rademacher",
             "proj_seed": 7,
         },
-        "norm": {"factorize": False, "proj_dim": 64, "proj_max_batch_size": 8,
-                 "proj_type": "rademacher", "proj_seed": 7},
+        "norm": {"style": "materialized", "proj_dim": 64,
+                 "proj_max_batch_size": 8, "proj_type": "rademacher",
+                 "proj_seed": 7},
     },
 )
 ```

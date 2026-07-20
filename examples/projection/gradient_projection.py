@@ -69,26 +69,30 @@ class CustomNet(nn.Module):
         return self.norm(self.fc(self.embed(input_ids)))
 
 
-# Per-layer projection config.  Two styles exist, chosen per layer by
-# ``factorize``: True (LoGRA) projects the two factors independently and the
-# layer stays factorized at width proj_dim -- defined for outer-product
-# gradients (linear/conv families, embeddings via one-hot inputs); False
-# (TRAK) materializes the per-sample weight gradient and projects it to a
-# dense (B, proj_dim) block -- required for norm layers.  "__default__"
-# covers every hooked layer without its own entry.  Keep ``proj_seed`` fixed
-# and the projection device consistent across everything scored together:
-# different seeds (or dattri's CPU vs CUDA projectors) are different
-# projections.
+# Per-layer projection config.  Three styles exist, chosen per layer by
+# ``style``:
+#   * "logra_factorized" (LoGRA) projects the two factors independently and the
+#     layer stays factorized at width proj_dim -- defined for outer-product
+#     gradients (linear/conv families, embeddings via one-hot inputs);
+#   * "logra_materialized" LoGRA-projects then materializes the factors into a
+#     compact (B, proj_dim*proj_dim) block (smaller on disk, no per-token
+#     structure);
+#   * "materialized" (TRAK) materializes the per-sample weight gradient and
+#     projects it to a dense (B, proj_dim) block -- required for norm layers.
+# "__default__" covers every hooked layer without its own entry.  Keep
+# ``proj_seed`` fixed and the projection device consistent across everything
+# scored together: different seeds (or dattri's CPU vs CUDA projectors) are
+# different projections.
 PROJ_KWARGS = {
     "__default__": {  # LoGRA: project both factors, stay factorized
-        "factorize": True,
+        "style": "logra_factorized",
         "proj_dim": PROJ_DIM,
         "proj_max_batch_size": 8,
         "proj_type": "rademacher",
         "proj_seed": 7,
     },
     "norm": {  # TRAK: materialize the per-sample gradient, then project
-        "factorize": False,
+        "style": "materialized",
         "proj_dim": PROJ_DIM,
         "proj_max_batch_size": 8,
         "proj_type": "rademacher",
@@ -196,14 +200,14 @@ if __name__ == "__main__":
             linear_io=REGISTER_ALL,
             projection={
                 "mlp.fc1": {  # wide layer, generous budget
-                    "factorize": True,
+                    "style": "logra_factorized",
                     "proj_dim": 128,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
                     "proj_seed": 7,
                 },
                 "mlp.fc2": {  # same family, tighter budget
-                    "factorize": True,
+                    "style": "logra_factorized",
                     "proj_dim": 32,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",

@@ -785,7 +785,7 @@ class HookManager:
                 strict=True,
             ):
                 grads[pos].append((dev, part))
-        elif buf["_proj_kw"].get("factorize", True):
+        elif buf["_proj_kw"].get("style", "logra_factorized") == "logra_factorized":
             # Projected factorized: both factors were appended together at
             # match time, aligned with pair_pos.
             for (dev, part), (_, pos) in zip(
@@ -838,9 +838,15 @@ class HookManager:
             ):
                 out_name = layer_name if inv_k == 0 else f"{layer_name}@{inv_k + 1}"
 
-                # Materialized (TRAK) projection: the projected per-sample
-                # gradient was assembled into _proj_parts at capture time.
-                if proj_kw is not None and not proj_kw.get("factorize", True):
+                # Materialized styles ("materialized"/TRAK and
+                # "logra_materialized"): the projected per-sample gradient was
+                # assembled into _proj_parts at capture time.
+                proj_style = (
+                    proj_kw.get("style", "logra_factorized")
+                    if proj_kw is not None
+                    else "logra_factorized"
+                )
+                if proj_kw is not None and proj_style != "logra_factorized":
                     if not proj_parts:
                         raise RuntimeError(
                             f"Layer '{layer_name}' has no buffered data. "
