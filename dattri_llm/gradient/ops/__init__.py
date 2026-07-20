@@ -41,10 +41,12 @@ from dattri_llm.gradient.ops.kronecker import (
     _kfac,
     _kfac_cross,
     ekfac_materialize,
+    ekfac_precondition,
     fim,
     kfac,
     kfac_cross,
     kfac_eigh,
+    kfac_precondition,
     sym_inverse,
 )
 from dattri_llm.gradient.ops.materialize import (
@@ -143,6 +145,7 @@ __all__ = [
     "dot",
     "effective_dims",
     "ekfac_materialize",
+    "ekfac_precondition",
     "extract_module_kwargs",
     "fim",
     "grad_norm_sq",
@@ -154,6 +157,7 @@ __all__ = [
     "kfac",
     "kfac_cross",
     "kfac_eigh",
+    "kfac_precondition",
     "materialize",
     "maybe_use_materialized_gram",
     "maybe_use_materialized_norm",

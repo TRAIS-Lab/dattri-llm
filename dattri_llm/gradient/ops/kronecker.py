@@ -265,6 +265,65 @@ def ekfac_materialize(
     )
 
 
+def kfac_precondition(
+    f: Factorized,
+    layer_type: str,
+    A_inv: torch.Tensor,
+    G_inv: torch.Tensor,
+    include_bias: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preprocess and whiten one side's factors by the inverse K-FAC covariances.
+
+    Returns the *preprocessed* ``(a @ A_inv, g @ G_inv)`` factor pair.  Because
+    both inverses are symmetric, a cross-gram of these whitened factors against
+    a raw (preprocessed) side equals :func:`kfac_cross` -- so the whitening can
+    be paid **once on the small side** (typically the test/query gradients)
+    instead of once per train block.
+    """
+    bf = f.as_batch_first()
+    a, g = _preprocess_factorized(
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        bf.module_kwargs,
+        include_bias,
+    )
+    return a.float() @ A_inv.float(), g.float() @ G_inv.float()
+
+
+def ekfac_precondition(
+    M: torch.Tensor,
+    U_A: torch.Tensor,
+    U_G: torch.Tensor,
+    lam: torch.Tensor,
+    layer_type: str,
+) -> torch.Tensor:
+    """Apply the full damped EK-FAC inverse to eigenbasis coordinates.
+
+    *M* is a ``(B, D)`` block of :func:`ekfac_materialize` outputs and *lam*
+    the damped corrected eigenvalues ``(D,)``.  Returns the **original-basis**
+    representation flattened back to ``(B, D)`` in the same layout
+    :func:`_materialize` uses for *layer_type*, so that ``<dW_raw, R>`` equals
+    the EK-FAC score -- gradients on the other side then need *no* rotation.
+
+    The materialize layout differs by layer family: linear/conv flatten the
+    weight gradient ``(d_out, d_in)``-major (``U_G`` on the output/left side),
+    while conv-transpose flattens ``(C_in, P)``-major (``U_A`` on the left).
+    """
+    Md = M / lam
+    if is_conv_transpose(layer_type):
+        # dW' = U_A^T dW U_G, flattened (C_in, P) = (U_A rows, U_G rows).
+        c_in, p = U_A.shape[0], U_G.shape[0]
+        M3 = Md.reshape(M.shape[0], c_in, p)
+        R = torch.einsum("ce,bef,pf->bcp", U_A.float(), M3, U_G.float())
+        return R.reshape(M.shape[0], c_in * p)
+    # Linear / conv: dW' = U_G^T dW U_A, flattened (d_out, d_in).
+    d_out, d_in = U_G.shape[0], U_A.shape[0]
+    M3 = Md.reshape(M.shape[0], d_out, d_in)
+    R = torch.einsum("oe,bef,if->boi", U_G.float(), M3, U_A.float())
+    return R.reshape(M.shape[0], d_out * d_in)
+
+
 # ---------------------------------------------------------------------------
 # Per-layer streaming accumulators
 # ---------------------------------------------------------------------------

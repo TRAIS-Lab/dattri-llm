@@ -68,7 +68,7 @@ from dattri_llm.attribution.utils import (
 )
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import Factorized
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.streaming import (
     DiskGradientSource,
     GradientSource,
@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     from torch.utils.data import Dataset
 
     from dattri_llm.attribution.arguments import AttributionArguments
-    from dattri_llm.gradient.gradient import Gradient
     from dattri_llm.gradient.hooks import HookManagerConfig
 
 
@@ -238,52 +237,23 @@ class _KroneckerBaseAttributor(BaseAttributor):
     # Main entry point                                                   #
     # ------------------------------------------------------------------ #
 
-    def _run(
+    def _fit_context(
         self,
         train_source: GradientSource,
-        test_source: GradientSource,
-        *,
-        damping: float = 1e-3,
-        loop_over_test: bool = False,
-        non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
-        direct_fim_max_params: int = 4096,
-        algorithm_meta_extra: dict | None = None,
-        layer_name: list[str] | None = None,
-    ) -> AttributionScore:
-        """Fit the K-FAC preconditioner from ``train_source``, then score it
-        against ``test_source`` -- the shared loop behind :meth:`attribute_from_cache`
-        and :meth:`attribute`.
+        device: torch.device,
+        damping: float,
+        non_kfac_strategy: str,
+        direct_fim_max_params: int,
+    ) -> tuple[dict, dict[str, torch.Tensor]]:
+        """Fit the K-FAC preconditioner and the direct empirical Fisher.
 
-        ``train_source`` must be **re-iterable**: the Fisher pre-pass re-reads the
-        train gradients before scoring (EK-FAC reads them twice more), so a
-        single-shot trajectory stream is rejected.
+        One (or, for EK-FAC, two) sweep(s) over ``train_source``.  The
+        empirical-Fisher accumulator is filled in the *same* first pass: it
+        always receives layers stored materialized (K-FAC is impossible for
+        them, so the dense Fisher is their only preconditioner), and
+        additionally the norm layers when the direct strategy is requested.
+        Returns ``(ctx, fim_ctx)``.
         """
-        if damping < 0:
-            raise ValueError(f"damping must be non-negative, got {damping}.")
-        if non_kfac_strategy not in ("ignore", "direct"):
-            raise ValueError(
-                "non_kfac_strategy must be 'ignore' or 'direct', got "
-                f"{non_kfac_strategy!r}.",
-            )
-        if direct_fim_max_params <= 0:
-            raise ValueError(
-                f"direct_fim_max_params must be positive, got {direct_fim_max_params}.",
-            )
-        if not getattr(train_source, "reusable", False):
-            raise ValueError(
-                f"{type(self).__name__} needs a re-iterable train source: the "
-                "Fisher pre-pass re-reads the train gradients before scoring. Use "
-                "on-disk gradients or a frozen GradientStreamer (enable_update=False, "
-                "single-shot trajectory stream).",
-            )
-
-        device = self.args.device
-
-        # Fit the K-FAC preconditioner over the training gradients.  The
-        # empirical-Fisher accumulator is filled in the *same* first pass:
-        # it always receives layers stored materialized (K-FAC is impossible
-        # for them, so the dense Fisher is their only preconditioner), and
-        # additionally the norm layers when the direct strategy is requested.
         self._fisher_saw_embedding = set()
         self._skipped_materialized = set()
         self._direct_norm_layers = non_kfac_strategy == "direct"
@@ -317,6 +287,120 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 )
                 + ". Check the hook config and the collected layers.",
             )
+        return ctx, fim_ctx
+
+    def _write_preconditioned_store(
+        self,
+        test_source: GradientSource,
+        ctx: dict,
+        fim_ctx: dict[str, torch.Tensor],
+        out_dir: str,
+        device: torch.device,
+    ) -> str:
+        """Persist fully preconditioned test representations to *out_dir*.
+
+        One sweep over ``test_source``: every block's K-FAC/EK-FAC and
+        direct-Fisher representations are computed via :meth:`_prepare_test` /
+        :meth:`_prepare_fim_test` (which carry the entire preconditioner on
+        the test side), **materialized** to one ``(B_te, D)`` tensor per
+        layer, and stored as materialized :class:`Gradient` records with the
+        source records' steps and hashes.  Scoring against the store is a
+        plain inner product, so it composes with
+        :class:`~dattri_llm.attribution.algorithm.tracin.TracInAttributor.attribute_from_cache`
+        exactly like a DVEmb embedding store.
+        """
+        fm = GradientFileManager(str(out_dir))
+        for step, test_block, hashes in test_source:
+            test_g = test_block.to(device)
+            kfac_rep = self._prepare_test(test_g, ctx)
+            fim_rep = self._prepare_fim_test(test_g, fim_ctx)
+            data: dict[str, torch.Tensor] = {}
+            layer_types: dict[str, str] = {}
+            for layer, entry in kfac_rep.items():
+                if isinstance(entry, tuple):
+                    # K-FAC whitened factors -> materialize for storage.
+                    a_w, g_w = entry
+                    tensor = ops._materialize(
+                        a_w,
+                        g_w,
+                        test_g.layer_types[layer],
+                    )
+                else:  # already a (B_te, D) preconditioned matrix (EK-FAC)
+                    tensor = entry
+                data[layer] = tensor.detach().cpu()
+                layer_types[layer] = test_g.layer_types[layer]
+            for layer, tensor in fim_rep.items():
+                data[layer] = tensor.detach().cpu()
+                layer_types[layer] = test_g.layer_types[layer]
+            grad = Gradient(
+                representation=dict.fromkeys(data, "materialized"),
+                data=data,
+                layer_types=layer_types,
+            )
+            fm.save_bulk(
+                [GradientRecord(step=step, input_hash=list(hashes), gradient=grad)],
+            )
+        return str(out_dir)
+
+    def _run(
+        self,
+        train_source: GradientSource,
+        test_source: GradientSource,
+        *,
+        damping: float = 1e-3,
+        loop_over_test: bool = False,
+        preconditioned_test_dir: str | None = None,
+        non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
+        direct_fim_max_params: int = 4096,
+        algorithm_meta_extra: dict | None = None,
+        layer_name: list[str] | None = None,
+    ) -> AttributionScore:
+        """Fit the K-FAC preconditioner from ``train_source``, then score it
+        against ``test_source`` -- the shared loop behind :meth:`attribute_from_cache`
+        and :meth:`attribute`.
+
+        ``train_source`` must be **re-iterable**: the Fisher pre-pass re-reads the
+        train gradients before scoring (EK-FAC reads them twice more), so a
+        single-shot trajectory stream is rejected.
+
+        With ``loop_over_test=True`` and *preconditioned_test_dir* set, the
+        preconditioned test representations are computed once, persisted
+        there, and re-streamed **from disk** on every per-train-block sweep
+        (instead of being recomputed from the raw test gradients each time).
+        """
+        if damping < 0:
+            raise ValueError(f"damping must be non-negative, got {damping}.")
+        if preconditioned_test_dir is not None and not loop_over_test:
+            raise ValueError(
+                "preconditioned_test_dir only applies to loop_over_test=True "
+                "(with loop_over_test=False the preconditioned representations "
+                "are simply held in memory).",
+            )
+        if non_kfac_strategy not in ("ignore", "direct"):
+            raise ValueError(
+                "non_kfac_strategy must be 'ignore' or 'direct', got "
+                f"{non_kfac_strategy!r}.",
+            )
+        if direct_fim_max_params <= 0:
+            raise ValueError(
+                f"direct_fim_max_params must be positive, got {direct_fim_max_params}.",
+            )
+        if not getattr(train_source, "reusable", False):
+            raise ValueError(
+                f"{type(self).__name__} needs a re-iterable train source: the "
+                "Fisher pre-pass re-reads the train gradients before scoring. Use "
+                "on-disk gradients or a frozen GradientStreamer (enable_update=False, "
+                "single-shot trajectory stream).",
+            )
+
+        device = self.args.device
+        ctx, fim_ctx = self._fit_context(
+            train_source,
+            device,
+            damping,
+            non_kfac_strategy,
+            direct_fim_max_params,
+        )
 
         # Per test block: (K-FAC rep, direct-Fisher rep).  Per (train, test) pair:
         # the summed K-FAC + direct-Fisher score.
@@ -325,6 +409,38 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 test_g,
                 fim_ctx,
             )
+
+        if preconditioned_test_dir is not None:
+            # Precondition once, persist, and re-stream the (small) store per
+            # train block; records already carry the full preconditioner, so
+            # "preparing" a disk block is just splitting its layers.
+            self._write_preconditioned_store(
+                test_source,
+                ctx,
+                fim_ctx,
+                preconditioned_test_dir,
+                device,
+            )
+            test_source = DiskGradientSource(
+                GradientFileManager(preconditioned_test_dir),
+                self.args,
+                desc=f"{self.algorithm}: preconditioned test",
+            )
+
+            def prepare(  # noqa: F811 -- intentional swap of the prepare hook
+                test_g: Gradient,
+            ) -> tuple[object, dict[str, torch.Tensor]]:
+                kfac_rep = {
+                    layer: tensor
+                    for layer, tensor in test_g.data.items()
+                    if layer in ctx
+                }
+                fim_rep = {
+                    layer: tensor.float()
+                    for layer, tensor in test_g.data.items()
+                    if layer in fim_ctx
+                }
+                return kfac_rep, fim_rep
 
         def score(train_g: Gradient, rep: object, n_test: int) -> torch.Tensor:
             test_rep, fim_rep = rep
@@ -365,6 +481,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         damping: float = 1e-3,
         selected_training_steps: Iterable[int] | None = None,
         loop_over_test: bool = False,
+        preconditioned_test_dir: str | None = None,
         verbose: bool = False,
         non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
         direct_fim_max_params: int = 4096,
@@ -386,6 +503,13 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 output rows) to these steps; ``None`` uses all on disk.
             loop_over_test: Re-stream + rebuild the test reps per train block (low
                 memory) instead of caching them once (default).
+            preconditioned_test_dir: With ``loop_over_test=True``, persist the
+                preconditioned test representations here and re-stream them
+                from disk on every sweep, instead of recomputing them from
+                the raw test gradients each time.  See
+                :meth:`cache_preconditioned_test` to build this store ahead
+                of time (e.g. once, for reuse across many
+                ``attribute_from_cache`` calls with the same test set).
             verbose: Show tqdm progress bars on the logging process.
             non_kfac_strategy: Governs the **norm** layers (K-FAC is
                 undefined for them): ``"ignore"`` (default) skips them;
@@ -429,6 +553,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
             test,
             damping=damping,
             loop_over_test=loop_over_test,
+            preconditioned_test_dir=preconditioned_test_dir,
             non_kfac_strategy=non_kfac_strategy,
             direct_fim_max_params=direct_fim_max_params,
             algorithm_meta_extra={
@@ -439,6 +564,97 @@ class _KroneckerBaseAttributor(BaseAttributor):
                 },
             },
             layer_name=layer_name,
+        )
+
+    def cache_preconditioned_test(
+        self,
+        train_gradients_dir: str,
+        test_gradients_dir: str,
+        preconditioned_test_dir: str | None = None,
+        *,
+        damping: float = 1e-3,
+        selected_training_steps: Iterable[int] | None = None,
+        non_kfac_strategy: Literal["ignore", "direct"] = "ignore",
+        direct_fim_max_params: int = 4096,
+        layer_name: str | list[str] | None = None,
+        verbose: bool = False,
+    ) -> str:
+        """Fit the preconditioner and persist **preconditioned** test reps.
+
+        Mirrors ``DVEmbAttributor.cache_dvemb``: a one-time sweep that turns
+        raw test gradients into a store already carrying the full K-FAC/EK-FAC
+        (and direct-Fisher) preconditioner applied on the test side (see the
+        module docstring and :func:`dattri_llm.gradient.ops.kfac_precondition`
+        / :func:`~dattri_llm.gradient.ops.ekfac_precondition` for the identity
+        this relies on).  Scoring the store against train gradients then
+        reduces to a plain ``TracInAttributor`` inner product -- no
+        preconditioner is recomputed::
+
+            dvemb_dir = attr.cache_preconditioned_test(train_dir, test_dir)
+            scores = TracInAttributor(args).attribute_from_cache(
+                train_gradients_dir=train_dir, test_gradients_dir=dvemb_dir)
+
+        and this store can be reused across any later call, or passed via
+        ``attribute_from_cache(..., loop_over_test=True,
+        preconditioned_test_dir=...)`` to persist it inline instead of
+        pre-building it.
+
+        Args:
+            train_gradients_dir: Directory written by :class:`GradientFileManager`
+                for the train pass (fits the preconditioner).
+            test_gradients_dir: Directory written for the test pass (the raw
+                gradients that get preconditioned).
+            preconditioned_test_dir: Where to store the result; defaults to
+                ``<args.output_dir>/<algorithm>_preconditioned_test``.
+            damping: As in :meth:`attribute_from_cache`.
+            selected_training_steps: As in :meth:`attribute_from_cache`
+                (restricts the Fisher fit, not what gets stored).
+            non_kfac_strategy: As in :meth:`attribute_from_cache`.
+            direct_fim_max_params: As in :meth:`attribute_from_cache`.
+            layer_name: As in :meth:`attribute_from_cache`.
+            verbose: Show tqdm progress bars on the logging process.
+
+        Returns:
+            ``preconditioned_test_dir``.
+        """
+        if preconditioned_test_dir is None:
+            subdir = f"{self.algorithm.lower()}_preconditioned_test"
+            preconditioned_test_dir = str(Path(self.args.output_dir) / subdir)
+        layer_name = normalize_layer_names(layer_name)
+        train = DiskGradientSource(
+            GradientFileManager(train_gradients_dir),
+            self.args,
+            steps=selected_training_steps,
+            layer_name=layer_name,
+            desc=f"{self.algorithm}: train (fitting)",
+            verbose=verbose,
+        )
+        test = DiskGradientSource(
+            GradientFileManager(test_gradients_dir),
+            self.args,
+            layer_name=layer_name,
+            desc=f"{self.algorithm}: test (raw)",
+            verbose=verbose,
+        )
+        if not getattr(train, "reusable", False):
+            raise ValueError(
+                f"{type(self).__name__} needs a re-iterable train source to fit "
+                "the preconditioner; use on-disk gradients.",
+            )
+        device = self.args.device
+        ctx, fim_ctx = self._fit_context(
+            train,
+            device,
+            damping,
+            non_kfac_strategy,
+            direct_fim_max_params,
+        )
+        return self._write_preconditioned_store(
+            test,
+            ctx,
+            fim_ctx,
+            preconditioned_test_dir,
+            device,
         )
 
     def attribute(
@@ -625,9 +841,13 @@ class _KroneckerBaseAttributor(BaseAttributor):
         test_g: Gradient,
         fim_ctx: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        """``(B_te, P)`` weight gradient per direct-Fisher layer."""
+        """``(B_te, P)`` **preconditioned** weight gradient per direct-Fisher layer.
+
+        ``F_l^-1`` is symmetric, so it is applied wholly on this (small) side,
+        once -- each train block then needs only a plain dot.
+        """
         return {
-            layer: self._fisher_grad(test_g, layer)
+            layer: self._fisher_grad(test_g, layer).float() @ fim_ctx[layer]
             for layer in fim_ctx
             if layer in test_g.data
         }
@@ -640,15 +860,15 @@ class _KroneckerBaseAttributor(BaseAttributor):
     ) -> torch.Tensor | None:
         """``(B_tr, B_te)`` direct-Fisher score, or ``None`` if no layer applies.
 
-        ``F_l^-1`` is symmetric, so ``score = M_tr F^-1 M_te^T``.
+        ``fim_test_rep`` already carries ``F^-1``, so this is a raw dot.
         """
         total: torch.Tensor | None = None
-        for layer, F_inv in fim_ctx.items():
+        for layer in fim_ctx:
             if layer not in train_g.data or layer not in fim_test_rep:
                 continue
             M_tr = self._fisher_grad(train_g, layer).float()  # (B_tr, P)
-            M_te = fim_test_rep[layer].float()  # (B_te, P)
-            block = (M_tr @ F_inv) @ M_te.T  # (B_tr, B_te)
+            R_te = fim_test_rep[layer]  # (B_te, P), preconditioned
+            block = M_tr @ R_te.T  # (B_tr, B_te)
             total = block if total is None else total + block
         return total
 
@@ -723,32 +943,58 @@ class KFACAttributor(_KroneckerBaseAttributor):
         }
 
     @staticmethod
-    def _prepare_test(test_g: Gradient, _ctx: object) -> Gradient:
-        # K-FAC's factorised cross-gram reads the raw factors directly, so the
-        # test "representation" is just the (device-resident) gradient block.
-        return test_g
+    def _prepare_test(
+        test_g: Gradient,
+        ctx: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    ) -> dict[str, object]:
+        # Whiten the *test* factors by the inverse covariances **once**.  The
+        # inverses are symmetric, so the preconditioner can live entirely on
+        # this (small) side; each train block then enters the cross-gram raw --
+        # this is the score-pass hotspot removed by P0 (train-side whitening
+        # used to run once per train block).
+        rep: dict[str, object] = {}
+        for layer, (A_inv, G_inv) in ctx.items():
+            if layer not in test_g.data:
+                continue
+            rep[layer] = ops.kfac_precondition(
+                test_g.data[layer],
+                test_g.layer_types[layer],
+                A_inv,
+                G_inv,
+            )
+        return rep
 
     @staticmethod
     def _score(
         train_g: Gradient,
-        test_g: Gradient,
+        test_rep: dict[str, object],
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor]],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         total: torch.Tensor | None = None
-        for layer, (A_inv, G_inv) in ctx.items():
-            if layer not in train_g.data or layer not in test_g.data:
+        for layer in ctx:
+            rep = test_rep.get(layer)
+            if rep is None or layer not in train_g.data:
                 continue
-            block = ops.kfac_cross(
-                train_g.data[layer],
-                test_g.data[layer],
-                train_g.layer_types[layer],
-                A_inv,
-                G_inv,
-            )
+            if isinstance(rep, torch.Tensor):
+                # Preconditioned-materialized rep (e.g. read back from a
+                # ``cache_preconditioned_test`` store): plain dot against the
+                # raw materialized train gradient.
+                M_tr = ops.materialize(
+                    train_g.data[layer],
+                    train_g.layer_types[layer],
+                )
+                block = M_tr @ rep.to(M_tr.dtype).T
+            else:
+                # Whitened-factor rep: raw train factors cross-grammed against
+                # the (test-side) whitened factors -- equal to kfac_cross by
+                # symmetry of the inverses, without per-block whitening.
+                a1, g1 = ops.preprocess_factorized(
+                    train_g.data[layer],
+                    train_g.layer_types[layer],
+                )
+                block = ops._cross_gram(a1, g1, *rep, train_g.layer_types[layer])
             total = block if total is None else total + block
-        if total is None:
-            total = torch.zeros(train_g.batch_size, test_g.batch_size)
-        return total
+        return total  # None when no layer overlaps; _combine_score zero-fills
 
 
 class EKFACAttributor(_KroneckerBaseAttributor):
@@ -857,42 +1103,45 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         test_g: Gradient,
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> dict[str, torch.Tensor]:
-        # Rotate + materialise the test gradients into the eigenbasis once; the
-        # result (one ``(B_te, D)`` matrix per layer) is what each train block is
-        # contracted against.
-        return {
-            layer: ops.ekfac_materialize(
+        # Apply the *entire* damped EK-FAC inverse to the test gradients once:
+        # rotate into the eigenbasis, divide by the corrected spectrum, and
+        # rotate **back out** (``R = U_G (M/lam) U_A^T``).  Scoring then dots
+        # raw train gradients against ``R`` -- the per-train-block eigenbasis
+        # rotations (the score-pass hotspot removed by P0) disappear.
+        rep: dict[str, torch.Tensor] = {}
+        for layer, (U_A, U_G, lam) in ctx.items():
+            if layer not in test_g.data:
+                continue
+            M = ops.ekfac_materialize(
                 test_g.data[layer],
                 test_g.layer_types[layer],
                 U_A,
                 U_G,
+            )  # (B_te, D) eigenbasis coordinates
+            rep[layer] = ops.ekfac_precondition(
+                M,
+                U_A,
+                U_G,
+                lam,
+                test_g.layer_types[layer],
             )
-            for layer, (U_A, U_G, _) in ctx.items()
-            if layer in test_g.data
-        }
+        return rep
 
     @staticmethod
     def _score(
         train_g: Gradient,
         test_mats: dict[str, torch.Tensor],
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         total: torch.Tensor | None = None
-        for layer, (U_A, U_G, lam) in ctx.items():
-            if layer not in train_g.data or layer not in test_mats:
+        for layer in ctx:
+            M_te = test_mats.get(layer)  # (B_te, D), fully preconditioned
+            if M_te is None or layer not in train_g.data:
                 continue
-            M_tr = ops.ekfac_materialize(
+            M_tr = ops.materialize(
                 train_g.data[layer],
                 train_g.layer_types[layer],
-                U_A,
-                U_G,
-            )  # (B_tr, D)
-            M_te = test_mats[layer]  # (B_te, D)
-            block = (M_tr / lam) @ M_te.T  # lam is damped at fit time; (B_tr, B_te)
+            )  # (B_tr, D) raw weight gradient -- no rotation
+            block = M_tr @ M_te.to(M_tr.dtype).T  # (B_tr, B_te)
             total = block if total is None else total + block
-        if total is None:
-            total = torch.zeros(
-                train_g.batch_size,
-                next(iter(test_mats.values())).shape[0] if test_mats else 0,
-            )
-        return total
+        return total  # None when no layer overlaps; _combine_score zero-fills

@@ -1071,3 +1071,96 @@ class TestMaterializedLayers:
         acc = ops.KroneckerAccumulator()
         with pytest.raises(TypeError, match="factorized"):
             acc.update(rec.gradient, ["fc2"])
+
+
+# --------------------------------------------------------------------------- #
+# P0: test-side preconditioning equivalences                                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestPreconditionedTestSide:
+    """The P0 rewrite (whole preconditioner applied once on the test side)
+    must be a pure refactor: every path -- in-memory loop, disk-persisted
+    loop, and the public ``cache_preconditioned_test`` + TracIn scoring --
+    must reproduce the default score bit-for-bit (up to float tolerance).
+    """
+
+    CLASSES = (KFACAttributor, EKFACAttributor)
+
+    def _default(self, cls, collected, out):
+        return _make(cls, out).attribute_from_cache(
+            damping=DAMPING,
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+        ).query(
+            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_loop_over_test_matches_cached(self, cls, collected, tmp_path):
+        base = self._default(cls, collected, tmp_path / "base")
+        looped = _make(cls, tmp_path / "loop").attribute_from_cache(
+            damping=DAMPING,
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            loop_over_test=True,
+        ).query(
+            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        )
+        assert torch.allclose(base, looped, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}: max diff {(base - looped).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_disk_persisted_loop_matches_cached(self, cls, collected, tmp_path):
+        base = self._default(cls, collected, tmp_path / "base")
+        disk = _make(cls, tmp_path / "disk").attribute_from_cache(
+            damping=DAMPING,
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            loop_over_test=True,
+            preconditioned_test_dir=str(tmp_path / "pre_te"),
+        ).query(
+            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        )
+        assert torch.allclose(base, disk, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}: max diff {(base - disk).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_cache_then_tracin_matches_cached(self, cls, collected, tmp_path):
+        from dattri_llm.attribution.algorithm.tracin import TracInAttributor
+
+        base = self._default(cls, collected, tmp_path / "base")
+        pre_dir = _make(cls, tmp_path / "cache").cache_preconditioned_test(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            preconditioned_test_dir=str(tmp_path / "pre_te"),
+            damping=DAMPING,
+        )
+        # Scoring a fully-preconditioned test store against raw train
+        # gradients is a plain inner product -> TracIn reproduces the score.
+        scored = TracInAttributor(
+            AttributionArguments(
+                output_dir=str(tmp_path / "tr_out"),
+                dataloader_num_workers=0,
+                dataloader_pin_memory=False,
+            ),
+        ).attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=pre_dir,
+        ).query(
+            collected["train_hashes"], collected["test_hashes"], trajectory="agnostic",
+        )
+        assert torch.allclose(base, scored, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}: max diff {(base - scored).abs().max():.2e}"
+        )
+
+    def test_preconditioned_dir_requires_loop(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="loop_over_test=True"):
+            _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                preconditioned_test_dir=str(tmp_path / "pre_te"),
+            )
