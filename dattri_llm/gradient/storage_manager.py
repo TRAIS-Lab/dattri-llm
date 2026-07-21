@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from dattri_llm.gradient.gradient import Factorized, GradientRecord
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
 
@@ -41,9 +41,36 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-    from dattri_llm.gradient.gradient import Gradient
-
 RESIDENCIES = ("disk", "memory", "tiered")
+
+# On-disk serialization for the ``disk`` backend.  ``"pickle"`` (default) writes
+# one ``torch.save`` file per group.  ``"memmap"`` writes materialized groups as
+# a flat ``.mmap.bin`` (concatenated raw tensor bytes, 8-byte aligned) beside a
+# small ``.mmap.meta`` (the record/gradient metadata + per-layer byte offsets),
+# so reads are copy-on-write ``np.memmap`` views with no pickle deserialization
+# (~4x faster warm reads for compact materialized blocks).  Groups that are not
+# purely materialized -- any factorized (a, g) layer -- fall back to ``.pt``
+# transparently, so a memmap store may hold both handle kinds.
+DISK_FORMATS = ("pickle", "memmap")
+
+# numpy has no bfloat16, so a group holding bf16 tensors cannot be memmapped and
+# falls back to pickle.
+_MEMMAP_UNSUPPORTED_DTYPES = (torch.bfloat16,)
+
+
+def _group_memmappable(records: list[GradientRecord]) -> bool:
+    """Whether every record's every layer is a plain, numpy-representable tensor.
+
+    Memmap stores concatenated dense bytes, so a factorized ``(a, g)`` layer (or
+    a bf16 tensor numpy cannot view) disqualifies the group -> pickle fallback.
+    """
+    for record in records:
+        for value in record.gradient.data.values():
+            if not isinstance(value, torch.Tensor):
+                return False
+            if value.dtype in _MEMMAP_UNSUPPORTED_DTYPES:
+                return False
+    return True
 
 
 def _gradient_nbytes(gradient: Gradient) -> int:
@@ -236,13 +263,20 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         *,
         residency: str = "disk",
         budget_bytes: int | None = None,
+        disk_format: str = "pickle",
     ) -> None:
         if residency not in RESIDENCIES:
             raise ValueError(
                 f"residency must be one of {list(RESIDENCIES)}, got {residency!r}.",
             )
+        if disk_format not in DISK_FORMATS:
+            raise ValueError(
+                f"disk_format must be one of {list(DISK_FORMATS)}, got "
+                f"{disk_format!r}.",
+            )
         self._root_dir = Path(save_dir)
         self._residency = residency
+        self._disk_format = disk_format
         # Memory / tiered state: location handle -> in-RAM record group, plus a
         # running byte count and (tiered only) the spill budget.  A group is
         # spilled to the disk backend when the count exceeds the budget.
@@ -393,8 +427,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
                 "per-batch hash list -- use save_bulk([record]) instead.",
             )
         record = _to_cpu_record(record)
-        disk_name = f"step_{record.step:06d}_{record.input_hash}.pt"
-        location = self._write_group([record], disk_name)
+        base_name = f"step_{record.step:06d}_{record.input_hash}"
+        location = self._write_group([record], base_name)
         self._index_entry(record, filename=location, idx=0)
         self._persist_index()
         if self._residency == "tiered":
@@ -441,15 +475,15 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
     def _write_group(
         self,
         records: list[GradientRecord],
-        disk_name: str | None,
+        base_name: str | None,
     ) -> str:
         """Persist one record group through the active residency backend.
 
-        *disk_name* is the file name to use for the ``disk`` backend, or
-        ``None`` to auto-name it ``batch_<counter>.pt``.  Returns the group's
-        location handle: a relative file path (``disk``, or a spilled
-        ``tiered`` group) or a synthetic ``mem_*`` key (``memory``/unspilled
-        ``tiered``).
+        *base_name* is the extension-less file name to use for the ``disk``
+        backend (the format decides the extension), or ``None`` to auto-name it
+        ``batch_<counter>``.  Returns the group's location handle: a relative
+        file path (``disk``, or a spilled ``tiered`` group) or a synthetic
+        ``mem_*`` key (``memory``/unspilled ``tiered``).
         """
         if self._residency in ("memory", "tiered"):
             loc = f"mem_{self._group_seq:08d}"
@@ -457,27 +491,121 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             self._mem_groups[loc] = records
             self._mem_bytes += _records_nbytes(records)
             return loc
-        return self._write_group_to_disk(records, disk_name)
+        return self._write_group_to_disk(records, base_name)
 
     def _write_group_to_disk(
         self,
         records: list[GradientRecord],
-        disk_name: str | None,
+        base_name: str | None,
     ) -> str:
         """Serialize a group to a file; returns the root-relative path handle.
 
         The batch counter is read **after** :meth:`_ensure_save_dir` (which
         settles it from any existing files on the first call), so auto-named
-        files never collide or overwrite.
+        files never collide or overwrite.  Under ``disk_format="memmap"`` a
+        purely materialized group is written as a ``.mmap`` handle (flat
+        ``.mmap.bin`` + ``.mmap.meta``); everything else (and every group under
+        ``"pickle"``) is a ``.pt`` ``torch.save`` file.  The handle's extension
+        is what the read path dispatches on, so the two kinds coexist freely.
         """
         save_dir = self._ensure_save_dir()
         save_dir.mkdir(parents=True, exist_ok=True)
-        if disk_name is None:
-            disk_name = f"batch_{self._next_batch_id:06d}.pt"
+        if base_name is None:
+            base_name = f"batch_{self._next_batch_id:06d}"
             self._next_batch_id += 1
-        path = save_dir / disk_name
-        torch.save(records, path)
-        return self._local_prefix + path.name
+        if self._disk_format == "memmap" and _group_memmappable(records):
+            handle = f"{base_name}.mmap"
+            self._write_group_memmap(records, save_dir / handle)
+        else:
+            handle = f"{base_name}.pt"
+            torch.save(records, save_dir / handle)
+        return self._local_prefix + handle
+
+    @staticmethod
+    def _write_group_memmap(records: list[GradientRecord], handle_path: Path) -> None:
+        """Write a materialized group as ``<handle>.bin`` + ``<handle>.meta``.
+
+        The ``.bin`` is the concatenation of every layer's raw tensor bytes,
+        each 8-byte aligned so the reader can ``view`` any dtype at its offset.
+        The ``.meta`` (a small ``torch.save``) carries the record + gradient
+        metadata and each layer's ``(byte offset, shape, dtype)`` into the bin.
+        """
+        meta_records: list[dict] = []
+        byte_off = 0
+        with Path(f"{handle_path}.bin").open("wb") as binf:
+            for record in records:
+                layers: dict[str, dict] = {}
+                for name, tensor in record.gradient.data.items():
+                    arr = tensor.detach().to("cpu").contiguous().numpy()
+                    raw = arr.tobytes()
+                    binf.write(raw)
+                    layers[name] = {
+                        "byte_off": byte_off,
+                        "shape": list(arr.shape),
+                        "dtype": str(arr.dtype),
+                    }
+                    byte_off += len(raw)
+                    pad = (-byte_off) % 8  # keep the next tensor 8-byte aligned
+                    if pad:
+                        binf.write(b"\x00" * pad)
+                        byte_off += pad
+                grad = record.gradient
+                meta_records.append(
+                    {
+                        "step": record.step,
+                        "input_hash": record.input_hash,
+                        "sample_id_key": getattr(record, "sample_id_key", None),
+                        "representation": dict(grad.representation),
+                        "layer_types": dict(grad.layer_types),
+                        "indexing": dict(grad.indexing),
+                        "layers": layers,
+                    },
+                )
+        torch.save(meta_records, Path(f"{handle_path}.meta"))
+
+    @staticmethod
+    def _read_group_memmap(handle_path: Path) -> list[GradientRecord]:
+        """Reconstruct a group written by :meth:`_write_group_memmap`.
+
+        The bin is mapped copy-on-write (``mode="c"``): reads are lazy, zero-copy
+        page-cache hits, and the reconstructed tensors are writable (private COW
+        pages) so nothing downstream is surprised by a read-only buffer.
+        """
+        import numpy as np
+
+        meta_records = torch.load(Path(f"{handle_path}.meta"), weights_only=False)
+        mm = np.memmap(Path(f"{handle_path}.bin"), dtype=np.uint8, mode="c")
+        records: list[GradientRecord] = []
+        for meta in meta_records:
+            data: dict[str, torch.Tensor] = {}
+            for name, spec in meta["layers"].items():
+                np_dtype = np.dtype(spec["dtype"])
+                shape = tuple(spec["shape"])
+                count = int(np.prod(shape)) if shape else 1
+                off = spec["byte_off"]
+                arr = mm[off : off + count * np_dtype.itemsize].view(np_dtype)
+                data[name] = torch.from_numpy(arr.reshape(shape))
+            grad = Gradient(
+                representation=meta["representation"],
+                data=data,
+                layer_types=meta["layer_types"],
+                indexing=meta["indexing"],
+                validate_on_init=False,
+            )
+            records.append(
+                GradientRecord(
+                    step=meta["step"],
+                    input_hash=meta["input_hash"],
+                    gradient=grad,
+                    sample_id_key=meta["sample_id_key"],
+                ),
+            )
+        return records
+
+    @property
+    def disk_format(self) -> str:
+        """This store's on-disk serialization (``"pickle"``/``"memmap"``)."""
+        return self._disk_format
 
     def _maybe_spill(self) -> None:
         """Spill the oldest in-RAM groups to disk until under the byte budget."""
@@ -832,6 +960,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         """
         if file_relpath in self._mem_groups:
             return self._mem_groups[file_relpath]
+        if file_relpath.endswith(".mmap"):
+            return self._read_group_memmap(self._root_dir / file_relpath)
         obj = torch.load(self._root_dir / file_relpath, weights_only=False)
         return obj if isinstance(obj, list) else [obj]
 
@@ -841,6 +971,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         loc = entry["file"]
         if loc in self._mem_groups:
             return self._mem_groups[loc][entry["idx"]]
+        if loc.endswith(".mmap"):
+            return self._read_group_memmap(self._root_dir / loc)[entry["idx"]]
         obj = torch.load(self._root_dir / loc, weights_only=False)
         if isinstance(obj, list):
             return obj[entry["idx"]]

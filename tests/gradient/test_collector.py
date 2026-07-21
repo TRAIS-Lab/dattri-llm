@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
     HookManager,
@@ -1483,3 +1483,157 @@ class TestResidency:
             # A fresh memory store on the same dir must not adopt the disk index.
             mem = GradientStorageManager(d, residency="memory")
             assert mem.index == {}
+
+
+class TestDiskFormat:
+    """disk_format='memmap' -- flat .bin + .meta for materialized groups, with a
+    transparent pickle fallback for anything holding factorized factors.
+    """
+
+    @staticmethod
+    def _materialized_record(step: int, seed: int) -> GradientRecord:
+        torch.manual_seed(seed)
+        data = {
+            "L0": torch.randn(4, 32),
+            "L1": torch.randn(4, 16),
+            "ids": torch.arange(4 * 8).reshape(4, 8),  # int64 layer
+        }
+        gradient = Gradient(
+            representation=dict.fromkeys(data, "materialized"),
+            data=data,
+            layer_types=dict.fromkeys(data, "nn.Linear"),
+        )
+        return GradientRecord(
+            step=step,
+            input_hash=[f"h{step}_{i}" for i in range(4)],
+            gradient=gradient,
+        )
+
+    @staticmethod
+    def _factorized_record(step: int, seed: int) -> GradientRecord:
+        torch.manual_seed(seed)
+        gradient = Gradient(
+            representation={"L0": "factorized"},
+            data={
+                "L0": Factorized(
+                    activation=torch.randn(4, 2, 8),
+                    pre_activation_grad=torch.randn(4, 2, 8),
+                ),
+            },
+            layer_types={"L0": "nn.Linear"},
+            validate_on_init=False,
+        )
+        return GradientRecord(
+            step=step,
+            input_hash=[f"h{step}_{i}" for i in range(4)],
+            gradient=gradient,
+        )
+
+    def _collect(self, disk_format, tmpdir, record_fn):
+        fm = GradientStorageManager(tmpdir, disk_format=disk_format)
+        for step in range(5):
+            fm.save_bulk([record_fn(step, seed=step)])
+        return fm
+
+    def test_rejects_unknown_disk_format(self):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            pytest.raises(ValueError, match="disk_format must be one of"),
+        ):
+            GradientStorageManager(d, disk_format="parquet")
+
+    def test_memmap_writes_bin_and_meta_no_pt(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._collect("memmap", d, self._materialized_record)
+            assert len(list(Path(d).glob("*.mmap.bin"))) == 5
+            assert len(list(Path(d).glob("*.mmap.meta"))) == 5
+            assert list(Path(d).glob("*.pt")) == []
+
+    def test_memmap_matches_pickle(self):
+        with tempfile.TemporaryDirectory() as dp, tempfile.TemporaryDirectory() as dm:
+            self._collect("pickle", dp, self._materialized_record)
+            self._collect("memmap", dm, self._materialized_record)
+            # A plain reader (default pickle format) must read .mmap handles by
+            # suffix -- the on-disk store is self-describing.
+            pk, mm = GradientStorageManager(dp), GradientStorageManager(dm)
+            for (fp, _sp), (fmm, _sm) in zip(
+                pk.iter_steps(list(range(5))),
+                mm.iter_steps(list(range(5))),
+                strict=True,
+            ):
+                rp, rm = pk.load_records(fp), mm.load_records(fmm)
+                for a, b in zip(rp, rm, strict=True):
+                    assert a.step == b.step
+                    assert a.input_hash == b.input_hash
+                    for layer in a.gradient.data:
+                        ta, tb = a.gradient.data[layer], b.gradient.data[layer]
+                        assert ta.dtype == tb.dtype  # dtype preserved (incl int64)
+                        assert torch.equal(ta, tb)
+
+    def test_memmap_per_sample_slicing(self):
+        """The by-hash index resolves a single sample through the mmap loader."""
+        with tempfile.TemporaryDirectory() as dm, tempfile.TemporaryDirectory() as dp:
+            mm = self._collect("memmap", dm, self._materialized_record)
+            pk = self._collect("pickle", dp, self._materialized_record)
+            # Sample "h3_2" is row 2 of the step-3 block.
+            entry_mm = mm.index["h3_2"][0]
+            entry_pk = pk.index["h3_2"][0]
+            rec_mm = mm._load_entry(entry_mm)
+            rec_pk = pk._load_entry(entry_pk)
+            assert torch.equal(
+                rec_mm.gradient.data["L0"],
+                rec_pk.gradient.data["L0"],
+            )
+
+    def test_memmap_reconstructed_tensors_are_writable(self):
+        with tempfile.TemporaryDirectory() as d:
+            mm = self._collect("memmap", d, self._materialized_record)
+            loc = next(iter(mm.iter_steps([0])))[0]
+            rec = mm.load_records(loc)[0]
+            # Copy-on-write mapping -> writable without touching the file.
+            rec.gradient.data["L0"].add_(1.0)  # must not raise
+
+    def test_memmap_falls_back_to_pickle_for_factorized(self):
+        with tempfile.TemporaryDirectory() as dm, tempfile.TemporaryDirectory() as dp:
+            fm = self._collect("memmap", dm, self._factorized_record)
+            # Factorized groups cannot be memmapped -> .pt, no .mmap.
+            assert len(list(Path(dm).glob("*.pt"))) == 5
+            assert list(Path(dm).glob("*.mmap.bin")) == []
+            self._collect("pickle", dp, self._factorized_record)
+            mm, pk = GradientStorageManager(dm), GradientStorageManager(dp)
+            for (fmm, _), (fp, _) in zip(
+                mm.iter_steps(list(range(5))),
+                pk.iter_steps(list(range(5))),
+                strict=True,
+            ):
+                for a, b in zip(mm.load_records(fmm), pk.load_records(fp), strict=True):
+                    fa = a.gradient.data["L0"]
+                    fb = b.gradient.data["L0"]
+                    assert torch.equal(fa.activation, fb.activation)
+                    assert torch.equal(fa.pre_activation_grad, fb.pre_activation_grad)
+            assert fm.disk_format == "memmap"
+
+    def test_memmap_mixed_group_falls_back(self):
+        """A group mixing a materialized and a factorized layer -> pickle."""
+        with tempfile.TemporaryDirectory() as d:
+            fm = GradientStorageManager(d, disk_format="memmap")
+            grad = Gradient(
+                representation={"mat": "materialized", "fac": "factorized"},
+                data={
+                    "mat": torch.randn(4, 8),
+                    "fac": Factorized(
+                        activation=torch.randn(4, 2, 8),
+                        pre_activation_grad=torch.randn(4, 2, 8),
+                    ),
+                },
+                layer_types={"mat": "nn.Linear", "fac": "nn.Linear"},
+                validate_on_init=False,
+            )
+            record = GradientRecord(
+                step=0,
+                input_hash=["a", "b", "c", "d"],
+                gradient=grad,
+            )
+            fm.save_bulk([record])
+            assert len(list(Path(d).glob("*.pt"))) == 1
+            assert list(Path(d).glob("*.mmap.bin")) == []

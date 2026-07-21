@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import tempfile
 import warnings
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
@@ -221,7 +222,37 @@ class DVEmbAttributor(BaseAttributor):
         test_dir = str(pathlib.Path(cache_dir) / "test_grads")
         train_fm = GradientStorageManager(train_dir)
         test_fm = GradientStorageManager(test_dir)
+        recorded_lr = self._collect_trajectory(
+            train_fm,
+            test_fm,
+            train_dataset,
+            test_dataset,
+            hook_config,
+            offload_interval,
+        )
+        # Record the LR actually applied per step, so attribute_from_cache can
+        # verify the configured ``learning_rate`` matches the real trajectory.
+        self._write_lr_schedule(train_dir, recorded_lr)
+        return train_dir, test_dir
 
+    def _collect_trajectory(
+        self,
+        train_fm: GradientStorageManager,
+        test_fm: GradientStorageManager,
+        train_dataset: Dataset,
+        test_dataset: Dataset,
+        hook_config: HookManagerConfig | None,
+        offload_interval: int,
+    ) -> dict[int, float]:
+        """Collect the training trajectory + final-model test gradients.
+
+        Drives the live trajectory (``theta_0 -> theta_T``) into *train_fm* and
+        the frozen ``theta_T`` test pass into *test_fm* (any residency), and
+        returns the per-step learning rates actually applied -- the schedule the
+        DVEmb Fisher product must match.  The attributor drives the streamers,
+        so it saves directly (the OffloadCallback is only for training loops the
+        attributor cannot drive itself).
+        """
         self.task._load_checkpoints(0)
         model = self.task.get_model()
         train_loss = task_loss_fn(self.task.original_loss_func)
@@ -229,10 +260,6 @@ class DVEmbAttributor(BaseAttributor):
         # defaults to the loss when none is given), at the final model theta_T.
         test_loss = task_loss_fn(self.task.original_target_func)
 
-        # 1) Train trajectory theta_0 -> theta_T: offload each step's per-batch
-        # gradient.  The attributor drives the streamer, so it saves directly
-        # via collect_to_disk (the OffloadCallback is only for training loops
-        # the attributor cannot drive itself).
         train_streamer = GradientStreamer(
             model,
             train_dataset,
@@ -243,11 +270,6 @@ class DVEmbAttributor(BaseAttributor):
             config=hook_config,
         )
         collect_to_disk(train_streamer, train_fm, offload_interval=offload_interval)
-        # Record the LR actually applied per step, so attribute_from_cache can
-        # verify the configured ``learning_rate`` matches the real trajectory.
-        self._write_lr_schedule(train_dir, train_streamer.learning_rates)
-
-        # 2) Test gradients at the now-final model theta_T (frozen probe).
         test_streamer = GradientStreamer(
             model,
             test_dataset,
@@ -258,8 +280,7 @@ class DVEmbAttributor(BaseAttributor):
             config=hook_config,
         )
         collect_to_disk(test_streamer, test_fm, offload_interval=offload_interval)
-
-        return train_dir, test_dir
+        return train_streamer.learning_rates
 
     def cache_dvemb(
         self,
@@ -326,21 +347,22 @@ class DVEmbAttributor(BaseAttributor):
             raise ValueError(
                 f"hessian_mode must be 'full' or 'diagonal', got {hessian_mode!r}.",
             )
+        train_fm = GradientStorageManager(train_gradients_dir)
         (
-            _train_fm,
             prop_steps,
             output_steps,
             _final_step,
             learning_rate,
         ) = self._resolve_sweep(
-            train_gradients_dir,
+            train_fm,
+            self._read_lr_schedule(train_gradients_dir),
             selected_training_steps,
             final_step,
             learning_rate,
         )
         device = self.args.device
         train_source = DiskGradientSource(
-            GradientStorageManager(train_gradients_dir),
+            train_fm,
             self.args,
             steps=prop_steps,
             layer_name=normalize_layer_names(layer_name),
@@ -745,22 +767,23 @@ class DVEmbAttributor(BaseAttributor):
 
     def _resolve_sweep(
         self,
-        train_gradients_dir: str,
+        train_fm: GradientStorageManager,
+        recorded_lr: dict[int, float] | None,
         selected_training_steps: Iterable[int] | None,
         final_step: int | None,
         learning_rate: float | Mapping[int, float],
-    ) -> tuple[GradientStorageManager, list[int], set, int, float | dict[int, float]]:
+    ) -> tuple[list[int], set, int, float | dict[int, float]]:
         """Resolve the sweep parameters shared by scoring and embedding-only runs.
 
-        Opens the train store, fixes ``final_step`` (default: one past the last
-        recorded step), derives the propagated steps (< ``final_step``) and the
+        Fixes ``final_step`` (default: one past the last recorded step in
+        *train_fm*), derives the propagated steps (< ``final_step``) and the
         emitted subset (``selected_training_steps`` filters rows, never the
         Fisher product), and canonicalises ``learning_rate`` -- warning when it
-        disagrees with the schedule :meth:`cache` recorded.
+        disagrees with *recorded_lr* (the schedule the collection recorded, or
+        ``None`` when there is none).
 
-        Returns ``(train_fm, prop_steps, output_steps, final_step, learning_rate)``.
+        Returns ``(prop_steps, output_steps, final_step, learning_rate)``.
         """
-        train_fm = GradientStorageManager(train_gradients_dir)
         available = train_fm.available_steps()
         if final_step is None:
             final_step = (max(available) + 1) if available else 0
@@ -771,10 +794,9 @@ class DVEmbAttributor(BaseAttributor):
                 f"No training step satisfies step < final_step ({final_step}); "
                 f"available steps: {available}.",
             )
-        # If the train dir carries a schedule recorded by cache(), check the
-        # configured learning_rate against it (warn-only; configured one is used).
+        # If a recorded schedule is available, check the configured learning_rate
+        # against it (warn-only; the configured one is used).
         learning_rate = self._normalize_lr(learning_rate)
-        recorded_lr = self._read_lr_schedule(train_gradients_dir)
         if recorded_lr is not None:
             self._warn_on_lr_mismatch(learning_rate, recorded_lr, prop_steps)
         # ``selected_training_steps`` filters only which steps are emitted as
@@ -785,7 +807,7 @@ class DVEmbAttributor(BaseAttributor):
             output_steps = set(resolve_steps(train_fm, selected_training_steps)) & set(
                 prop_steps,
             )
-        return train_fm, prop_steps, output_steps, final_step, learning_rate
+        return prop_steps, output_steps, final_step, learning_rate
 
     def _train_layer_slices(
         self,
@@ -828,20 +850,30 @@ class DVEmbAttributor(BaseAttributor):
         verbose: bool = False,
         hook_config: HookManagerConfig | None = None,
         learning_rate: float | Mapping[int, float] = 1.0,
+        residency: str = "disk",
     ) -> AttributionScore:
-        """Score **on the fly**: cache the trajectory, then attribute from cache.
+        """Score **on the fly**: collect the trajectory, then attribute from it.
 
-        Exactly :meth:`cache` (live train trajectory + final-model ``theta_T`` test
-        gradients) followed by :meth:`attribute_from_cache`.  ``final_step`` is
-        not exposed here -- it is the number of training steps just run.
+        Equivalent to :meth:`cache` (live train trajectory + final-model
+        ``theta_T`` test gradients) followed by :meth:`attribute_from_cache`.
+        ``final_step`` is not exposed here -- it is the number of training steps
+        just run.
+
+        ``residency`` controls where the collected raw representations live.
+        ``"disk"`` (default) persists them under ``args.output_dir`` (re-openable
+        later); ``"memory"`` / ``"tiered"`` keep them in RAM (spilling+cleaning
+        up for tiered) and sweep them there without touching disk.  DVEmb always
+        collects the trajectory once (it is a single-shot training pass), so
+        residency only relocates that store -- it never changes the pass count.
+        (This is why the default is ``"disk"`` rather than the ``None`` of
+        :meth:`KFACAttributor.attribute`: there is no re-run-the-model option to
+        fall back to, so the trajectory must always be stored somewhere.)
 
         The ``learning_rate`` schedule used for the Fisher product and
         ``loss_reduction`` should match the live training run configured by
         ``args`` (e.g. for a constant schedule, set
         ``learning_rate == args.learning_rate``); otherwise the propagation
-        factors ``(I - eta H_k)`` will not match the trajectory.  :meth:`cache`
-        records the *actual* per-step LR and :meth:`attribute_from_cache` warns
-        if the configured schedule disagrees with it.
+        factors ``(I - eta H_k)`` will not match the trajectory.
 
         Args:
             train_dataset: Training dataset to stream.
@@ -855,24 +887,69 @@ class DVEmbAttributor(BaseAttributor):
             verbose: As in :meth:`attribute_from_cache`.
             learning_rate: As in :meth:`attribute_from_cache`.
             hook_config: As in :meth:`cache`.
+            residency: Where the collected raw representations live --
+                ``"disk"`` (default), ``"memory"``, or ``"tiered"``.
         """
-        train_dir, test_dir = self.cache(
-            train_dataset,
-            test_dataset,
-            hook_config=hook_config,
-        )
-        return self.attribute_from_cache(
-            train_dir,
-            test_dir,
-            propagation=propagation,
-            dvemb_dir=dvemb_dir,
-            hessian_mode=hessian_mode,
-            loop_over_test=loop_over_test,
-            selected_training_steps=selected_training_steps,
-            loss_reduction=loss_reduction,
-            verbose=verbose,
-            learning_rate=learning_rate,
-        )
+        if residency == "disk":
+            train_dir, test_dir = self.cache(
+                train_dataset,
+                test_dataset,
+                hook_config=hook_config,
+            )
+            return self.attribute_from_cache(
+                train_dir,
+                test_dir,
+                propagation=propagation,
+                dvemb_dir=dvemb_dir,
+                hessian_mode=hessian_mode,
+                loop_over_test=loop_over_test,
+                selected_training_steps=selected_training_steps,
+                loss_reduction=loss_reduction,
+                verbose=verbose,
+                learning_rate=learning_rate,
+            )
+        if self.task is None:
+            raise ValueError(
+                "attribute() (live collection) requires a ``task`` with a model; "
+                "pass pre-collected gradients to attribute_from_cache() instead.",
+            )
+        # In-RAM residency: collect the trajectory + test into residency stores
+        # (context-managed so a tiered store's spill files are cleaned up) and
+        # sweep them directly -- the recorded LR schedule stays in memory.
+        with (
+            GradientStorageManager(
+                tempfile.mkdtemp(prefix="dvemb_train_"),
+                residency=residency,
+            ) as train_fm,
+            GradientStorageManager(
+                tempfile.mkdtemp(prefix="dvemb_test_"),
+                residency=residency,
+            ) as test_fm,
+        ):
+            recorded_lr = self._collect_trajectory(
+                train_fm,
+                test_fm,
+                train_dataset,
+                test_dataset,
+                hook_config,
+                offload_interval=1,
+            )
+            return self._attribute_from_stores(
+                train_fm,
+                test_fm,
+                recorded_lr=recorded_lr,
+                propagation=propagation,
+                dvemb_fm=(GradientStorageManager(dvemb_dir) if dvemb_dir else None),
+                dvemb_dir=dvemb_dir,
+                hessian_mode=hessian_mode,
+                loop_over_test=loop_over_test,
+                selected_training_steps=selected_training_steps,
+                final_step=None,
+                loss_reduction=loss_reduction,
+                verbose=verbose,
+                layer_name=None,
+                learning_rate=learning_rate,
+            )
 
     def attribute_from_cache(
         self,
@@ -1037,15 +1114,56 @@ class DVEmbAttributor(BaseAttributor):
                 "test_gradients_dir.",
             )
 
-        test_fm = GradientStorageManager(test_gradients_dir)
+        return self._attribute_from_stores(
+            GradientStorageManager(train_gradients_dir),
+            GradientStorageManager(test_gradients_dir),
+            recorded_lr=self._read_lr_schedule(train_gradients_dir),
+            propagation=propagation,
+            dvemb_fm=GradientStorageManager(dvemb_dir) if dvemb_dir else None,
+            dvemb_dir=dvemb_dir,
+            hessian_mode=hessian_mode,
+            loop_over_test=loop_over_test,
+            selected_training_steps=selected_training_steps,
+            final_step=final_step,
+            loss_reduction=loss_reduction,
+            verbose=verbose,
+            layer_name=layer_name,
+            learning_rate=learning_rate,
+        )
+
+    def _attribute_from_stores(
+        self,
+        train_fm: GradientStorageManager,
+        test_fm: GradientStorageManager,
+        *,
+        recorded_lr: dict[int, float] | None,
+        propagation: str,
+        dvemb_fm: GradientStorageManager | None,
+        dvemb_dir: str | None,
+        hessian_mode: str,
+        loop_over_test: bool,
+        selected_training_steps: Iterable[int] | None,
+        final_step: int | None,
+        loss_reduction: str,
+        verbose: bool,
+        layer_name: str | list[str] | None,
+        learning_rate: float | Mapping[int, float],
+    ) -> AttributionScore:
+        """Sweep + score directly from two (already-opened) gradient stores.
+
+        The residency-agnostic core of :meth:`attribute_from_cache` and the
+        in-RAM :meth:`attribute` path: the stores may be disk, memory, or
+        tiered.  *recorded_lr* is the schedule the collection recorded (from the
+        on-disk schedule file, or the streamer's live rates), or ``None``.
+        """
         (
-            train_fm,
             prop_steps,
             output_steps,
             final_step,
             learning_rate,
         ) = self._resolve_sweep(
-            train_gradients_dir,
+            train_fm,
+            recorded_lr,
             selected_training_steps,
             final_step,
             learning_rate,
@@ -1075,7 +1193,7 @@ class DVEmbAttributor(BaseAttributor):
             output_steps=output_steps,
             loss_reduction=loss_reduction,
             propagation=propagation,
-            dvemb_fm=GradientStorageManager(dvemb_dir) if dvemb_dir else None,
+            dvemb_fm=dvemb_fm,
             hessian_mode=hessian_mode,
             loop_over_test=loop_over_test,
             verbose=verbose,

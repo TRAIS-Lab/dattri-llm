@@ -1184,6 +1184,39 @@ class TestPreconditionedTestSide:
             f"{cls.__name__}: max diff {(base - scored).abs().max():.2e}"
         )
 
+    @pytest.mark.parametrize("cls", CLASSES)
+    @pytest.mark.parametrize("residency", ["memory", "tiered"])
+    def test_residency_preconditioned_store_matches_cached(
+        self,
+        cls,
+        residency,
+        collected,
+        tmp_path,
+    ):
+        """An ephemeral (RAM/tiered) preconditioned-test store must reproduce
+        the default score exactly -- residency only relocates the reps, and a
+        tiered store's spill is cleaned up on return.
+        """
+        base = self._default(cls, collected, tmp_path / "base")
+        cached = (
+            _make(cls, tmp_path / f"res_{residency}")
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                loop_over_test=True,
+                preconditioned_test_residency=residency,
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
+        )
+        assert torch.allclose(base, cached, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}/{residency}: max diff {(base - cached).abs().max():.2e}"
+        )
+
     def test_preconditioned_dir_requires_loop(self, collected, tmp_path):
         with pytest.raises(ValueError, match="loop_over_test=True"):
             _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
@@ -1191,4 +1224,168 @@ class TestPreconditionedTestSide:
                 train_gradients_dir=str(collected["train_dir"]),
                 test_gradients_dir=str(collected["test_dir"]),
                 preconditioned_test_dir=str(tmp_path / "pre_te"),
+            )
+
+    def test_preconditioned_residency_requires_loop(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="loop_over_test=True"):
+            _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                preconditioned_test_residency="memory",
+            )
+
+    def test_invalid_preconditioned_residency_raises(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="preconditioned_test_residency"):
+            _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+                loop_over_test=True,
+                preconditioned_test_residency="nope",
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Persisted (dataset-size-independent) Fisher factors                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestPersistedFisher:
+    """``fit()`` persists the damping-free Fisher factors; then
+    ``attribute_from_cache(fisher_dir=...)`` re-damps them and skips the Fisher
+    pre-pass.  The score must equal a fresh fit -- for any queries (the fit
+    never sees the test set) and any ``damping`` (folded in only at load).
+    """
+
+    CLASSES = (KFACAttributor, EKFACAttributor)
+
+    def _score(self, attr, collected, **kw):
+        return attr.attribute_from_cache(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            **kw,
+        ).query(
+            collected["train_hashes"],
+            collected["test_hashes"],
+            trajectory="agnostic",
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_persisted_matches_fresh(self, cls, collected, tmp_path):
+        fresh = self._score(_make(cls, tmp_path / "fresh"), collected, damping=DAMPING)
+        fdir = _make(cls, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        loaded = self._score(
+            _make(cls, tmp_path / "load"),
+            collected,
+            damping=DAMPING,
+            fisher_dir=fdir,
+        )
+        assert torch.allclose(fresh, loaded, atol=1e-5, rtol=1e-4), (
+            f"{cls.__name__}: max diff {(fresh - loaded).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_one_fit_reused_across_damping(self, cls, collected, tmp_path):
+        """A single persisted fit re-damps correctly for any damping -- the raw
+        factors are damping-free.
+        """
+        fdir = _make(cls, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        for damping in (1e-3, 1e-1):
+            fresh = self._score(
+                _make(cls, tmp_path / f"fresh_{damping}"),
+                collected,
+                damping=damping,
+            )
+            loaded = self._score(
+                _make(cls, tmp_path / f"load_{damping}"),
+                collected,
+                damping=damping,
+                fisher_dir=fdir,
+            )
+            assert torch.allclose(fresh, loaded, atol=1e-5, rtol=1e-4), (
+                f"{cls.__name__} @ damping={damping}: "
+                f"max diff {(fresh - loaded).abs().max():.2e}"
+            )
+
+    def test_persisted_direct_fim_matches_fresh(self, norm_collected, tmp_path):
+        """The direct dense-Fisher factors persist and reload too; the fit's
+        ``non_kfac_strategy`` (``"direct"``) wins over the (default) call value.
+        """
+
+        def score(attr, **kw):
+            return attr.attribute_from_cache(
+                damping=DAMPING,
+                train_gradients_dir=str(norm_collected["train_dir"]),
+                test_gradients_dir=str(norm_collected["test_dir"]),
+                **kw,
+            ).query(
+                norm_collected["train_hashes"],
+                norm_collected["test_hashes"],
+                trajectory="agnostic",
+            )
+
+        fresh = score(
+            _attr(KFACAttributor, tmp_path / "fresh"),
+            non_kfac_strategy="direct",
+        )
+        fdir = _attr(KFACAttributor, tmp_path / "fit").fit(
+            str(norm_collected["train_dir"]),
+            str(tmp_path / "fisher"),
+            non_kfac_strategy="direct",
+        )
+        loaded = score(_attr(KFACAttributor, tmp_path / "load"), fisher_dir=fdir)
+        assert torch.allclose(fresh, loaded, atol=1e-4, rtol=1e-3), (
+            f"max diff {(fresh - loaded).abs().max():.2e}"
+        )
+
+    def test_load_wrong_algorithm_raises(self, collected, tmp_path):
+        fdir = _make(KFACAttributor, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        with pytest.raises(ValueError, match="KFAC"):
+            self._score(
+                _make(EKFACAttributor, tmp_path / "x"),
+                collected,
+                damping=DAMPING,
+                fisher_dir=fdir,
+            )
+
+    def test_missing_fisher_dir_raises(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="No fitted Fisher"):
+            self._score(
+                _make(KFACAttributor, tmp_path / "x"),
+                collected,
+                damping=DAMPING,
+                fisher_dir=str(tmp_path / "does_not_exist"),
+            )
+
+    def test_ekfac_mode_mismatch_raises(self, collected, tmp_path):
+        args = AttributionArguments(
+            output_dir=str(tmp_path / "fit"),
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
+        fdir = EKFACAttributor(args, mode="exact").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        other = AttributionArguments(
+            output_dir=str(tmp_path / "load"),
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
+        with pytest.raises(ValueError, match="mode"):
+            self._score(
+                EKFACAttributor(other, mode="approx"),
+                collected,
+                damping=DAMPING,
+                fisher_dir=fdir,
             )
