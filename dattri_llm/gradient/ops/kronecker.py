@@ -291,6 +291,29 @@ def kfac_precondition(
     return a.float() @ A_inv.float(), g.float() @ G_inv.float()
 
 
+def kfac_precondition_materialized(
+    block: torch.Tensor,
+    A_inv: torch.Tensor,
+    G_inv: torch.Tensor,
+) -> torch.Tensor:
+    """Two-sided K-FAC preconditioning of a **compact materialized** block.
+
+    *block* is one per-sample gradient matrix flattened to ``(B, k_g * k_a)`` --
+    e.g. a ``logra_materialized`` capture, ``dW = sum_t (P_g g_t)(P_a a_t)^T`` in
+    the projected space, laid out ``(k_g, k_a)`` row-major (see
+    :func:`_materialize`).  With the projected inverse covariances ``A_inv``
+    (``k_a x k_a``) and ``G_inv`` (``k_g x k_g``) this applies
+    ``(A_inv (x) G_inv) vec(dW) = vec(G_inv dW A_inv)`` -- the same two small
+    matmuls logix uses -- returning the preconditioned block flattened back to
+    ``(B, k_g * k_a)``, ready to dot against a raw materialized train block.
+    """
+    batch = block.shape[0]
+    k_g, k_a = G_inv.shape[0], A_inv.shape[0]
+    d_w = block.reshape(batch, k_g, k_a).float()
+    preconditioned = G_inv.float() @ d_w @ A_inv.float()  # (B, k_g, k_a)
+    return preconditioned.reshape(batch, k_g * k_a)
+
+
 def ekfac_precondition(
     M: torch.Tensor,
     U_A: torch.Tensor,

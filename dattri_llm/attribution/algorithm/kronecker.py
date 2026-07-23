@@ -1354,12 +1354,19 @@ class KFACAttributor(_KroneckerBaseAttributor):
         for layer, (A_inv, G_inv) in ctx.items():
             if layer not in test_g.data:
                 continue
-            rep[layer] = ops.kfac_precondition(
-                test_g.data[layer],
-                test_g.layer_types[layer],
-                A_inv,
-                G_inv,
-            )
+            value = test_g.data[layer]
+            if isinstance(value, torch.Tensor):
+                # Compact materialized store (logra_materialized): apply the whole
+                # inverse two-sided in the projected space -> a preconditioned
+                # materialized block, dotted raw against train (logix-style).
+                rep[layer] = ops.kfac_precondition_materialized(value, A_inv, G_inv)
+            else:
+                rep[layer] = ops.kfac_precondition(
+                    value,
+                    test_g.layer_types[layer],
+                    A_inv,
+                    G_inv,
+                )
         return rep
 
     @staticmethod
@@ -1374,12 +1381,16 @@ class KFACAttributor(_KroneckerBaseAttributor):
             if rep is None or layer not in train_g.data:
                 continue
             if isinstance(rep, torch.Tensor):
-                # Preconditioned-materialized rep (e.g. read back from a
-                # ``cache_preconditioned_test`` store): plain dot against the
-                # raw materialized train gradient.
-                M_tr = ops.materialize(
-                    train_g.data[layer],
-                    train_g.layer_types[layer],
+                # Preconditioned-materialized rep (a ``cache_preconditioned_test``
+                # store, or the compact two-sided precondition): plain dot against
+                # the raw materialized train gradient.  A compact train block is
+                # already materialized -- use it directly; a factorized block is
+                # materialized on the fly.
+                train_val = train_g.data[layer]
+                M_tr = (
+                    train_val.reshape(train_val.shape[0], -1).float()
+                    if isinstance(train_val, torch.Tensor)
+                    else ops.materialize(train_val, train_g.layer_types[layer])
                 )
                 block = M_tr @ rep.to(M_tr.dtype).T
             else:
@@ -1393,6 +1404,49 @@ class KFACAttributor(_KroneckerBaseAttributor):
                 block = ops._cross_gram(a1, g1, *rep, train_g.layer_types[layer])
             total = block if total is None else total + block
         return total  # None when no layer overlaps; _combine_score zero-fills
+
+    def save_fisher(
+        self,
+        covariances: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        fisher_dir: str | None = None,
+    ) -> str:
+        """Persist externally-fitted K-FAC covariances as a Fisher factor store.
+
+        *covariances* is the ``{layer: (A, G)}`` produced during collection by a
+        :class:`~dattri_llm.gradient.callbacks.KroneckerCovarianceCallback`
+        (manual workflow) or a :func:`collect_to_disk` ``on_block`` accumulator
+        (OTF).  Writing them in the same format as :meth:`fit` lets
+        ``attribute_from_cache(fisher_dir=...)`` re-damp and score **without a
+        Fisher pre-pass** -- and, when the gradients were captured
+        ``logra_materialized``, the ``(A, G)`` are the compact projected
+        covariances that precondition that compact store directly.
+
+        Args:
+            covariances: Raw (damping-free) ``{layer: (A, G)}`` covariances.
+            fisher_dir: Where to write them; defaults to
+                ``<args.output_dir>/<algorithm>_fisher``.
+
+        Returns:
+            ``fisher_dir``.
+        """
+        if fisher_dir is None:
+            fisher_dir = str(
+                Path(self.args.output_dir) / f"{self.algorithm.lower()}_fisher",
+            )
+        path = Path(fisher_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        cpu = torch.device("cpu")
+        torch.save(
+            {
+                # No direct-Fisher layers in a covariance-only fit; the strategy
+                # fields are recorded for the load-time compatibility check.
+                "meta": self._fisher_meta("ignore", 4096),
+                "raw_ctx": self._move_raw(covariances, cpu),
+                "raw_fim": {},
+            },
+            path / self._FISHER_FILE,
+        )
+        return fisher_dir
 
 
 class EKFACAttributor(_KroneckerBaseAttributor):

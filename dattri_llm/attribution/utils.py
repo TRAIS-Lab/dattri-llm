@@ -52,6 +52,7 @@ def collect_to_disk(
     file_manager: GradientStorageManager,
     *,
     offload_interval: int = 1,
+    on_block: Callable[[int, Gradient, list[str]], None] | None = None,
 ) -> None:
     """Run a gradient streamer to completion, persisting every block to disk.
 
@@ -75,6 +76,14 @@ def collect_to_disk(
             packs that many steps into each file -- amortising the per-file
             index rewrite over a long trajectory (``enable_update=True``) at the
             cost of holding that many blocks in memory before each flush.
+        on_block: Optional ``(step, gradient, hashes)`` hook invoked on **every**
+            streamed block, before it is staged.  The OTF analogue of a manual
+            collection callback: because the attributor drives the streamer here
+            (not through a :class:`HookManager`), it accumulates side quantities
+            -- e.g. the K-FAC covariances a :class:`KroneckerAccumulator` builds
+            -- directly off the streamed blocks, so a re-pass over the store to
+            fit them is not needed.  Runs on the (single-shot) collection pass,
+            so it sees each block exactly once.
     """
     if offload_interval < 1:
         raise ValueError(
@@ -84,6 +93,8 @@ def collect_to_disk(
     staged: list[GradientRecord] = []
     with streamer:
         for step, grad, hashes in streamer:
+            if on_block is not None:
+                on_block(step, grad, hashes)
             staged.append(
                 GradientRecord(
                     step=step,

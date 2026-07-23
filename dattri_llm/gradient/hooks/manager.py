@@ -304,6 +304,8 @@ class HookManager:
         self,
         layer_name: str,
         activation: torch.Tensor,
+        layer_type: str,
+        module_kwargs: dict | None,
     ) -> None:
         # Maintain the step's participation roster incrementally: O(1) here
         # instead of an O(n_layers) rescan on every backward fire in
@@ -336,12 +338,14 @@ class HookManager:
                     ):
                         self._backward_end_scheduled = True
         for cb in self._callbacks:
-            cb.on_layer_forward(layer_name, activation)
+            cb.on_layer_forward(layer_name, activation, layer_type, module_kwargs)
 
     def _check_step_bwd_complete(
         self,
         layer_name: str,
         grad_output: torch.Tensor,
+        layer_type: str,
+        module_kwargs: dict | None,
     ) -> None:
         """Fired by each MLP layer's full backward hook.
 
@@ -349,7 +353,7 @@ class HookManager:
         checks whether the composite ``_bwd_done`` condition is met.
         """
         for cb in self._callbacks:
-            cb.on_layer_backward(layer_name, grad_output)
+            cb.on_layer_backward(layer_name, grad_output, layer_type, module_kwargs)
 
         if not self._collecting:
             return

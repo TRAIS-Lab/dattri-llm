@@ -47,6 +47,7 @@ from dattri_llm.gradient.ops.kronecker import (
     kfac_cross,
     kfac_eigh,
     kfac_precondition,
+    kfac_precondition_materialized,
     sym_inverse,
 )
 from dattri_llm.gradient.ops.materialize import (
@@ -79,7 +80,9 @@ from dattri_llm.gradient.ops.projection import (
     _apply_projector,
     _project_factorized,
     _project_materialized,
+    project_activation,
     project_factorized,
+    project_gradient,
     project_layer,
     project_materialized,
 )
@@ -160,12 +163,15 @@ __all__ = [
     "kfac_cross",
     "kfac_eigh",
     "kfac_precondition",
+    "kfac_precondition_materialized",
     "materialize",
     "maybe_use_materialized_gram",
     "maybe_use_materialized_norm",
     "pairwise_dot",
     "preprocess_factorized",
+    "project_activation",
     "project_factorized",
+    "project_gradient",
     "project_layer",
     "project_materialized",
     "sym_inverse",

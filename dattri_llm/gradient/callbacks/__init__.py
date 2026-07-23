@@ -39,6 +39,9 @@ from dattri_llm.gradient.callbacks.data_selection_callback import (
     DataSelectionCallback,
     _ShardSpec,
 )
+from dattri_llm.gradient.callbacks.kronecker_covariance_callback import (
+    KroneckerCovarianceCallback,
+)
 from dattri_llm.gradient.callbacks.offload_callback import OffloadCallback
 
 __all__ = [
@@ -48,6 +51,7 @@ __all__ = [
     "CaptureCallback",
     "DataSelectionCallback",
     "HookManagerCallback",
+    "KroneckerCovarianceCallback",
     "OffloadCallback",
     "_ShardSpec",
 ]

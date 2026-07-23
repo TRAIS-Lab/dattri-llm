@@ -201,3 +201,155 @@ class TestDVEmbResidencyMatchesDisk:
         assert ids_d == ids_r
         assert disk.test_ids == ram.test_ids
         assert torch.equal(m_d, m_r), f"max diff {(m_d - m_r).abs().max():.2e}"
+
+
+class TestCollectToDiskOnBlock:
+    """collect_to_disk's on_block hook is the OTF covariance path: accumulating
+    K-FAC covariances off the streamed blocks (no callback, no re-pass) must
+    reproduce KFACAttributor.fit's covariances over the resulting store.
+    """
+
+    def _streamer(self, attr, train_ds):
+        from dattri_llm.attribution.utils import task_loss_fn
+        from dattri_llm.gradient.streaming import GradientStreamer
+
+        attr.task._load_checkpoints(0)
+        return GradientStreamer(
+            attr.task.get_model(),
+            train_ds,
+            attr.args,
+            batch_size=attr.args.per_device_train_batch_size,
+            loss_fn=task_loss_fn(attr.task.original_loss_func),
+        )
+
+    def test_on_block_covariance_matches_fit(self, tmp_path):
+        from dattri_llm.attribution.utils import collect_to_disk
+        from dattri_llm.gradient.ops import KroneckerAccumulator
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import DiskGradientSource
+
+        task, train_ds, _ = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path / "o"), task=task)
+
+        fm = GradientStorageManager(str(tmp_path / "store"))
+        kron = KroneckerAccumulator()
+        n_blocks = 0
+
+        def on_block(_step, grad, _hashes):
+            nonlocal n_blocks
+            n_blocks += 1
+            kron.update(grad, attr._kfac_layers(grad))
+
+        collect_to_disk(self._streamer(attr, train_ds), fm, on_block=on_block)
+        otf = kron.result()
+        assert n_blocks > 0
+
+        # Re-pass fit over the store the same collection just wrote.
+        raw_ctx, _ = attr._fit_raw_context(
+            DiskGradientSource(fm, attr.args),
+            attr.args.device,
+            "ignore",
+            4096,
+        )
+        assert set(otf) == set(raw_ctx)
+        for layer in raw_ctx:
+            a_o, g_o = otf[layer]
+            a_f, g_f = raw_ctx[layer]
+            assert torch.allclose(a_o, a_f, atol=1e-5), f"A {layer}"
+            assert torch.allclose(g_o, g_f, atol=1e-5), f"G {layer}"
+
+    def test_on_block_none_is_a_noop(self, tmp_path):
+        from dattri_llm.attribution.utils import collect_to_disk
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+
+        task, train_ds, _ = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path / "o"), task=task)
+        fm = GradientStorageManager(str(tmp_path / "store"))
+        collect_to_disk(self._streamer(attr, train_ds), fm)  # no on_block
+        assert fm.index  # still collected the store
+
+
+class TestCompactKFAC:
+    """K-FAC over a logra_materialized (compact) store, preconditioned by the
+    projected (A, G) collected at capture, must match K-FAC over a
+    logra_factorized store of the same projected gradients -- the logix-style
+    compact path.
+    """
+
+    PROJ = 4
+    DAMP = 1e-3
+
+    def _proj(self, style):
+        from dattri_llm.gradient.hooks import REGISTER_ALL, HookManagerConfig
+
+        return HookManagerConfig(
+            linear_io=REGISTER_ALL,
+            projection={
+                "__default__": {
+                    "style": style,
+                    "proj_dim": self.PROJ,
+                    "proj_max_batch_size": 32,
+                    "proj_type": "rademacher",
+                    "proj_seed": 0,
+                },
+            },
+        )
+
+    def _collect(self, attr, ds, out, style, cov=None):
+        from dattri_llm.attribution.utils import collect_to_disk, task_loss_fn
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import GradientStreamer
+
+        attr.task._load_checkpoints(0)
+        streamer = GradientStreamer(
+            attr.task.get_model(),
+            ds,
+            attr.args,
+            batch_size=attr.args.per_device_train_batch_size,
+            loss_fn=task_loss_fn(attr.task.original_loss_func),
+            config=self._proj(style),
+        )
+        if cov is not None:
+            streamer.hook_manager.add_callback(cov)
+        fm = GradientStorageManager(str(out))
+        collect_to_disk(streamer, fm)
+        return str(out)
+
+    def test_compact_matches_factorized(self, tmp_path):
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        # -- factorized reference: fit covariances in a re-pass --
+        task, tr, te = _make_task_and_data()
+        attr_f = KFACAttributor(_args(tmp_path / "f"), task=task)
+        train_f = self._collect(attr_f, tr, tmp_path / "tr_f", "logra_factorized")
+        test_f = self._collect(attr_f, te, tmp_path / "te_f", "logra_factorized")
+        ids_f, s_fac = attr_f.attribute_from_cache(
+            train_f,
+            test_f,
+            damping=self.DAMP,
+        ).agnostic_matrix()
+
+        # -- compact: covariances collected at capture, scored two-sided --
+        task, tr, te = _make_task_and_data()
+        attr_m = KFACAttributor(_args(tmp_path / "m"), task=task)
+        cov = KroneckerCovarianceCallback()
+        train_m = self._collect(
+            attr_m,
+            tr,
+            tmp_path / "tr_m",
+            "logra_materialized",
+            cov=cov,
+        )
+        test_m = self._collect(attr_m, te, tmp_path / "te_m", "logra_materialized")
+        fisher = attr_m.save_fisher(cov.result(), str(tmp_path / "fisher"))
+        ids_m, s_mat = attr_m.attribute_from_cache(
+            train_m,
+            test_m,
+            damping=self.DAMP,
+            fisher_dir=fisher,
+        ).agnostic_matrix()
+
+        assert ids_f == ids_m
+        assert torch.allclose(s_fac, s_mat, atol=1e-4, rtol=1e-3), (
+            f"max diff {(s_fac - s_mat).abs().max():.2e}"
+        )

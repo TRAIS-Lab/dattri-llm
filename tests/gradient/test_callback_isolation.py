@@ -94,12 +94,12 @@ class SpyCallback(HookManagerCallback):
         self.layer_forward_counts: dict[str, int] = {}
         self.layer_backward_counts: dict[str, int] = {}
 
-    def on_layer_forward(self, layer_name, activation):
+    def on_layer_forward(self, layer_name, activation, layer_type, module_kwargs):
         self.layer_forward_counts[layer_name] = (
             self.layer_forward_counts.get(layer_name, 0) + 1
         )
 
-    def on_layer_backward(self, layer_name, grad_output):
+    def on_layer_backward(self, layer_name, grad_output, layer_type, module_kwargs):
         self.layer_backward_counts[layer_name] = (
             self.layer_backward_counts.get(layer_name, 0) + 1
         )

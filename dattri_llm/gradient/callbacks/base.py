@@ -18,28 +18,52 @@ class HookManagerCallback:
     PyTorch's hook system and fire regardless of trainer callback support.
     """
 
-    def on_layer_forward(self, layer_name: str, activation: torch.Tensor) -> None:
+    def on_layer_forward(
+        self,
+        layer_name: str,
+        activation: torch.Tensor,
+        layer_type: str,
+        module_kwargs: dict | None,
+    ) -> None:
         """Called after each layer's forward hook captures the activation.
 
         Fires once per layer per forward pass.  ``activation`` is on the
         capture device -- the training device by default, CPU when the
-        manager was built with ``offload_to_cpu=True``.
+        manager was built with ``offload_to_cpu=True`` -- and is the **raw**
+        (un-projected) input, whatever projection style the store uses.
 
         Args:
             layer_name: Fully-qualified name of the hooked layer.
             activation: Captured input activation, shape ``(B, *, in_features)``.
+            layer_type: Canonical class name of the layer (e.g. ``"nn.Linear"``),
+                as used by :mod:`dattri_llm.gradient.ops`.
+            module_kwargs: The layer's serializable hyperparameters (from
+                :func:`~dattri_llm.gradient.ops.extract_module_kwargs` -- e.g.
+                ``has_bias``, conv stride/padding).  Together with ``layer_type``
+                this is everything needed to build the layer's K-FAC covariance
+                without re-inspecting the module.
         """
 
-    def on_layer_backward(self, layer_name: str, grad_output: torch.Tensor) -> None:
+    def on_layer_backward(
+        self,
+        layer_name: str,
+        grad_output: torch.Tensor,
+        layer_type: str,
+        module_kwargs: dict | None,
+    ) -> None:
         """Called after each layer's backward hook captures the gradient.
 
-        ``grad_output`` is on the capture device (see :meth:`on_layer_forward`).
-        Fires once per layer per backward pass (once per replica under
-        DataParallel).
+        ``grad_output`` is on the capture device (see :meth:`on_layer_forward`)
+        and is the **raw** (un-projected) output gradient.  Fires once per layer
+        per backward pass (once per replica under DataParallel).
 
         Args:
             layer_name: Fully-qualified name of the hooked layer.
             grad_output: Captured output gradient, shape ``(B, *, out_features)``.
+            layer_type: Canonical class name of the layer (see
+                :meth:`on_layer_forward`).
+            module_kwargs: The layer's serializable hyperparameters (see
+                :meth:`on_layer_forward`).
         """
 
     def on_step_end(self, record: GradientRecord) -> None:

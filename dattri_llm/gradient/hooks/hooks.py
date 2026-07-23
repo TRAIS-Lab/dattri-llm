@@ -277,6 +277,7 @@ def register_linear_io_hooks(
                 a = inp[0].detach()
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
                 buf = buffers[layer_name]
+                emit_type, emit_kwargs = buf["_class_name"], buf["_module_kwargs"]
                 if buf["_proj_kw"] is None:
                     if offload_to_cpu:
                         a = a.cpu()
@@ -288,17 +289,31 @@ def register_linear_io_hooks(
                         buf["_fwd_fires"] += 1
                     buf["activation"] = a
                 else:
-                    # Projected layer: keep the raw activation on-device so the
-                    # backward hook projects (a, g) together; the full factor is
-                    # never buffered.  A per-device *stack* pairs each call's a
-                    # with its g even when a layer is invoked multiple times per
-                    # forward (weight tying / RNN unroll) -- backward pops in the
-                    # reverse (LIFO) order the forwards ran.
+                    # Projected layer.  For linear (a-side independent of g) the
+                    # activation is projected *here*, so the buffer holds only the
+                    # small a_p and the callback sees the projected factor; other
+                    # types keep the raw activation for the joint backward
+                    # projection.  A per-device *stack* pairs each call's a with
+                    # its g even when a layer is invoked multiple times per forward
+                    # (weight tying / RNN unroll) -- backward pops LIFO.
+                    style = buf["_proj_kw"].get("style", "logra_factorized")
+                    if _preprojects_activation(buf["_class_name"], style):
+                        proj_kw = {
+                            k: v for k, v in buf["_proj_kw"].items() if k != "style"
+                        }
+                        a = ops.project_activation(
+                            a,
+                            buf["_class_name"],
+                            projector,
+                            buf["_module_kwargs"],
+                            **proj_kw,
+                        )
+                        emit_type, emit_kwargs = "nn.Linear", None
                     with buf["_lock"]:
                         buf["_device_id"].setdefault(dev_idx, []).append(a)
                         buf["_fwd_fires"] += 1
                 if on_layer_forward is not None:
-                    on_layer_forward(layer_name, a)
+                    on_layer_forward(layer_name, a, emit_type, emit_kwargs)
 
             return _fwd
 
@@ -311,6 +326,11 @@ def register_linear_io_hooks(
                 g = grad_output[0].detach()
                 dev_idx = grad_output[0].device.index if grad_output[0].is_cuda else 0
                 buf = buffers[layer_name]
+                emit_g, emit_type, emit_kwargs = (
+                    g,
+                    buf["_class_name"],
+                    buf["_module_kwargs"],
+                )
                 if buf["_proj_kw"] is None:
                     if offload_to_cpu:
                         g = g.cpu()
@@ -326,17 +346,24 @@ def register_linear_io_hooks(
                         buf["_pair_pos"].append((dev_idx, len(stack)))
                         buf["_grad_parts"].append((dev_idx, g))
                     buf["grad_output"] = g
-                elif not _capture_projected(
-                    buf,
-                    g,
-                    dev_idx,
-                    projector,
-                    offload_to_cpu,
-                ):
-                    _warn_orphan_backward(layer_name)
-                    return
+                    emit_g = g
+                else:
+                    matched, g_p = _capture_projected(
+                        buf,
+                        g,
+                        dev_idx,
+                        projector,
+                        offload_to_cpu,
+                    )
+                    if not matched:
+                        _warn_orphan_backward(layer_name)
+                        return
+                    if g_p is not None:
+                        # Pre-projected linear: hand the callback the projected
+                        # gradient factor (paired with the forward's a_p).
+                        emit_g, emit_type, emit_kwargs = g_p, "nn.Linear", None
                 if on_layer_backward is not None:
-                    on_layer_backward(layer_name, g)
+                    on_layer_backward(layer_name, emit_g, emit_type, emit_kwargs)
 
             return _bwd
 
@@ -366,13 +393,29 @@ def _warn_orphan_backward(layer_name: str) -> None:
     )
 
 
+def _preprojects_activation(layer_type: str, style: str) -> bool:
+    """Whether a projected layer's activation is projected in the *forward* hook.
+
+    ``True`` for linear layers under the double-sided (LoGRA) styles: the a-side
+    projection does not depend on the gradient, so it can run at forward -- the
+    buffer then holds the small ``(B, T, proj_dim)`` factor instead of the full
+    activation, and the projected factors reach the per-layer callbacks.  Other
+    types stay on the joint backward projection (e.g. an embedding's g-masking
+    reads the raw activation's padding ids, which are gone once projected).
+    """
+    return ops.is_linear(layer_type) and style in (
+        "logra_factorized",
+        "logra_materialized",
+    )
+
+
 def _capture_projected(
     buf: LayerBuffer,
     g: torch.Tensor,
     dev_idx: int,
     projector: Callable,
     offload_to_cpu: bool = False,
-) -> bool:
+) -> tuple[bool, torch.Tensor | None]:
     """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
 
     Called from the backward hook of a projected layer, pairing ``g`` with the
@@ -387,25 +430,53 @@ def _capture_projected(
     * ``"materialized"`` (TRAK) -- the materialize-then-project per-sample block
       goes to ``_proj_parts``.
 
+    When the layer pre-projected its activation at forward
+    (:func:`_preprojects_activation`), the popped ``a`` is already the projected
+    factor ``a_p``, so only ``g`` is projected here.
+
     Only the small projected result is retained (moved to CPU when
     *offload_to_cpu*) -- the raw factors are discarded here, so the buffer never
     holds the full gradient.
 
     Returns:
-        ``True`` when a forward capture was matched and consumed, ``False``
-        for an orphan backward (nothing buffered).
+        ``(matched, g_p)`` -- ``matched`` is ``False`` for an orphan backward
+        (nothing buffered).  ``g_p`` is the projected gradient factor when the
+        activation was pre-projected (so the caller can emit the projected
+        factors to callbacks), else ``None``.
     """
     with buf["_lock"]:
         stack = buf["_device_id"].get(dev_idx)
         a = stack.pop() if stack else None
         pair_pos = (dev_idx, len(stack)) if a is not None else None
     if a is None:
-        return False
+        return False, None
 
     kw = dict(buf["_proj_kw"])
     style = kw.pop("style", "logra_factorized")
     layer_type = buf["_class_name"]
     module_kwargs = buf["_module_kwargs"]
+
+    # Activation pre-projected at forward: ``a`` is already ``a_p``; project only
+    # ``g``.  The stored factors are identical to the joint path (same seeds).
+    if _preprojects_activation(layer_type, style):
+        a_p = a
+        g_p = ops.project_gradient(g, layer_type, projector, module_kwargs, **kw)
+        if style == "logra_factorized":
+            if offload_to_cpu:
+                a_p, g_p = a_p.cpu(), g_p.cpu()
+            with buf["_lock"]:
+                buf["_act_parts"].append((dev_idx, a_p))
+                buf["_grad_parts"].append((dev_idx, g_p))
+                buf["_pair_pos"].append(pair_pos)
+            return True, g_p
+        mat = ops._materialize(a_p, g_p, "nn.Linear")
+        if offload_to_cpu:
+            mat = mat.cpu()
+        with buf["_lock"]:
+            buf["_proj_parts"].append((dev_idx, mat))
+            buf["_pair_pos"].append(pair_pos)
+        return True, g_p
+
     if a.ndim == 1 and is_embedding(layer_type):
         a, g = a.unsqueeze(0), g.unsqueeze(0)
 
@@ -424,7 +495,7 @@ def _capture_projected(
             buf["_act_parts"].append((dev_idx, a_p))
             buf["_grad_parts"].append((dev_idx, g_p))
             buf["_pair_pos"].append(pair_pos)
-        return True
+        return True, None
 
     if style == "logra_materialized":
         a_p, g_p = ops._project_factorized(
@@ -453,7 +524,7 @@ def _capture_projected(
     with buf["_lock"]:
         buf["_proj_parts"].append((dev_idx, mat))
         buf["_pair_pos"].append(pair_pos)
-    return True
+    return True, None
 
 
 def remove_hooks(handles: list[torch.utils.hooks.RemovableHook]) -> None:

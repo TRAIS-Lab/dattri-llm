@@ -1637,3 +1637,147 @@ class TestDiskFormat:
             fm.save_bulk([record])
             assert len(list(Path(d).glob("*.pt"))) == 1
             assert list(Path(d).glob("*.mmap.bin")) == []
+
+
+class TestKroneckerCovarianceCallback:
+    """The inline covariance callback must reproduce the block-level
+    KroneckerAccumulator's ``(A, G)`` -- i.e. fitting during capture from the
+    raw per-layer factors matches fitting from the assembled factorized blocks.
+    """
+
+    @staticmethod
+    def _reference(records):
+        from dattri_llm.gradient.ops import KroneckerAccumulator
+
+        acc = KroneckerAccumulator()
+        for r in records:
+            layers = [
+                n for n, v in r.gradient.data.items() if isinstance(v, Factorized)
+            ]
+            acc.update(r.gradient, layers)
+        return acc.result()
+
+    def _collect(self, model, xs):
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        rec = RecordingCallback()
+        cov = KroneckerCovarianceCallback()
+        hm = HookManager(model, callbacks=[rec, cov])
+        with hm.collect():
+            for x in xs:
+                model(x).pow(2).sum().backward()
+                model.zero_grad(set_to_none=True)
+        return rec, cov
+
+    def test_matches_block_accumulator_single_step(self):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(6, 8), nn.ReLU(), nn.Linear(8, 4))
+        rec, cov = self._collect(model, [torch.randn(5, 6)])
+        ref, got = self._reference(rec.records), cov.result()
+        assert set(got) == set(ref)
+        for layer in ref:
+            a_ref, g_ref = ref[layer]
+            a_got, g_got = got[layer]
+            assert torch.allclose(a_got, a_ref, atol=1e-5), f"A {layer}"
+            assert torch.allclose(g_got, g_ref, atol=1e-5), f"G {layer}"
+
+    def test_matches_block_accumulator_multi_step(self):
+        torch.manual_seed(1)
+        model = nn.Sequential(nn.Linear(4, 5, bias=False), nn.ReLU(), nn.Linear(5, 3))
+        xs = [torch.randn(3, 4) for _ in range(4)]
+        rec, cov = self._collect(model, xs)
+        ref, got = self._reference(rec.records), cov.result()
+        assert set(got) == set(ref)
+        for layer in ref:
+            a_ref, g_ref = ref[layer]
+            a_got, g_got = got[layer]
+            assert torch.allclose(a_got, a_ref, atol=1e-5), f"A {layer}"
+            assert torch.allclose(g_got, g_ref, atol=1e-5), f"G {layer}"
+
+    def test_reset_clears_state(self):
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        torch.manual_seed(2)
+        model = nn.Sequential(nn.Linear(4, 4))
+        cov = KroneckerCovarianceCallback()
+        hm = HookManager(model, callbacks=[cov])
+        with hm.collect():
+            model(torch.randn(3, 4)).pow(2).sum().backward()
+        assert cov.result()
+        cov.reset()
+        assert cov.result() == {}
+
+
+class TestProjectedCovarianceCallback:
+    """Under a LoGRA projection, the covariance callback receives the *projected*
+    factors (a-side projected in the forward hook), so it fits compact
+    ``(proj_dim, proj_dim)`` covariances -- the logix-style factors that match a
+    ``logra_materialized`` compact store.
+    """
+
+    PROJ = 4
+
+    def _config(self, style):
+        from dattri_llm.gradient.hooks import REGISTER_ALL, HookManagerConfig
+
+        return HookManagerConfig(
+            linear_io=REGISTER_ALL,
+            projection={
+                "__default__": {
+                    "style": style,
+                    "proj_dim": self.PROJ,
+                    "proj_max_batch_size": 32,
+                    "proj_type": "rademacher",
+                    "proj_seed": 0,
+                },
+            },
+        )
+
+    def _collect(self, style):
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 8))
+        rec = RecordingCallback()
+        cov = KroneckerCovarianceCallback()
+        hm = HookManager(model, config=self._config(style), callbacks=[rec, cov])
+        with hm.collect():
+            model(torch.randn(5, 16)).pow(2).sum().backward()
+        return rec, cov
+
+    def test_covariances_are_compact_and_match_blocks(self):
+        from dattri_llm.gradient.ops import KroneckerAccumulator
+
+        # logra_factorized keeps the projected factors in the block, so the block
+        # KroneckerAccumulator is the reference for the compact covariance.
+        rec, cov = self._collect("logra_factorized")
+        got = cov.result()
+        assert got, "no covariances collected"
+        for layer, (a_cov, g_cov) in got.items():
+            assert a_cov.shape == (self.PROJ, self.PROJ), f"{layer} A {a_cov.shape}"
+            assert g_cov.shape == (self.PROJ, self.PROJ), f"{layer} G {g_cov.shape}"
+
+        acc = KroneckerAccumulator()
+        for r in rec.records:
+            layers = [
+                n for n, v in r.gradient.data.items() if isinstance(v, Factorized)
+            ]
+            acc.update(r.gradient, layers)
+        ref = acc.result()
+        assert set(got) == set(ref)
+        for layer in ref:
+            a_ref, g_ref = ref[layer]
+            a_got, g_got = got[layer]
+            assert torch.allclose(a_got, a_ref, atol=1e-5), f"A {layer}"
+            assert torch.allclose(g_got, g_ref, atol=1e-5), f"G {layer}"
+
+    def test_compact_store_still_gets_projected_covariance(self):
+        # logra_materialized stores a compact (B, k*k) block (no factors), yet the
+        # callback still fits the compact (k, k) covariances from the projected
+        # factors emitted at capture -- the whole point of the logix-style path.
+        _rec, cov = self._collect("logra_materialized")
+        got = cov.result()
+        assert got
+        for layer, (a_cov, g_cov) in got.items():
+            assert a_cov.shape == (self.PROJ, self.PROJ), f"{layer} A {a_cov.shape}"
+            assert g_cov.shape == (self.PROJ, self.PROJ), f"{layer} G {g_cov.shape}"

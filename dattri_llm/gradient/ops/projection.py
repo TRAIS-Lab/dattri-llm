@@ -8,7 +8,7 @@ import torch
 
 from dattri_llm.gradient.ops.materialize import _materialize
 from dattri_llm.gradient.ops.preprocess import _preprocess_factorized, _to_3d
-from dattri_llm.gradient.ops.types import is_embedding, is_norm
+from dattri_llm.gradient.ops.types import is_embedding, is_linear, is_norm
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -152,6 +152,74 @@ def _project_factorized(
         **proj_kwargs,
     )
     return a_p, g_p
+
+
+def project_activation(
+    a: torch.Tensor,
+    layer_type: str,
+    projector: Callable,
+    module_kwargs: dict | None,
+    include_bias: bool = True,
+    *,
+    proj_dim: int,
+    proj_seed: int = 0,
+    **proj_kwargs,
+) -> torch.Tensor:
+    """Project **only** a linear layer's activation factor (the a-side of
+    :func:`_project_factorized`).
+
+    For a linear layer the a-side prep is just the bias ones-column and does not
+    depend on the gradient, so this runs in the *forward* hook -- the capture
+    buffer then holds the small ``(B, T, proj_dim)`` factor instead of the full
+    ``(B, T, d_in)`` activation.  Uses ``proj_seed + 1`` (dattri's LoGRA input-side
+    convention), so composing it with :func:`project_gradient` reproduces
+    :func:`_project_factorized` exactly.
+    """
+    if not is_linear(layer_type):
+        raise ValueError(
+            f"project_activation is for linear layers only, got {layer_type!r}.",
+        )
+    if module_kwargs is not None and module_kwargs["has_bias"] and include_bias:
+        a = torch.cat([a, torch.ones_like(a[..., :1])], dim=-1)
+    a_f = _to_3d(a.float())
+    return _apply_projector(
+        projector,
+        a_f,
+        proj_dim=proj_dim,
+        proj_seed=proj_seed + 1,
+        **proj_kwargs,
+    )
+
+
+def project_gradient(
+    g: torch.Tensor,
+    layer_type: str,
+    projector: Callable,
+    module_kwargs: dict | None,  # noqa: ARG001 - parity with the a-side signature
+    *,
+    proj_dim: int,
+    proj_seed: int = 0,
+    **proj_kwargs,
+) -> torch.Tensor:
+    """Project **only** a linear layer's gradient factor (the g-side of
+    :func:`_project_factorized`).
+
+    A linear layer's gradient needs no per-layer prep, so this is a plain
+    projection with ``proj_seed`` -- run in the *backward* hook and paired with
+    the forward-projected activation.
+    """
+    if not is_linear(layer_type):
+        raise ValueError(
+            f"project_gradient is for linear layers only, got {layer_type!r}.",
+        )
+    g_f = _to_3d(g.float())
+    return _apply_projector(
+        projector,
+        g_f,
+        proj_dim=proj_dim,
+        proj_seed=proj_seed,
+        **proj_kwargs,
+    )
 
 
 def project_materialized(
