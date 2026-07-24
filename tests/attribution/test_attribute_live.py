@@ -353,3 +353,98 @@ class TestCompactKFAC:
         assert torch.allclose(s_fac, s_mat, atol=1e-4, rtol=1e-3), (
             f"max diff {(s_fac - s_mat).abs().max():.2e}"
         )
+
+
+class TestBatchedScoring:
+    """score_sources always re-batches the train side into
+    ``per_device_train_batch_size`` groups; the batch size only affects
+    speed/memory, so scores must be bit-identical for every value.
+    """
+
+    @staticmethod
+    def _materialized_store(out, n_blocks, per_block, hash_prefix, d=12):
+        from dattri_llm.gradient.gradient import Gradient, GradientRecord
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+
+        fm = GradientStorageManager(str(out))
+        for s in range(n_blocks):
+            g = Gradient(
+                representation={"L0": "materialized", "L1": "materialized"},
+                data={"L0": torch.randn(per_block, d), "L1": torch.randn(per_block, d)},
+                layer_types={"L0": "nn.Linear", "L1": "nn.Linear"},
+            )
+            hashes = [f"{hash_prefix}{s}_{i}" for i in range(per_block)]
+            fm.save_bulk([GradientRecord(step=s, input_hash=hashes, gradient=g)])
+        return str(out)
+
+    def test_batch_size_invariant(self, tmp_path):
+        from dattri_llm.attribution.utils import score_sources
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import DiskGradientSource
+
+        torch.manual_seed(0)
+        train_dir = self._materialized_store(tmp_path / "tr", 4, 3, "t")  # 12 docs
+        test_dir = self._materialized_store(tmp_path / "te", 2, 2, "q")
+
+        def prep(test_g):
+            return {name: test_g.data[name] for name in test_g.data}
+
+        def score_block(train_g, rep, _n_test):
+            total = None
+            for name in train_g.data:
+                b = train_g.data[name].float() @ rep[name].float().T
+                total = b if total is None else total + b
+            return total
+
+        def run(batch):
+            args = _args(tmp_path / "o")
+            args.per_device_train_batch_size = batch  # the scoring batch
+            train = DiskGradientSource(GradientStorageManager(train_dir), args)
+            test = DiskGradientSource(GradientStorageManager(test_dir), args)
+            return score_sources(
+                train,
+                test,
+                args.device,
+                prepare_test=prep,
+                score_block=score_block,
+            )
+
+        s1, ids1, steps1, tids1 = run(1)  # one stored (3-doc) block per batch
+        s5, ids5, steps5, _ = run(5)  # 5-doc batches (regroups 3-doc blocks)
+        sn, idsn, stepsn, tidsn = run(100)  # whole 12-doc store as one batch
+        assert (ids1, steps1, tids1) == (idsn, stepsn, tidsn)
+        assert (ids1, steps1) == (ids5, steps5)
+        assert torch.equal(s1, s5)
+        assert torch.equal(s1, sn)
+
+    def test_factorized_scored_per_block(self, tmp_path):
+        # A factorized store can't be stacked into a dense (B, D) batch;
+        # score_sources scores it one block at a time (no crash, right row count).
+        from dattri_llm.attribution.utils import score_sources
+        from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import DiskGradientSource
+
+        torch.manual_seed(0)
+        fm = GradientStorageManager(str(tmp_path / "fac"))
+        for s in range(3):
+            g = Gradient(
+                representation={"L0": "factorized"},
+                data={"L0": Factorized(torch.randn(2, 4, 5), torch.randn(2, 4, 5))},
+                layer_types={"L0": "nn.Linear"},
+                validate_on_init=False,
+            )
+            fm.save_bulk(
+                [GradientRecord(step=s, input_hash=[f"t{s}_0", f"t{s}_1"], gradient=g)],
+            )
+        args = _args(tmp_path / "o")
+        train = DiskGradientSource(GradientStorageManager(str(tmp_path / "fac")), args)
+        test = DiskGradientSource(GradientStorageManager(str(tmp_path / "fac")), args)
+        scores, ids, _steps, _tids = score_sources(
+            train,
+            test,
+            args.device,
+            prepare_test=lambda g: g,
+            score_block=lambda _t, _r, n: torch.zeros(2, n),
+        )
+        assert scores.shape[0] == len(ids) == 6

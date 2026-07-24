@@ -110,6 +110,106 @@ def collect_to_disk(
             file_manager.save_bulk(staged)
 
 
+def _score_one(
+    train_g: Gradient,
+    cached_test: list[tuple[object, list[str]]],
+    test_index: dict[str, int],
+    num_test: int,
+    score_block: Callable[[Gradient, object, int], torch.Tensor],
+) -> torch.Tensor:
+    """Cross-gram one device-resident train block against every cached test
+    block, returning its ``(B_train, num_test)`` CPU row chunk.
+    """
+    row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
+    for test_rep, test_hashes in cached_test:
+        cols = [test_index[h] for h in test_hashes]
+        block = score_block(train_g, test_rep, len(cols))
+        row[:, cols] = block.detach().to("cpu", torch.float)
+    return row
+
+
+def _batched_train_score(
+    train_source: Iterable,
+    device: object,
+    cached_test: list[tuple[object, list[str]]],
+    test_index: dict[str, int],
+    num_test: int,
+    score_block: Callable[[Gradient, object, int], torch.Tensor],
+    batch_size: int,
+) -> tuple[torch.Tensor, list[str], list[int]]:
+    """Score the train side in ``batch_size``-sample batches -- one set of GEMMs
+    per batch instead of one per stored block.
+
+    Re-batches the store's collection blocks into ``batch_size``-sample scoring
+    batches: each layer's ``(B, D)`` materialized tensors are concatenated to
+    ``(K, D)`` (one ``cat`` per layer, O(N) not pairwise, one host->device
+    transfer) and scored together, collapsing the ~``blocks x layers`` tiny
+    matmuls into ~``ceil(N/K) x layers`` big ones.  Factorized blocks -- whose
+    per-token factors can't be stacked into a dense ``(B, D)`` -- are scored one
+    block at a time (the batching is a no-op for them).  One pass over
+    *train_source* either way.
+    """
+    row_chunks: list[torch.Tensor] = []
+    row_train_ids: list[str] = []
+    row_steps: list[int] = []
+    pending: dict[str, list[torch.Tensor]] = {}
+    pending_ids: list[str] = []
+    pending_steps: list[int] = []
+    pending_n = 0
+    meta: Gradient | None = None
+
+    def flush() -> None:
+        nonlocal pending, pending_ids, pending_steps, pending_n
+        if pending_n == 0:
+            return
+        # One cat per layer (O(N) copies, not pairwise O(N^2)) + one H2D transfer.
+        data = {
+            name: torch.cat(tensors, dim=0).to(device)
+            for name, tensors in pending.items()
+        }
+        big = Gradient(
+            representation=meta.representation,
+            data=data,
+            layer_types=meta.layer_types,
+            indexing=meta.indexing,
+            validate_on_init=False,
+        )
+        row_chunks.append(
+            _score_one(big, cached_test, test_index, num_test, score_block),
+        )
+        row_train_ids.extend(pending_ids)
+        row_steps.extend(pending_steps)
+        pending, pending_ids, pending_steps, pending_n = {}, [], [], 0
+
+    for step, block, hashes in train_source:
+        if not all(isinstance(v, torch.Tensor) for v in block.data.values()):
+            # Factorized: score this block alone (flush any pending batch first;
+            # homogeneous stores never mix, but stay correct if they do).
+            flush()
+            train_g = block.to(device)
+            row_chunks.append(
+                _score_one(train_g, cached_test, test_index, num_test, score_block),
+            )
+            row_train_ids.extend(hashes)
+            row_steps.extend([step] * train_g.batch_size)
+            continue
+        meta = block
+        for name, tensor in block.data.items():
+            pending.setdefault(name, []).append(tensor)
+        pending_ids.extend(hashes)
+        pending_steps.extend([step] * block.batch_size)
+        pending_n += block.batch_size
+        if pending_n >= batch_size:
+            flush()
+    flush()
+    scores = (
+        torch.cat(row_chunks, dim=0)
+        if row_chunks
+        else torch.zeros(0, num_test, dtype=torch.float)
+    )
+    return scores, row_train_ids, row_steps
+
+
 def score_sources(
     train_source: Iterable,
     test_source: Iterable,
@@ -146,7 +246,20 @@ def score_sources(
         prepare_test: The per-method preparation hook described above.
         score_block: The per-method scoring hook described above.
         loop_over_test: Re-stream + re-prepare the test blocks per train block
-            (low memory) instead of caching them once (default).
+            (low memory) instead of caching them once (default).  This path always
+            scores block-by-block (no train-side re-batching).
+
+    Notes:
+        The train side is always scored in ``per_device_train_batch_size``-sample
+        batches (read from ``train_source``'s args), collapsing the tiny per-block
+        matmuls into big GEMMs; the test side is already blocked at
+        ``per_device_eval_batch_size`` by its source.  For ``attribute`` (live
+        streamer) that batch matches the collection batch, so scoring memory
+        aligns with collection; for ``attribute_from_cache`` there is no
+        collection, so raise ``per_device_train_batch_size`` to score the whole
+        store at once.  The batch size only affects speed/memory -- scores are
+        identical for every value.  Factorized stores can't be stacked into a
+        dense batch, so they are scored one block at a time regardless.
 
     Returns:
         ``(scores, row_train_ids, row_steps, test_ids)`` -- ``scores`` is
@@ -177,19 +290,31 @@ def score_sources(
             cached_test.append((prepare_test(test_g.to(device)), test_hashes))
     num_test = len(test_ids)
 
-    # Score every train block against every test block.
+    if not loop_over_test:
+        # Batch the train side at per_device_train_batch_size (the scoring batch,
+        # read from the source's args); factorized blocks fall to per-block inside.
+        train_args = getattr(train_source, "_args", None)
+        batch_size = getattr(train_args, "per_device_train_batch_size", 1) or 1
+        scores, row_train_ids, row_steps = _batched_train_score(
+            train_source,
+            device,
+            cached_test,
+            test_index,
+            num_test,
+            score_block,
+            batch_size,
+        )
+        return scores, row_train_ids, row_steps, test_ids
+
+    # loop_over_test: re-stream + re-prepare the test blocks per train block.
     row_chunks: list[torch.Tensor] = []
-    row_train_ids: list[str] = []
-    row_steps: list[int] = []
+    row_train_ids = []
+    row_steps = []
     for train_step, train_block, train_hashes in train_source:
         train_g = train_block.to(device)
         row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
-        test_blocks = (
-            ((prepare_test(g.to(device)), h) for _s, g, h in test_source)
-            if loop_over_test
-            else cached_test
-        )
-        for test_rep, test_hashes in test_blocks:
+        for _s, test_g, test_hashes in test_source:
+            test_rep = prepare_test(test_g.to(device))
             cols = [test_index[h] for h in test_hashes]
             block = score_block(train_g, test_rep, len(cols))
             row[:, cols] = block.detach().to("cpu", torch.float)
