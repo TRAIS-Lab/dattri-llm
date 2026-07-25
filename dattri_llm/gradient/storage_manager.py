@@ -27,7 +27,10 @@ import json
 import operator
 import shutil
 import tempfile
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,7 +40,7 @@ from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
     from typing_extensions import Self
 
@@ -124,6 +127,100 @@ def _to_cpu_record(record: GradientRecord) -> GradientRecord:
     )
 
 
+def _expand_log_line(payload: dict) -> dict[str, list[dict]]:
+    """Rebuild index entries from one append-only log line.
+
+    A log line stores the group's location and, for each record in it, an
+    ``idx``, a ``step`` and its hashes in batch order; a sample's
+    ``sample_idx`` is its position in that hash list.
+
+    Args:
+        payload: One decoded log line.
+
+    Returns:
+        Mapping from identifier to the entries that line contributes.
+    """
+    out: dict[str, list[dict]] = {}
+    location = payload["file"]
+    for record in payload["records"]:
+        idx = record["idx"]
+        step = record["step"]
+        for sample_idx, h in enumerate(record["hashes"]):
+            out.setdefault(h, []).append(
+                {
+                    "file": location,
+                    "idx": idx,
+                    "step": step,
+                    "sample_idx": sample_idx,
+                },
+            )
+    return out
+
+
+class _PhaseTimings:
+    """Accumulated wall-clock time for the phases of a save.
+
+    A save splits into four phases:
+
+    * ``to_cpu`` -- moving the captured payloads off the GPU
+      (:func:`_to_cpu_record`).  Pure bandwidth; scales with gradient size.
+    * ``write_group`` -- handing the group to the residency backend:
+      ``torch.save``, a memmap write, or (``memory``/unspilled ``tiered``)
+      just stashing it in RAM.  Scales with gradient size, and is where the
+      ``disk_format`` choice shows up.
+    * ``index_update`` -- updating the in-memory hash index.  Cheap, but
+      scales with the number of samples in the flush.
+    * ``index_write`` -- persisting the index delta (``disk`` residency only;
+      a no-op for the ephemeral residencies).
+
+    Timing is always on; there is no flag to enable.
+    """
+
+    _PHASES = ("to_cpu", "write_group", "index_update", "index_write")
+
+    def __init__(self) -> None:
+        self._seconds: dict[str, float] = dict.fromkeys(self._PHASES, 0.0)
+        self._calls: dict[str, int] = dict.fromkeys(self._PHASES, 0)
+
+    @contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        """Time the wrapped block into phase *name* (counted even if it raises)."""
+        start = perf_counter()
+        try:
+            yield
+        finally:
+            self._seconds[name] += perf_counter() - start
+            self._calls[name] += 1
+
+    def as_dict(self) -> dict[str, dict[str, float]]:
+        """Per-phase ``{"seconds", "calls"}``, in the order phases run."""
+        return {
+            name: {"seconds": self._seconds[name], "calls": self._calls[name]}
+            for name in self._PHASES
+        }
+
+    def reset(self) -> None:
+        """Zero every counter (e.g. to exclude a warm-up phase)."""
+        for name in self._PHASES:
+            self._seconds[name] = 0.0
+            self._calls[name] = 0
+
+    def report(self) -> str:
+        """A human-readable table of the accumulated timings."""
+        saves = max(self._calls.values()) if self._calls else 0
+        lines = [f"GradientStorageManager save timings ({saves} saves):"]
+        for name in self._PHASES:
+            seconds = self._seconds[name]
+            calls = self._calls[name]
+            per_call = (seconds / calls * 1e3) if calls else 0.0
+            lines.append(
+                f"  {name:<13} {seconds:8.3f} s  ({calls} calls, "
+                f"{per_call:7.2f} ms/call)",
+            )
+        lines.append(f"  {'total':<13} {sum(self._seconds.values()):8.3f} s")
+        return "\n".join(lines)
+
+
 def _merge_index(dst: dict[str, list[dict]], src: dict[str, list[dict]]) -> None:
     for h, entries in src.items():
         existing = dst.setdefault(h, [])
@@ -172,7 +269,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
     Under single-GPU / non-distributed::
 
         save_dir/
-            index.json
+            index_meta.json
+            index.jsonl
             batch_000000.pt
             batch_000001.pt
             ...
@@ -181,11 +279,13 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
 
         save_dir/
             rank_0/
-                index.json
+                index_meta.json
+                index.jsonl
                 batch_000000.pt
                 ...
             rank_1/
-                index.json
+                index_meta.json
+                index.jsonl
                 batch_000000.pt
                 ...
             rank_2/ ...
@@ -196,27 +296,34 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
     * **File-name collision** -- each rank's ``_next_batch_id`` counter is
       local to its own subdirectory, so ``batch_000000.pt`` on rank 0 and
       ``batch_000000.pt`` on rank 1 live in different directories.
-    * **``index.json`` race** -- every rank writes only to its own
-      ``rank_N/index.json``; there are no concurrent writes to a shared file.
+    * **Index race** -- every rank appends only to its own
+      ``rank_N/index.jsonl``; there are no concurrent writes to a shared file.
     * **Silent data loss** -- in DDP each rank processes a different micro-batch,
       so all ranks must save; restricting saves to rank 0 would discard 3/4 of
       the gradient data.
 
-    Index format (inside each ``index.json``)::
+    The index is stored as an **append-only log**: each save appends one line
+    to ``index.jsonl`` describing only what that save wrote, and the
+    store-wide settings live in a small constant-size ``index_meta.json``::
 
-        {
-            "sample_id_key": null,
-            "index": {
-                "<identifier>": [
-                    {"file": "rank_0/batch_000000.pt", "idx": 2, "step": 0,
-                     "sample_idx": 5},
-                    {"file": "rank_0/batch_000002.pt", "idx": 0, "step": 4,
-                     "sample_idx": 1}
-                ]
-            }
-        }
+        index_meta.json:
+            {"format": 2, "sample_id_key": null,
+             "gradient_accumulation_steps": 1}
 
-    The mapping is ``identifier -> (step, sample_idx) -> file``.  The
+        index.jsonl (one line per save):
+            {"file": "rank_0/batch_000000.pt", "records": [
+                {"idx": 0, "step": 0, "hashes": ["<h0>", "<h1>"]},
+                {"idx": 1, "step": 1, "hashes": ["<h2>", "<h3>"]}]}
+            {"file": "rank_0/batch_000001.pt", "records": [...]}
+
+    Each save's cost is proportional to what that save added rather than to
+    everything the store holds.  Only ``disk`` residency persists an index at
+    all -- see :meth:`_persist_index`.
+
+    Reading expands the log back into the in-memory mapping
+    ``identifier -> (step, sample_idx) -> file``: the line's ``file`` plus a
+    record's ``idx``/``step`` plus each hash's position in ``hashes``
+    reconstructs one ``{file, idx, step, sample_idx}`` entry.  The
     identifier is whatever the capturing
     :class:`~dattri_llm.gradient.hooks.HookManager` assigned: the SHA-256
     content hash by default (sample-position independent -- a sample hashes
@@ -255,7 +362,10 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             internally).
     """
 
-    _INDEX_FILE = "index.json"
+    # The append-only entry log plus its constant-size settings sidecar.
+    _INDEX_LOG_FILE = "index.jsonl"
+    _INDEX_META_FILE = "index_meta.json"
+    _INDEX_FORMAT = 2
 
     def __init__(
         self,
@@ -297,6 +407,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         # litters ``save_dir`` with orphaned spill files.
         self._spill_dir: Path | None = None
         self._closed: bool = False
+        # Per-phase save timings; see _PhaseTimings.
+        self._timings = _PhaseTimings()
 
         # Where this process writes (root, or its rank_N/ subdirectory) is
         # resolved lazily at the first save, NOT here: managers are commonly
@@ -374,6 +486,34 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         self._id_key_known = True
 
     @property
+    def timing(self) -> dict[str, dict[str, float]]:
+        """Accumulated seconds and call counts for each save phase.
+
+        Phases are ``to_cpu`` (device-to-host transfer), ``write_group``
+        (the residency backend's write), ``index_update`` (in-memory index)
+        and ``index_write`` (index delta to disk) -- see
+        :class:`_PhaseTimings`::
+
+            with hookmanager.collect():
+                trainer.train()
+            print(storage_manager.timing_report())
+        """
+        return self._timings.as_dict()
+
+    def reset_timing(self) -> None:
+        """Zero the save timings, e.g. to exclude warm-up steps."""
+        self._timings.reset()
+
+    def timing_report(self) -> str:
+        """A printable per-phase breakdown of time spent saving.
+
+        Returns:
+            A table of accumulated seconds, call counts and per-call
+            milliseconds for each save phase.
+        """
+        return self._timings.report()
+
+    @property
     def gradient_accumulation_steps(self) -> int:
         """Micro-batches per stored step for this store (1 when undeclared).
 
@@ -426,11 +566,15 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
                 "save() takes a single-hash record; this record carries a "
                 "per-batch hash list -- use save_bulk([record]) instead.",
             )
-        record = _to_cpu_record(record)
+        with self._timings.phase("to_cpu"):
+            record = _to_cpu_record(record)
         base_name = f"step_{record.step:06d}_{record.input_hash}"
-        location = self._write_group([record], base_name)
-        self._index_entry(record, filename=location, idx=0)
-        self._persist_index()
+        with self._timings.phase("write_group"):
+            location = self._write_group([record], base_name)
+        with self._timings.phase("index_update"):
+            self._index_entry(record, filename=location, idx=0)
+        with self._timings.phase("index_write"):
+            self._persist_index([record], location)
         if self._residency == "tiered":
             self._maybe_spill()
         return location
@@ -454,11 +598,15 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             The location handle of the written group (a relative file path for
             ``disk`` residency, a synthetic ``mem_*`` key for ``memory``).
         """
-        records = [_to_cpu_record(r) for r in records]
-        location = self._write_group(records, None)
-        for idx, record in enumerate(records):
-            self._index_entry(record, filename=location, idx=idx)
-        self._persist_index()
+        with self._timings.phase("to_cpu"):
+            records = [_to_cpu_record(r) for r in records]
+        with self._timings.phase("write_group"):
+            location = self._write_group(records, None)
+        with self._timings.phase("index_update"):
+            for idx, record in enumerate(records):
+                self._index_entry(record, filename=location, idx=idx)
+        with self._timings.phase("index_write"):
+            self._persist_index(records, location)
         if self._residency == "tiered":
             self._maybe_spill()
         return location
@@ -992,77 +1140,123 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         return self._index
 
     def _read_all_indexes(self) -> dict[str, list[dict]]:
-        """Merge index.json from the root dir and every rank_N/ subdirectory.
+        """Merge the index of the root dir and of every rank_N/ subdirectory.
 
-        Every index file also carries the store's ``sample_id_key``; it is
-        adopted from the first file read, and all files must agree (see
+        Each directory's log also carries the store's ``sample_id_key`` and
+        accumulation convention in its settings sidecar; they are adopted
+        from the first directory read, and all must agree (see
         :meth:`_adopt_sample_id_key`).
         """
         merged: dict[str, list[dict]] = {}
-
-        def read_one(path: Path) -> None:
-            with path.open(encoding="utf-8") as f:
-                payload = json.load(f)
-            key = payload["sample_id_key"]
-            # JSON has no int/str key distinction problem for values, but a
-            # positional (int) sample_id_key round-trips as int natively.
-            self._adopt_sample_id_key(key)
-            self.declare_gradient_accumulation_steps(
-                payload.get("gradient_accumulation_steps", 1),
-            )
-            _merge_index(merged, payload["index"])
-
-        # Root-level index: non-distributed saves.
-        root_idx = self._root_dir / self._INDEX_FILE
-        if root_idx.exists():
-            read_one(root_idx)
-        # Per-rank indexes written by this class under DDP.
-        for rank_dir in sorted(self._root_dir.glob("rank_*")):
-            if not rank_dir.is_dir():
-                continue
-            rank_idx = rank_dir / self._INDEX_FILE
-            if rank_idx.exists():
-                read_one(rank_idx)
+        directories = [self._root_dir]
+        directories += [d for d in sorted(self._root_dir.glob("rank_*")) if d.is_dir()]
+        for directory in directories:
+            self._read_index_dir(directory, merged)
         return merged
 
-    def _persist_index(self) -> None:
-        """Persist the index for a ``disk`` store; a no-op otherwise.
+    def _read_index_dir(self, directory: Path, merged: dict[str, list[dict]]) -> None:
+        """Expand one directory's append-only log into *merged*, in write order."""
+        log = directory / self._INDEX_LOG_FILE
+        if not log.exists():
+            return
+
+        meta_path = directory / self._INDEX_META_FILE
+        if meta_path.exists():
+            with meta_path.open(encoding="utf-8") as f:
+                meta = json.load(f)
+            # A positional (int) sample_id_key round-trips through JSON natively.
+            self._adopt_sample_id_key(meta["sample_id_key"])
+            self.declare_gradient_accumulation_steps(
+                meta.get("gradient_accumulation_steps", 1),
+            )
+
+        with log.open(encoding="utf-8") as f:
+            for line in f:
+                entry = line.strip()
+                if not entry:
+                    continue
+                try:
+                    payload = json.loads(entry)
+                except json.JSONDecodeError:
+                    # Appends are whole lines, so a short line means the
+                    # process died mid-append.
+                    warnings.warn(
+                        f"Ignoring a truncated final line in {log} -- the "
+                        "records it described are not indexed.",
+                        stacklevel=2,
+                    )
+                    break
+                _merge_index(merged, _expand_log_line(payload))
+
+    def _persist_index(
+        self,
+        records: list[GradientRecord],
+        location: str,
+    ) -> None:
+        """Persist one save's index delta for a ``disk`` store; else a no-op.
 
         ``memory``/``tiered`` stores keep the index in RAM only -- they are
         ephemeral (single-process, not re-opened), and a spilled tiered group's
         files carry no standalone index (the live index in RAM already points
         at them).
+
+        Args:
+            records: The records just written, in group order.
+            location: The group's location handle.
         """
         if self._residency == "disk":
-            self._write_index()
+            self._append_index(records, location)
 
-    def _write_index(self) -> None:
-        """Write only this rank's entries to _save_dir/index.json.
+    def _append_index(self, records: list[GradientRecord], location: str) -> None:
+        """Append one line describing *records* to this rank's index log.
 
-        The write is atomic (temp file + ``os.replace``): a crash mid-write
-        leaves the previous index intact instead of a truncated JSON that
-        would lose every prior entry for this rank.
+        Called after the group file has been written.  The line is emitted as
+        a single ``write`` of a complete, newline-terminated JSON object and
+        flushed to the OS.
+
+        Args:
+            records: The records just written, in group order -- their position
+                in this list is the ``idx`` used to address them on load.
+            location: The group's location handle, relative to the root
+                *save_dir*.
         """
         save_dir = self._ensure_save_dir()
         save_dir.mkdir(parents=True, exist_ok=True)
-        # Filter to entries whose file path belongs to this rank's save_dir.
-        # For non-distributed _local_prefix is "", so all entries match.
-        local_index: dict[str, list[dict]] = {}
-        for h, entries in self._index.items():
-            local = [e for e in entries if e["file"].startswith(self._local_prefix)]
-            if local:
-                local_index[h] = local
-        tmp_path = save_dir / (self._INDEX_FILE + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
+
+        # Constant-size settings sidecar, rewritten atomically on each save.
+        meta_tmp = save_dir / (self._INDEX_META_FILE + ".tmp")
+        with meta_tmp.open("w", encoding="utf-8") as f:
             json.dump(
                 {
+                    "format": self._INDEX_FORMAT,
                     "sample_id_key": self._sample_id_key,
                     "gradient_accumulation_steps": self.gradient_accumulation_steps,
-                    "index": local_index,
                 },
                 f,
             )
-        tmp_path.replace(save_dir / self._INDEX_FILE)
+        meta_tmp.replace(save_dir / self._INDEX_META_FILE)
+
+        line = {
+            "file": location,
+            "records": [
+                {
+                    "idx": idx,
+                    "step": record.step,
+                    "hashes": [
+                        str(h)
+                        for h in (
+                            record.input_hash
+                            if isinstance(record.input_hash, list)
+                            else [record.input_hash]
+                        )
+                    ],
+                }
+                for idx, record in enumerate(records)
+            ],
+        }
+        with (save_dir / self._INDEX_LOG_FILE).open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line, separators=(",", ":")) + "\n")
+            f.flush()
 
     def _compute_next_batch_id(self) -> int:
         if not self._save_dir.exists():

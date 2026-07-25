@@ -140,8 +140,8 @@ class TestFileManagerRoundTrip:
 
     def test_scheme_persisted_and_reloaded(self, tmp_path):
         self._collect(tmp_path)
-        payload = json.loads((Path(tmp_path) / "index.json").read_text())
-        assert payload["sample_id_key"] == "idx"
+        meta = json.loads((Path(tmp_path) / "index_meta.json").read_text())
+        assert meta["sample_id_key"] == "idx"
         fresh = GradientStorageManager(str(tmp_path))
         assert fresh.sample_id_key == "idx"
         assert fresh.lookup_by_hash(32) == [(0, 0)]

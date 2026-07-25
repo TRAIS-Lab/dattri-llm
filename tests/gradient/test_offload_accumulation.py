@@ -173,8 +173,8 @@ class TestStoreConvention:
             [torch.randn(B, IN_DIM, generator=gen) for _ in range(2)],
             accum=2,
         )
-        payload = json.loads((tmp_path / "index.json").read_text())
-        assert payload["gradient_accumulation_steps"] == 2
+        meta = json.loads((tmp_path / "index_meta.json").read_text())
+        assert meta["gradient_accumulation_steps"] == 2
         assert GradientStorageManager(str(tmp_path)).gradient_accumulation_steps == 2
 
     def test_mixed_conventions_rejected(self, tmp_path):
