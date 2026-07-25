@@ -5,3 +5,16 @@ __pycache__/
 
 # local tooling
 /.claude/
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Benchmark measurements and generated plots under experiments/ -- every one is
+# reproduced by re-running its benchmark.  Scoped to experiments/ so the library
+# itself can still carry .jsonl fixtures if it ever needs to.
+experiments/results/
+experiments/**/*.jsonl
+experiments/**/*.png
+experiments/**/*.ipynb

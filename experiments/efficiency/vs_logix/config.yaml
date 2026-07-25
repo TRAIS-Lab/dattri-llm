@@ -1,0 +1,4 @@
+root_dir: ./logix_logs
+lora:
+  init: random
+  rank: 64
