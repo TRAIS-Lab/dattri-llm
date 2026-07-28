@@ -71,6 +71,51 @@ from dattri_llm.gradient.callbacks.base import HookManagerCallback  # noqa: E402
 from dattri_llm.gradient.gradient import GradientRecord  # noqa: E402
 
 
+def available_ram_bytes() -> int:
+    """Host RAM available for page cache, or 0 when it cannot be read."""
+    try:
+        with Path("/proc/meminfo").open(encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # macOS / BSD
+        import subprocess
+
+        out = subprocess.run(  # noqa: S603
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return int(out.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def describe_filesystem(path: Path) -> str:
+    """Mount point and fs type backing *path*, e.g. ``"/scratch (ext4)"``.
+
+    A store written to a tmpfs mount measures memory bandwidth, not disk, so
+    which filesystem was used has to travel with the result.
+    """
+    try:
+        target = path.resolve()
+        best = ("", "")
+        with Path("/proc/mounts").open(encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                mount, fstype = parts[1], parts[2]
+                if str(target).startswith(mount) and len(mount) > len(best[0]):
+                    best = (mount, fstype)
+        if best[0]:
+            return f"{best[0]} ({best[1]})"
+    except (OSError, IndexError):
+        pass
+    return "unknown"
+
+
 def dir_bytes(path: str | Path) -> int:
     """Total size of every file under *path*."""
     p = Path(path)
@@ -144,8 +189,8 @@ class Config:
     # library's main lever on how many bytes reach the store at all.
     proj_dim: int | None = None
     # Tiered only.  None takes the library default (~half of available RAM),
-    # which a short benchmark never reaches -- so the sweep pins a small budget
-    # to actually exercise the spill path rather than reporting 0 for it.
+    # which a short benchmark never reaches; the sweep pins 0 so every group is
+    # evicted and the spill path is exercised whatever the payload size.
     budget_bytes: int | None = None
 
     @property
@@ -223,32 +268,54 @@ def _hook_config(cfg: Config) -> object:
     return HookManagerConfig(**kwargs)
 
 
-def _build_sweep(quick: bool) -> list[Config]:
-    """The configurations to run.
+# Projection widths for --proj-sweep, coarse to fine.  Spans both sides of the
+# compute/write crossover: wide values cost projection compute without shrinking
+# much, narrow ones remove the bytes entirely.
+_PROJ_LADDER = (None, 512, 256, 128, 64, 32, 16, 8)
 
-    Every entry differs from the ``factorized/pickle/raw`` baseline along
-    exactly one axis, so any pair including the baseline isolates that axis.
+
+def _build_proj_sweep() -> list[Config]:
+    """One axis only: projection width, everything else at the baseline."""
+    return [Config(proj_dim=p) for p in _PROJ_LADDER]
+
+
+# Default projection width for this model.  The knee of the --proj-sweep curve:
+# 128->64 still buys 1.63x walltime, 64->32 only 1.07x, so below 64 you trade
+# sketch fidelity for almost no speed.  d=256 here, so this is d/4 (64*64 =
+# 4096 dims/layer, the rank LoGRA and logix use).  It does not transfer to
+# another model -- re-run --proj-sweep when the hidden size changes.
+DEFAULT_PROJ_DIM = 64
+
+
+def _build_sweep(quick: bool, proj_dim: int | None) -> list[Config]:
+    """The configurations to run, all at *proj_dim* except the projection axis.
+
+    Every entry differs from the baseline along exactly one axis, so any pair
+    including the baseline isolates that axis.
     """
+    base = {"proj_dim": proj_dim}
     if quick:
         # One axis only, so even the smoke run is interpretable.
         return [
-            Config(disk_format="pickle"),
-            Config(disk_format="memmap"),
+            Config(disk_format="pickle", **base),
+            Config(disk_format="memmap", **base),
         ]
     return [
-        Config(),
-        Config(disk_format="memmap"),
-        Config(representation="materialized"),
-        # Projection: the byte-count lever, dominant on a disk-bound store.
-        Config(proj_dim=64),
+        Config(**base),
+        Config(disk_format="memmap", **base),
+        Config(representation="materialized", **base),
+        # Projection axis: one coarser and one finer than the default.
+        Config(proj_dim=None),
         Config(proj_dim=16),
         # Where the device->host copy happens.
-        Config(offload_to_cpu=True),
+        Config(offload_to_cpu=True, **base),
         # Stall frequency vs stall size.
-        Config(offload_interval=1),
-        Config(offload_interval=32),
-        # The spill path: a 64 MiB budget so groups are actually evicted.
-        Config(residency="tiered", budget_bytes=64 * 2**20),
+        Config(offload_interval=1, **base),
+        Config(offload_interval=32, **base),
+        # The spill path.  A zero budget evicts every group as it lands, so
+        # the row measures spilling at any payload size -- a fixed budget stops
+        # firing as soon as projection shrinks the store under it.
+        Config(residency="tiered", budget_bytes=0, **base),
     ]
 
 
@@ -260,6 +327,7 @@ def _run_one(
     seq_len: int,
     device: str,
     results: Results,
+    store_dir: str | None = None,
 ) -> dict:
     """Train ``steps`` steps under *cfg*, returning the measured row."""
     from dattri_llm.gradient.callbacks import OffloadCallback
@@ -276,7 +344,7 @@ def _run_one(
     torch.manual_seed(0)
     model = TinyTransformer().to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-    save_dir = Path(tempfile.mkdtemp(prefix="offload_bench_"))
+    save_dir = Path(tempfile.mkdtemp(prefix="offload_bench_", dir=store_dir))
 
     try:
         store = GradientStorageManager(
@@ -346,6 +414,24 @@ def _run_one(
             "offload_share": round(offload_s / wall, 4) if wall > 0 else None,
             "store_bytes": store_bytes,
             "written_as": written,
+            # Disk throughput actually achieved.  When every config lands on the
+            # same number, storage bandwidth is the constraint and no amount of
+            # serializer work will move it.
+            # Compute is whatever walltime is not offloading.  The async
+            # ceiling follows: overlapping writes with compute leaves
+            # max(C, W), so the best a writer thread can ever do is
+            # (C + W) / max(C, W) -- 2x when balanced, ~1x at either extreme.
+            "compute_s": round(max(wall - offload_s, 0.0), 3),
+            "async_ceiling": (
+                round((wall) / max(wall - offload_s, offload_s), 2)
+                if max(wall - offload_s, offload_s) > 0
+                else None
+            ),
+            "write_mbps": (
+                round(store_bytes / 2**20 / timing["write_group"]["seconds"], 1)
+                if timing["write_group"]["seconds"] > 0
+                else None
+            ),
             "samples": steps * batch_size,
             "phases": {k: round(v["seconds"], 4) for k, v in timing.items()},
             "saves": max((p["calls"] for p in timing.values()), default=0),
@@ -370,6 +456,9 @@ def _run_one(
             offload_share=row["offload_share"],
             store_bytes=store_bytes,
             written_as=written,
+            write_mbps=row["write_mbps"],
+            compute_s=row["compute_s"],
+            async_ceiling=row["async_ceiling"],
             peak_mem_gb=round(peak_gb, 3),
             **cfg.as_dict(),
         )
@@ -404,13 +493,17 @@ def _median_row(repeats: list[dict]) -> dict:
     row["offload_share"] = (
         round(row["offload_s"] / row["wall_s"], 4) if row["wall_s"] else None
     )
+    row["compute_s"] = round(max(row["wall_s"] - row["offload_s"], 0.0), 3)
+    denom = max(row["compute_s"], row["offload_s"])
+    row["async_ceiling"] = round(row["wall_s"] / denom, 2) if denom > 0 else None
     return row
 
 
 def _print_table(rows: list[dict]) -> None:
     phases = ["to_cpu", "write_group", "index_update", "index_write", "spill"]
     header = (
-        f"{'config':<58} {'as':>5} {'wall':>7} {'offload':>8} {'share':>6} {'x':>5}  "
+        f"{'config':<58} {'as':>5} {'wall':>7} {'compute':>8} {'offload':>8} "
+        f"{'share':>6} {'async':>6} {'MB/s':>7} {'x':>5}  "
         + " ".join(f"{p[:11]:>11}" for p in phases)
         + f" {'store':>10}"
     )
@@ -420,10 +513,13 @@ def _print_table(rows: list[dict]) -> None:
         share = f"{r['offload_share'] * 100:5.1f}%" if r["offload_share"] else "    -"
         cells = " ".join(f"{r['phases'].get(p, 0.0):11.4f}" for p in phases)
         spread = f"{r.get('wall_spread', 0.0):.2f}" if r.get("runs", 1) > 1 else "-"
+        mbps = f"{r['write_mbps']:.0f}" if r.get("write_mbps") else "-"
+        ceil = f"{r['async_ceiling']:.2f}x" if r.get("async_ceiling") else "-"
         print(
             f"{r['config']:<58} {r['written_as']:>5} {r['wall_s']:7.2f} "
-            f"{r['offload_s']:8.3f} "
-            f"{share:>6} {spread:>5}  {cells} {r['store_bytes'] / 2**20:9.1f}M",
+            f"{r.get('compute_s', 0.0):8.3f} {r['offload_s']:8.3f} "
+            f"{share:>6} {ceil:>6} {mbps:>7} {spread:>5}  {cells} "
+            f"{r['store_bytes'] / 2**20:9.1f}M",
         )
 
 
@@ -436,6 +532,21 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--quick", action="store_true", help="short smoke sweep")
+    parser.add_argument(
+        "--proj-sweep",
+        action="store_true",
+        help="vary only projection width, to locate the compute/write crossover",
+    )
+    parser.add_argument(
+        "--proj-dim",
+        default=str(DEFAULT_PROJ_DIM),
+        help=(
+            f"projection width every config runs at (default {DEFAULT_PROJ_DIM}); "
+            "'raw' disables projection.  Use 'raw' when comparing serializers -- "
+            "projection shrinks the write so far that the other axes get lost in "
+            "the noise.  Ignored by --proj-sweep"
+        ),
+    )
     parser.add_argument("--list", action="store_true", help="show configs only")
     parser.add_argument(
         "--repeat",
@@ -450,9 +561,23 @@ def main() -> int:
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--store-dir",
+        default=None,
+        help=(
+            "filesystem to write gradient stores to (default: TMPDIR).  Point "
+            "this at the node-local scratch you actually train against -- "
+            "TMPDIR is tmpfs on many clusters, which measures RAM, not disk"
+        ),
+    )
     args = parser.parse_args()
 
-    configs = _build_sweep(args.quick)
+    proj_dim = None if args.proj_dim.lower() in ("raw", "none") else int(args.proj_dim)
+    configs = (
+        _build_proj_sweep()
+        if args.proj_sweep
+        else _build_sweep(args.quick, proj_dim)
+    )
     if args.list:
         for cfg in configs:
             print(cfg.name)
@@ -460,10 +585,25 @@ def main() -> int:
 
     out = HERE / "results.jsonl"
     out.unlink(missing_ok=True)
+    store_root = Path(args.store_dir) if args.store_dir else Path(tempfile.gettempdir())
+    ram = available_ram_bytes()
+    fs = describe_filesystem(store_root)
     results = Results(
         out,
-        meta={"device": args.device, "torch": torch.__version__},
+        meta={
+            "device": args.device,
+            "torch": torch.__version__,
+            "store_root": str(store_root),
+            "store_fs": fs,
+            "ram_bytes": ram,
+        },
     )
+    print(f"store -> {store_root}  fs={fs}  RAM={ram / 2**30:.1f} GiB")
+    if "tmpfs" in fs or "ramfs" in fs:
+        print(
+            "  WARNING: that mount is RAM-backed -- this measures memory "
+            "bandwidth, not disk.  Pass --store-dir pointing at real storage.",
+        )
 
     # Throwaway config: absorbs one-time process costs (filesystem cache,
     # allocator, torch.save code paths) that would otherwise all land on
@@ -476,6 +616,7 @@ def main() -> int:
         seq_len=args.seq_len,
         device=args.device,
         results=Results(out, meta={}),
+        store_dir=args.store_dir,
     )
 
     rows = []
@@ -489,12 +630,21 @@ def main() -> int:
                 seq_len=args.seq_len,
                 device=args.device,
                 results=results,
+                store_dir=args.store_dir,
             )
             for _ in range(args.repeat)
         ]
         rows.append(_median_row(repeats))
     results.flush()
     _print_table(rows)
+    biggest = max((r["store_bytes"] for r in rows), default=0)
+    if ram and biggest < ram * 0.5:
+        print(
+            f"\n  WARNING: the largest store ({biggest / 2**30:.1f} GiB) fits "
+            f"well inside available RAM ({ram / 2**30:.1f} GiB), so writes may "
+            "never reach the platter and write_group measures page cache.  "
+            "Scale up with --steps / --batch-size / --seq-len.",
+        )
     print(f"\nwrote {out}")
     print(json.dumps({"device": args.device, "configs": len(rows)}))
     return 0
