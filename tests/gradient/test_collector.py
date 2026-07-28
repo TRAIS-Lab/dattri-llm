@@ -444,6 +444,58 @@ class TestGradientStorageManager:
                 manager.save_bulk([rec])
                 assert len(log.read_text().splitlines()) == step + 1
 
+    def test_index_meta_written_once_not_per_save(self, tiny_model, tiny_batch):
+        """The settings sidecar never changes, so only the first save writes it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = GradientStorageManager(tmpdir)
+            meta = Path(tmpdir) / "index_meta.json"
+
+            rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
+            manager.save_bulk([rec])
+            assert meta.exists()
+            first_mtime = meta.stat().st_mtime_ns
+
+            for step in range(1, 5):
+                rec = self._make_record(step, f"{step:064x}", tiny_model, tiny_batch)
+                manager.save_bulk([rec])
+            assert meta.stat().st_mtime_ns == first_mtime
+            # No temp file left behind by the one write that did happen.
+            assert list(Path(tmpdir).glob("*.tmp")) == []
+
+    def test_index_meta_precedes_first_log_line(self, tiny_model, tiny_batch):
+        """A log never exists without the settings needed to interpret it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = GradientStorageManager(tmpdir)
+            manager.save_bulk(
+                [self._make_record(0, self._HASH_A, tiny_model, tiny_batch)],
+            )
+            meta = json.loads((Path(tmpdir) / "index_meta.json").read_text())
+            assert meta["sample_id_key"] is None
+            assert meta["gradient_accumulation_steps"] == 1
+            assert meta["format"] == GradientStorageManager._INDEX_FORMAT
+
+    def test_index_meta_rewritten_when_settings_change(
+        self,
+        tiny_model,
+        tiny_batch,
+    ):
+        """Skipping the rewrite must not skip a genuine settings change."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = GradientStorageManager(tmpdir)
+            manager.save_bulk(
+                [self._make_record(0, self._HASH_A, tiny_model, tiny_batch)],
+            )
+            meta = Path(tmpdir) / "index_meta.json"
+            assert json.loads(meta.read_text())["gradient_accumulation_steps"] == 1
+
+            manager.declare_gradient_accumulation_steps(4)
+            manager.save_bulk(
+                [self._make_record(1, self._HASH_B, tiny_model, tiny_batch)],
+            )
+            assert json.loads(meta.read_text())["gradient_accumulation_steps"] == 4
+            # And a reopened store adopts the updated convention.
+            assert GradientStorageManager(tmpdir).gradient_accumulation_steps == 4
+
     def test_index_write_cost_does_not_grow_with_store_size(
         self,
         tiny_model,
@@ -542,7 +594,13 @@ class TestGradientStorageManager:
         tiny_batch,
         monkeypatch,
     ):
-        """A crash mid-index-write must leave the previous index readable."""
+        """A crash mid-meta-write must leave the previous index readable.
+
+        The sidecar is only rewritten when its settings actually change, so
+        the crash is staged on such a change -- the one case where an
+        already-populated store rewrites it and a torn write could destroy
+        the settings a reader needs.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientStorageManager(tmpdir)
             rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
@@ -553,13 +611,14 @@ class TestGradientStorageManager:
             def crashing_dump(obj, fp, *args, **kwargs):
                 # Emit a truncated payload, then die -- as a hard kill
                 # mid-write would.
-                fp.write('{"sample_id_key": null, "index": {"trunc')
+                fp.write('{"format": 2, "sample_id_key": null, "trunc')
                 raise RuntimeError("simulated crash mid-write")
 
             monkeypatch.setattr(
                 "dattri_llm.gradient.storage_manager.json.dump",
                 crashing_dump,
             )
+            manager.declare_gradient_accumulation_steps(4)  # forces a rewrite
             rec2 = self._make_record(1, self._HASH_B, tiny_model, tiny_batch)
             with pytest.raises(RuntimeError, match="simulated crash"):
                 manager.save(rec2)
@@ -568,13 +627,18 @@ class TestGradientStorageManager:
                 real_dump,
             )
 
-            # The on-disk index is the pre-crash version, not truncated JSON:
+            # The on-disk sidecar is the pre-crash version, not truncated JSON:
             # a fresh manager still loads every previously indexed record.
             recovered = GradientStorageManager(tmpdir)
             assert self._HASH_A in recovered.index
             assert self._HASH_B not in recovered.index
             records = recovered.load_all_by_hash(self._HASH_A)
             assert [r.step for r in records] == [0]
+
+            # The failed write was not recorded as done, so the next save retries.
+            manager.save(self._make_record(2, self._HASH_B, tiny_model, tiny_batch))
+            meta = json.loads((Path(tmpdir) / "index_meta.json").read_text())
+            assert meta["gradient_accumulation_steps"] == 4
 
     def test_load_all_by_hash(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1964,6 +2028,44 @@ class TestDiskFormat:
             fm.save_bulk([record])
             assert len(list(Path(d).glob("*.pt"))) == 1
             assert list(Path(d).glob("*.mmap.bin")) == []
+
+    def test_memmap_reopen_does_not_overwrite_existing_groups(self):
+        """Reopening a memmap store resumes the counter instead of restarting.
+
+        The auto-name counter has to see ``batch_<id>.mmap.bin``, not just
+        ``batch_<id>.pt``; otherwise a second collection into the same dir
+        rewrites ``batch_000000.mmap`` while the index still points at it, and
+        the first run's samples silently read back as the second run's data.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            first = GradientStorageManager(d, disk_format="memmap")
+            first.save_bulk([self._materialized_record(0, seed=0)])
+            expected = self._materialized_record(0, seed=0).gradient.data["L0"]
+
+            second = GradientStorageManager(d, disk_format="memmap")
+            second.save_bulk([self._materialized_record(1, seed=99)])
+
+            assert sorted(p.name for p in Path(d).glob("*.mmap.bin")) == [
+                "batch_000000.mmap.bin",
+                "batch_000001.mmap.bin",
+            ]
+            # Run 1's sample still resolves to run 1's gradient.
+            reader = GradientStorageManager(d, disk_format="memmap")
+            got = reader.load_sample_by_hash("h0_0", 0, 0)
+            assert torch.equal(got.data["L0"], expected[0:1])
+
+    def test_memmap_reopen_keeps_every_step_loadable(self):
+        """Two collections into one memmap dir keep both runs' steps intact."""
+        with tempfile.TemporaryDirectory() as d:
+            for run in range(2):
+                fm = GradientStorageManager(d, disk_format="memmap")
+                for step in range(3):
+                    fm.save_bulk(
+                        [self._materialized_record(run * 3 + step, seed=step)],
+                    )
+            reader = GradientStorageManager(d, disk_format="memmap")
+            assert reader.available_steps() == [0, 1, 2, 3, 4, 5]
+            assert len(list(Path(d).glob("*.mmap.bin"))) == 6
 
 
 class TestKroneckerCovarianceCallback:

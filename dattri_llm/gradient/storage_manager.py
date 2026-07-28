@@ -240,8 +240,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
     physically live; it is invisible to every reader above this class:
 
     * ``"disk"`` (default) -- the durable store-then-attribute layout below:
-      ``torch.save`` per group, a persisted ``index.json``, crash-safe, and
-      re-openable across processes / ranks.  ``close()`` is a no-op.
+      ``torch.save`` per group, a persisted index, and re-openable across
+      processes / ranks.  ``close()`` is a no-op.
     * ``"memory"`` -- records held in RAM, never serialized (zero I/O).
       **Ephemeral**: nothing is written to ``save_dir`` (which is ignored,
       including any pre-existing index), and the records are gone once the
@@ -249,7 +249,7 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
       caches, not a system of record.
     * ``"tiered"`` -- RAM up to ``budget_bytes`` (default ~half of available
       RAM), then the oldest groups spill to a **temporary** subdir of
-      ``save_dir``.  Also ephemeral: no ``index.json`` is written, and
+      ``save_dir``.  Also ephemeral: no index is written, and
       :meth:`close` (called on ``with``-exit and best-effort at GC) removes the
       spill dir, so a tiered store never leaves orphaned files behind.  Use it
       as a context manager::
@@ -264,7 +264,7 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
 
     Under ``DistributedDataParallel`` (or any context where
     ``torch.distributed`` is initialised), each rank writes to its own
-    subdirectory so that file names and ``index.json`` never collide:
+    subdirectory so that file names and index files never collide:
 
     Under single-GPU / non-distributed::
 
@@ -409,6 +409,9 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         self._closed: bool = False
         # Per-phase save timings; see _PhaseTimings.
         self._timings = _PhaseTimings()
+        # Last settings payload written to the meta sidecar, so a save only
+        # rewrites it when it actually changed; see _write_index_meta.
+        self._meta_written: dict | None = None
 
         # Where this process writes (root, or its rank_N/ subdirectory) is
         # resolved lazily at the first save, NOT here: managers are commonly
@@ -1207,12 +1210,40 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         if self._residency == "disk":
             self._append_index(records, location)
 
+    def _write_index_meta(self, save_dir: Path) -> None:
+        """Write the settings sidecar iff its content changed since last write.
+
+        The payload (format, identifier scheme, accumulation convention) is
+        adopted once and then never varies, so writing it on every save cost a
+        temp file plus a rename per save for a file that never changed --
+        which measured as the bulk of the index write.  The first save of a
+        process still writes it before appending any log line, so a log never
+        exists without the settings to read it by.
+        """
+        meta = {
+            "format": self._INDEX_FORMAT,
+            "sample_id_key": self._sample_id_key,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+        }
+        if meta == self._meta_written:
+            return
+        meta_tmp = save_dir / (self._INDEX_META_FILE + ".tmp")
+        with meta_tmp.open("w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        meta_tmp.replace(save_dir / self._INDEX_META_FILE)
+        self._meta_written = meta
+
     def _append_index(self, records: list[GradientRecord], location: str) -> None:
         """Append one line describing *records* to this rank's index log.
 
         Called after the group file has been written.  The line is emitted as
         a single ``write`` of a complete, newline-terminated JSON object and
         flushed to the OS.
+
+        ``flush()`` reaches the OS page cache, not the platter -- nothing in
+        this class is ``fsync``ed.  The write-then-index ordering therefore
+        holds across a process crash but not a power loss, which may leave the
+        log durable and its group file not.
 
         Args:
             records: The records just written, in group order -- their position
@@ -1222,19 +1253,7 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         """
         save_dir = self._ensure_save_dir()
         save_dir.mkdir(parents=True, exist_ok=True)
-
-        # Constant-size settings sidecar, rewritten atomically on each save.
-        meta_tmp = save_dir / (self._INDEX_META_FILE + ".tmp")
-        with meta_tmp.open("w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "format": self._INDEX_FORMAT,
-                    "sample_id_key": self._sample_id_key,
-                    "gradient_accumulation_steps": self.gradient_accumulation_steps,
-                },
-                f,
-            )
-        meta_tmp.replace(save_dir / self._INDEX_META_FILE)
+        self._write_index_meta(save_dir)
 
         line = {
             "file": location,
@@ -1259,11 +1278,19 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             f.flush()
 
     def _compute_next_batch_id(self) -> int:
+        """Settle the auto-name counter above every ``batch_*`` file present.
+
+        Must see *every* disk format's files: a group is ``batch_<id>.pt``
+        under pickle but ``batch_<id>.mmap.bin`` / ``.mmap.meta`` under memmap,
+        so the id is read from the name between ``batch_`` and the first dot
+        rather than from a single assumed extension.
+        """
         if not self._save_dir.exists():
             return 0
-        ids = [
-            int(p.stem.split("_")[1])
-            for p in self._save_dir.glob("batch_*.pt")
-            if p.stem.split("_")[1].isdigit()
-        ]
+        prefix = "batch_"
+        ids = []
+        for path in self._save_dir.glob(f"{prefix}*"):
+            digits = path.name[len(prefix) :].split(".")[0]
+            if digits.isdigit():
+                ids.append(int(digits))
         return max(ids) + 1 if ids else 0

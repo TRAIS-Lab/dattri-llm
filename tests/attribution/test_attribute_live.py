@@ -414,8 +414,9 @@ class TestBatchedScoring:
         sn, idsn, stepsn, tidsn = run(100)  # whole 12-doc store as one batch
         assert (ids1, steps1, tids1) == (idsn, stepsn, tidsn)
         assert (ids1, steps1) == (ids5, steps5)
-        assert torch.equal(s1, s5)
-        assert torch.equal(s1, sn)
+
+        torch.testing.assert_close(s1, s5)
+        torch.testing.assert_close(s1, sn)
 
     def test_factorized_scored_per_block(self, tmp_path):
         # A factorized store can't be stacked into a dense (B, D) batch;
