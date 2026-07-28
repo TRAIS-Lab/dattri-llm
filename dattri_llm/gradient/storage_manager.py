@@ -160,7 +160,7 @@ def _expand_log_line(payload: dict) -> dict[str, list[dict]]:
 class _PhaseTimings:
     """Accumulated wall-clock time for the phases of a save.
 
-    A save splits into four phases:
+    A save splits into five phases:
 
     * ``to_cpu`` -- moving the captured payloads off the GPU
       (:func:`_to_cpu_record`).  Pure bandwidth; scales with gradient size.
@@ -172,11 +172,18 @@ class _PhaseTimings:
       scales with the number of samples in the flush.
     * ``index_write`` -- persisting the index delta (``disk`` residency only;
       a no-op for the ephemeral residencies).
+    * ``spill`` -- evicting in-RAM groups to disk once a ``tiered`` store is
+      over budget (:meth:`GradientStorageManager._maybe_spill`).  ~0 for every
+      other residency, but a full ``torch.save`` per evicted group when it
+      does fire, which is why it is timed rather than left off the report.
+
+    Every phase is entered once per save regardless of residency, so the call
+    counts stay uniform and a phase that did no work reads as 0 seconds.
 
     Timing is always on; there is no flag to enable.
     """
 
-    _PHASES = ("to_cpu", "write_group", "index_update", "index_write")
+    _PHASES = ("to_cpu", "write_group", "index_update", "index_write", "spill")
 
     def __init__(self) -> None:
         self._seconds: dict[str, float] = dict.fromkeys(self._PHASES, 0.0)
@@ -578,8 +585,9 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             self._index_entry(record, filename=location, idx=0)
         with self._timings.phase("index_write"):
             self._persist_index([record], location)
-        if self._residency == "tiered":
-            self._maybe_spill()
+        with self._timings.phase("spill"):
+            if self._residency == "tiered":
+                self._maybe_spill()
         return location
 
     def save_bulk(self, records: list[GradientRecord]) -> Path:
@@ -610,8 +618,9 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
                 self._index_entry(record, filename=location, idx=idx)
         with self._timings.phase("index_write"):
             self._persist_index(records, location)
-        if self._residency == "tiered":
-            self._maybe_spill()
+        with self._timings.phase("spill"):
+            if self._residency == "tiered":
+                self._maybe_spill()
         return location
 
     # ---------------------------------------------------------------------- #

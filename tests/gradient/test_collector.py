@@ -569,6 +569,7 @@ class TestGradientStorageManager:
                 "write_group",
                 "index_update",
                 "index_write",
+                "spill",
             }
             assert all(p["calls"] == 1 for p in timing.values())
             assert all(p["seconds"] >= 0.0 for p in timing.values())
@@ -587,6 +588,46 @@ class TestGradientStorageManager:
                     assert all(p["calls"] == 1 for p in manager.timing.values())
                 # No index persisted for the ephemeral residencies.
                 assert list(Path(tmpdir).rglob("index.jsonl")) == []
+
+    def test_tiered_spill_is_timed(self, tiny_model, tiny_batch):
+        """A tiered spill is a full torch.save per group, so it must be timed.
+
+        It runs after the four write phases; leaving it outside the report let
+        a spilling store look nearly free while doing real disk work.
+        """
+        # budget_bytes=0 -> every save immediately evicts to the spill dir.
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            GradientStorageManager(
+                tmpdir,
+                residency="tiered",
+                budget_bytes=0,
+            ) as manager,
+        ):
+            for step in range(3):
+                manager.save_bulk(
+                    [
+                        self._make_record(
+                            step,
+                            f"{step:064x}",
+                            tiny_model,
+                            tiny_batch,
+                        ),
+                    ],
+                )
+            assert list(Path(tmpdir).rglob("tiered_spill_*/*.pt"))
+            assert manager.timing["spill"]["seconds"] > 0.0
+            assert manager.timing["spill"]["calls"] == 3
+
+    def test_spill_time_is_zero_without_spilling(self, tiny_model, tiny_batch):
+        """A disk store never spills, so the phase reads 0 rather than absent."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = GradientStorageManager(tmpdir)
+            manager.save_bulk(
+                [self._make_record(0, self._HASH_A, tiny_model, tiny_batch)],
+            )
+            assert manager.timing["spill"]["calls"] == 1
+            assert manager.timing["spill"]["seconds"] < 1e-3
 
     def test_index_write_is_atomic_under_crash(
         self,
