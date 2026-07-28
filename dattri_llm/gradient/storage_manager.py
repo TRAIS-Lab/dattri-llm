@@ -47,33 +47,53 @@ if TYPE_CHECKING:
 RESIDENCIES = ("disk", "memory", "tiered")
 
 # On-disk serialization for the ``disk`` backend.  ``"pickle"`` (default) writes
-# one ``torch.save`` file per group.  ``"memmap"`` writes materialized groups as
-# a flat ``.mmap.bin`` (concatenated raw tensor bytes, 8-byte aligned) beside a
-# small ``.mmap.meta`` (the record/gradient metadata + per-layer byte offsets),
-# so reads are copy-on-write ``np.memmap`` views with no pickle deserialization
-# (~4x faster warm reads for compact materialized blocks).  Groups that are not
-# purely materialized -- any factorized (a, g) layer -- fall back to ``.pt``
-# transparently, so a memmap store may hold both handle kinds.
+# one ``torch.save`` file per group.  ``"memmap"`` writes a flat ``.mmap.bin``
+# (concatenated raw tensor bytes, 8-byte aligned) beside a small ``.mmap.meta``
+# (record/gradient metadata + per-layer byte offsets), read back as
+# copy-on-write ``torch.from_file`` views with no pickle deserialization.  A
+# materialized layer contributes one byte range, a factorized layer two (its
+# ``a`` and ``g`` factors); any other payload goes to ``.pt``, so a memmap
+# store may hold both handle kinds.
 DISK_FORMATS = ("pickle", "memmap")
 
-# numpy has no bfloat16, so a group holding bf16 tensors cannot be memmapped and
-# falls back to pickle.
-_MEMMAP_UNSUPPORTED_DTYPES = (torch.bfloat16,)
+# Layout version of the .mmap pair; the reader rejects any other value.
+_MEMMAP_FORMAT = 2
 
 
 def _group_memmappable(records: list[GradientRecord]) -> bool:
-    """Whether every record's every layer is a plain, numpy-representable tensor.
+    """Whether every layer of every record is a payload the memmap writer knows.
 
-    Memmap stores concatenated dense bytes, so a factorized ``(a, g)`` layer (or
-    a bf16 tensor numpy cannot view) disqualifies the group -> pickle fallback.
+    That is a plain tensor (one byte range) or a :class:`Factorized` pair (two);
+    anything else sends the group to pickle.
     """
-    for record in records:
-        for value in record.gradient.data.values():
-            if not isinstance(value, torch.Tensor):
-                return False
-            if value.dtype in _MEMMAP_UNSUPPORTED_DTYPES:
-                return False
-    return True
+    return all(
+        isinstance(value, (torch.Tensor, Factorized))
+        for record in records
+        for value in record.gradient.data.values()
+    )
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    """``torch.bfloat16`` -> ``"bfloat16"``, for a JSON/pickle-safe meta field."""
+    return str(dtype).removeprefix("torch.")
+
+
+# Every dtype torch exposes, keyed by the name the meta stores.
+_DTYPE_BY_NAME = {
+    _dtype_name(value): value
+    for value in vars(torch).values()
+    if isinstance(value, torch.dtype)
+}
+
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    """Inverse of :func:`_dtype_name`; raises on a name torch does not define."""
+    try:
+        return _DTYPE_BY_NAME[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown tensor dtype {name!r} in memmap metadata.",
+        ) from None
 
 
 def _gradient_nbytes(gradient: Gradient) -> int:
@@ -663,10 +683,11 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         The batch counter is read **after** :meth:`_ensure_save_dir` (which
         settles it from any existing files on the first call), so auto-named
         files never collide or overwrite.  Under ``disk_format="memmap"`` a
-        purely materialized group is written as a ``.mmap`` handle (flat
-        ``.mmap.bin`` + ``.mmap.meta``); everything else (and every group under
-        ``"pickle"``) is a ``.pt`` ``torch.save`` file.  The handle's extension
-        is what the read path dispatches on, so the two kinds coexist freely.
+        group of tensor / :class:`Factorized` payloads is written as a
+        ``.mmap`` handle (flat ``.mmap.bin`` + ``.mmap.meta``); anything the
+        memmap writer does not know (and every group under ``"pickle"``) is a
+        ``.pt`` ``torch.save`` file.  The handle's extension is what the read
+        path dispatches on, so the two kinds coexist freely.
         """
         save_dir = self._ensure_save_dir()
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -683,32 +704,60 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
 
     @staticmethod
     def _write_group_memmap(records: list[GradientRecord], handle_path: Path) -> None:
-        """Write a materialized group as ``<handle>.bin`` + ``<handle>.meta``.
+        """Write a group as ``<handle>.bin`` + ``<handle>.meta``.
 
-        The ``.bin`` is the concatenation of every layer's raw tensor bytes,
-        each 8-byte aligned so the reader can ``view`` any dtype at its offset.
-        The ``.meta`` (a small ``torch.save``) carries the record + gradient
-        metadata and each layer's ``(byte offset, shape, dtype)`` into the bin.
+        The ``.bin`` concatenates every layer's raw tensor bytes, each 8-byte
+        aligned so the reader can ``view`` any dtype at its offset.  The
+        ``.meta`` (a small ``torch.save``) holds the record + gradient metadata
+        and, per layer, one *part* per tensor: ``data`` for a materialized
+        layer, ``activation`` + ``pre_activation_grad`` for a factorized one.
+        A factorized layer's non-tensor state (``module_kwargs``,
+        ``batch_first``) is stored in the meta beside its parts.
         """
         meta_records: list[dict] = []
         byte_off = 0
+
         with Path(f"{handle_path}.bin").open("wb") as binf:
+
+            def _write_part(tensor: torch.Tensor) -> dict:
+                """Append one tensor's bytes, returning its meta spec."""
+                nonlocal byte_off
+                dense = tensor.detach().to("cpu").contiguous()
+                raw = dense.view(torch.uint8).flatten().numpy().tobytes()
+                binf.write(raw)
+                spec = {
+                    "byte_off": byte_off,
+                    "nbytes": len(raw),
+                    "shape": list(dense.shape),
+                    "dtype": _dtype_name(dense.dtype),
+                }
+                byte_off += len(raw)
+                pad = (-byte_off) % 8
+                if pad:
+                    binf.write(b"\x00" * pad)
+                    byte_off += pad
+                return spec
+
             for record in records:
                 layers: dict[str, dict] = {}
-                for name, tensor in record.gradient.data.items():
-                    arr = tensor.detach().to("cpu").contiguous().numpy()
-                    raw = arr.tobytes()
-                    binf.write(raw)
-                    layers[name] = {
-                        "byte_off": byte_off,
-                        "shape": list(arr.shape),
-                        "dtype": str(arr.dtype),
-                    }
-                    byte_off += len(raw)
-                    pad = (-byte_off) % 8  # keep the next tensor 8-byte aligned
-                    if pad:
-                        binf.write(b"\x00" * pad)
-                        byte_off += pad
+                for name, value in record.gradient.data.items():
+                    if isinstance(value, Factorized):
+                        layers[name] = {
+                            "kind": "factorized",
+                            "parts": {
+                                "activation": _write_part(value.activation),
+                                "pre_activation_grad": _write_part(
+                                    value.pre_activation_grad,
+                                ),
+                            },
+                            "module_kwargs": value.module_kwargs,
+                            "batch_first": value.batch_first,
+                        }
+                    else:
+                        layers[name] = {
+                            "kind": "dense",
+                            "parts": {"data": _write_part(value)},
+                        }
                 grad = record.gradient
                 meta_records.append(
                     {
@@ -721,30 +770,61 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
                         "layers": layers,
                     },
                 )
-        torch.save(meta_records, Path(f"{handle_path}.meta"))
+
+        torch.save(
+            {"format": _MEMMAP_FORMAT, "records": meta_records},
+            Path(f"{handle_path}.meta"),
+        )
 
     @staticmethod
     def _read_group_memmap(handle_path: Path) -> list[GradientRecord]:
         """Reconstruct a group written by :meth:`_write_group_memmap`.
 
-        The bin is mapped copy-on-write (``mode="c"``): reads are lazy, zero-copy
-        page-cache hits, and the reconstructed tensors are writable (private COW
-        pages) so nothing downstream is surprised by a read-only buffer.
+        The bin is mapped with ``torch.from_file(shared=False)`` -- a private
+        (copy-on-write) mapping, so reads are lazy page-cache hits and the
+        reconstructed tensors are writable without those writes reaching the
+        file.
         """
-        import numpy as np
+        bin_path = Path(f"{handle_path}.bin")
+        payload = torch.load(Path(f"{handle_path}.meta"), weights_only=False)
+        if not isinstance(payload, dict) or payload.get("format") != _MEMMAP_FORMAT:
+            found = payload.get("format") if isinstance(payload, dict) else "pre-v2"
+            raise ValueError(
+                f"{handle_path.name} was written in memmap format {found!r}, but "
+                f"this version reads format {_MEMMAP_FORMAT}. Re-collect the "
+                "store; the byte offsets are not compatible.",
+            )
 
-        meta_records = torch.load(Path(f"{handle_path}.meta"), weights_only=False)
-        mm = np.memmap(Path(f"{handle_path}.bin"), dtype=np.uint8, mode="c")
+        total = bin_path.stat().st_size
+        buffer = (
+            torch.from_file(str(bin_path), shared=False, size=total, dtype=torch.uint8)
+            if total
+            else torch.empty(0, dtype=torch.uint8)
+        )
+
+        def _read_part(spec: dict) -> torch.Tensor:
+            dtype = _dtype_from_name(spec["dtype"])
+            shape = tuple(spec["shape"])
+            if spec["nbytes"] == 0:  # a 0-element layer has nothing to view
+                return torch.empty(shape, dtype=dtype)
+            off = spec["byte_off"]
+            raw = buffer[off : off + spec["nbytes"]]
+            return raw.view(dtype).reshape(shape)
+
         records: list[GradientRecord] = []
-        for meta in meta_records:
-            data: dict[str, torch.Tensor] = {}
-            for name, spec in meta["layers"].items():
-                np_dtype = np.dtype(spec["dtype"])
-                shape = tuple(spec["shape"])
-                count = int(np.prod(shape)) if shape else 1
-                off = spec["byte_off"]
-                arr = mm[off : off + count * np_dtype.itemsize].view(np_dtype)
-                data[name] = torch.from_numpy(arr.reshape(shape))
+        for meta in payload["records"]:
+            data: dict[str, torch.Tensor | Factorized] = {}
+            for name, layer in meta["layers"].items():
+                parts = layer["parts"]
+                if layer["kind"] == "factorized":
+                    data[name] = Factorized(
+                        activation=_read_part(parts["activation"]),
+                        pre_activation_grad=_read_part(parts["pre_activation_grad"]),
+                        module_kwargs=layer["module_kwargs"],
+                        batch_first=layer["batch_first"],
+                    )
+                else:
+                    data[name] = _read_part(parts["data"])
             grad = Gradient(
                 representation=meta["representation"],
                 data=data,

@@ -2025,12 +2025,15 @@ class TestDiskFormat:
             # Copy-on-write mapping -> writable without touching the file.
             rec.gradient.data["L0"].add_(1.0)  # must not raise
 
-    def test_memmap_falls_back_to_pickle_for_factorized(self):
+    def test_memmap_handles_factorized(self):
+        """Factorized groups memmap, byte-identical to the pickle path.
+
+        Each factorized layer contributes two byte ranges (``a`` and ``g``).
+        """
         with tempfile.TemporaryDirectory() as dm, tempfile.TemporaryDirectory() as dp:
             fm = self._collect("memmap", dm, self._factorized_record)
-            # Factorized groups cannot be memmapped -> .pt, no .mmap.
-            assert len(list(Path(dm).glob("*.pt"))) == 5
-            assert list(Path(dm).glob("*.mmap.bin")) == []
+            assert len(list(Path(dm).glob("*.mmap.bin"))) == 5
+            assert list(Path(dm).glob("*.pt")) == []
             self._collect("pickle", dp, self._factorized_record)
             mm, pk = GradientStorageManager(dm), GradientStorageManager(dp)
             for (fmm, _), (fp, _) in zip(
@@ -2045,30 +2048,100 @@ class TestDiskFormat:
                     assert torch.equal(fa.pre_activation_grad, fb.pre_activation_grad)
             assert fm.disk_format == "memmap"
 
-    def test_memmap_mixed_group_falls_back(self):
-        """A group mixing a materialized and a factorized layer -> pickle."""
+    def test_memmap_preserves_factorized_non_tensor_state(self):
+        """A factorized layer's non-tensor state survives the round trip.
+
+        ``module_kwargs`` and ``batch_first`` live in the meta, not the bin.
+        """
         with tempfile.TemporaryDirectory() as d:
             fm = GradientStorageManager(d, disk_format="memmap")
             grad = Gradient(
+                representation={"L0": "factorized"},
+                data={
+                    "L0": Factorized(
+                        activation=torch.randn(2, 4, 8),
+                        pre_activation_grad=torch.randn(2, 4, 8),
+                        module_kwargs={"has_bias": True, "stride": [1, 1]},
+                        batch_first=False,
+                    ),
+                },
+                layer_types={"L0": "nn.Linear"},
+                validate_on_init=False,
+            )
+            # batch_first=False -> (T=2, B=4, ...), so the batch is 4 wide.
+            fm.save_bulk(
+                [GradientRecord(step=0, input_hash=list("abcd"), gradient=grad)],
+            )
+
+            loaded = GradientStorageManager(d).load_records(
+                next(iter(GradientStorageManager(d).iter_steps([0])))[0],
+            )[0]
+            factor = loaded.gradient.data["L0"]
+            assert factor.module_kwargs == {"has_bias": True, "stride": [1, 1]}
+            assert factor.batch_first is False
+
+    def test_memmap_mixed_group(self):
+        """A group mixing materialized and factorized layers memmaps as one bin."""
+        with tempfile.TemporaryDirectory() as d:
+            fm = GradientStorageManager(d, disk_format="memmap")
+            mat = torch.randn(4, 8)
+            act = torch.randn(4, 2, 8)
+            pag = torch.randn(4, 2, 8)
+            grad = Gradient(
                 representation={"mat": "materialized", "fac": "factorized"},
                 data={
-                    "mat": torch.randn(4, 8),
-                    "fac": Factorized(
-                        activation=torch.randn(4, 2, 8),
-                        pre_activation_grad=torch.randn(4, 2, 8),
-                    ),
+                    "mat": mat,
+                    "fac": Factorized(activation=act, pre_activation_grad=pag),
                 },
                 layer_types={"mat": "nn.Linear", "fac": "nn.Linear"},
                 validate_on_init=False,
             )
-            record = GradientRecord(
-                step=0,
-                input_hash=["a", "b", "c", "d"],
-                gradient=grad,
+            fm.save_bulk(
+                [GradientRecord(step=0, input_hash=list("abcd"), gradient=grad)],
             )
-            fm.save_bulk([record])
-            assert len(list(Path(d).glob("*.pt"))) == 1
-            assert list(Path(d).glob("*.mmap.bin")) == []
+            assert len(list(Path(d).glob("*.mmap.bin"))) == 1
+            assert list(Path(d).glob("*.pt")) == []
+
+            reader = GradientStorageManager(d)
+            rec = reader.load_records(next(iter(reader.iter_steps([0])))[0])[0]
+            assert torch.equal(rec.gradient.data["mat"], mat)
+            assert torch.equal(rec.gradient.data["fac"].activation, act)
+            assert torch.equal(rec.gradient.data["fac"].pre_activation_grad, pag)
+
+    def test_memmap_supports_bfloat16(self):
+        """bfloat16 payloads memmap like any other dtype."""
+        with tempfile.TemporaryDirectory() as d:
+            fm = GradientStorageManager(d, disk_format="memmap")
+            payload = torch.randn(4, 8).to(torch.bfloat16)
+            grad = Gradient(
+                representation={"L0": "materialized"},
+                data={"L0": payload},
+                layer_types={"L0": "nn.Linear"},
+                validate_on_init=False,
+            )
+            fm.save_bulk(
+                [GradientRecord(step=0, input_hash=list("abcd"), gradient=grad)],
+            )
+            assert len(list(Path(d).glob("*.mmap.bin"))) == 1
+
+            reader = GradientStorageManager(d)
+            rec = reader.load_records(next(iter(reader.iter_steps([0])))[0])[0]
+            assert rec.gradient.data["L0"].dtype == torch.bfloat16
+            assert torch.equal(rec.gradient.data["L0"], payload)
+
+    def test_memmap_rejects_stale_format(self):
+        """A mismatched layout version is rejected rather than misread."""
+        with tempfile.TemporaryDirectory() as d:
+            fm = GradientStorageManager(d, disk_format="memmap")
+            fm.save_bulk([self._materialized_record(0, seed=0)])
+            handle = next(iter(fm.iter_steps([0])))[0]
+            meta_path = Path(d) / f"{handle}.meta"
+            payload = torch.load(meta_path, weights_only=False)
+            payload["format"] = 1  # pretend it was written by the old writer
+            torch.save(payload, meta_path)
+
+            with pytest.raises(ValueError, match="memmap format"):
+                GradientStorageManager(d).load_records(handle)
 
     def test_memmap_reopen_does_not_overwrite_existing_groups(self):
         """Reopening a memmap store resumes the counter instead of restarting.

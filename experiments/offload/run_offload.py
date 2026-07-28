@@ -22,9 +22,9 @@ axis                 values                      why it is in the matrix
 ===================  ==========================  ============================
 ``disk_format``      pickle, memmap              pickle holds the GIL, the
                                                  memmap write releases it
-representation       factorized, materialized    factorized is the library
-                                                 default and currently never
-                                                 reaches the memmap path
+representation       factorized, materialized    both memmap; materialized is
+                                                 larger on disk (outer product
+                                                 expanded)
 ``offload_to_cpu``   False, True                 moves the device->host copy
                                                  between ``to_cpu`` and the
                                                  forward/backward hooks
@@ -102,11 +102,11 @@ class Results:
 class MaterializeCallback(HookManagerCallback):
     """Materializes each record before handing it to the wrapped callback.
 
-    The capture path emits factorized gradients, which
-    ``_group_memmappable`` rejects -- so a ``disk_format="memmap"`` store
-    silently writes pickle instead.  Materializing here is what lets the sweep
-    compare the two formats on payloads that can actually take the memmap
-    path, rather than measuring pickle twice.
+    The capture path emits factorized gradients, so this is how the sweep gets
+    a materialized arm to compare against: same steps, same layers, but the
+    outer product expanded (~2.8x the bytes).  Both representations reach the
+    memmap writer, so the comparison isolates payload size and shape rather
+    than which serializer ran.
     """
 
     def __init__(self, inner: HookManagerCallback) -> None:
@@ -289,9 +289,8 @@ def _run_one(
         timing = store.timing
         offload_s = sum(p["seconds"] for p in timing.values())
         store_bytes = dir_bytes(save_dir)
-        # Which serializer actually ran.  A memmap store falls back to pickle
-        # for any group holding a factorized layer, so without this the sweep
-        # could compare "memmap" against "memmap" and never say so.
+        # Which serializer actually ran: a memmap store falls back to pickle
+        # for a payload its writer does not know.
         written = (
             "pt"
             if not list(save_dir.rglob("*.mmap.bin"))
@@ -385,6 +384,19 @@ def main() -> int:
     results = Results(
         out,
         meta={"device": args.device, "torch": torch.__version__},
+    )
+
+    # Throwaway config: absorbs one-time process costs (filesystem cache,
+    # allocator, torch.save code paths) that would otherwise all land on
+    # config #1 and penalise it ~12%.  Its rows are discarded.
+    print("[warm-up] priming process-level caches", flush=True)
+    _run_one(
+        configs[0],
+        steps=max(2, args.steps // 4),
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        device=args.device,
+        results=Results(out, meta={}),
     )
 
     rows = []

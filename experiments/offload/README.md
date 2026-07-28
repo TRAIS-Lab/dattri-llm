@@ -22,8 +22,8 @@ Eight points, varying one axis at a time from `factorized/pickle/cpu=0/int=8/dis
 * **`disk_format`** (pickle, memmap) -- pickle holds the GIL, the memmap write
   releases it; decides whether a writer thread can overlap.
 * **representation** (factorized, materialized) -- factorized is the library
-  default and `_group_memmappable` rejects it, so only the materialized configs
-  reach the memmap path.
+  default; materialized expands the outer product, so it is ~2.8x larger on
+  disk.  Both take the memmap path.
 * **`offload_to_cpu`** (False, True) -- moves the device->host copy between
   `to_cpu` and the capture hooks.
 * **`offload_interval`** (1, 8, 32) -- stall frequency vs stall size.
@@ -46,40 +46,41 @@ Eight points, varying one axis at a time from `factorized/pickle/cpu=0/int=8/dis
 * Single-device only: per-rank layout and DDP/FSDP flush behaviour are
   unmeasured.  Laptop variance is ~20% on walltime -- ratios are stable,
   absolutes are not.
-* **The first config in a sweep is penalised ~12%.**  The per-config warm-up
-  step does not cover one-time process costs (filesystem cache, allocator,
-  `torch.save` code paths); running one config four times gives write_group
-  0.805 / 0.731 / 0.693 / 0.719.  Only compare configs that are adjacent, or
-  whose gap is far larger than that.  Fixing this needs a throwaway config
-  before the sweep.
+* A throwaway config runs before the recorded sweep, absorbing one-time
+  process costs (filesystem cache, allocator, `torch.save` code paths) that
+  would otherwise all land on config #1 and penalise it ~12%.
 
 ## Baseline -- CPU only (2026-07-27)
 
 ```
 config                                  as    wall  offload  share   write_group  index_write     spill    store
-factorized/pickle/cpu=0/int=8/disk      pt    1.73    1.052  60.8%        1.0493       0.0019    0.0000   480.9M
-factorized/memmap/cpu=0/int=8/disk      pt    1.26    0.800  63.2%        0.7977       0.0016    0.0000   480.9M
-materialized/pickle/cpu=0/int=8/disk    pt    3.37    2.581  76.6%        2.5765       0.0044    0.0000  1364.4M
-materialized/memmap/cpu=0/int=8/disk  mmap    1.29    0.529  40.9%        0.5266       0.0025    0.0000  1364.3M
-factorized/pickle/cpu=1/int=8/disk      pt    1.42    0.821  57.9%        0.8189       0.0020    0.0000   480.9M
-factorized/pickle/cpu=0/int=1/disk      pt    1.79    1.094  61.1%        1.0857       0.0075    0.0000   481.0M
-factorized/pickle/cpu=0/int=32/disk     pt    1.70    0.999  58.9%        0.9979       0.0007    0.0000   480.9M
-factorized/pickle/cpu=0/int=8/tiered    pt    1.34    0.834  62.4%        0.0003       0.0000    0.8339   480.9M
+factorized/pickle/cpu=0/int=8/disk      pt    1.22    0.814  66.5%        0.8119       0.0020    0.0000   480.9M
+factorized/memmap/cpu=0/int=8/disk    mmap    0.59    0.128  21.6%        0.1260       0.0013    0.0000   480.7M
+materialized/pickle/cpu=0/int=8/disk    pt    2.89    2.183  75.6%        2.1801       0.0023    0.0000  1364.4M
+materialized/memmap/cpu=0/int=8/disk  mmap    1.06    0.323  30.5%        0.3202       0.0024    0.0000  1364.3M
+factorized/pickle/cpu=1/int=8/disk      pt    1.14    0.688  60.6%        0.6854       0.0020    0.0000   480.9M
+factorized/pickle/cpu=0/int=1/disk      pt    1.27    0.734  57.7%        0.7265       0.0067    0.0000   481.0M
+factorized/pickle/cpu=0/int=32/disk     pt    1.38    0.872  63.1%        0.8715       0.0007    0.0000   480.9M
+factorized/pickle/cpu=0/int=8/tiered    pt    1.28    0.787  61.5%        0.0004       0.0000    0.7860   480.9M
 ```
 
-* **`write_group` is the whole problem**: offloading is 58-77% of walltime and
-  essentially all of it is the serializer.  `index_write` at 0.0007-0.008 s
-  confirms the append-only index and write-once meta sidecar are no longer a
-  factor.
-* **`factorized/memmap` writes as `pt`.**  Both factorized rows did identical
-  work, so their 0.80-vs-1.05 gap is the first-config penalty above, not the
-  format -- the `as` column is the only reliable signal here.  Where memmap is
-  genuinely reachable it is **4.9x faster** on `write_group` (2.58 s ->
-  0.53 s, adjacent configs) -- the gap extending it to factorized groups is
-  chasing.
-* **Tiered spends 62% of walltime spilling**, all in the `spill` phase that
+* **`write_group` dominates the pickle configs**: offloading is 58-76% of
+  walltime there and essentially all of it is the serializer.  `index_write` at
+  0.0007-0.007 s puts the append-only index and write-once meta sidecar well
+  below the noise floor.
+* **memmap is ~6.8x faster than pickle on factorized `write_group`.**  Median of
+  5 runs each: 0.748 s -> 0.111 s, with memmap far tighter run-to-run
+  (0.095-0.115 vs 0.707-0.835) since a memcpy is more predictable than pickling.
+  Offload drops from 66% of walltime to 22%, and total training time roughly
+  halves (1.22 s -> 0.59 s).  This is the library's *default* representation, so
+  it applies to an ordinary capture, not a special case.
+* **Store size is unchanged by format** (480.9 M vs 480.7 M): memmap changes
+  speed, not bytes.  The 2.8x gap between factorized and materialized is the
+  outer-product expansion, independent of serializer.
+* **Tiered spends 61% of walltime spilling**, all in the `spill` phase that
   previously ran outside the timing blocks; the same run used to report ~0.1%
-  offload overhead.
+  offload overhead.  Note spill still uses `torch.save`, so it has not yet
+  benefited from memmap.
 
 Run: `python run_offload.py [--quick] [--list] [--device cuda:0]`
 -> `results.jsonl`
