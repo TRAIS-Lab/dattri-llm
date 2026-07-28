@@ -15,30 +15,34 @@ What it measures, per configuration:
   worth anything,
 * bytes actually written to disk.
 
-The axes are the ones that move those numbers:
+Every config differs from the ``factorized/pickle/raw`` baseline along exactly
+one axis, so any pair including the baseline isolates that axis:
 
 ===================  ==========================  ============================
-axis                 values                      why it is in the matrix
+axis                 values                      what it changes
 ===================  ==========================  ============================
-``disk_format``      pickle, memmap              pickle holds the GIL, the
-                                                 memmap write releases it
-representation       factorized, materialized    both memmap; materialized is
-                                                 larger on disk (outer product
-                                                 expanded)
-``offload_to_cpu``   False, True                 moves the device->host copy
-                                                 between ``to_cpu`` and the
-                                                 forward/backward hooks
-``offload_interval`` 1, 8, 32                    trades stall frequency
-                                                 against stall size
+``proj_dim``         raw, 64, 16                 how many bytes reach the
+                                                 store at all
+``disk_format``      pickle, memmap              serializer cost per byte
+representation       factorized, materialized    payload size and shape
+``offload_to_cpu``   False, True                 whether the device->host copy
+                                                 lands in ``to_cpu`` or in the
+                                                 (uninstrumented) hooks
+``offload_interval`` 1, 8, 32                    stall frequency vs stall size
 ``residency``        disk, tiered                exercises the spill path
 ===================  ==========================  ============================
 
 Usage::
 
     python run_offload.py                    # the default sweep
+    python run_offload.py --repeat 3         # medians over 3 runs per config
     python run_offload.py --quick            # a fast smoke sweep
     python run_offload.py --steps 200 --batch-size 16
     python run_offload.py --list             # show the configs, run nothing
+
+On a disk with variable throughput (cloud VMs) use ``--repeat 3`` or more: the
+``x`` column reports max/min walltime across repeats, and anything above ~1.5
+means the disk, not the config, is setting the pace.
 
 Results are appended to ``results.jsonl`` next to this file, one line per
 (config, phase) plus a ``summary`` line per config.
@@ -49,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import statistics
 import sys
 import tempfile
 import time
@@ -135,6 +140,9 @@ class Config:
     offload_to_cpu: bool = False
     offload_interval: int = 8
     residency: str = "disk"
+    # Capture-time random projection width, or None for raw factors.  The
+    # library's main lever on how many bytes reach the store at all.
+    proj_dim: int | None = None
     # Tiered only.  None takes the library default (~half of available RAM),
     # which a short benchmark never reaches -- so the sweep pins a small budget
     # to actually exercise the spill path rather than reporting 0 for it.
@@ -142,10 +150,12 @@ class Config:
 
     @property
     def name(self) -> str:
+        # o2c = offload_to_cpu (where the device->host copy happens), NOT the
+        # compute device -- that is reported separately as `device`.
         return (
             f"{self.representation}/{self.disk_format}/"
-            f"cpu={int(self.offload_to_cpu)}/int={self.offload_interval}/"
-            f"{self.residency}"
+            f"proj={self.proj_dim or 'raw'}/o2c={int(self.offload_to_cpu)}/"
+            f"int={self.offload_interval}/{self.residency}"
         )
 
     def as_dict(self) -> dict:
@@ -155,6 +165,7 @@ class Config:
             "offload_to_cpu": self.offload_to_cpu,
             "offload_interval": self.offload_interval,
             "residency": self.residency,
+            "proj_dim": self.proj_dim,
             "budget_bytes": self.budget_bytes,
         }
 
@@ -189,28 +200,56 @@ class TinyTransformer(nn.Module):
         return self.head(self.norm(h))
 
 
+# The model's outer-product layers -- the only ones ``logra_factorized`` is
+# defined for.  Hooking just these keeps every config's layer set identical.
+_LINEAR_PATTERNS = (r"blocks\.\d+\.(attn|proj|fc_in|fc_out)$", r"^head$")
+
+
+def _hook_config(cfg: Config) -> object:
+    """HookManagerConfig for *cfg*: the linear layer set, plus projection."""
+    from dattri_llm.gradient.hooks import HookManagerConfig
+
+    kwargs: dict = {"linear_io": list(_LINEAR_PATTERNS)}
+    if cfg.proj_dim is not None:
+        kwargs["projection"] = {
+            "__default__": {
+                "style": "logra_factorized",
+                "proj_dim": cfg.proj_dim,
+                "proj_max_batch_size": 32,
+                "proj_type": "rademacher",
+                "proj_seed": 0,
+            },
+        }
+    return HookManagerConfig(**kwargs)
+
+
 def _build_sweep(quick: bool) -> list[Config]:
-    """The configurations to run, coarsest axis first."""
+    """The configurations to run.
+
+    Every entry differs from the ``factorized/pickle/raw`` baseline along
+    exactly one axis, so any pair including the baseline isolates that axis.
+    """
     if quick:
+        # One axis only, so even the smoke run is interpretable.
         return [
-            Config(disk_format="pickle", representation="factorized"),
-            Config(disk_format="memmap", representation="materialized"),
+            Config(disk_format="pickle"),
+            Config(disk_format="memmap"),
         ]
-    configs: list[Config] = []
-    # Format x representation: the pair that decides whether the memmap fast
-    # path is reachable at all for the library's default capture.
-    for representation in ("factorized", "materialized"):
-        for disk_format in ("pickle", "memmap"):
-            configs.append(
-                Config(disk_format=disk_format, representation=representation),
-            )
-    # Where the device->host copy happens.
-    configs.append(Config(offload_to_cpu=True))
-    # Stall frequency vs stall size.
-    configs.extend(Config(offload_interval=n) for n in (1, 32))
-    # The spill path: a 64 MiB budget so groups are actually evicted to disk.
-    configs.append(Config(residency="tiered", budget_bytes=64 * 2**20))
-    return configs
+    return [
+        Config(),
+        Config(disk_format="memmap"),
+        Config(representation="materialized"),
+        # Projection: the byte-count lever, dominant on a disk-bound store.
+        Config(proj_dim=64),
+        Config(proj_dim=16),
+        # Where the device->host copy happens.
+        Config(offload_to_cpu=True),
+        # Stall frequency vs stall size.
+        Config(offload_interval=1),
+        Config(offload_interval=32),
+        # The spill path: a 64 MiB budget so groups are actually evicted.
+        Config(residency="tiered", budget_bytes=64 * 2**20),
+    ]
 
 
 def _run_one(
@@ -224,7 +263,7 @@ def _run_one(
 ) -> dict:
     """Train ``steps`` steps under *cfg*, returning the measured row."""
     from dattri_llm.gradient.callbacks import OffloadCallback
-    from dattri_llm.gradient.hooks import HookManager
+    from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
     from dattri_llm.gradient.storage_manager import GradientStorageManager
 
     on_cuda = device.startswith("cuda")  # matches "cuda" and "cuda:N"
@@ -254,6 +293,7 @@ def _run_one(
             offload = MaterializeCallback(offload)
         hooks = HookManager(
             model,
+            config=_hook_config(cfg),
             callbacks=[offload],
             offload_to_cpu=cfg.offload_to_cpu,
         )
@@ -338,10 +378,39 @@ def _run_one(
     return row
 
 
+def _median_row(repeats: list[dict]) -> dict:
+    """Collapse repeated runs of one config into per-field medians.
+
+    Medians resist a single stalled write (page-cache writeback, a throttled
+    cloud disk).  ``runs`` and the walltime spread ride along so a reader can
+    tell when the repeats disagreed.
+    """
+    head = repeats[0]
+    if len(repeats) == 1:
+        return {**head, "runs": 1, "wall_spread": 0.0}
+    walls = sorted(r["wall_s"] for r in repeats)
+    row = {
+        **head,
+        "runs": len(repeats),
+        "wall_s": round(statistics.median(walls), 3),
+        "offload_s": round(statistics.median(r["offload_s"] for r in repeats), 3),
+        "phases": {
+            phase: round(statistics.median(r["phases"][phase] for r in repeats), 4)
+            for phase in head["phases"]
+        },
+        # max/min: >1.5 means the disk, not the config, is setting the pace.
+        "wall_spread": round(walls[-1] / walls[0], 2) if walls[0] > 0 else 0.0,
+    }
+    row["offload_share"] = (
+        round(row["offload_s"] / row["wall_s"], 4) if row["wall_s"] else None
+    )
+    return row
+
+
 def _print_table(rows: list[dict]) -> None:
     phases = ["to_cpu", "write_group", "index_update", "index_write", "spill"]
     header = (
-        f"{'config':<46} {'as':>5} {'wall':>7} {'offload':>8} {'share':>6}  "
+        f"{'config':<58} {'as':>5} {'wall':>7} {'offload':>8} {'share':>6} {'x':>5}  "
         + " ".join(f"{p[:11]:>11}" for p in phases)
         + f" {'store':>10}"
     )
@@ -350,10 +419,11 @@ def _print_table(rows: list[dict]) -> None:
     for r in rows:
         share = f"{r['offload_share'] * 100:5.1f}%" if r["offload_share"] else "    -"
         cells = " ".join(f"{r['phases'].get(p, 0.0):11.4f}" for p in phases)
+        spread = f"{r.get('wall_spread', 0.0):.2f}" if r.get("runs", 1) > 1 else "-"
         print(
-            f"{r['config']:<46} {r['written_as']:>5} {r['wall_s']:7.2f} "
+            f"{r['config']:<58} {r['written_as']:>5} {r['wall_s']:7.2f} "
             f"{r['offload_s']:8.3f} "
-            f"{share:>6}  {cells} {r['store_bytes'] / 2**20:9.1f}M",
+            f"{share:>6} {spread:>5}  {cells} {r['store_bytes'] / 2**20:9.1f}M",
         )
 
 
@@ -367,6 +437,15 @@ def main() -> int:
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--quick", action="store_true", help="short smoke sweep")
     parser.add_argument("--list", action="store_true", help="show configs only")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help=(
+            "runs per config; the table reports medians.  Disks with variable "
+            "throughput (cloud VMs) need >=3 before any comparison is meaningful"
+        ),
+    )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -402,7 +481,7 @@ def main() -> int:
     rows = []
     for i, cfg in enumerate(configs, 1):
         print(f"[{i}/{len(configs)}] {cfg.name}", flush=True)
-        rows.append(
+        repeats = [
             _run_one(
                 cfg,
                 steps=args.steps,
@@ -410,8 +489,10 @@ def main() -> int:
                 seq_len=args.seq_len,
                 device=args.device,
                 results=results,
-            ),
-        )
+            )
+            for _ in range(args.repeat)
+        ]
+        rows.append(_median_row(repeats))
     results.flush()
     _print_table(rows)
     print(f"\nwrote {out}")

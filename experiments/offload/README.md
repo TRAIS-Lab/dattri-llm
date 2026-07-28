@@ -17,18 +17,25 @@ configs, so disk use is peak, not cumulative.
 
 ## Configurations
 
-Eight points, varying one axis at a time from `factorized/pickle/cpu=0/int=8/disk`:
+Nine points.  Every one differs from the `factorized/pickle/raw` baseline along
+exactly one axis, so any pair including the baseline isolates that axis.
 
-* **`disk_format`** (pickle, memmap) -- pickle holds the GIL, the memmap write
-  releases it; decides whether a writer thread can overlap.
-* **representation** (factorized, materialized) -- factorized is the library
-  default; materialized expands the outer product, so it is ~2.8x larger on
-  disk.  Both take the memmap path.
-* **`offload_to_cpu`** (False, True) -- moves the device->host copy between
-  `to_cpu` and the capture hooks.
+* **`proj_dim`** (raw, 64, 16) -- capture-time random projection, i.e. how many
+  bytes reach the store at all.
+* **`disk_format`** (pickle, memmap) -- serializer cost per byte; pickle holds
+  the GIL, the memmap write releases it.
+* **representation** (factorized, materialized) -- materialized expands the
+  outer product, ~2.8x the bytes.
+* **`offload_to_cpu`** (False, True) -- whether the device->host copy lands in
+  `to_cpu` or in the capture hooks.  Note this is **not** the compute device;
+  the config label is `o2c=`, and the device is reported separately.
 * **`offload_interval`** (1, 8, 32) -- stall frequency vs stall size.
 * **`residency`** (disk, tiered) -- tiered pins a 64 MiB budget so groups are
   evicted and the `spill` phase is exercised.
+
+Only linear layers are hooked (`blocks.N.{attn,proj,fc_in,fc_out}`, `head`):
+`logra_factorized` is undefined for the embedding and LayerNorm, and leaving
+them out keeps every config's layer set identical.
 
 ## Notes
 
@@ -50,37 +57,41 @@ Eight points, varying one axis at a time from `factorized/pickle/cpu=0/int=8/dis
   process costs (filesystem cache, allocator, `torch.save` code paths) that
   would otherwise all land on config #1 and penalise it ~12%.
 
-## Baseline -- CPU only (2026-07-27)
+## Baseline -- CPU only (2026-07-27, medians of 3)
 
 ```
-config                                  as    wall  offload  share   write_group  index_write     spill    store
-factorized/pickle/cpu=0/int=8/disk      pt    1.22    0.814  66.5%        0.8119       0.0020    0.0000   480.9M
-factorized/memmap/cpu=0/int=8/disk    mmap    0.59    0.128  21.6%        0.1260       0.0013    0.0000   480.7M
-materialized/pickle/cpu=0/int=8/disk    pt    2.89    2.183  75.6%        2.1801       0.0023    0.0000  1364.4M
-materialized/memmap/cpu=0/int=8/disk  mmap    1.06    0.323  30.5%        0.3202       0.0024    0.0000  1364.3M
-factorized/pickle/cpu=1/int=8/disk      pt    1.14    0.688  60.6%        0.6854       0.0020    0.0000   480.9M
-factorized/pickle/cpu=0/int=1/disk      pt    1.27    0.734  57.7%        0.7265       0.0067    0.0000   481.0M
-factorized/pickle/cpu=0/int=32/disk     pt    1.38    0.872  63.1%        0.8715       0.0007    0.0000   480.9M
-factorized/pickle/cpu=0/int=8/tiered    pt    1.28    0.787  61.5%        0.0004       0.0000    0.7860   480.9M
+config                                          as    wall  offload  share     x   write_group     spill    store
+factorized/pickle/proj=raw/o2c=0/int=8/disk     pt    1.11    0.699  62.7%  1.11        0.6968    0.0000   457.6M
+factorized/memmap/proj=raw/o2c=0/int=8/disk   mmap    0.52    0.097  18.8%  1.07        0.0955    0.0000   457.4M
+materialized/pickle/proj=raw/o2c=0/int=8/disk   pt    2.76    2.003  72.7%  1.04        1.9997    0.0000  1302.2M
+factorized/pickle/proj=64/o2c=0/int=8/disk      pt    1.09    0.113  10.4%  1.06        0.1117    0.0000    66.2M
+factorized/pickle/proj=16/o2c=0/int=8/disk      pt    1.03    0.044   4.3%  1.07        0.0424    0.0000    16.8M
+factorized/pickle/proj=raw/o2c=1/int=8/disk     pt    1.15    0.690  60.0%  1.03        0.6878    0.0000   457.6M
+factorized/pickle/proj=raw/o2c=0/int=1/disk     pt    1.15    0.674  58.6%  1.10        0.6667    0.0000   457.6M
+factorized/pickle/proj=raw/o2c=0/int=32/disk    pt    1.19    0.719  60.6%  1.07        0.7180    0.0000   457.6M
+factorized/pickle/proj=raw/o2c=0/int=8/tiered   pt    1.23    0.711  57.7%  1.11        0.0003    0.7101   457.6M
 ```
 
-* **`write_group` dominates the pickle configs**: offloading is 58-76% of
-  walltime there and essentially all of it is the serializer.  `index_write` at
-  0.0007-0.007 s puts the append-only index and write-once meta sidecar well
-  below the noise floor.
-* **memmap is ~6.8x faster than pickle on factorized `write_group`.**  Median of
-  5 runs each: 0.748 s -> 0.111 s, with memmap far tighter run-to-run
-  (0.095-0.115 vs 0.707-0.835) since a memcpy is more predictable than pickling.
-  Offload drops from 66% of walltime to 22%, and total training time roughly
-  halves (1.22 s -> 0.59 s).  This is the library's *default* representation, so
-  it applies to an ordinary capture, not a special case.
-* **Store size is unchanged by format** (480.9 M vs 480.7 M): memmap changes
-  speed, not bytes.  The 2.8x gap between factorized and materialized is the
-  outer-product expansion, independent of serializer.
-* **Tiered spends 61% of walltime spilling**, all in the `spill` phase that
-  previously ran outside the timing blocks; the same run used to report ~0.1%
-  offload overhead.  Note spill still uses `torch.save`, so it has not yet
-  benefited from memmap.
+* **Projection is the dominant lever.**  `proj=16` cuts the store 27x (457.6 ->
+  16.8 MB) and offload from 62.7% of walltime to 4.3% -- a bigger effect than
+  any serializer choice, because it removes the bytes instead of writing them
+  faster.  `proj=64` sits between at 6.9x.
+* **memmap is 7.3x faster than pickle** on the same factorized payload (0.697 ->
+  0.096 s), taking offload from 62.7% to 18.8%.  Store size is unchanged
+  (457.6 vs 457.4 MB): the format changes speed, not bytes.
+* **The two levers are independent** and untested in combination; a projected
+  memmap store should compound, but no config measures it.
+* **`offload_interval` barely matters** (0.667 / 0.697 / 0.718 s for 1 / 8 / 32).
+  Total bytes are identical and the disk absorbs them either way.
+* **Tiered spends 58% of walltime spilling**, all in `spill`.  That path still
+  uses `torch.save`, so it has not benefited from memmap.
+* `index_update` and `index_write` are 0.0002-0.007 s throughout -- well below
+  the noise floor.
+
+**On a disk-bound machine these ratios collapse.**  A Colab run measured
+40-160 MB/s with 1.7x variance between identical configs; there the serializer
+is nearly irrelevant and only `proj_dim` moves the needle.  Always check the
+`x` column before comparing anything.
 
 Run: `python run_offload.py [--quick] [--list] [--device cuda:0]`
 -> `results.jsonl`

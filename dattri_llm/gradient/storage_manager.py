@@ -723,15 +723,18 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
                 """Append one tensor's bytes, returning its meta spec."""
                 nonlocal byte_off
                 dense = tensor.detach().to("cpu").contiguous()
-                raw = dense.view(torch.uint8).flatten().numpy().tobytes()
+                # memoryview over the tensor's own buffer: written straight to
+                # the file with no intermediate copy of the payload.
+                raw = memoryview(dense.view(torch.uint8).flatten().numpy())
+                nbytes = raw.nbytes
                 binf.write(raw)
                 spec = {
                     "byte_off": byte_off,
-                    "nbytes": len(raw),
+                    "nbytes": nbytes,
                     "shape": list(dense.shape),
                     "dtype": _dtype_name(dense.dtype),
                 }
-                byte_off += len(raw)
+                byte_off += nbytes
                 pad = (-byte_off) % 8
                 if pad:
                     binf.write(b"\x00" * pad)
