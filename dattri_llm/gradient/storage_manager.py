@@ -46,8 +46,8 @@ if TYPE_CHECKING:
 
 RESIDENCIES = ("disk", "memory", "tiered")
 
-# On-disk serialization for the ``disk`` backend.  ``"pickle"`` (default) writes
-# one ``torch.save`` file per group.  ``"memmap"`` writes a flat ``.mmap.bin``
+# On-disk serialization for the ``disk`` backend.  ``"pickle"`` writes one
+# ``torch.save`` file per group.  ``"memmap"`` (default) writes a flat ``.mmap.bin``
 # (concatenated raw tensor bytes, 8-byte aligned) beside a small ``.mmap.meta``
 # (record/gradient metadata + per-layer byte offsets), read back as
 # copy-on-write ``torch.from_file`` views with no pickle deserialization.  A
@@ -374,10 +374,14 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
     requested sample.
 
     .. warning::
-        Records are deserialised with ``torch.load(..., weights_only=False)``
-        (they contain :class:`GradientRecord` objects, not bare tensors),
-        which executes arbitrary pickled code.  Only open gradient
-        directories you produced yourself or otherwise trust.
+        ``.pt`` groups are deserialised with ``torch.load(...,
+        weights_only=False)`` (they contain :class:`GradientRecord` objects,
+        not bare tensors), which executes arbitrary pickled code.  Only open
+        such directories if you produced them yourself or otherwise trust
+        them.  ``.mmap`` groups carry no pickled objects -- raw tensor bytes
+        plus a primitives-only meta read under ``weights_only=True`` -- so a
+        store written entirely under ``disk_format="memmap"`` (the default)
+        is not exposed to this.
 
     Args:
         save_dir: Root directory.  Under DDP, subdirectories ``rank_N/`` are
@@ -400,7 +404,7 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         *,
         residency: str = "disk",
         budget_bytes: int | None = None,
-        disk_format: str = "pickle",
+        disk_format: str = "memmap",
     ) -> None:
         if residency not in RESIDENCIES:
             raise ValueError(
@@ -694,13 +698,26 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         if base_name is None:
             base_name = f"batch_{self._next_batch_id:06d}"
             self._next_batch_id += 1
+        return self._local_prefix + self._serialize_group(records, save_dir, base_name)
+
+    def _serialize_group(
+        self,
+        records: list[GradientRecord],
+        directory: Path,
+        base_name: str,
+    ) -> str:
+        """Write one group under *directory*, returning its file name.
+
+        The format dispatch shared by the normal write path and tiered spill,
+        so a store's ``disk_format`` applies wherever its groups land.
+        """
         if self._disk_format == "memmap" and _group_memmappable(records):
             handle = f"{base_name}.mmap"
-            self._write_group_memmap(records, save_dir / handle)
+            self._write_group_memmap(records, directory / handle)
         else:
             handle = f"{base_name}.pt"
-            torch.save(records, save_dir / handle)
-        return self._local_prefix + handle
+            torch.save(records, directory / handle)
+        return handle
 
     @staticmethod
     def _write_group_memmap(records: list[GradientRecord], handle_path: Path) -> None:
@@ -789,7 +806,10 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         file.
         """
         bin_path = Path(f"{handle_path}.bin")
-        payload = torch.load(Path(f"{handle_path}.meta"), weights_only=False)
+        # weights_only=True: the meta is primitives only, so it never needs the
+        # unrestricted unpickler.  This is what keeps a pure memmap store free of
+        # arbitrary code execution on load.
+        payload = torch.load(Path(f"{handle_path}.meta"), weights_only=True)
         if not isinstance(payload, dict) or payload.get("format") != _MEMMAP_FORMAT:
             found = payload.get("format") if isinstance(payload, dict) else "pre-v2"
             raise ValueError(
@@ -875,12 +895,16 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         return self._spill_dir
 
     def _spill_group(self, loc: str) -> None:
-        """Move one in-RAM group to the spill dir and repoint its index entries."""
+        """Move one in-RAM group to the spill dir and repoint its index entries.
+
+        Written through the store's ``disk_format``, so a spilled group is
+        serialized the same way a directly-written one would be.
+        """
         records = self._mem_groups.pop(loc)
         self._mem_bytes -= _records_nbytes(records)
-        path = self._ensure_spill_dir() / f"{loc}.pt"
-        torch.save(records, path)
-        disk_loc = str(path.relative_to(self._root_dir))
+        spill_dir = self._ensure_spill_dir()
+        handle = self._serialize_group(records, spill_dir, loc)
+        disk_loc = str((spill_dir / handle).relative_to(self._root_dir))
         for entry in self._group_entries.get(loc, []):
             entry["file"] = disk_loc  # shared dict -> also updates self._index
         if loc in self._group_entries:

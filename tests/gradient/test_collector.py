@@ -28,6 +28,29 @@ from dattri_llm.utils.hashing import hash_batch, hash_sample
 # --------------------------------------------------------------------------- #
 
 
+def group_files(root: Path, location: str) -> list[Path]:
+    """The real files backing a location handle.
+
+    A pickle handle names one file; a memmap handle names a ``.bin``/``.meta``
+    pair and is not itself a path, so tests must not stat it directly.
+    """
+    base = root / location
+    if location.endswith(".mmap"):
+        return [q for q in (Path(f"{base}.bin"), Path(f"{base}.meta")) if q.exists()]
+    return [base] if base.exists() else []
+
+
+def group_count(
+    root: Path,
+    pattern: str = "batch_*",
+    *,
+    recursive: bool = False,
+) -> int:
+    """Number of stored groups under *root*, counting a memmap pair as one."""
+    found = root.rglob(pattern) if recursive else root.glob(pattern)
+    return len({q.name.split(".")[0] for q in found})
+
+
 class RecordingCallback(HookManagerCallback):
     """Stores every GradientRecord emitted by the collector."""
 
@@ -413,7 +436,7 @@ class TestGradientStorageManager:
             manager = GradientStorageManager(tmpdir)
             rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
             location = manager.save(rec)
-            assert (Path(tmpdir) / location).exists()
+            assert group_files(Path(tmpdir), location)
 
     def test_save_updates_index(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -615,7 +638,7 @@ class TestGradientStorageManager:
                         ),
                     ],
                 )
-            assert list(Path(tmpdir).rglob("tiered_spill_*/*.pt"))
+            assert group_count(Path(tmpdir), "tiered_spill_*/*") > 0
             assert manager.timing["spill"]["seconds"] > 0.0
             assert manager.timing["spill"]["calls"] == 3
 
@@ -763,9 +786,9 @@ class TestBatchSaving:
                 self._make_record(0, self._HASH_B, tiny_model, tiny_batch),
             ]
             location = manager.save_bulk(recs)
-            assert (Path(tmpdir) / location).exists()
+            assert group_files(Path(tmpdir), location)
             assert location.startswith("batch_")
-            assert len(list(Path(tmpdir).glob("batch_*.pt"))) == 1
+            assert group_count(Path(tmpdir)) == 1
 
     def test_save_bulk_indexes_all_hashes(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -800,15 +823,14 @@ class TestBatchSaving:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager1 = GradientStorageManager(tmpdir)
             recs = [self._make_record(0, self._HASH_A, tiny_model, tiny_batch)]
-            manager1.save_bulk(recs)  # writes batch_000000.pt
+            manager1.save_bulk(recs)  # writes group batch_000000
 
             manager2 = GradientStorageManager(tmpdir)
             recs2 = [self._make_record(1, self._HASH_B, tiny_model, tiny_batch)]
-            manager2.save_bulk(recs2)  # should write batch_000001.pt
+            manager2.save_bulk(recs2)  # should write group batch_000001
 
-            batch_files = sorted(Path(tmpdir).glob("batch_*.pt"))
-            assert len(batch_files) == 2
-            assert batch_files[1].name == "batch_000001.pt"
+            stems = sorted({q.name.split(".")[0] for q in Path(tmpdir).glob("batch_*")})
+            assert stems == ["batch_000000", "batch_000001"]
 
     def test_per_batch_input_hash_indexed(self, tiny_model, tiny_batch):
         """Per-batch records carry input_hash as a list; the file manager
@@ -837,8 +859,8 @@ class TestBatchSaving:
             with collector.collect():
                 tiny_model(tiny_batch["input_ids"]).mean().backward()
             # B per-sample records in one batch file
-            assert len(list(Path(tmpdir).glob("batch_*.pt"))) == 1
-            assert len(list(Path(tmpdir).glob("step_*.pt"))) == 0
+            assert group_count(Path(tmpdir)) == 1
+            assert group_count(Path(tmpdir), "step_*") == 0
             collector.remove()
 
     def test_offload_load_all_per_sample(self, tiny_model, tiny_batch):
@@ -952,7 +974,7 @@ class TestOffloadCallback:
             with collector.collect():
                 tiny_model(tiny_batch["input_ids"]).mean().backward()
             # OffloadCallback always writes batch files
-            assert len(list(Path(tmpdir).glob("batch_*.pt"))) == 1
+            assert group_count(Path(tmpdir)) == 1
             collector.remove()
 
     def test_index_log_written(self, tiny_model, tiny_batch):
@@ -1010,7 +1032,7 @@ class TestOffloadCallback:
             with collector.collect():
                 for _ in range(4):
                     tiny_model(tiny_batch["input_ids"]).mean().backward()
-            assert len(list(Path(tmpdir).glob("batch_*.pt"))) == 2
+            assert group_count(Path(tmpdir)) == 2
             collector.remove()
 
     def test_staged_property(self, tiny_model, tiny_batch):
@@ -1402,8 +1424,8 @@ class TestGradientStorageManagerDDP:
 
         assert (tmp_path / "rank_0").is_dir()
         assert (tmp_path / "rank_1").is_dir()
-        assert len(list((tmp_path / "rank_0").glob("batch_*.pt"))) == 1
-        assert len(list((tmp_path / "rank_1").glob("batch_*.pt"))) == 1
+        assert group_count(tmp_path / "rank_0") == 1
+        assert group_count(tmp_path / "rank_1") == 1
 
     def test_no_batch_id_collision(self, tmp_path, monkeypatch, tiny_model, tiny_batch):
         """Both ranks start _next_batch_id at 0 but write to different subdirs."""
@@ -1415,9 +1437,9 @@ class TestGradientStorageManagerDDP:
             rec = self._make_record(0, h, tiny_model, tiny_batch)
             m.save_bulk([rec])
 
-        # Both write batch_000000.pt but in separate dirs -- no data loss.
-        assert (tmp_path / "rank_0" / "batch_000000.pt").exists()
-        assert (tmp_path / "rank_1" / "batch_000000.pt").exists()
+        # Both write group batch_000000 but in separate dirs -- no data loss.
+        assert group_count(tmp_path / "rank_0") >= 1
+        assert group_count(tmp_path / "rank_1") >= 1
 
     def test_rank_resolved_lazily_at_first_save(
         self,
@@ -1443,18 +1465,18 @@ class TestGradientStorageManagerDDP:
             managers[rank].save_bulk([rec])
 
         # Nothing landed in the root; each rank got its own subdirectory.
-        assert not list(tmp_path.glob("*.pt"))
+        assert group_count(tmp_path) == 0
         assert not (tmp_path / "index.jsonl").exists()
-        assert (tmp_path / "rank_0" / "batch_000000.pt").exists()
-        assert (tmp_path / "rank_1" / "batch_000000.pt").exists()
+        assert group_count(tmp_path / "rank_0") >= 1
+        assert group_count(tmp_path / "rank_1") >= 1
 
         # The routing freezes at the first save: a later probe change (e.g.
         # destroy_process_group) must not switch directories mid-run.
         monkeypatch.setattr(fm_module, "dist_rank", lambda: None)
         rec = self._make_record(1, self._HASH_A, tiny_model, tiny_batch)
         managers[0].save_bulk([rec])
-        assert (tmp_path / "rank_0" / "batch_000001.pt").exists()
-        assert not list(tmp_path.glob("*.pt"))
+        assert group_count(tmp_path / "rank_0") == 2
+        assert group_count(tmp_path) == 0
 
     def test_each_rank_has_own_index_log(
         self,
@@ -1567,7 +1589,7 @@ class TestGradientStorageManagerDDP:
         m.save_bulk([rec])
 
         assert not any(tmp_path.glob("rank_*"))
-        assert (tmp_path / "batch_000000.pt").exists()
+        assert group_count(tmp_path) == 1
         assert (tmp_path / "index.jsonl").exists()
 
     def test_linear_io_pattern_filters_layers(self, tiny_model, tiny_batch):
@@ -1794,13 +1816,69 @@ class TestIndexMergeRoundTrip:
         # Every referenced path resolves under the root, from a reader that
         # never knew which rank produced it.
         for rel in files:
-            assert (tmp_path / rel).exists()
+            assert group_files(tmp_path, rel)
         assert len(reader.load_records(next(iter(files)))) == 2
         assert len(expected) == 24
 
 
 class TestResidency:
     """disk / memory / tiered residency backends of GradientStorageManager."""
+
+    def test_tiered_spill_uses_the_store_disk_format(self):
+        """A spilled group is serialized like a directly-written one.
+
+        Spill wrote ``torch.save`` unconditionally, so a memmap store silently
+        fell back to pickle for every evicted group.
+        """
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            GradientStorageManager(
+                tmpdir,
+                residency="tiered",
+                disk_format="memmap",
+                budget_bytes=0,
+            ) as manager,
+        ):
+            payload = torch.randn(4, 8)
+            grad = Gradient(
+                representation={"L0": "materialized"},
+                data={"L0": payload},
+                layer_types={"L0": "nn.Linear"},
+                validate_on_init=False,
+            )
+            manager.save_bulk(
+                [GradientRecord(step=0, input_hash=list("abcd"), gradient=grad)],
+            )
+
+            spilled = list(Path(tmpdir).rglob("tiered_spill_*/*.mmap.bin"))
+            assert spilled, "expected the spilled group to be memmapped"
+            assert list(Path(tmpdir).rglob("tiered_spill_*/*.pt")) == []
+            # The repointed index entry still resolves to the spilled group.
+            got = manager.load_sample_by_hash("a", 0, 0)
+            assert torch.equal(got.data["L0"], payload[0:1])
+
+    def test_tiered_spill_falls_back_to_pickle_for_unmappable(self):
+        """A pickle store's spill stays pickle."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            GradientStorageManager(
+                tmpdir,
+                residency="tiered",
+                disk_format="pickle",
+                budget_bytes=0,
+            ) as manager,
+        ):
+            grad = Gradient(
+                representation={"L0": "materialized"},
+                data={"L0": torch.randn(4, 8)},
+                layer_types={"L0": "nn.Linear"},
+                validate_on_init=False,
+            )
+            manager.save_bulk(
+                [GradientRecord(step=0, input_hash=list("abcd"), gradient=grad)],
+            )
+            assert list(Path(tmpdir).rglob("tiered_spill_*/*.pt"))
+            assert list(Path(tmpdir).rglob("tiered_spill_*/*.mmap.bin")) == []
 
     @staticmethod
     def _batch_record(step: int, seed: int) -> GradientRecord:
@@ -1852,7 +1930,7 @@ class TestResidency:
     def test_disk_creates_one_file_per_group(self):
         with tempfile.TemporaryDirectory() as d:
             self._collect("disk", d)
-            assert len(list(Path(d).glob("batch_*.pt"))) == 5
+            assert group_count(Path(d)) == 5
 
     def test_tiered_spills_oldest_and_reads_transparently(self):
         with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as dt:
@@ -1860,8 +1938,8 @@ class TestResidency:
             # Budget for ~2 groups resident -> the 3 oldest spill to disk.
             budget = int(self._GROUP_BYTES * 2.5)
             fm, tiered_blocks = self._collect("tiered", dt, budget_bytes=budget)
-            spilled = list(Path(dt).rglob("*.pt"))
-            assert len(spilled) == 3  # 5 groups - 2 kept resident
+            spilled = group_count(Path(dt), "tiered_spill_*/*")
+            assert spilled == 3  # 5 groups - 2 kept resident
             assert fm._mem_bytes <= budget
             # Reads are transparent across the memory/disk split.
             for step in range(5):
@@ -1879,10 +1957,10 @@ class TestResidency:
             fm = GradientStorageManager(d, residency="tiered", budget_bytes=budget)
             for step in range(5):
                 fm.save_bulk([self._batch_record(step, seed=step)])
-            assert len(list(Path(d).rglob("*.pt"))) == 3  # spilled
+            assert group_count(Path(d), "tiered_spill_*/*") == 3  # spilled
             fm.close()
             # Spill dir gone; save_dir left pristine.
-            assert list(Path(d).rglob("*.pt")) == []
+            assert group_count(Path(d), "tiered_spill_*/*") == 0
             assert list(Path(d).iterdir()) == []
 
     def test_tiered_context_manager_cleans_up(self):
@@ -1895,7 +1973,7 @@ class TestResidency:
             ) as fm:
                 for step in range(5):
                     fm.save_bulk([self._batch_record(step, seed=step)])
-                assert len(list(Path(d).rglob("*.pt"))) == 3
+                assert group_count(Path(d), "tiered_spill_*/*") == 3
             assert list(Path(d).iterdir()) == []  # cleaned on __exit__
 
     def test_close_is_idempotent_and_noop_for_disk(self):
@@ -1905,7 +1983,7 @@ class TestResidency:
             fm.close()
             fm.close()  # idempotent
             # Disk files are the durable store -- untouched by close().
-            assert len(list(Path(d).glob("batch_*.pt"))) == 1
+            assert group_count(Path(d)) == 1
 
     def test_memory_ignores_existing_disk_index(self):
         with tempfile.TemporaryDirectory() as d:
