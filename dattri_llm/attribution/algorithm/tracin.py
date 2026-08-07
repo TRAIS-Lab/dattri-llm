@@ -30,6 +30,7 @@ required.
 from __future__ import annotations
 
 import warnings
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,6 +60,32 @@ if TYPE_CHECKING:
     from dattri_llm.attribution.arguments import AttributionArguments
     from dattri_llm.gradient.gradient import Gradient
     from dattri_llm.gradient.hooks import HookManagerConfig
+
+
+# Per-train-block cache of the materialized train gradient, so a factorized train
+# block is materialized once and dotted against every (fixed) cached test block
+# rather than re-materialized inside ``similarity`` on each train x test pair.
+# Keyed weakly on the block so entries evict when the block is dropped; a no-op
+# for blocks already stored materialized (``Gradient.materialize`` returns self).
+_TRAIN_MAT_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _cached_similarity(
+    train_g: Gradient,
+    test_rep: Gradient,
+    metric: str,
+) -> torch.Tensor:
+    """Cross-gram of a train block against an already-materialized test block.
+
+    ``test_rep`` is materialized once by ``prepare_test``; the train block is
+    materialized once here and reused across the fixed test blocks, so the score
+    is a bare dot instead of re-materializing both factorized sides per pair.
+    """
+    train_mat = _TRAIN_MAT_CACHE.get(train_g)
+    if train_mat is None:
+        train_mat = train_g.materialize()
+        _TRAIN_MAT_CACHE[train_g] = train_mat
+    return train_mat.similarity(test_rep, metric=metric, reduce="all")
 
 
 class TracInAttributor(BaseAttributor):
@@ -259,12 +286,8 @@ class TracInAttributor(BaseAttributor):
             train_source,
             test_source,
             self.args.device,
-            prepare_test=lambda g: g,
-            score_block=lambda tr, te, _n: tr.similarity(
-                te,
-                metric=metric,
-                reduce="all",
-            ),
+            prepare_test=lambda g: g.materialize(),
+            score_block=lambda tr, te, _n: _cached_similarity(tr, te, metric),
             loop_over_test=loop_over_test,
         )
         result = AttributionScore(
@@ -416,7 +439,7 @@ class TracInAttributor(BaseAttributor):
         name, metric = self._label(normalized_grad)
 
         def score_block(tr: Gradient, te: Gradient, _n: int) -> torch.Tensor:
-            return tr.similarity(te, metric=metric, reduce="all")
+            return _cached_similarity(tr, te, metric)
 
         # Layer selection is the hook config's job; record what was hooked (the
         # scored layer set) for the AttributionScore metadata.
@@ -449,7 +472,7 @@ class TracInAttributor(BaseAttributor):
                     train,
                     test,
                     device,
-                    prepare_test=lambda g: g,
+                    prepare_test=lambda g: g.materialize(),
                     score_block=score_block,
                     loop_over_test=loop_over_test,
                 )

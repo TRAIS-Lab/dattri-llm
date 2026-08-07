@@ -54,6 +54,7 @@ from __future__ import annotations
 import contextlib
 import tempfile
 import warnings
+import weakref
 from abc import abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -86,6 +87,13 @@ if TYPE_CHECKING:
 
     from dattri_llm.attribution.arguments import AttributionArguments
     from dattri_llm.gradient.hooks import HookManagerConfig
+
+
+# Per-train-block cache of materialized ``{layer: (B, K*D)}`` weight gradients,
+# so a factorized train block is materialized once and reused across the (fixed)
+# cached test blocks rather than re-materialized on every train x test dot.
+# Keyed weakly on the block so entries evict when the block is dropped.
+_TRAIN_MAT_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 class _KroneckerBaseAttributor(BaseAttributor):
@@ -1361,12 +1369,14 @@ class KFACAttributor(_KroneckerBaseAttributor):
                 # materialized block, dotted raw against train (logix-style).
                 rep[layer] = ops.kfac_precondition_materialized(value, A_inv, G_inv)
             else:
-                rep[layer] = ops.kfac_precondition(
-                    value,
-                    test_g.layer_types[layer],
-                    A_inv,
-                    G_inv,
-                )
+                # Materialize the (fixed) test block ONCE -- token-sum the
+                # factors to the full weight gradient -- then precondition it
+                # two-sided.  Scoring is then a bare dot, and the test is not
+                # re-materialized on every train block (the old whitened-factor
+                # path routed to ``_cross_gram``, which re-materialized *both*
+                # sides on each train x test call).
+                m_te = ops.materialize(value, test_g.layer_types[layer])
+                rep[layer] = ops.kfac_precondition_materialized(m_te, A_inv, G_inv)
         return rep
 
     @staticmethod
@@ -1375,6 +1385,15 @@ class KFACAttributor(_KroneckerBaseAttributor):
         test_rep: dict[str, object],
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor | None:
+        # ``score_sources`` calls ``_score`` with the *same* ``train_g`` for
+        # every cached test block, so materialize each train layer **once** and
+        # reuse it across the test loop (previously the outer product was rebuilt
+        # on every train x test call).  The cache is keyed weakly on the block,
+        # so it evicts automatically when the block is dropped -- no id() reuse.
+        tr_mat = _TRAIN_MAT_CACHE.get(train_g)
+        if tr_mat is None:
+            tr_mat = {}
+            _TRAIN_MAT_CACHE[train_g] = tr_mat
         total: torch.Tensor | None = None
         for layer in ctx:
             rep = test_rep.get(layer)
@@ -1385,13 +1404,16 @@ class KFACAttributor(_KroneckerBaseAttributor):
                 # store, or the compact two-sided precondition): plain dot against
                 # the raw materialized train gradient.  A compact train block is
                 # already materialized -- use it directly; a factorized block is
-                # materialized on the fly.
-                train_val = train_g.data[layer]
-                M_tr = (
-                    train_val.reshape(train_val.shape[0], -1).float()
-                    if isinstance(train_val, torch.Tensor)
-                    else ops.materialize(train_val, train_g.layer_types[layer])
-                )
+                # materialized once (cached above) and reused.
+                M_tr = tr_mat.get(layer)
+                if M_tr is None:
+                    train_val = train_g.data[layer]
+                    M_tr = (
+                        train_val.reshape(train_val.shape[0], -1).float()
+                        if isinstance(train_val, torch.Tensor)
+                        else ops.materialize(train_val, train_g.layer_types[layer])
+                    )
+                    tr_mat[layer] = M_tr
                 block = M_tr @ rep.to(M_tr.dtype).T
             else:
                 # Whitened-factor rep: raw train factors cross-grammed against
@@ -1596,15 +1618,23 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         test_mats: dict[str, torch.Tensor],
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor | None:
+        # Materialize each train layer once and reuse across the (fixed) cached
+        # test blocks -- the same block is scored against every test block, so
+        # ``ops.materialize`` was re-run per train x test call.  Cache keyed
+        # weakly on the block (shared with K-FAC: both materialize the same way).
+        tr_mat = _TRAIN_MAT_CACHE.get(train_g)
+        if tr_mat is None:
+            tr_mat = {}
+            _TRAIN_MAT_CACHE[train_g] = tr_mat
         total: torch.Tensor | None = None
         for layer in ctx:
             M_te = test_mats.get(layer)  # (B_te, D), fully preconditioned
             if M_te is None or layer not in train_g.data:
                 continue
-            M_tr = ops.materialize(
-                train_g.data[layer],
-                train_g.layer_types[layer],
-            )  # (B_tr, D) raw weight gradient -- no rotation
+            M_tr = tr_mat.get(layer)  # (B_tr, D) raw weight gradient -- no rotation
+            if M_tr is None:
+                M_tr = ops.materialize(train_g.data[layer], train_g.layer_types[layer])
+                tr_mat[layer] = M_tr
             block = M_tr @ M_te.to(M_tr.dtype).T  # (B_tr, B_te)
             total = block if total is None else total + block
         return total  # None when no layer overlaps; _combine_score zero-fills
