@@ -12,6 +12,7 @@ This package re-exports the full surface of its submodules so existing
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
 from dattri_llm.gradient.hooks.config import (
+    INVASIVE_LINEAR_IO,
     LINEAR_IO,
     PARAM_GRAD,
     REGISTER_ALL,
@@ -31,8 +32,10 @@ from dattri_llm.gradient.hooks.hooks import (
     ParamGradBuffer,
     _capture_projected,
     _has_trainable_params,
+    _is_invasive_capable,
     _is_linear_io_capable,
     _make_layer_buffer,
+    install_invasive_forward,
     register_linear_io_hooks,
     register_linear_param_hooks,
     register_param_grad_hooks,
@@ -41,6 +44,7 @@ from dattri_llm.gradient.hooks.hooks import (
 from dattri_llm.gradient.hooks.manager import HookManager
 
 __all__ = [
+    "INVASIVE_LINEAR_IO",
     "LINEAR_IO",
     "PARAM_GRAD",
     "REGISTER_ALL",
@@ -56,12 +60,14 @@ __all__ = [
     "_derive_scalar_loss",
     "_has_trainable_params",
     "_invoke_model",
+    "_is_invasive_capable",
     "_is_linear_io_capable",
     "_make_layer_buffer",
     "_resolve_projector",
     "_selector_matches",
     "_warn_zero_layers",
     "default_hook_assignment",
+    "install_invasive_forward",
     "register_linear_io_hooks",
     "register_linear_param_hooks",
     "register_param_grad_hooks",

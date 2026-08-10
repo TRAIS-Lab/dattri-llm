@@ -11,6 +11,7 @@ from torch import nn
 
 from dattri_llm.gradient.hooks.hooks import (
     _has_trainable_params,
+    _is_invasive_capable,
     _is_linear_io_capable,
     remove_hooks,
 )
@@ -69,9 +70,13 @@ Selector = _RegisterAll | list[str] | None
 # Hook-family names and the layer_types marker used for materialized grads.
 LINEAR_IO = "linear_io"
 PARAM_GRAD = "param_grad"
+# Like ``linear_io`` but replaces the layer's forward so the weight-gradient
+# matmul is skipped (nn.Linear only).  Produces no ``weight.grad`` -- capture
+# only; see :func:`~dattri_llm.gradient.hooks.hooks.install_invasive_forward`.
+INVASIVE_LINEAR_IO = "invasive_linear_io"
 
 
-_VALID_HOOK_TYPES = frozenset({LINEAR_IO, PARAM_GRAD})
+_VALID_HOOK_TYPES = frozenset({LINEAR_IO, PARAM_GRAD, INVASIVE_LINEAR_IO})
 
 
 class HookManagerConfig:
@@ -261,6 +266,7 @@ class HookManagerConfig:
         hook_types: dict[str, str] | None = None,
         linear_io: Selector = None,
         param_grad: Selector = None,
+        invasive_linear_io: Selector = None,
         layer_types: dict[str, str] | None = None,
         module_kwargs: dict[str, dict] | None = None,
         projection: dict[str, dict] | None = None,
@@ -269,6 +275,15 @@ class HookManagerConfig:
         self.hook_types = self._validate_assignment(hook_types)
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
         self.param_grad = self._validate_selector(PARAM_GRAD, param_grad)
+        # ``invasive_linear_io`` captures identically to ``linear_io`` but
+        # overrides the nn.Linear forward to skip the weight-gradient matmul.
+        # WARNING: layers hooked this way produce no ``weight.grad`` and are
+        # incompatible with optimizer updates / DataSelectionCallback -- use it
+        # only for gradient capture (attribution).
+        self.invasive_linear_io = self._validate_selector(
+            INVASIVE_LINEAR_IO,
+            invasive_linear_io,
+        )
         self.layer_types = self._validate_layer_types(layer_types)
         self.module_kwargs = self._validate_module_kwargs(module_kwargs)
         # Optional per-layer random projection applied to every assembled step
@@ -388,7 +403,10 @@ class HookManagerConfig:
     def is_default(self) -> bool:
         """True when nothing was requested (the auto fallback applies)."""
         return (
-            not self.hook_types and self.linear_io is None and self.param_grad is None
+            not self.hook_types
+            and self.linear_io is None
+            and self.param_grad is None
+            and self.invasive_linear_io is None
         )
 
 
@@ -490,6 +508,13 @@ def resolve_hook_assignments(
                 f"Layer '{layer_name}' was assigned 'param_grad' but has no "
                 "trainable parameters.",
             )
+        if hook_type == INVASIVE_LINEAR_IO and not _is_invasive_capable(module):
+            raise ValueError(
+                f"Layer '{layer_name}' was assigned 'invasive_linear_io' but "
+                f"its type ({canonical_class_name(module)}) is not nn.Linear. "
+                "The invasive hook overrides the linear forward and only "
+                "supports nn.Linear.",
+            )
         assign(layer_name, hook_type)
 
     # 2. Selector add-ons extend the assignment with applicable layers only.
@@ -504,6 +529,11 @@ def resolve_hook_assignments(
             name,
         ):
             assign(name, PARAM_GRAD)
+        if _is_invasive_capable(module) and _selector_matches(
+            config.invasive_linear_io,
+            name,
+        ):
+            assign(name, INVASIVE_LINEAR_IO)
 
     if not assignment:
         _warn_zero_layers()

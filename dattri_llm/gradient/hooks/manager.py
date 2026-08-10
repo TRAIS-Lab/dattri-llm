@@ -13,6 +13,7 @@ from torch import nn
 
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks.config import (
+    INVASIVE_LINEAR_IO,
     LINEAR_IO,
     PARAM_GRAD,
     HookManagerConfig,
@@ -20,6 +21,7 @@ from dattri_llm.gradient.hooks.config import (
     resolve_hook_assignments,
 )
 from dattri_llm.gradient.hooks.hooks import (
+    install_invasive_forward,
     register_linear_io_hooks,
     register_linear_param_hooks,
     register_param_grad_hooks,
@@ -244,6 +246,9 @@ class HookManager:
         self._has_linear_io: bool = False
         self._buffers: dict = {}
         self._handles: list = []
+        # Revert closures for ``invasive_linear_io`` forward overrides -- restore
+        # each patched nn.Linear's original forward on remove().
+        self._invasive_reverts: list = []
         self._mlp_weight_handles: list = []  # post-accumulate hooks for sub-cond (b)
         self._n_layers: int = 0
         self._has_param_grad: bool = False
@@ -1216,7 +1221,12 @@ class HookManager:
         assignment = resolve_hook_assignments(root, self._config)
         linear_io_layers = {n for n, t in assignment.items() if t == LINEAR_IO}
         param_grad_layers = {n for n, t in assignment.items() if t == PARAM_GRAD}
-        self._has_linear_io = bool(linear_io_layers)
+        invasive_layers = {n for n, t in assignment.items() if t == INVASIVE_LINEAR_IO}
+        # Invasive layers capture exactly like linear_io (identical forward/
+        # backward hooks and bookkeeping); they only additionally override the
+        # nn.Linear forward to skip the weight-gradient matmul.
+        capture_layers = linear_io_layers | invasive_layers
+        self._has_linear_io = bool(capture_layers)
         self._has_param_grad = bool(param_grad_layers)
 
         self._bwd_done = True
@@ -1226,7 +1236,7 @@ class HookManager:
             self._bwd_done = False
             self._buffers, self._handles = register_linear_io_hooks(
                 model,
-                layer_names=linear_io_layers,
+                layer_names=capture_layers,
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
                 type_overrides=self._config.layer_types,
@@ -1240,11 +1250,24 @@ class HookManager:
                 offload_to_cpu=self._offload_to_cpu,
             )
             self._n_layers = len(self._buffers)
+            # The weight.grad post-accumulate barrier (sub-condition b) only
+            # covers non-invasive layers: invasive layers never populate
+            # weight.grad, so their step completion rides solely on the backward
+            # hooks (sub-condition a, which fires identically for them).
             self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
                 model,
                 layer_names=linear_io_layers,
                 on_linear_param_grad=self._check_step_mlp_param_complete,
             )
+            if invasive_layers:
+                # Override the nn.Linear forward to skip the weight-gradient
+                # matmul, but only while collecting (so training outside a
+                # collect() context still gets ordinary weight.grad).
+                self._invasive_reverts = install_invasive_forward(
+                    model,
+                    invasive_layers,
+                    should_intervene=lambda: self._collecting,
+                )
 
         self._grad_done = True
         self._n_params_hooked = 0
@@ -1298,6 +1321,10 @@ class HookManager:
         self._model_fwd_handle = None
         remove_hooks(self._handles)
         self._handles = []
+        # Restore any invasive_linear_io forward overrides to their originals.
+        for revert in self._invasive_reverts:
+            revert()
+        self._invasive_reverts = []
         self._buffers.clear()
         remove_hooks(self._mlp_weight_handles)
         self._mlp_weight_handles = []
