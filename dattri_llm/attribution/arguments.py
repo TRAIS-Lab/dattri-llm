@@ -96,6 +96,9 @@ class AttributionArguments:
         device_prefetch_depth: Number of gradient blocks copied host->device
             ahead of the scoring loop on a dedicated CUDA stream (``1`` =
             double buffering, ``0`` = synchronous copies).  CUDA only.
+        async_disk_write: Write gradient files from a background thread
+            during attributor-driven collection, overlapping D2H + disk IO
+            with compute.  The finished store matches a synchronous run.
         ddp_find_unused_parameters: Passed to
             :class:`torch.nn.parallel.DistributedDataParallel` as
             ``find_unused_parameters``.  ``None`` lets PyTorch choose.
@@ -359,6 +362,19 @@ class AttributionArguments:
                 "loop on a dedicated CUDA stream (``1`` = double buffering, "
                 "``0`` = synchronous copies).  Each prefetched block is extra "
                 "device memory.  CUDA only."
+            ),
+        },
+    )
+
+    async_disk_write: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "During attributor-driven collection, write gradient files "
+                "from a background thread (bounded queue), overlapping the "
+                "device-to-host copy and disk IO with the next block's "
+                "forward/backward.  The finished store is identical to a "
+                "synchronous run."
             ),
         },
     )

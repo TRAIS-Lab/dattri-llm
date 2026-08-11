@@ -31,11 +31,13 @@ from dattri_llm.gradient.ops import (
     materialize,
     pairwise_dot,
 )
+from dattri_llm.gradient.async_writer import AsyncGradientWriter
 from dattri_llm.gradient.prefetch import prefetch_to_device
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 __all__ = [
     "REGISTER_ALL",
+    "AsyncGradientWriter",
     "CaptureCallback",
     "DataSelectionCallback",
     "FisherAccumulator",

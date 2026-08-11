@@ -54,6 +54,7 @@ def collect_to_disk(
     *,
     offload_interval: int = 1,
     on_block: Callable[[int, Gradient, list[str]], None] | None = None,
+    async_write: bool | None = None,
 ) -> None:
     """Run a gradient streamer to completion, persisting every block to disk.
 
@@ -85,30 +86,51 @@ def collect_to_disk(
             -- directly off the streamed blocks, so a re-pass over the store to
             fit them is not needed.  Runs on the (single-shot) collection pass,
             so it sees each block exactly once.
+        async_write: Write flush groups through a background
+            :class:`~dattri_llm.gradient.async_writer.AsyncGradientWriter`,
+            overlapping D2H + disk IO with the next block's forward/backward.
+            The writer is drained before this function returns, so the store
+            is complete and identical to a synchronous run.  ``None``
+            (default) reads ``async_disk_write`` off the streamer's args.
     """
     if offload_interval < 1:
         raise ValueError(
             f"offload_interval must be >= 1, got {offload_interval}.",
         )
+    if async_write is None:
+        async_write = getattr(
+            getattr(streamer, "_args", None), "async_disk_write", False,
+        )
+    writer = None
+    if async_write:
+        from dattri_llm.gradient.async_writer import AsyncGradientWriter
+
+        writer = AsyncGradientWriter(file_manager)
+    save = writer.submit if writer is not None else file_manager.save_bulk
+
     id_key = streamer.hook_manager.sample_id_key
     staged: list[GradientRecord] = []
-    with streamer:
-        for step, grad, hashes in streamer:
-            if on_block is not None:
-                on_block(step, grad, hashes)
-            staged.append(
-                GradientRecord(
-                    step=step,
-                    input_hash=hashes,
-                    gradient=grad,
-                    sample_id_key=id_key,
-                ),
-            )
-            if len(staged) >= offload_interval:
-                file_manager.save_bulk(staged)
-                staged = []
-        if staged:
-            file_manager.save_bulk(staged)
+    try:
+        with streamer:
+            for step, grad, hashes in streamer:
+                if on_block is not None:
+                    on_block(step, grad, hashes)
+                staged.append(
+                    GradientRecord(
+                        step=step,
+                        input_hash=hashes,
+                        gradient=grad,
+                        sample_id_key=id_key,
+                    ),
+                )
+                if len(staged) >= offload_interval:
+                    save(staged)
+                    staged = []
+            if staged:
+                save(staged)
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def _score_one(

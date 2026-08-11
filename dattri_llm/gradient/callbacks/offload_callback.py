@@ -42,6 +42,15 @@ class OffloadCallback(HookManagerCallback):
             the store's step convention is recorded and cannot be mixed.
             Default ``1``: every backward is its own stored step, with the
             capture step index kept verbatim.
+        async_write: Hand each flush to a background
+            :class:`~dattri_llm.gradient.async_writer.AsyncGradientWriter`
+            instead of writing inline, overlapping the device-to-host copy
+            and disk write with the training loop.  The writer is drained and
+            stopped when the collect context closes, so the finished store is
+            identical to a synchronous one.  Default ``False``.
+        max_pending_writes: Flush groups allowed in flight before staging
+            blocks (``async_write`` only); each pending group keeps its
+            payload memory alive.
     """
 
     def __init__(
@@ -50,6 +59,8 @@ class OffloadCallback(HookManagerCallback):
         file_manager: GradientStorageManager,
         recording_type: str = "per_batch",
         gradient_accumulation_steps: int = 1,
+        async_write: bool = False,
+        max_pending_writes: int = 2,
     ) -> None:
         if recording_type not in ("per_sample", "per_batch"):
             raise ValueError(
@@ -65,6 +76,9 @@ class OffloadCallback(HookManagerCallback):
         self.file_manager = file_manager
         self._recording_type = recording_type
         self._accum_steps = gradient_accumulation_steps
+        self._async_write = async_write
+        self._max_pending_writes = max_pending_writes
+        self._writer = None
         file_manager.declare_gradient_accumulation_steps(gradient_accumulation_steps)
         # Open accumulation window (micro-batch records not yet merged) and
         # the optimizer-step counter that re-stamps merged records.
@@ -149,16 +163,31 @@ class OffloadCallback(HookManagerCallback):
         """Flush any records still staged when the collect() context closes.
 
         A ragged trailing accumulation window (the loop ended mid-window,
-        as a Trainer epoch can) is merged and staged first.
+        as a Trainer epoch can) is merged and staged first.  Under
+        ``async_write`` the background writer is drained and stopped here, so
+        the store is complete and safe to read once the context has closed.
         """
         if self._window:
             self._stage(self._merge_window())
         self._flush()
+        if self._writer is not None:
+            writer, self._writer = self._writer, None
+            writer.close()
 
     def _flush(self) -> None:
         if not self._staged:
             return
-        self.file_manager.save_bulk(self._staged)
+        if self._async_write:
+            if self._writer is None:
+                from dattri_llm.gradient.async_writer import AsyncGradientWriter
+
+                self._writer = AsyncGradientWriter(
+                    self.file_manager,
+                    max_pending=self._max_pending_writes,
+                )
+            self._writer.submit(self._staged)
+        else:
+            self.file_manager.save_bulk(self._staged)
         self._staged.clear()
         self._staged_steps.clear()
 

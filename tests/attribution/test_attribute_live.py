@@ -117,6 +117,33 @@ class TestLiveLoopOverTest:
         )
 
 
+class TestAsyncDiskWrite:
+    def test_async_cache_scores_match_sync(self, tmp_path):
+        """``async_disk_write=True`` is a performance-only knob: the cached
+        store and the scores computed from it must match a synchronous run.
+        """
+        task, train_ds, test_ds = _make_task_and_data()
+
+        def run(out_dir, async_write):
+            args = _args(out_dir)
+            args.async_disk_write = async_write
+            attr = TracInAttributor(args, task=task)
+            ((train_dir, test_dir),) = attr.cache(train_ds, test_ds)
+            return attr.attribute_from_cache(
+                train_gradients_dir=train_dir,
+                test_gradients_dir=test_dir,
+            )
+
+        sync_res = run(tmp_path / "sync", async_write=False)
+        async_res = run(tmp_path / "async", async_write=True)
+
+        ids_s, m_s = sync_res.agnostic_matrix()
+        ids_a, m_a = async_res.agnostic_matrix()
+        assert ids_s == ids_a
+        assert sync_res.test_ids == async_res.test_ids
+        assert torch.equal(m_s, m_a), f"max diff {(m_s - m_a).abs().max():.2e}"
+
+
 class TestCachedGradientsMatchLive:
     """residency={memory,tiered} (collect the raw representations once into a
     store, then replay the Fisher sweeps) must score identically to the default
