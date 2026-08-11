@@ -323,6 +323,55 @@ class TestTracInOnDisk:
             )
         assert result.scores.shape == (N_TRAIN, N_TEST)
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"device_prefetch_depth": 0},
+            {"device_prefetch_depth": 3},
+            {"per_device_train_batch_size": 1},
+            {"per_device_train_batch_size": 64},
+            {"dataloader_num_workers": 2},
+        ],
+        ids=["depth0", "depth3", "score-bs1", "score-bs64", "workers2"],
+    )
+    def test_performance_knobs_do_not_change_scores(
+        self,
+        collected,
+        tmp_path,
+        overrides,
+    ):
+        """Device prefetch depth, scoring batch size, and loader workers are
+        performance-only knobs: rows, columns, and scores must not move.
+
+        Prefetch depth and worker count leave the compute identical (bitwise
+        equality); the scoring batch size regroups the same dot products into
+        different GEMM shapes, so it is checked to numerical tolerance.
+        """
+
+        def run(out_dir: Path, **kwargs):
+            defaults = {
+                "dataloader_num_workers": 0,
+                "dataloader_pin_memory": False,
+            }
+            args = AttributionArguments(
+                output_dir=str(out_dir),
+                **{**defaults, **kwargs},
+            )
+            return TracInAttributor(args).attribute_from_cache(
+                train_gradients_dir=str(collected["train_dir"]),
+                test_gradients_dir=str(collected["test_dir"]),
+            )
+
+        base = run(tmp_path / "base")
+        res = run(tmp_path / "res", **overrides)
+        assert res.test_ids == base.test_ids
+        assert res.row_train_ids == base.row_train_ids
+        assert res.row_steps == base.row_steps
+        if "per_device_train_batch_size" in overrides:
+            assert torch.allclose(res.scores, base.scores, atol=1e-6, rtol=1e-5)
+        else:
+            assert torch.equal(res.scores, base.scores)
+
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o")
         with pytest.raises(TypeError, match=r"train_gradients_dir"):

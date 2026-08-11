@@ -93,6 +93,9 @@ class AttributionArguments:
         dataloader_prefetch_factor: Number of batches each DataLoader worker
             prefetches.  ``None`` uses the PyTorch default (``2`` when
             ``num_workers > 0``).
+        device_prefetch_depth: Number of gradient blocks copied host->device
+            ahead of the scoring loop on a dedicated CUDA stream (``1`` =
+            double buffering, ``0`` = synchronous copies).  CUDA only.
         ddp_find_unused_parameters: Passed to
             :class:`torch.nn.parallel.DistributedDataParallel` as
             ``find_unused_parameters``.  ``None`` lets PyTorch choose.
@@ -348,6 +351,18 @@ class AttributionArguments:
         },
     )
 
+    device_prefetch_depth: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Gradient blocks copied host->device ahead of the scoring "
+                "loop on a dedicated CUDA stream (``1`` = double buffering, "
+                "``0`` = synchronous copies).  Each prefetched block is extra "
+                "device memory.  CUDA only."
+            ),
+        },
+    )
+
     # -- Distributed / large-model --------------------------------------------
 
     ddp_find_unused_parameters: bool | None = field(
@@ -480,6 +495,12 @@ class AttributionArguments:
             logger.warning(
                 "dataloader_persistent_workers=True has no effect when "
                 "dataloader_num_workers=0.",
+            )
+
+        if self.device_prefetch_depth < 0:
+            raise ValueError(
+                f"device_prefetch_depth must be >= 0, "
+                f"got {self.device_prefetch_depth}.",
             )
 
         if self.full_determinism and (self.bf16 or self.fp16):

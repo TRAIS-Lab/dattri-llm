@@ -45,11 +45,46 @@ class Factorized:
         self,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
     ) -> Factorized:
-        """Return a copy with both factors moved to *device* / cast to *dtype*."""
+        """Return a copy with both factors moved to *device* / cast to *dtype*.
+
+        With ``non_blocking=True`` the copies are asynchronous (given pinned
+        memory); the caller owns the stream synchronization before reading
+        (see :mod:`dattri_llm.gradient.prefetch`).
+        """
         return Factorized(
-            activation=self.activation.to(device=device, dtype=dtype),
-            pre_activation_grad=self.pre_activation_grad.to(device=device, dtype=dtype),
+            activation=self.activation.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking,
+            ),
+            pre_activation_grad=self.pre_activation_grad.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking,
+            ),
+            module_kwargs=self.module_kwargs,
+            batch_first=self.batch_first,
+        )
+
+    def pin_memory(self) -> Factorized:
+        """Return a copy with both factors in pinned host memory.
+
+        Idempotent: already-pinned or non-CPU factors pass through unchanged.
+        Pinning is what makes ``to(device, non_blocking=True)`` a true async
+        transfer; torch's DataLoader ``pin_memory=True`` recursion finds this
+        method automatically.
+        """
+
+        def pin(t: torch.Tensor) -> torch.Tensor:
+            if t.device.type != "cpu" or t.is_pinned():
+                return t
+            return t.pin_memory()
+
+        return Factorized(
+            activation=pin(self.activation),
+            pre_activation_grad=pin(self.pre_activation_grad),
             module_kwargs=self.module_kwargs,
             batch_first=self.batch_first,
         )
@@ -337,12 +372,44 @@ class Gradient:
         self,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
     ) -> Gradient:
-        """Return a copy with every payload moved to *device* / cast to *dtype*."""
+        """Return a copy with every payload moved to *device* / cast to *dtype*.
+
+        With ``non_blocking=True`` the caller owns the stream synchronization
+        before reading (see :meth:`Factorized.to`).
+        """
         new_data = {}
 
         for name, value in self.data.items():
-            new_data[name] = value.to(device=device, dtype=dtype)
+            new_data[name] = value.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking,
+            )
+
+        return Gradient(
+            representation=dict(self.representation),
+            data=new_data,
+            layer_types=self.layer_types,
+            indexing=dict(self.indexing),
+        )
+
+    def pin_memory(self) -> Gradient:
+        """Return a copy with every CPU payload in pinned (page-locked) memory.
+
+        Idempotent; see :meth:`Factorized.pin_memory`.  Lets ``pin_memory=True``
+        DataLoaders pin whole blocks for async host->device transfers
+        (:mod:`dattri_llm.gradient.prefetch`).
+        """
+        new_data: dict[str, GradientData] = {}
+        for name, value in self.data.items():
+            if isinstance(value, Factorized):
+                new_data[name] = value.pin_memory()
+            elif value.device.type == "cpu" and not value.is_pinned():
+                new_data[name] = value.pin_memory()
+            else:
+                new_data[name] = value
 
         return Gradient(
             representation=dict(self.representation),

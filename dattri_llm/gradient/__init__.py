@@ -31,6 +31,7 @@ from dattri_llm.gradient.ops import (
     materialize,
     pairwise_dot,
 )
+from dattri_llm.gradient.prefetch import prefetch_to_device
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 __all__ = [
@@ -56,6 +57,7 @@ __all__ = [
     "materialize",
     "ops",
     "pairwise_dot",
+    "prefetch_to_device",
     "register_linear_io_hooks",
     "register_linear_param_hooks",
     "register_param_grad_hooks",

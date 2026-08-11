@@ -13,7 +13,7 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING
 
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 from tqdm.auto import tqdm
 
 from dattri_llm.gradient import ops
@@ -124,7 +124,7 @@ class GradientFileMultiStepDataset(Dataset):
     def __getitem__(self, i: int) -> dict[int, tuple[Gradient, list[str]]]:
         file_rel, by_step = self._files[i]
         records = self._fm.load_records(file_rel)
-        return {
+        blocks = {
             step: _records_to_block(
                 records,
                 idxs,
@@ -134,6 +134,15 @@ class GradientFileMultiStepDataset(Dataset):
             )
             for step, idxs in by_step.items()
         }
+        if get_worker_info() is not None:
+            # Memmap-backed tensors can't cross the worker->parent IPC (torch's
+            # fd-sharing sends a closed mapping fd -> EBADF); clone to heap
+            # storage.  With ``num_workers=0`` the zero-copy view is the point.
+            blocks = {
+                step: (block.clone(), hashes)
+                for step, (block, hashes) in blocks.items()
+            }
+        return blocks
 
 
 def make_gradient_multistep_dataloader(
