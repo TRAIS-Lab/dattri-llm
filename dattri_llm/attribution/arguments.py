@@ -412,7 +412,12 @@ class AttributionArguments:
             "help": (
                 "FSDP configuration passed to the ``FullyShardedDataParallel`` "
                 "constructor.  May be a ``dict``, a JSON string, or a path to a "
-                "JSON file."
+                "JSON file.  Two HF-style keys build an ``auto_wrap_policy`` "
+                "instead of passing through: ``transformer_layer_cls_to_wrap`` "
+                "(module class name or list; each instance becomes its own "
+                "FSDP unit -- required for large models so parameters gather "
+                "per block, not all at once) and ``min_num_params`` "
+                "(size-based wrapping)."
             ),
         },
     )

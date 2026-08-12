@@ -27,6 +27,7 @@ this module is method-agnostic.
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager
@@ -164,6 +165,63 @@ class DiskGradientSource(GradientSource):
             desc=self._desc,
             verbose=False,
         )
+
+
+def _build_auto_wrap_policy(
+    model: nn.Module,
+    fsdp_config: dict,
+) -> Callable | None:
+    """Build an FSDP ``auto_wrap_policy`` from HF-style ``fsdp_config`` keys.
+
+    Consumes (pops) the policy keys so the remaining dict is pure FSDP kwargs:
+
+    * ``"transformer_layer_cls_to_wrap"`` -- module class name (or list of
+      names); every instance becomes its own FSDP unit, so parameters are
+      gathered one block at a time instead of the whole model at once.  This
+      is what keeps peak memory at ``one_block + shard`` for large models.
+    * ``"min_num_params"`` -- size-based policy: wrap any submodule with at
+      least this many parameters.
+
+    An explicit ``"auto_wrap_policy"`` callable in the config wins and passes
+    through untouched.  With none of the keys present, returns ``None`` and
+    the model is wrapped as a single flat FSDP unit (fine for small models;
+    at large scale every rank then transiently materializes the full
+    parameters each step).
+    """
+    if "auto_wrap_policy" in fsdp_config:
+        return None
+    cls_names = fsdp_config.pop("transformer_layer_cls_to_wrap", None)
+    min_params = fsdp_config.pop("min_num_params", None)
+    if cls_names is None and min_params is None:
+        return None
+    if cls_names is not None and min_params is not None:
+        raise ValueError(
+            "fsdp_config: pass either transformer_layer_cls_to_wrap or "
+            "min_num_params, not both.",
+        )
+    if cls_names is not None:
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+        wanted = {cls_names} if isinstance(cls_names, str) else set(cls_names)
+        classes = {
+            type(m) for m in model.modules() if type(m).__name__ in wanted
+        }
+        missing = wanted - {c.__name__ for c in classes}
+        if missing:
+            raise ValueError(
+                f"transformer_layer_cls_to_wrap: no module of class "
+                f"{sorted(missing)} found in the model.",
+            )
+        return functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=classes,
+        )
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+
+    return functools.partial(
+        size_based_auto_wrap_policy,
+        min_num_params=int(min_params),
+    )
 
 
 def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
@@ -775,6 +833,12 @@ class GradientStreamer(GradientSource):
                     else ShardingStrategy.FULL_SHARD
                 )
                 fsdp_kwargs = dict(args.fsdp_config or {})
+                # HF-style policy keys (transformer_layer_cls_to_wrap /
+                # min_num_params) become an auto_wrap_policy; without one the
+                # model is a single flat FSDP unit.
+                policy = _build_auto_wrap_policy(model, fsdp_kwargs)
+                if policy is not None:
+                    fsdp_kwargs["auto_wrap_policy"] = policy
                 # use_orig_params keeps the original submodule params (what the hooks
                 # captured and what per-sample gradient reads need).
                 fsdp_kwargs.setdefault("use_orig_params", True)
