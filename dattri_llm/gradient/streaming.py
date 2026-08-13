@@ -203,9 +203,7 @@ def _build_auto_wrap_policy(
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
         wanted = {cls_names} if isinstance(cls_names, str) else set(cls_names)
-        classes = {
-            type(m) for m in model.modules() if type(m).__name__ in wanted
-        }
+        classes = {type(m) for m in model.modules() if type(m).__name__ in wanted}
         missing = wanted - {c.__name__ for c in classes}
         if missing:
             raise ValueError(

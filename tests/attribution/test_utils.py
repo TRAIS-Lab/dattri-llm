@@ -58,9 +58,7 @@ def make_factorized_block(seed: int = 0, b: int = B) -> Gradient:
 
 
 def make_stream(n: int = 4, factory=make_materialized_block) -> list:
-    return [
-        (i, factory(seed=i), [f"h{i}-{j}" for j in range(B)]) for i in range(n)
-    ]
+    return [(i, factory(seed=i), [f"h{i}-{j}" for j in range(B)]) for i in range(n)]
 
 
 class FakeSource:
@@ -130,7 +128,8 @@ class TestNormalizeLayerNames:
     def test_list_is_copied(self):
         names = ["a", "b"]
         out = normalize_layer_names(names)
-        assert out == names and out is not names
+        assert out == names
+        assert out is not names
 
 
 class TestTaskLossFn:
@@ -163,7 +162,8 @@ class TestCollectToDisk:
         assert [r.input_hash for r in records] == [h for _, _, h in blocks]
         assert all(r.sample_id_key == "idx" for r in records)
         assert records[1].gradient is blocks[1][1]
-        assert streamer.entered == 1 and streamer.exited == 1
+        assert streamer.entered == 1
+        assert streamer.exited == 1
 
     @pytest.mark.parametrize(
         ("interval", "expected_call_sizes"),
@@ -252,8 +252,9 @@ def _flat_rows(g: Gradient) -> torch.Tensor:
     if isinstance(value, Factorized):
         bf = value.as_batch_first()
         # Token-summed outer product, flattened per sample.
-        return torch.einsum("bti,bto->boi", bf.activation,
-                            bf.pre_activation_grad).flatten(1)
+        return torch.einsum(
+            "bti,bto->boi", bf.activation, bf.pre_activation_grad
+        ).flatten(1)
     return value
 
 
@@ -277,7 +278,12 @@ class TestBatchedTrainScore:
         cached = [(make_materialized_block(seed=99, b=3), ["t0", "t1", "t2"])]
         test_index = {"t0": 0, "t1": 1, "t2": 2}
         return _batched_train_score(
-            iter(source), "cpu", cached, test_index, 3, _dot_score_block,
+            iter(source),
+            "cpu",
+            cached,
+            test_index,
+            3,
+            _dot_score_block,
             batch_size,
         )
 
@@ -307,7 +313,8 @@ class TestBatchedTrainScore:
     def test_empty_source(self):
         scores, ids, steps = self._run([], batch_size=4)
         assert scores.shape == (0, 3)
-        assert ids == [] and steps == []
+        assert ids == []
+        assert steps == []
 
 
 # --------------------------------------------------------------------------- #
@@ -335,7 +342,9 @@ class TestScoreSources:
     def test_scores_match_oracle(self):
         train, test = self._sources()
         scores, row_ids, row_steps, test_ids = score_sources(
-            train, test, "cpu",
+            train,
+            test,
+            "cpu",
             prepare_test=lambda g: g,
             score_block=_dot_score_block,
         )
@@ -347,18 +356,22 @@ class TestScoreSources:
     def test_loop_over_test_matches_cached(self):
         train_a, test_a = self._sources()
         cached = score_sources(
-            train_a, test_a, "cpu",
+            train_a,
+            test_a,
+            "cpu",
             prepare_test=lambda g: g,
             score_block=_dot_score_block,
         )
         train_b, test_b = self._sources()
         looped = score_sources(
-            train_b, test_b, "cpu",
+            train_b,
+            test_b,
+            "cpu",
             prepare_test=lambda g: g,
             score_block=_dot_score_block,
             loop_over_test=True,
         )
-        for got, want in zip(looped, cached):
+        for got, want in zip(looped, cached, strict=True):
             if isinstance(got, torch.Tensor):
                 assert torch.allclose(got, want, atol=1e-6)
             else:
@@ -372,7 +385,9 @@ class TestScoreSources:
         train, test = self._sources(reusable=False)
         with pytest.raises(ValueError, match="reusable"):
             score_sources(
-                train, test, "cpu",
+                train,
+                test,
+                "cpu",
                 prepare_test=lambda g: g,
                 score_block=_dot_score_block,
                 loop_over_test=True,
@@ -388,7 +403,9 @@ class TestScoreSources:
             return torch.zeros(train_g.batch_size, n_test)
 
         score_sources(
-            train, test, "cpu",
+            train,
+            test,
+            "cpu",
             prepare_test=lambda g: marker,
             score_block=score_block,
         )
@@ -402,7 +419,9 @@ class TestScoreSources:
         )
         train, test = self._sources(args=args)
         scores, *_ = score_sources(
-            train, test, "cpu",
+            train,
+            test,
+            "cpu",
             prepare_test=lambda g: g,
             score_block=_dot_score_block,
         )

@@ -404,9 +404,9 @@ class Gradient:
         """
         new_data: dict[str, GradientData] = {}
         for name, value in self.data.items():
-            if isinstance(value, Factorized):
-                new_data[name] = value.pin_memory()
-            elif value.device.type == "cpu" and not value.is_pinned():
+            if isinstance(value, Factorized) or (
+                value.device.type == "cpu" and not value.is_pinned()
+            ):
                 new_data[name] = value.pin_memory()
             else:
                 new_data[name] = value

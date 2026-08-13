@@ -69,16 +69,14 @@ def make_materialized_block(seed: int = 0, b: int = B) -> Gradient:
 
 
 def make_stream(n: int = 4, factory=make_block) -> list:
-    return [
-        (i, factory(seed=i), [f"h{i}-{j}" for j in range(B)]) for i in range(n)
-    ]
+    return [(i, factory(seed=i), [f"h{i}-{j}" for j in range(B)]) for i in range(n)]
 
 
 def assert_blocks_equal(a: Gradient, b: Gradient) -> None:
     assert a.layer_names == b.layer_names
     assert a.representation == b.representation
     assert a.indexing == b.indexing
-    for ta, tb in zip(_payload_tensors(a), _payload_tensors(b)):
+    for ta, tb in zip(_payload_tensors(a), _payload_tensors(b), strict=True):
         assert torch.equal(ta.cpu(), tb.cpu())
 
 
@@ -142,7 +140,11 @@ class TestPinMemory:
         pinned = make_block().pin_memory()
         again = pinned.pin_memory()
         # Already-pinned payloads pass through as the same tensor objects.
-        for t1, t2 in zip(_payload_tensors(pinned), _payload_tensors(again)):
+        for t1, t2 in zip(
+            _payload_tensors(pinned),
+            _payload_tensors(again),
+            strict=True,
+        ):
             assert t1 is t2
 
     @pinning_only
@@ -161,7 +163,11 @@ class TestPinMemory:
     def test_device_payloads_pass_through(self):
         block = make_block().to("cuda")
         pinned = block.pin_memory()
-        for t1, t2 in zip(_payload_tensors(block), _payload_tensors(pinned)):
+        for t1, t2 in zip(
+            _payload_tensors(block),
+            _payload_tensors(pinned),
+            strict=True,
+        ):
             assert t1 is t2  # nothing to pin on device
 
 
@@ -176,7 +182,7 @@ class TestPrefetchToDevice:
         blocks = make_stream(5)
         out = list(prefetch_to_device(iter(blocks), "cpu", depth=depth))
         assert len(out) == len(blocks)
-        for (step, g, hashes), (o_step, o_g, o_hashes) in zip(blocks, out):
+        for (step, g, hashes), (o_step, o_g, o_hashes) in zip(blocks, out, strict=True):
             assert o_step == step
             assert o_hashes == hashes
             assert_blocks_equal(g, o_g)
@@ -222,22 +228,28 @@ class TestPrefetchToDevice:
         out = list(prefetch_to_device(iter(blocks), "cuda", depth=depth))
         torch.cuda.synchronize()
         assert [o[0] for o in out] == [b[0] for b in blocks]
-        for (_, g, hashes), (_, o_g, o_hashes) in zip(blocks, out):
+        for (_, g, hashes), (_, o_g, o_hashes) in zip(blocks, out, strict=True):
             assert o_g.device.type == "cuda"
             assert o_hashes == hashes
             assert_blocks_equal(g, o_g)
 
     @cuda_only
-    def test_cuda_resident_blocks_pass_through(self):
+    @pytest.mark.parametrize("spec", ["cuda", "cuda:0", torch.device("cuda")])
+    def test_cuda_resident_blocks_pass_through(self, spec):
+        """An already-resident block must be handed through, not re-copied.
+
+        Regression: tensors always report an indexed device, and
+        ``torch.device("cuda") != torch.device("cuda:0")``, so an unindexed
+        target used to miss the residency check and copy device->device.
+        """
         dev_block = make_block().to("cuda")
-        out = list(prefetch_to_device(iter([(0, dev_block, ["h"])]), "cuda"))
-        assert out[0][1] is dev_block  # no copy for already-resident blocks
+        out = list(prefetch_to_device(iter([(0, dev_block, ["h"])]), spec))
+        assert out[0][1] is dev_block
 
     @cuda_only
     def test_cuda_depth_zero_is_synchronous(self):
         blocks = make_stream(3)
         out = list(prefetch_to_device(iter(blocks), "cuda", depth=0))
-        for (_, g, _), (_, o_g, _) in zip(blocks, out):
+        for (_, g, _), (_, o_g, _) in zip(blocks, out, strict=True):
             assert o_g.device.type == "cuda"
             assert_blocks_equal(g, o_g)
-

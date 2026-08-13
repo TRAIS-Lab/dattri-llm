@@ -169,11 +169,15 @@ class TestAsyncGradientWriter:
         fm = GatedFileManager(fail=boom)
         fm.gate.set()
         w = AsyncGradientWriter(fm, max_pending=1)
-        for i in range(4):  # would deadlock if failed groups kept the queue full
-            try:
+
+        def submit_until_error() -> None:
+            # Would deadlock instead of raising if failed groups were left
+            # occupying the queue.
+            for i in range(4):
                 w.submit([make_record(i)])
-            except RuntimeError:
-                break
+
+        with pytest.raises(RuntimeError, match="boom"):
+            submit_until_error()
         with pytest.raises(RuntimeError, match="boom"):
             w.close()
         assert fm.saved == []
@@ -273,9 +277,7 @@ class FakeStreamer:
 
 
 def make_blocks(n=4):
-    return [
-        (i, make_record(i).gradient, [f"h{i}-0", f"h{i}-1"]) for i in range(n)
-    ]
+    return [(i, make_record(i).gradient, [f"h{i}-0", f"h{i}-1"]) for i in range(n)]
 
 
 class TestCollectToDiskAsync:

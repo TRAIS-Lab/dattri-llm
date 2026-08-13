@@ -99,7 +99,9 @@ def collect_to_disk(
         )
     if async_write is None:
         async_write = getattr(
-            getattr(streamer, "_args", None), "async_disk_write", False,
+            getattr(streamer, "_args", None),
+            "async_disk_write",
+            False,
         )
     writer = None
     if async_write:
@@ -156,7 +158,7 @@ def _rebatch_blocks(
     batch_size: int,
 ) -> Iterable[tuple[list[int], Gradient, list[str]]]:
     """Re-batch a source's collection blocks into ``batch_size``-sample scoring
-    batches, yielding ``(per_row_steps, Gradient, per_row_ids)`` on the host.
+    batches.
 
     Each layer's ``(B, D)`` materialized tensors are concatenated to ``(K, D)``
     (one ``cat`` per layer, O(N) not pairwise), collapsing the tiny per-block
@@ -165,6 +167,10 @@ def _rebatch_blocks(
     concatenation stays on the source device; the device move is the
     consumer's job, so it can be overlapped
     (:func:`~dattri_llm.gradient.prefetch.prefetch_to_device`).
+
+    Yields:
+        ``(per_row_steps, Gradient, per_row_ids)`` host-resident batches, in
+        the source's sample order.
     """
     pending: dict[str, list[torch.Tensor]] = {}
     pending_ids: list[str] = []
@@ -175,9 +181,7 @@ def _rebatch_blocks(
     def build() -> tuple[list[int], Gradient, list[str]]:
         nonlocal pending, pending_ids, pending_steps, pending_n
         # One cat per layer (O(N) copies, not pairwise O(N^2)).
-        data = {
-            name: torch.cat(tensors, dim=0) for name, tensors in pending.items()
-        }
+        data = {name: torch.cat(tensors, dim=0) for name, tensors in pending.items()}
         big = Gradient(
             representation=meta.representation,
             data=data,

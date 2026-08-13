@@ -123,8 +123,8 @@ class AsyncGradientWriter:
                 self._error = None
             raise error
 
+    @staticmethod
     def _record_events(
-        self,
         records: list[GradientRecord],
     ) -> list[tuple[torch.device, torch.cuda.Event]]:
         """Fence the producer's in-flight kernels for every CUDA device that
@@ -174,7 +174,7 @@ class AsyncGradientWriter:
             stream = self._copy_stream(device)
             stream.wait_event(event)
         if len(events) == 1:
-            (device, _), = events
+            ((device, _),) = events
             stream = self._copy_stream(device)
             with torch.cuda.stream(stream):
                 records = [self._cpu_record(r) for r in records]

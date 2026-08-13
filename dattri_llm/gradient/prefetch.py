@@ -38,9 +38,8 @@ _copy_streams: dict[int, torch.cuda.Stream] = {}
 
 
 def _copy_stream(device: torch.device) -> torch.cuda.Stream:
-    index = (
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
+    """The shared copy stream for *device* (which must carry an index)."""
+    index = device.index
     stream = _copy_streams.get(index)
     if stream is None:
         stream = torch.cuda.Stream(device=index)
@@ -96,8 +95,16 @@ def prefetch_to_device(
             yield meta, gradient.to(device), meta2
         return
 
+    # Resolve a bare "cuda" to the concrete current device: tensors always
+    # report an indexed device, and ``torch.device("cuda") != cuda:0``, so
+    # without this the already-resident check below never fires and every
+    # block is pointlessly re-copied.
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
     stream = _copy_stream(device)
-    # (meta, device_gradient, meta2, copy_event | None, host_ref | None)
+    # Entries are (meta, device_gradient, meta2, copy_event, host_ref); the
+    # last two are None for a block that was already resident.
     pending: deque[tuple] = deque()
     it = iter(blocks)
 
@@ -128,12 +135,14 @@ def prefetch_to_device(
         return meta, dev_g, meta2
 
     exhausted = False
+    sentinel = object()
     while True:
         while not exhausted and len(pending) <= depth:
-            try:
-                pending.append(stage(next(it)))
-            except StopIteration:
+            item = next(it, sentinel)
+            if item is sentinel:
                 exhausted = True
+            else:
+                pending.append(stage(item))
         if not pending:
             return
         yield finalize(pending.popleft())
