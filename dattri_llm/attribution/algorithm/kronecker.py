@@ -328,7 +328,10 @@ class _KroneckerBaseAttributor(BaseAttributor):
         training gradients.
         """
         ctx = self._damp_ctx(raw_ctx, damping)
-        fim_ctx = {layer: ops.sym_inverse(F, damping) for layer, F in raw_fim.items()}
+        # The dense empirical Fisher blocks are large (up to
+        # ``direct_fim_max_params`` wide); invert them with Cholesky rather than
+        # the eigendecomposition ``_damp_ctx`` uses for the small K-FAC factors.
+        fim_ctx = {layer: ops.dense_inverse(F, damping) for layer, F in raw_fim.items()}
         return ctx, fim_ctx
 
     def _fit_context(
