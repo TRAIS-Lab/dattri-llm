@@ -935,6 +935,68 @@ class Gradient:
             total /= norm_sq_s.sqrt()[:, None] * norm_sq_o.sqrt()[None, :] + eps
         return total
 
+    def similarity_per_token(
+        self,
+        other: Gradient,
+        reduce: Literal["none", "all"] = "all",
+    ) -> dict[str, torch.Tensor] | torch.Tensor:
+        """Per-token-position gradient similarity: the influence of *each of this
+        gradient's token positions* against ``other``.
+
+        Where :meth:`similarity` returns the ``(B_self, B_other)`` cross-gram
+        ``K[i, j] = <dW_i, dW_j>``, this keeps ``self``'s token axis, returning
+        ``(B_self, T_self, B_other)`` with ``K[i, t, j]`` = the contribution of
+        ``self`` sample ``i``'s **token position ``t``**.  Summing over ``t``
+        recovers :meth:`similarity` exactly, so a token heatmap is a decomposition
+        of the ordinary attribution score, not a separate quantity.
+
+        This is *per-token-position* attribution, not per-token influence: the
+        backward gradient is taken over all positions as usual (autograd offers no
+        cheaper single-position gradient), and we merely pick out each position's
+        component of the already-captured factorized gradient.  Only factorized
+        (``"batch_token"``-indexed) layers carry a token axis; layers stored
+        materialized -- or captured with ``"batch"`` indexing -- have already
+        contracted it away and are skipped.
+
+        Args:
+            other: Gradient to attribute against (a target/reference batch).
+            reduce: ``"none"`` returns ``{layer: (B_self, T_self, B_other)}``;
+                ``"all"`` (default) sums the per-layer tensors into one
+                ``(B_self, T_self, B_other)`` full-model per-token cross-gram.
+
+        Returns:
+            ``{layer: (B_self, T_self, B_other)}`` for ``reduce="none"``, else a
+            single ``(B_self, T_self, B_other)`` tensor.
+        """
+        if reduce not in {"none", "all"}:
+            raise ValueError("reduce must be 'none' or 'all'")
+
+        per_layer: dict[str, torch.Tensor] = {}
+        for name in self.layer_names:
+            if name not in other.data:
+                continue
+            sv = self.data[name]
+            ov = other.data[name]
+            # A token axis exists only for factorized batch_token layers on self.
+            if not (
+                isinstance(sv, Factorized)
+                and isinstance(ov, Factorized)
+                and self._layer_indexing(name) == "batch_token"
+            ):
+                continue
+            per_layer[name] = ops.cross_dot_per_token(sv, ov, self.layer_types[name])
+
+        if reduce == "none":
+            return per_layer
+        if not per_layer:
+            raise ValueError(
+                "No shared factorized batch_token layers for per-token similarity"
+            )
+        # Full-model per-token cross-gram: the per-layer tensors share
+        # (B_self, T_self, B_other) and sum, since the whole-model gradient is the
+        # concatenation of its layers.
+        return torch.stack(list(per_layer.values())).sum(0)
+
     def _layer_cross_matrix(
         self,
         other: Gradient,

@@ -20,7 +20,12 @@ if TYPE_CHECKING:
 # config).  ``logra_*`` are the double-sided (Kronecker) factor projection --
 # keeping the factors, or materializing them into a compact per-sample block;
 # ``materialized`` is the single-sided (TRAK) materialize-then-project.
-PROJECTION_STYLES = ("logra_factorized", "logra_materialized", "materialized")
+PROJECTION_STYLES = (
+    "auto",
+    "logra_factorized",
+    "logra_materialized",
+    "materialized",
+)
 
 
 def _apply_projector(
@@ -287,6 +292,37 @@ def project_factorized(
     )
 
 
+def maybe_materialize_projected(
+    seq_len: int,
+    k_a: int,
+    k_g: int,
+    kappa: float = 1.0,
+) -> bool:
+    """``True`` when the projected factors should be materialized at capture.
+
+    The scoring path already routes between the factorized and materialized
+    cross-gram by :func:`~dattri_llm.gradient.ops.dot.maybe_use_materialized_gram`;
+    capture had no equivalent, so a projected capture kept the token axis however
+    unfavourable that was.  The same rule applies here, on the *projected* dims:
+    per sample and layer the factors cost ``S*(k_a+k_g)`` while their outer
+    product costs ``k_a*k_g``, so materializing wins once
+
+        S >= H = k_a*k_g / (k_a + k_g).
+
+    Projection makes this bite: at ``k_a=k_g=64`` the crossover is ``H=32``, so a
+    512-token sequence stores 16x more as factors than as the outer product --
+    the opposite of the unprojected case, where ``H`` is in the hundreds and
+    keeping the factors is what saves memory.
+
+    ``kappa > 1`` biases toward keeping the factors (they are what per-token
+    attribution needs; the outer product has summed the token axis away).
+    """
+    denom = k_a + k_g
+    if denom <= 0:
+        return False
+    return seq_len >= kappa * (k_a * k_g) / denom
+
+
 def project_layer(
     f: Factorized | torch.Tensor,
     layer_type: str,
@@ -298,6 +334,10 @@ def project_layer(
     """Route one layer to one of the three projection styles.
 
     Returns ``(payload, is_factorized)``:
+
+    * ``"auto"`` -- project the factors, then keep or materialize them according
+      to :func:`maybe_materialize_projected`, the capture-time counterpart of the
+      scoring cost model.
 
     * ``"logra_factorized"`` -- double-sided (LoGRA) projection, **keeping the
       factors**: payload is the ``(a_p, g_p)`` tuple (the caller rewraps it into
@@ -314,6 +354,15 @@ def project_layer(
     are no factors to project), whatever the requested style.
     """
     if not isinstance(f, torch.Tensor):
+        if style == "auto":
+            a_p, g_p = project_factorized(f, layer_type, projector, **proj_kwargs)
+            # Decide on the ACTUAL projected shapes rather than the requested
+            # proj_dim: a layer may project asymmetrically, and the bias column
+            # (include_bias) widens one side.
+            seq_len = a_p.shape[1] if a_p.ndim == 3 else 1
+            if maybe_materialize_projected(seq_len, a_p.shape[-1], g_p.shape[-1]):
+                return _materialize(a_p, g_p, "nn.Linear"), False
+            return (a_p, g_p), True
         if style == "logra_factorized":
             return project_factorized(f, layer_type, projector, **proj_kwargs), True
         if style == "logra_materialized":

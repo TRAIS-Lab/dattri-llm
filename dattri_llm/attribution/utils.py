@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from itertools import chain
 from typing import TYPE_CHECKING
 
 import torch
 
+from dattri_llm.attribution.memory import safe_prefetch_depth
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
 from dattri_llm.gradient.prefetch import prefetch_to_device
 
@@ -140,17 +142,51 @@ def _score_one(
     cached_test: list[tuple[object, list[str]]],
     test_index: dict[str, int],
     num_test: int,
-    score_block: Callable[[Gradient, object, int], torch.Tensor],
+    score_block: Callable[[Gradient, object, int, bool], torch.Tensor],
 ) -> torch.Tensor:
     """Cross-gram one device-resident train block against every cached test
     block, returning its ``(B_train, num_test)`` CPU row chunk.
     """
+    # A materialization cache on the train side only pays off when the same
+    # train block is scored against MORE THAN ONE test block: with a single
+    # block every layer is materialized once and used once, so caching it is
+    # pure retention (at full dimension, several GB per block held for nothing).
+    reuse = len(cached_test) > 1
     row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
     for test_rep, test_hashes in cached_test:
         cols = [test_index[h] for h in test_hashes]
-        block = score_block(train_g, test_rep, len(cols))
+        block = score_block(train_g, test_rep, len(cols), reuse)
         row[:, cols] = block.detach().to("cpu", torch.float)
     return row
+
+
+def _budgeted_prefetch(
+    blocks: Iterable,
+    device: object,
+    depth: int,
+) -> Iterable:
+    """:func:`prefetch_to_device` with the depth capped to what fits the device.
+
+    Prefetching keeps ``depth + 1`` blocks resident.  A projected block is a few
+    MB and the requested depth is always affordable, but a full-dimension block
+    is a sizeable fraction of the card -- there, double buffering is itself
+    enough to exhaust it before any scoring happens.
+
+    The first block is pulled to size the decision and then chained back, so the
+    stream is consumed exactly once.  Only pass a **host-resident** stream (e.g.
+    :func:`_rebatch_blocks` output): peeking a live :class:`GradientStreamer`
+    advances the shared hook manager's step counter before the prefetcher runs,
+    which desynchronizes a concurrently-running train pass.
+    """
+    it = iter(blocks)
+    first = next(it, None)
+    if first is None:
+        return
+    yield from prefetch_to_device(
+        chain([first], it),
+        device,
+        depth=safe_prefetch_depth(first[1], device, depth),
+    )
 
 
 def _rebatch_blocks(
@@ -219,7 +255,7 @@ def _batched_train_score(
     cached_test: list[tuple[object, list[str]]],
     test_index: dict[str, int],
     num_test: int,
-    score_block: Callable[[Gradient, object, int], torch.Tensor],
+    score_block: Callable[[Gradient, object, int, bool], torch.Tensor],
     batch_size: int,
     prefetch_depth: int = 1,
 ) -> tuple[torch.Tensor, list[str], list[int]]:
@@ -235,11 +271,7 @@ def _batched_train_score(
     row_steps: list[int] = []
 
     batches = _rebatch_blocks(train_source, batch_size)
-    for steps, train_g, ids in prefetch_to_device(
-        batches,
-        device,
-        depth=prefetch_depth,
-    ):
+    for steps, train_g, ids in _budgeted_prefetch(batches, device, prefetch_depth):
         row_chunks.append(
             _score_one(train_g, cached_test, test_index, num_test, score_block),
         )
@@ -260,7 +292,7 @@ def score_sources(
     device: object,
     *,
     prepare_test: Callable[[Gradient], object],
-    score_block: Callable[[Gradient, object, int], torch.Tensor],
+    score_block: Callable[[Gradient, object, int, bool], torch.Tensor],
     loop_over_test: bool = False,
 ) -> tuple[torch.Tensor, list[str], list[int], list[str]]:
     """Shared scoring skeleton for the trajectory-agnostic attributors.
@@ -277,9 +309,11 @@ def score_sources(
     * ``prepare_test(test_g) -> rep`` turns a device-resident test block into the
       representation ``score_block`` consumes (identity for TracIn; whitened /
       FIM reps for K-FAC).
-    * ``score_block(train_g, rep, n_test) -> (B_train, n_test)`` is the actual
+    * ``score_block(train_g, rep, n_test, reuse) -> (B_train, n_test)`` is the actual
       (preconditioned) cross-gram for one train block against one prepared test
-      block.
+      block.  ``reuse`` is ``True`` only when this train block will be scored
+      against further test blocks, and is the sole licence to retain a
+      materialized copy of it.
 
     Args:
         train_source: Source of train blocks; iterated **once** (a single-shot
@@ -378,7 +412,9 @@ def score_sources(
         ):
             test_rep = prepare_test(test_g)
             cols = [test_index[h] for h in test_hashes]
-            block = score_block(train_g, test_rep, len(cols))
+            # loop_over_test re-streams the test side per train block, so the
+            # same train block IS revisited -- retaining it is worthwhile here.
+            block = score_block(train_g, test_rep, len(cols), reuse=True)
             row[:, cols] = block.detach().to("cpu", torch.float)
         row_chunks.append(row)
         row_train_ids.extend(train_hashes)

@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from dattri_llm.attribution.base import BaseAttributor
+from dattri_llm.attribution.memory import DENSE_CACHE, can_cache, dense_nbytes
 from dattri_llm.attribution.score import AttributionScore
 from dattri_llm.attribution.utils import (
     collect_to_disk,
@@ -70,22 +71,64 @@ if TYPE_CHECKING:
 _TRAIN_MAT_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
+def _register_dense(source: Gradient, dense: Gradient) -> Gradient:
+    """Charge ``dense`` to the shared budget and return it.
+
+    ``Gradient.materialize`` returns ``self`` for an already-dense block, which
+    is not a new allocation and must not be counted.
+    """
+    if dense is not source:
+        DENSE_CACHE.register(dense, dense_nbytes(source))
+    return dense
+
+
 def _cached_similarity(
     train_g: Gradient,
     test_rep: Gradient,
     metric: str,
+    reuse: bool = True,
 ) -> torch.Tensor:
-    """Cross-gram of a train block against an already-materialized test block.
+    """Cross-gram of a train block against a prepared test block.
 
-    ``test_rep`` is materialized once by ``prepare_test``; the train block is
-    materialized once here and reused across the fixed test blocks, so the score
-    is a bare dot instead of re-materializing both factorized sides per pair.
+    When the dense form fits the caching budget, the train block is materialized
+    once here and reused across the fixed test blocks, so the score is a bare dot
+    instead of re-materializing both factorized sides per pair.
+
+    Over budget -- which at full dimension is ~1 GB *per sample* -- the block is
+    left factorized and scored through :meth:`Gradient.similarity`, whose kernel
+    materializes at most one layer at a time.  Caching is an optimization and must
+    never be the reason a run runs out of memory (see
+    :mod:`dattri_llm.attribution.memory`).
     """
-    train_mat = _TRAIN_MAT_CACHE.get(train_g)
-    if train_mat is None:
-        train_mat = train_g.materialize()
+    # Retaining a dense copy of the train block only pays off when it will be
+    # scored against another test block; with one test block it is written and
+    # never read (see ``score_sources``).
+    train_mat = _TRAIN_MAT_CACHE.get(train_g) if reuse else None
+    if (
+        reuse
+        and train_mat is None
+        and can_cache(
+            train_g,
+            train_g.device,
+            reserve=DENSE_CACHE.held(),
+        )
+    ):
+        train_mat = _register_dense(train_g, train_g.materialize())
         _TRAIN_MAT_CACHE[train_g] = train_mat
-    return train_mat.similarity(test_rep, metric=metric, reduce="all")
+    source = train_mat if train_mat is not None else train_g
+    return source.similarity(test_rep, metric=metric, reduce="all")
+
+
+def _prepare_test_budgeted(test_g: Gradient) -> Gradient:
+    """Materialize the test block only if the dense form fits the budget.
+
+    Returning the factorized block when it does not keeps both sides factorized:
+    a dense test side would otherwise force ``similarity`` to materialize the
+    train side to match it, reintroducing the very allocation the budget avoids.
+    """
+    if not can_cache(test_g, test_g.device, reserve=DENSE_CACHE.held()):
+        return test_g
+    return _register_dense(test_g, test_g.materialize())
 
 
 class TracInAttributor(BaseAttributor):
@@ -286,8 +329,13 @@ class TracInAttributor(BaseAttributor):
             train_source,
             test_source,
             self.args.device,
-            prepare_test=lambda g: g.materialize(),
-            score_block=lambda tr, te, _n: _cached_similarity(tr, te, metric),
+            prepare_test=_prepare_test_budgeted,
+            score_block=lambda tr, te, _n, reuse=True: _cached_similarity(
+                tr,
+                te,
+                metric,
+                reuse=reuse,
+            ),
             loop_over_test=loop_over_test,
         )
         result = AttributionScore(
@@ -438,8 +486,13 @@ class TracInAttributor(BaseAttributor):
         device = self.args.device
         name, metric = self._label(normalized_grad)
 
-        def score_block(tr: Gradient, te: Gradient, _n: int) -> torch.Tensor:
-            return _cached_similarity(tr, te, metric)
+        def score_block(
+            tr: Gradient,
+            te: Gradient,
+            _n: int,
+            reuse: bool = True,
+        ) -> torch.Tensor:
+            return _cached_similarity(tr, te, metric, reuse=reuse)
 
         # Layer selection is the hook config's job; record what was hooked (the
         # scored layer set) for the AttributionScore metadata.
@@ -472,7 +525,7 @@ class TracInAttributor(BaseAttributor):
                     train,
                     test,
                     device,
-                    prepare_test=lambda g: g.materialize(),
+                    prepare_test=_prepare_test_budgeted,
                     score_block=score_block,
                     loop_over_test=loop_over_test,
                 )

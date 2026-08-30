@@ -147,6 +147,92 @@ def _pairwise_dot(
 
 
 # ---------------------------------------------------------------------------
+# per-token-position cross-gram
+# ---------------------------------------------------------------------------
+
+
+def _cross_gram_per_token(
+    a1: torch.Tensor,
+    g1: torch.Tensor,
+    a2: torch.Tensor,
+    g2: torch.Tensor,
+    layer_type: str,
+) -> torch.Tensor:
+    """Per-token-position cross-gram ``K[i, t, j]`` on *preprocessed* factors:
+    the contribution of side-1 sample ``i``'s **token position ``t``** to the
+    weight-gradient inner product ``<dW1_i, dW2_j>``.
+
+    This keeps side 1's token axis and sums out side 2's; summing the result over
+    ``t`` recovers the ordinary ``(B1, B2)`` cross-gram exactly (``sum_t K[i,t,j] =
+    <dW1_i, dW2_j>``), so a token heatmap is a *decomposition* of the score, not a
+    different quantity.  Only the factorized (ghost) representation admits this --
+    the materialized path has already contracted the token axis away.  Returns a
+    ``(B1, T1, B2)`` tensor.
+    """
+    if is_embedding(layer_type):
+        tok1, tok2 = a1, a2  # (B1, T1), (B2, T2) int
+        g1_f, g2_f = g1.float(), g2.float()
+        B1, T1 = tok1.shape
+        B2, T2 = tok2.shape
+        E = g1_f.shape[-1]
+        vocab = int(max(tok1.max().item(), tok2.max().item())) + 1
+        flat1 = tok1.reshape(-1)
+        out = torch.zeros(B1, T1, B2, dtype=g1_f.dtype, device=g1_f.device)
+        for j in range(B2):
+            g2_sum = torch.zeros(vocab, E, dtype=g2_f.dtype, device=g2_f.device)
+            g2_sum.scatter_add_(0, tok2[j].unsqueeze(-1).expand(T2, E), g2_f[j])
+            gathered = g2_sum[flat1].reshape(B1, T1, E)  # (B1, T1, E)
+            out[:, :, j] = (g1_f * gathered).sum(-1)
+        return out
+
+    a1_f = _to_3d(a1.float())
+    g1_f = _to_3d(g1.float())
+    a2_f = _to_3d(a2.float())
+    g2_f = _to_3d(g2.float())
+
+    if is_norm(layer_type):
+        # dW2_j = sum_s x_hat2_js * g2_js (d-vector, diagonal). Query token t's
+        # contribution is (x_hat1_it * g1_it) dotted into it.
+        grad2 = (a2_f * g2_f).sum(1)  # (B2, d)
+        contrib = a1_f * g1_f  # (B1, T1, d)
+        return torch.einsum("btd,cd->btc", contrib, grad2)
+
+    # Linear/Conv family: materialize side 2's per-sample weight grad (K,D) once,
+    # then contract each side-1 token's rank-1 (a1_it (x) g1_it) against it.
+    m2 = torch.einsum("csk,csd->ckd", a2_f, g2_f)  # (B2, K, D)
+    return torch.einsum("btk,btd,ckd->btc", a1_f, g1_f, m2)  # (B1, T1, B2)
+
+
+def cross_dot_per_token(
+    f1: Factorized,
+    f2: Factorized,
+    layer_type: str,
+    include_bias: bool = True,
+) -> torch.Tensor:
+    """Per-token-position cross-gram on two :class:`Factorized` (batch-first-safe).
+
+    Returns ``(B1, T1, B2)`` -- side-1 token positions preserved; see
+    :func:`_cross_gram_per_token`.
+    """
+    b1, b2 = f1.as_batch_first(), f2.as_batch_first()
+    a1, g1 = _preprocess_factorized(
+        b1.activation,
+        b1.pre_activation_grad,
+        layer_type,
+        b1.module_kwargs,
+        include_bias,
+    )
+    a2, g2 = _preprocess_factorized(
+        b2.activation,
+        b2.pre_activation_grad,
+        layer_type,
+        b2.module_kwargs,
+        include_bias,
+    )
+    return _cross_gram_per_token(a1, g1, a2, g2, layer_type)
+
+
+# ---------------------------------------------------------------------------
 # dot
 # ---------------------------------------------------------------------------
 

@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from dattri_llm.attribution.base import BaseAttributor
+from dattri_llm.attribution.memory import cache_fits
 from dattri_llm.attribution.score import AttributionScore
 from dattri_llm.attribution.utils import (
     collect_to_disk,
@@ -524,9 +525,22 @@ class _KroneckerBaseAttributor(BaseAttributor):
             }
             return kfac_rep, fim_rep
 
-        def score(train_g: Gradient, rep: object, n_test: int) -> torch.Tensor:
+        def score(
+            train_g: Gradient,
+            rep: object,
+            n_test: int,
+            reuse: bool = True,
+        ) -> torch.Tensor:
             test_rep, fim_rep = rep
-            return self._combine_score(train_g, test_rep, fim_rep, ctx, fim_ctx, n_test)
+            return self._combine_score(
+                train_g,
+                test_rep,
+                fim_rep,
+                ctx,
+                fim_ctx,
+                n_test,
+                reuse,
+            )
 
         # Precondition once and re-stream the (small) store per train block.  An
         # explicit dir gives a durable disk store; otherwise an ephemeral
@@ -1283,6 +1297,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         ctx: object,
         fim_ctx: dict[str, torch.Tensor],
         n_test: int,
+        reuse: bool = True,
     ) -> torch.Tensor:
         """Sum the K-FAC and direct-Fisher contributions for one train/test pair.
 
@@ -1293,7 +1308,7 @@ class _KroneckerBaseAttributor(BaseAttributor):
         """
         block: torch.Tensor | None = None
         if ctx:
-            block = self._score(train_g, test_rep, ctx)
+            block = self._score(train_g, test_rep, ctx, reuse)
         fim_block = self._score_fim(train_g, fim_test_rep, fim_ctx)
         if fim_block is not None:
             block = fim_block if block is None else block + fim_block
@@ -1387,16 +1402,25 @@ class KFACAttributor(_KroneckerBaseAttributor):
         train_g: Gradient,
         test_rep: dict[str, object],
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        reuse: bool = True,
     ) -> torch.Tensor | None:
         # ``score_sources`` calls ``_score`` with the *same* ``train_g`` for
         # every cached test block, so materialize each train layer **once** and
         # reuse it across the test loop (previously the outer product was rebuilt
         # on every train x test call).  The cache is keyed weakly on the block,
         # so it evicts automatically when the block is dropped -- no id() reuse.
-        tr_mat = _TRAIN_MAT_CACHE.get(train_g)
-        if tr_mat is None:
-            tr_mat = {}
-            _TRAIN_MAT_CACHE[train_g] = tr_mat
+        # ``reuse`` is False when this train block is scored against exactly one
+        # test block -- the case once the test side is prepared in a single
+        # block.  Every layer is then materialized once and consumed once, so
+        # the cache is all writes and no reads: at full dimension that retains
+        # several GB per block for no benefit, on top of a test representation
+        # already holding one dense copy of the model's weights per query.
+        tr_mat: dict[str, torch.Tensor] | None = None
+        if reuse:
+            tr_mat = _TRAIN_MAT_CACHE.get(train_g)
+            if tr_mat is None:
+                tr_mat = {}
+                _TRAIN_MAT_CACHE[train_g] = tr_mat
         total: torch.Tensor | None = None
         for layer in ctx:
             rep = test_rep.get(layer)
@@ -1408,7 +1432,7 @@ class KFACAttributor(_KroneckerBaseAttributor):
                 # the raw materialized train gradient.  A compact train block is
                 # already materialized -- use it directly; a factorized block is
                 # materialized once (cached above) and reused.
-                M_tr = tr_mat.get(layer)
+                M_tr = tr_mat.get(layer) if tr_mat is not None else None
                 if M_tr is None:
                     train_val = train_g.data[layer]
                     M_tr = (
@@ -1416,7 +1440,15 @@ class KFACAttributor(_KroneckerBaseAttributor):
                         if isinstance(train_val, torch.Tensor)
                         else ops.materialize(train_val, train_g.layer_types[layer])
                     )
-                    tr_mat[layer] = M_tr
+                    # Retain the dense layer only while the accumulated cache
+                    # stays inside the budget; past it the layer is recomputed
+                    # per (train, test) pair, which is slower but bounded.
+                    if tr_mat is not None and cache_fits(
+                        tr_mat,
+                        M_tr,
+                        train_g.device,
+                    ):
+                        tr_mat[layer] = M_tr
                 block = M_tr @ rep.to(M_tr.dtype).T
             else:
                 # Whitened-factor rep: raw train factors cross-grammed against
@@ -1620,24 +1652,40 @@ class EKFACAttributor(_KroneckerBaseAttributor):
         train_g: Gradient,
         test_mats: dict[str, torch.Tensor],
         ctx: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        reuse: bool = True,
     ) -> torch.Tensor | None:
         # Materialize each train layer once and reuse across the (fixed) cached
         # test blocks -- the same block is scored against every test block, so
         # ``ops.materialize`` was re-run per train x test call.  Cache keyed
         # weakly on the block (shared with K-FAC: both materialize the same way).
-        tr_mat = _TRAIN_MAT_CACHE.get(train_g)
-        if tr_mat is None:
-            tr_mat = {}
-            _TRAIN_MAT_CACHE[train_g] = tr_mat
+        # ``reuse`` is False when this train block is scored against exactly one
+        # test block -- the case once the test side is prepared in a single
+        # block.  Every layer is then materialized once and consumed once, so
+        # the cache is all writes and no reads: at full dimension that retains
+        # several GB per block for no benefit, on top of a test representation
+        # already holding one dense copy of the model's weights per query.
+        tr_mat: dict[str, torch.Tensor] | None = None
+        if reuse:
+            tr_mat = _TRAIN_MAT_CACHE.get(train_g)
+            if tr_mat is None:
+                tr_mat = {}
+                _TRAIN_MAT_CACHE[train_g] = tr_mat
         total: torch.Tensor | None = None
         for layer in ctx:
             M_te = test_mats.get(layer)  # (B_te, D), fully preconditioned
             if M_te is None or layer not in train_g.data:
                 continue
-            M_tr = tr_mat.get(layer)  # (B_tr, D) raw weight gradient -- no rotation
+            M_tr = tr_mat.get(layer) if tr_mat is not None else None
             if M_tr is None:
                 M_tr = ops.materialize(train_g.data[layer], train_g.layer_types[layer])
-                tr_mat[layer] = M_tr
+                # Bounded cache: past the budget the layer is recomputed per
+                # (train, test) pair rather than retained.
+                if tr_mat is not None and cache_fits(
+                    tr_mat,
+                    M_tr,
+                    train_g.device,
+                ):
+                    tr_mat[layer] = M_tr
             block = M_tr @ M_te.to(M_tr.dtype).T  # (B_tr, B_te)
             total = block if total is None else total + block
         return total  # None when no layer overlaps; _combine_score zero-fills
