@@ -18,3 +18,11 @@ experiments/results/
 experiments/**/*.jsonl
 experiments/**/*.png
 experiments/**/*.ipynb
+
+# Exception: the Modal benchmark's committed record.  `aggregate.jsonl` is the
+# measured run behind the paper's scaling figures and the panels are rendered
+# from it by `plot.py`; keeping them in the tree is what lets a figure be traced
+# to the rows that produced it.  Scoped to that one directory -- everything else
+# under experiments/ stays ignored.
+!experiments/benchmark/modal/results/*.jsonl
+!experiments/benchmark/modal/results/*.png
