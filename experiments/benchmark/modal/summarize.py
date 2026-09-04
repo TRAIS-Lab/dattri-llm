@@ -42,11 +42,97 @@ def load(paths: list[str]) -> list[dict]:
     return rows
 
 
-def attribute_phase(rec: dict) -> dict | None:
-    """The timed attribution phase.  FSDP runs name it 'score'; the rest
-    'attribute'.  'cache' is the capture pass and is reported separately."""
-    by = {p["phase"]: p for p in rec.get("phases", [])}
-    return by.get("attribute") or by.get("score")
+def dtype_provenance(recs: list[dict]) -> None:
+    """Warn when a row's dtype came from the task rather than from the adapter.
+
+    `task["dtype"]` is what the experiment ASKED for; a top-level `dtype` is
+    what the adapter actually built. When an adapter ignores the override the
+    two diverge silently and every row still reads the same, so a mixed-dtype
+    check on the task field sees nothing wrong. That is exactly how a
+    cross-library ladder ended up comparing fp32 against bf16 at three of four
+    scales, undetected.
+    """
+    unstated = sorted({r["lib"] for r in recs if not r.get("dtype")})
+    if unstated:
+        print(f"  !! {', '.join(unstated)}: no adapter-reported dtype -- the row "
+              "shows what the experiment asked for, not what ran")
+    built = {}
+    for r in recs:
+        if r.get("dtype"):
+            built.setdefault(r["lib"], set()).add(r["dtype"])
+    if len({d for ds in built.values() for d in ds}) > 1:
+        print(f"  !! libraries did not share one dtype: "
+              f"{ {k: sorted(v) for k, v in built.items()} }")
+
+
+# Phases that are setup, not attribution.  Every other phase a library records
+# is attribution work, and the names differ per library because each was written
+# against its own pipeline:
+#     dattri_llm   attribute            (single)   /  cache + score  (FSDP)
+#     bergson      fit + score
+#     kronfluence  fit_factors + pairwise_scores
+# Reading one hard-coded name understated kronfluence to ~0 s and would have
+# drawn its curve along the axis.  Summing the non-setup phases is the only rule
+# that is correct for all three, and it leaves single-device dattri_llm rows
+# unchanged (their sole non-setup phase IS `attribute`).
+SETUP_PHASES = frozenset({"build_model", "load_data"})
+
+
+def attribution_phases(rec: dict) -> list[dict]:
+    return [p for p in rec.get("phases", []) if p["phase"] not in SETUP_PHASES]
+
+
+def attribution_time(rec: dict) -> float | None:
+    ps = attribution_phases(rec)
+    return sum(p["wall_s"] for p in ps) if ps else None
+
+
+def attribution_units(rec: dict) -> int | None:
+    for p in attribution_phases(rec):
+        if p.get("work_units"):
+            return p["work_units"]
+    return None
+
+
+def attribution_peak(rec: dict) -> float:
+    return max((g["alloc_gb"] for p in attribution_phases(rec)
+                for g in p.get("gpu_peak", [])), default=0.0)
+
+
+def mem_basis(rec: dict) -> str:
+    """How this row's GPU peak was measured.
+
+    Not every library can be instrumented the same way.  Adapters that run the
+    model in-process report `torch.cuda.max_memory_allocated` -- allocator bytes
+    only.  bergson runs through its own CLI in a SUBPROCESS, where those
+    counters see nothing, so its adapter polls `nvidia-smi memory.used`, which
+    is the whole process: allocator bytes PLUS reserved-but-unallocated PLUS the
+    CUDA context.  On one measured row reserved alone was 1.14x allocated before
+    context, so comparing smi-used against allocated overstates bergson by
+    roughly 20%.  The tell is structural: BenchRun emits `reserved_gb`, the
+    nvidia-smi path cannot.
+    """
+    for p in attribution_phases(rec):
+        for g in p.get("gpu_peak", []):
+            return "torch_allocated" if "reserved_gb" in g else "nvidia_smi_used"
+    return "unknown"
+
+
+def comparable_peak(rec: dict) -> float:
+    """Peak on the SAME basis for every library: whole-process device memory.
+
+    For torch-instrumented rows that means `reserved_gb`, the closest analogue
+    to what nvidia-smi reports; for bergson it is the smi reading as recorded.
+    A residual bias remains -- reserved still excludes the CUDA context that
+    smi-used includes, a few hundred MB -- and it favours the torch-measured
+    libraries, so this is the conservative direction for a claim that ours uses
+    less.  Use `run_peak` for single-library panels, where the paper's
+    allocated-bytes convention applies and nothing is being compared across
+    measurement methods.
+    """
+    key = "reserved_gb" if mem_basis(rec) == "torch_allocated" else "alloc_gb"
+    return max((g.get(key, g["alloc_gb"]) for p in attribution_phases(rec)
+                for g in p.get("gpu_peak", [])), default=0.0)
 
 
 def peak_alloc(phase: dict) -> float:
@@ -65,7 +151,7 @@ def by_family(rows: list[dict], method: str) -> None:
     `scaling-families-H200`, which puts both ladders on one card, or pass two
     result dirs from the same GPU.
     """
-    sel = [r for r in rows if r["task"]["method"] == method and attribute_phase(r)]
+    sel = [r for r in rows if r["task"]["method"] == method and attribution_time(r)]
     if not sel:
         print(f"\nno rows for method={method!r}")
         return
@@ -87,9 +173,11 @@ def by_family(rows: list[dict], method: str) -> None:
           f"{'s/smp':>8} {'peakGB':>8}")
     recs = []
     for r in sel:
-        t, ph = r["task"], attribute_phase(r)
-        recs.append((t["params_b"], t["family"], t["scale"], ph["wall_s"],
-                     ph.get("s_per_sample"), peak_alloc(ph)))
+        t = r["task"]
+        n = attribution_units(r)
+        wall = attribution_time(r)
+        recs.append((t["params_b"], t["family"], t["scale"], wall,
+                     (wall / n) if n else None, attribution_peak(r)))
     for pb, fam, sc, wall, sps, gb in sorted(recs):
         sps_s = f"{sps:.3f}" if sps else "-"
         print(f"  {fam:>7} {sc:>6} {pb:>7.2f}B {wall:>8.1f} {sps_s:>8} {gb:>8.2f}")
@@ -168,6 +256,7 @@ def main() -> None:
     if not rows:
         print("no rows found")
         return
+    dtype_provenance(rows)
     if family_mode:
         by_family(rows, family_mode)
         return
@@ -176,18 +265,23 @@ def main() -> None:
         memory_curve(rows, set(sel.split(",")) if sel else None)
         return
 
+    # `lib` is part of the key.  Without it a cross-library file collapses every
+    # library into one grid and each cell keeps whichever row was written last,
+    # so a table can read as one coherent curve while its points come from
+    # different libraries.
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for r in rows:
         t = r["task"]
-        groups[(t["family"], t.get("proj_mode", "?"), t["parallelism"])].append(r)
+        groups[(t["family"], t.get("proj_mode", "?"), t["parallelism"],
+                r["lib"])].append(r)
 
-    for (family, proj, par), recs in sorted(groups.items()):
+    for (family, proj, par, lib), recs in sorted(groups.items()):
         gpus = {r["device"]["gpu_name"] for r in recs}
         dtypes = {r.get("dtype") or r["task"].get("dtype") or "?" for r in recs}
         methods = [m for m in METHOD_ORDER
                    if m in {r["task"]["method"] for r in recs}]
 
-        print(f"\n=== {family}  proj={proj}  {par} "
+        print(f"\n=== {lib}  {family}  proj={proj}  {par} "
               f"[{', '.join(sorted(gpus))} | {', '.join(sorted(dtypes))}] ===")
         if len(gpus) > 1 or len(dtypes) > 1:
             print("  !! MIXED: rows below are NOT directly comparable")
@@ -201,15 +295,16 @@ def main() -> None:
         scales: dict[str, float] = {}
         for r in recs:
             t = r["task"]
-            ph = attribute_phase(r)
-            if ph is None:
+            wall = attribution_time(r)
+            if wall is None:
                 continue
             scales[t["scale"]] = t["params_b"]
+            n = attribution_units(r)
             cells[t["scale"], t["method"]] = {
-                "s": ph["wall_s"],
-                "sps": ph.get("s_per_sample"),
-                "gb": peak_alloc(ph),
-                "n": ph.get("work_units"),
+                "s": wall,
+                "sps": (wall / n) if n else None,
+                "gb": attribution_peak(r),
+                "n": n,
                 "disk": r.get("disk_total_gb", 0.0),
             }
 

@@ -27,12 +27,37 @@ import tasks as T
 HERE = Path(__file__).resolve().parent
 
 # library -> (conda env, adapter script).  Only adapters that exist are runnable.
-# modal/-only: dattri_llm alone.  The logix / kronfluence / bergson adapters
-# are not carried here -- their packages are not installable in the image (this
-# repo records no install command for any of them), so an entry pointing at a
-# missing file could only fail at launch.  They remain in the parent tree.
+# modal/-only: dattri_llm, bergson and kronfluence.  The logix adapter is not
+# carried here -- logix-ai keeps per-sample gradients at full parameter width,
+# which OOMed a 44 GB card on Pythia-410m (~98 GB for the 64-sample set), and it
+# needs its own Python 3.10 image on top.  It remains in the parent tree.
+# How each adapter must be launched when a task is sharded.  run.py dispatches
+# on the TASK's parallelism, not on the adapter, so without this table a
+# single-process adapter in an fsdp experiment would be spawned N times by
+# torchrun, each writing the same output paths -- N concurrent appenders to one
+# results.jsonl, and no error.
+#
+#   torchrun  rank-aware; launch under torchrun --nproc_per_node=N
+#   self      spawns its own workers (bergson takes --nproc_per_node itself),
+#             so it must be launched as ONE process or the spawns nest
+#   single    no distributed path; refuse rather than multi-launch it
+#   <how to launch>-<what parallelism that actually gives>
+LAUNCH: dict[str, str] = {
+    "run_ours.py": "single-none",
+    "run_ours_fsdp.py": "torchrun-fsdp",
+    # Accelerator() with no plugin is DDP: replication, not sharding.  Declared
+    # as ddp so a task asking for fsdp is refused rather than silently running
+    # N full copies and OOMing on every rank at the single-card limit.
+    "run_kronfluence.py": "torchrun-ddp",
+    # bergson spawns its own workers; --fsdp is incompatible with its
+    # single-process query-build path, so this is data parallel only.
+    "run_bergson.py": "self-ddp",
+}
+
 BACKENDS: dict[str, tuple[str, str]] = {
     "dattri_llm": ("dattri", "run_ours.py"),
+    "kronfluence": ("dattri", "run_kronfluence.py"),
+    "bergson": ("dattri", "run_bergson.py"),
 }
 
 # One workload everywhere, so every number in the paper is directly comparable:
@@ -56,11 +81,9 @@ WORKLOAD = {"n_train": 64, "n_test": 1, "block_size": 512, "batch": 1, "seed": 0
 #                  ~40 GB of peak at bf16 against a 46 GB A40, so fp32 would not
 #                  reach the top rung at all.  bf16 is the only constant that
 #                  spans 0.41B..6.9B on one card.
-#   * efficiency-* fp32 for every library.  run_logix.py hardcodes fp32 (its
-#                  LoGra covariance machinery is fp32-only and a bf16 model
-#                  raises a dtype-mismatch matmul), so bf16 here would compare a
-#                  bf16 ours/kronfluence against an fp32 logix.  These are all
-#                  single-scale (Pythia-0.5B), so no dip is possible either way.
+#   * efficiency-* fp32 for every library, so the cross-library cell is one
+#                  precision throughout.  These are all single-scale
+#                  (Pythia-0.5B), so no dip is possible either way.
 # Note run_bergson.py shells out to bergson's own CLI and sets no dtype, so
 # bergson picks its own regardless of what this says.
 EXPERIMENTS = {
@@ -116,6 +139,81 @@ EXPERIMENTS = {
         datasets=("wikitext103",), methods=("ekfac",),
         libs=("dattri_llm",), parallelisms=("single",),
         workload={"proj_mode": "rank64", "dtype": "bfloat16"}),
+
+    # -- cross-library efficiency: baselines ------------------------------
+    # bergson and kronfluence against ours on one model.  fp32 throughout, on
+    # H200: the un-projected regime is large enough that a 48 GB card is not
+    # enough headroom for it.
+    # kronfluence is absent from the rank-64 column and bergson's EK-FAC is
+    # skipped there: neither has a rank-64 mode.  run_kronfluence.py never reads
+    # proj_mode and always fits full-dimension factors, and run_bergson.py forces
+    # projection_dim=0 for EK-FAC whatever the preset asks.  Running them here
+    # would repeat the full-dim cells under a rank64 label -- paid for twice and
+    # mislabelled once.  Their cells belong in the full-dim column only.
+    "efficiency-baselines-rank64": dict(
+        families=("pythia",), scales=("0.5b",), datasets=("wikitext103",),
+        methods=("graddot", "kfac", "ekfac"),
+        libs=("bergson",), skip=(("bergson", "ekfac"),),
+        workload={"proj_mode": "rank64", "dtype": "float32"}),
+    "efficiency-baselines-full": dict(
+        families=("pythia",), scales=("0.5b",), datasets=("wikitext103",),
+        methods=("graddot", "kfac", "ekfac"),
+        libs=("bergson", "kronfluence"),
+        workload={"proj_mode": "full", "dtype": "float32"}),
+
+    # 110B on the same 4x H200 as the 32B/72B rungs.  Its own experiment rather
+    # than a third scale on scaling-qwen-H200-fsdp4: that one's results are
+    # already committed, and run.py appends, so extending it would either
+    # duplicate those rows or force a re-run of all six cells.
+    "scaling-qwen-H200-fsdp4-110b": dict(
+        families=("qwen",), scales=("110b",),
+        datasets=("wikitext103",), methods=("graddot", "kfac", "ekfac"),
+        libs=("dattri_llm",), parallelisms=("fsdp",),
+        workload={"proj_mode": "rank64", "dtype": "bfloat16"}),
+
+
+    # -- cross-library SCALING: every library up the Qwen ladder -----------
+    # Panel (c).  The efficiency-* cells above are single-scale and answer "how
+    # much does each library cost on one model"; this answers "how far up the
+    # ladder does each library get", which is the claim that needs a curve.
+    #
+    # One device (H200) and one dtype (fp32) throughout.  fp32 keeps these cells
+    # comparable with the efficiency-* cell above, and means they are NOT
+    # comparable with panels (a)/(b), which are bf16 -- a separate ladder, not
+    # an extension.
+    #
+    # Expect the baselines to drop out as the ladder climbs, and treat that as
+    # the result rather than as breakage: kronfluence has no rank-64 mode and
+    # fits full-dimension factors, and bergson's index already exceeds 100 GB at
+    # Pythia-410m, so both grow with the model where a rank-64 capture does not.
+    # run.py records nothing for a failed cell, so a library that stops simply
+    # ends its curve.
+    "scaling-crosslib-H200": dict(
+        families=("qwen",), scales=("0.5b", "1b", "3b", "7b"),
+        datasets=("wikitext103",), methods=("graddot", "kfac"),
+        libs=("dattri_llm", "bergson", "kronfluence"),
+        parallelisms=("single",),
+        workload={"proj_mode": "rank64", "dtype": "float32"}),
+
+    # EK-FAC across the same libraries and ladder.  Its own experiment rather
+    # than a third method on scaling-crosslib-H200: that one's 22 rows are
+    # already collected and run.py appends, so widening it would duplicate every
+    # GradDot and K-FAC cell.  plot.py picks the method columns up from the data,
+    # so concatenating the two files draws a three-panel figure.
+    #
+    # Note the strategies differ by library and that is by design -- the
+    # benchmark records the end-to-end total, not a matched implementation.
+    # Ours captures at rank 64; kronfluence has no rank-64 mode and always fits
+    # full-dimension factors; bergson forces projection_dim=0 for EK-FAC
+    # whatever the preset asks.  So this column compares each library's own
+    # EK-FAC, which is the honest comparison but not an equal-work one.
+    "scaling-crosslib-H200-ekfac": dict(
+        families=("qwen",), scales=("0.5b", "1b", "3b", "7b"),
+        datasets=("wikitext103",), methods=("ekfac",),
+        libs=("dattri_llm", "bergson", "kronfluence"),
+        parallelisms=("single",),
+        workload={"proj_mode": "rank64", "dtype": "float32"}),
+
 
     # Pythia on one A40; 6.9B is the largest Pythia released and it fits.
     "scaling-pythia-A40": dict(
@@ -210,11 +308,21 @@ def main() -> None:
         t = r["task"]
         label = f"{r['lib']}/{t['family']}-{t['scale']}/{t['method']}"
         adapter = HERE / "adapters" / r["adapter"]
-        if t.get("parallelism") == "fsdp":
+        how, mode = LAUNCH.get(r["adapter"], "single-none").split("-")
+        if t.get("parallelism") == "fsdp" and mode != "fsdp":
+            why = ("has no distributed path" if mode == "none" else
+                   "is data-parallel only: every rank holds a full model copy, "
+                   "so it cannot get under a single-card memory limit")
+            print(f"########## SKIP  {label}: {r['adapter']} {why}")
+            fail += 1
+            continue
+        if t.get("parallelism") == "fsdp" and how == "torchrun":
             nproc = t.get("n_gpus") or 1
             cmd = ["torchrun", f"--nproc_per_node={nproc}",
                    f"--master_port={20000 + os.getpid() % 10000}", str(adapter)]
         else:
+            # "self" adapters get one process even when sharded: they spawn
+            # their own workers from the rank count in the task.
             cmd = [sys.executable, "-u", str(adapter)]
         cmd += ["--task-file", str(plan_dir / f"{i}.json"), "--out", str(out)]
         print(f"\n########## [{i + 1}/{n}] {label}  ({time.strftime('%H:%M:%S')})")

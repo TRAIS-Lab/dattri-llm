@@ -29,10 +29,9 @@ harness appends every run to one ``results.jsonl``; on a Volume that would mean
 two containers appending to one file, so the split is per experiment and the
 files are concatenated when analyzed.
 
-Not ported: ``efficiency-baselines-*``.  Those need logix, bergson and
-kronfluence in the image, and this repo records no install command for any of
-them, so the package names would be guesses that fail at image build.  Add them
-to ``baseline_image`` below once the names are known.
+Baselines: bergson and kronfluence run on ``baseline_image``.  logix is not
+carried -- it keeps per-sample gradients at full parameter width and OOMs on
+Pythia-410m, and needs its own Python 3.10 image besides.
 """
 
 from __future__ import annotations
@@ -95,6 +94,10 @@ if LOCAL:
         ignore=["**/__pycache__", "**/out", "**/*.jsonl", "**/*.pt"],
     )
 
+# bergson and kronfluence install onto the main image; both are real PyPI
+# packages (`bergson`, `kronfluence`) with Python floors this image clears.
+baseline_image = image.uv_pip_install("bergson", "kronfluence")
+
 results_vol = modal.Volume.from_name("dattri-bench-results", create_if_missing=True)
 cache_vol = modal.Volume.from_name("dattri-bench-cache", create_if_missing=True)
 hf_vol = modal.Volume.from_name("dattri-bench-hf", create_if_missing=True)
@@ -120,15 +123,25 @@ app = modal.App("dattri-benchmark")
 # `models.n_gpus` adds an (80, 4) rung that upstream lacks (see models.py).
 # `run.py` passes that count to `torchrun --nproc_per_node`, so this MUST equal
 # what n_gpus returns or the launch fails.
+# The efficiency-* cells sit on H200, not L40S.  The un-projected regime is
+# large: logix OOMed a 44.4 GB card here before being dropped, and bergson's
+# index and kronfluence's full-dimension factors are in the same family.  The
+# whole cell shares one card -- a cross-library number means nothing if the
+# libraries did not run on the same hardware.
 GPU_FOR = {
-    "efficiency-dattri-llm-rank64": "L40S",
-    "efficiency-dattri-llm-full": "L40S",
+    "efficiency-dattri-llm-rank64": "H200",
+    "efficiency-dattri-llm-full": "H200",
     "scaling-pythia-A40": "L40S",
     "scaling-pythia-H200": "H200",
     "scaling-qwen-H200": "H200",
     "scaling-families-H200": "H200",
     "scaling-families-H200-ekfac": "H200",
     "scaling-qwen-H200-fsdp4": "H200:4",
+    "scaling-qwen-H200-fsdp4-110b": "H200:4",
+    "efficiency-baselines-rank64": "H200-baseline",
+    "efficiency-baselines-full": "H200-baseline",
+    "scaling-crosslib-H200": "H200-baseline",
+    "scaling-crosslib-H200-ekfac": "H200-baseline",
 }
 
 # Qwen-72B is ~145 GB of bf16 weights and every FSDP rank calls
@@ -178,11 +191,29 @@ def _publish(local_out: Path, experiment: str) -> None:
         src = local_out / name
         if src.exists():
             shutil.copy2(src, dest / name)
-    for sub in ("plans", "runs"):
-        src = local_out / sub
-        if src.is_dir():
-            shutil.copytree(src, dest / sub, dirs_exist_ok=True)
-    print(f"[publish] {local_out} -> {dest} (store/ intentionally omitted)", flush=True)
+    if (local_out / "plans").is_dir():
+        shutil.copytree(local_out / "plans", dest / "plans", dirs_exist_ok=True)
+
+    # runs/ is NOT copied wholesale.  Adapters put their stores inside their own
+    # run directory -- kronfluence writes kf_store/ there, bergson its index --
+    # so a recursive copy ships gigabytes of factors to a network volume and
+    # fills it (this is what raised ENOSPC and killed a 22-of-24 run at the
+    # publish step, after every measurement had already succeeded).  Only the
+    # two small per-run artifacts are published; the stores stay on scratch and
+    # die with the container, which is what the disk numbers already measured.
+    KEEP = ("record.json", "score.pt")
+    runs = local_out / "runs"
+    n = 0
+    if runs.is_dir():
+        for d in sorted(x for x in runs.iterdir() if x.is_dir()):
+            for name in KEEP:
+                src = d / name
+                if src.exists():
+                    (dest / "runs" / d.name).mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest / "runs" / d.name / name)
+                    n += 1
+    print(f"[publish] {local_out} -> {dest} "
+          f"(results + plans + {n} run artifacts; stores omitted)", flush=True)
 
 
 def _bench(experiment: str, dry_run: bool) -> None:
@@ -195,6 +226,10 @@ def _bench(experiment: str, dry_run: bool) -> None:
     local_out.mkdir(parents=True, exist_ok=True)
 
     env = dict(os.environ)
+    # bergson builds its gradient index from this rather than from run.py's
+    # --out_dir, so it needs pointing at container-local disk explicitly or it
+    # inherits BENCH_CACHE and writes >100 GB to a network volume.
+    env["BERGSON_STORE"] = str(local_out / "bergson")
     if "fsdp" in experiment:
         # Without this the FSDP adapter does `model.to(dev)` BEFORE FSDP shards,
         # which materializes the whole model on one card: 72B in bf16 is ~145 GB
@@ -374,6 +409,15 @@ def run_l40s(experiment: str, dry_run: bool = False) -> None:
     _bench(experiment, dry_run)
 
 
+# Panel (c) runs the same libraries up the Qwen ladder, so it needs an H200 for
+# headroom -- kronfluence's full-dimension factors and bergson's index both grow
+# with the model, and fp32 doubles every captured byte.
+@app.function(image=baseline_image, gpu="H200", volumes=VOLUMES, timeout=12 * HOUR,
+              ephemeral_disk=2048 * 1024)
+def run_baselines_h200(experiment: str, dry_run: bool = False) -> None:
+    _bench(experiment, dry_run)
+
+
 @app.function(image=image, gpu="H200", volumes=VOLUMES, timeout=12 * HOUR)
 def run_h200(experiment: str, dry_run: bool = False) -> None:
     _bench(experiment, dry_run)
@@ -398,10 +442,98 @@ def main(experiment: str = "scaling-pythia-A40", dry_run: bool = False) -> None:
         print(f"=== {experiment} (plan only, CPU) ===")
         plan_only.remote(experiment)
         return
-    fn = {"L40S": run_l40s, "H200": run_h200, "H200:4": run_h200_sharded}[gpu]
+    fn = {"L40S": run_l40s, "H200": run_h200, "H200:4": run_h200_sharded,
+          "H200-baseline": run_baselines_h200}[gpu]
     print(f"=== {experiment} on {gpu} ===")
     fn.remote(experiment, dry_run)
     print(f"=== results under the dattri-bench-results volume, {experiment}/ ===")
+
+
+# Named sets, so a figure is one command instead of a remembered sequence.
+# Order matters inside a group: cheaper and more likely to fail first, so a
+# broken adapter surfaces before the expensive cells are paid for.
+GROUPS: dict[str, list[str]] = {
+    "panels-ab": ["scaling-families-H200", "scaling-qwen-H200-fsdp4"],
+    "panel-c": ["scaling-crosslib-H200", "scaling-crosslib-H200-ekfac"],
+    "efficiency": ["efficiency-dattri-llm-rank64", "efficiency-dattri-llm-full",
+                   "efficiency-baselines-rank64", "efficiency-baselines-full"],
+    "pythia": ["scaling-pythia-A40", "scaling-pythia-H200"],
+}
+
+
+def _fetch(experiment: str, out_dir: Path) -> bool:
+    """Pull one experiment's results.jsonl off the volume, if it produced one."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / f"{experiment}.jsonl"
+    try:
+        with dest.open("wb") as fh:
+            for chunk in results_vol.read_file(f"{experiment}/results.jsonl"):
+                fh.write(chunk)
+    except Exception as e:  # noqa: BLE001 -- absent means every cell failed
+        dest.unlink(missing_ok=True)
+        print(f"  [fetch] {experiment}: no results.jsonl ({type(e).__name__})")
+        return False
+    print(f"  [fetch] {experiment}: {sum(1 for _ in dest.open())} rows -> {dest}")
+    return True
+
+
+@app.local_entrypoint()
+def bench(group: str = "", experiment: str = "", warm_first: bool = True,
+          dry_run: bool = False) -> None:
+    """Run a group or a single experiment end to end.
+
+        modal run modal_app.py::bench --group panel-c
+        modal run modal_app.py::bench --experiment scaling-crosslib-H200-ekfac
+
+    Both spellings work because `main` takes --experiment and this used to take
+    only --group, which is an easy and unhelpful thing to get wrong. Caches
+    weights and token pools on CPU, runs each experiment in order, then pulls
+    every results.jsonl into ./results/. One experiment failing does not stop
+    the rest: each writes its own file, and a group is usually several
+    independent figures' worth of cells.
+    """
+    if group and experiment:
+        raise SystemExit("pass --group or --experiment, not both")
+    if experiment:
+        if experiment not in GPU_FOR:
+            raise SystemExit(f"unknown experiment {experiment!r}\n"
+                             f"choices: {', '.join(sorted(GPU_FOR))}")
+        group, names = experiment, [experiment]
+    else:
+        group = group or "panels-ab"
+        if group not in GROUPS:
+            raise SystemExit(f"unknown group {group!r}\n"
+                             f"groups: {', '.join(GROUPS)}\n"
+                             f"or pass --experiment <name>")
+        names = GROUPS[group]
+    print(f"=== {group}: {len(names)} experiment(s) ===")
+    for i, exp in enumerate(names, 1):
+        gpu = GPU_FOR[exp]
+        print(f"\n--- [{i}/{len(names)}] {exp} on {gpu} ---")
+        if dry_run:
+            plan_only.remote(exp)
+            continue
+        if warm_first:
+            try:
+                prefetch.remote(exp)
+            except Exception as e:  # noqa: BLE001 -- warming only saves money
+                print(f"  [warm] skipped: {type(e).__name__}: {e}")
+        fn = {"L40S": run_l40s, "H200": run_h200, "H200:4": run_h200_sharded,
+              "L40S-baseline": run_baselines,
+              "H200-baseline": run_baselines_h200,
+          "H200:4-baseline": run_baselines_h200_x4}[gpu]
+        try:
+            fn.remote(exp, False)
+        except Exception as e:  # noqa: BLE001 -- keep going; others are independent
+            print(f"  [run] {exp} FAILED: {type(e).__name__}: {e}")
+    if dry_run:
+        return
+    print("\n=== fetching results ===")
+    out = Path("results")
+    got = [e for e in names if _fetch(e, out)]
+    print(f"\n{len(got)}/{len(names)} experiments produced results in {out}/")
+    if got:
+        print("next: python summarize.py results/*.jsonl")
 
 
 @app.local_entrypoint()

@@ -21,6 +21,12 @@ MODELS: dict[str, dict[str, tuple[str, float]]] = {
         "32b": ("Qwen/Qwen2.5-32B", 32.5),
         # Beyond a single H200: sharded capture only.
         "72b": ("Qwen/Qwen2.5-72B", 72.7),
+        # Qwen1.5, not 2.5: the 2.5 line stops at 72B, and 110B is the only
+        # dense Qwen release between there and the 4-card ceiling.  The
+        # per-shard fit on the measured 32.5B/72.7B points (5.0 + 1.05*P)
+        # projects ~122 GB/card at 4-way -- under a 141 GB H200, but that is a
+        # two-point extrapolation, so treat it as a hypothesis the run tests.
+        "110b": ("Qwen/Qwen1.5-110B", 111.2),
     },
     # Llama-3 -- gated (needs an HF token with Llama-3 access).
     # Pythia -- open; same architecture & training data across scales, so the
@@ -93,7 +99,9 @@ def n_gpus(params_b: float, parallelism: str) -> int:
     # ranks hold ~36 GB of shard each and have ample headroom.  Four also halves
     # the CPU-side init cost, which is the binding constraint at 72B: every rank
     # calls from_pretrained independently, so host RAM scales with world size.
-    for ceiling, g in ((8, 2), (16, 2), (32, 4), (80, 4)):
+    # The 130 rung is where the measured per-shard fit (5.0 + 1.05*P at 4-way)
+    # meets a 141 GB H200, so 110B is the last dense model this tier can hold.
+    for ceiling, g in ((8, 2), (16, 2), (32, 4), (80, 4), (130, 4)):
         if params_b <= ceiling:
             return g
     return 8
