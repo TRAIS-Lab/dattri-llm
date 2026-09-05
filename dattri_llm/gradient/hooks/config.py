@@ -15,7 +15,11 @@ from dattri_llm.gradient.hooks.hooks import (
     _is_linear_io_capable,
     remove_hooks,
 )
-from dattri_llm.gradient.ops import ALL_LAYER_TYPES, canonical_class_name
+from dattri_llm.gradient.ops import (
+    ALL_LAYER_TYPES,
+    canonical_class_name,
+    maybe_materialize_projected,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -346,7 +350,53 @@ class HookManagerConfig:
                     f"projection[{name!r}]['style'] = {style!r} is not a valid "
                     f"projection style. Valid styles: {list(PROJECTION_STYLES)}.",
                 )
-        return {k: dict(v) for k, v in projection.items()}
+        return {
+            k: HookManagerConfig._resolve_auto_style(k, dict(v))
+            for k, v in projection.items()
+        }
+
+    @staticmethod
+    def _resolve_auto_style(name: str, kw: dict) -> dict:
+        """Resolve ``style="auto"`` to a concrete style, once, here.
+
+        ``auto`` is a *request* ("pick the cheaper representation"), not a
+        representation.  The capture path decides several things from the style
+        -- most importantly whether a linear layer's activation is projected in
+        the forward hook (:func:`hooks._preprojects_activation`), which is what
+        keeps the buffer at ``(B, T, proj_dim)`` instead of the full width.
+        Those consumers pattern-match the style *name*, so an unresolved
+        ``"auto"`` silently missed every fast path and made a projected capture
+        ~13x slower than the style it would have chosen.
+
+        Resolving here means nothing downstream ever sees ``"auto"``: the rest
+        of the library only handles concrete styles, and a new consumer cannot
+        forget one.
+
+        The rule needs the sequence length (materializing wins once
+        ``S >= k_a*k_g/(k_a+k_g)``), which the config does not otherwise carry,
+        so ``auto`` requires an explicit ``seq_len``.
+        """
+        if kw.get("style") != "auto":
+            return kw
+        seq_len = kw.pop("seq_len", None)
+        proj_dim = kw.get("proj_dim")
+        if seq_len is None or proj_dim is None:
+            raise ValueError(
+                f"projection[{name!r}] uses style='auto', which needs both "
+                "'proj_dim' and 'seq_len' to choose a representation: "
+                "materializing the projected factors wins once "
+                "seq_len >= proj_dim/2. Pass seq_len (the block/sequence "
+                "length you capture at), or name the style explicitly "
+                "('logra_factorized' / 'logra_materialized').",
+            )
+        k_a = kw.get("proj_dim_a", proj_dim)
+        k_g = kw.get("proj_dim_g", proj_dim)
+        kw["style"] = (
+            "logra_materialized"
+            if maybe_materialize_projected(seq_len, k_a, k_g)
+            else "logra_factorized"
+        )
+        return kw
 
     @staticmethod
     def _validate_layer_types(
