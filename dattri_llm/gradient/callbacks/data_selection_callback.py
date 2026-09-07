@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import warnings
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -39,6 +41,56 @@ class _ShardSpec(NamedTuple):
 _THRESHOLD_MODES = frozenset({"hard", "bottom_fraction", "negative_bottom_fraction"})
 _SCORE_MODES = frozenset({"ghost", "materialized"})
 _TARGET_MODES = frozenset({"batch", "fixed", "val_loader"})
+
+
+def _concat_batches(batches: list[object]) -> object:
+    """Concatenate several val batches into one along the batch axis.
+
+    Used only by ``val_targets_per_pass > 1``, so that ``k`` steps' worth of
+    targets come out of a single forward/backward.  Handles the shapes a
+    ``DataLoader`` actually yields -- a tensor, a mapping of tensors, or a
+    sequence of either -- and requires every non-batch dimension to match.
+
+    Padding is deliberately *not* attempted: the right fill value depends on
+    what a field means (``0`` for ``input_ids``, ``0`` for an attention mask,
+    ``-100`` for labels), and guessing that from a key name would silently
+    corrupt the target for anyone whose loader names things differently.  A
+    loader whose batches differ in length should pad in its own ``collate_fn``.
+    """
+    first = batches[0]
+    if torch.is_tensor(first):
+        shapes = {tuple(b.shape[1:]) for b in batches}
+        if len(shapes) != 1:
+            raise ValueError(
+                "val_targets_per_pass > 1 needs val batches whose non-batch "
+                f"dimensions agree; got {sorted(shapes)}. Pad to a common "
+                "length in the loader's collate_fn, or set "
+                "val_targets_per_pass=1.",
+            )
+        return torch.cat(list(batches), dim=0)
+    if isinstance(first, Mapping):
+        if {frozenset(b.keys()) for b in batches} != {frozenset(first.keys())}:
+            raise ValueError(
+                "val_targets_per_pass > 1 needs every val batch to carry "
+                "the same keys.",
+            )
+        return type(first)(
+            {k: _concat_batches([b[k] for b in batches]) for k in first},
+        )
+    if isinstance(first, (list, tuple)):
+        if len({len(b) for b in batches}) != 1:
+            raise ValueError(
+                "val_targets_per_pass > 1 needs every val batch to have the "
+                "same number of elements.",
+            )
+        return type(first)(
+            _concat_batches([b[i] for b in batches]) for i in range(len(first))
+        )
+    raise TypeError(
+        f"Cannot concatenate val batches of type {type(first).__name__}; "
+        "val_targets_per_pass > 1 supports tensors, mappings and sequences of "
+        "them. Set val_targets_per_pass=1 for other batch types.",
+    )
 
 
 class DataSelectionCallback(HookManagerCallback):
@@ -186,6 +238,16 @@ class DataSelectionCallback(HookManagerCallback):
     (``k_r / (B_r - k_r)``), matching the average-of-local-means gradient
     semantics of DDP/FSDP.
 
+    **Val-target prefetch** (``val_targets_per_pass`` argument):
+
+    With ``target="val_loader"`` the attribution target is recomputed every
+    step from one val batch.  At the batch sizes this is used with (typically
+    one example) that forward/backward is *launch-bound*: on an H200 a
+    Llama-3.2-1B pass costs 29.9 ms for a single row against 76.8 ms for eight
+    -- 3.1x the per-row cost -- because the per-layer kernel launches are paid
+    whether or not there are rows to fill them.
+
+
     **Distributed (DDP / FSDP):**
 
     Both regimes hold the *averaged* global gradient
@@ -258,6 +320,7 @@ class DataSelectionCallback(HookManagerCallback):
         val_loader: Iterable[object] | None = None,
         val_loss_fn: Callable[[nn.Module, Any], torch.Tensor] | None = None,
         renormalize: bool = False,
+        val_targets_per_pass: int = 1,
         *,
         scoring_kwargs: dict[str, Any] | None = None,
         selection_kwargs: dict[str, Any] | None = None,
@@ -350,6 +413,24 @@ class DataSelectionCallback(HookManagerCallback):
         self._score_mode = scoring_kwargs["score_mode"]
         self._target = target
         self._target_gradient = target_gradient
+        if val_targets_per_pass < 1:
+            raise ValueError(
+                f"val_targets_per_pass must be >= 1, got {val_targets_per_pass}.",
+            )
+        hard_threshold = selection_kwargs.get("threshold_mode") == "hard"
+        if val_targets_per_pass > 1 and hard_threshold:
+            warnings.warn(
+                "val_targets_per_pass > 1 with threshold_mode='hard': batching "
+                "the val targets rescales the scores by a per-step constant "
+                "when the val loss averages over its batch, so an absolute "
+                "threshold no longer means what it did at "
+                "val_targets_per_pass=1. Rank-based threshold modes are "
+                "unaffected.",
+                stacklevel=2,
+            )
+        self._val_targets_per_pass = val_targets_per_pass
+        # Per-sample targets already computed and not yet consumed.
+        self._val_targets: list[Gradient] = []
         self._val_loader = val_loader
         self._val_loss_fn = val_loss_fn
         self._val_iter = iter(val_loader) if val_loader is not None else None
@@ -527,6 +608,14 @@ class DataSelectionCallback(HookManagerCallback):
         # from on_step_end right before target resolution.
         return self._pending_val_gradient
 
+    def _next_val_batch(self) -> object:
+        """One batch off the val loader, restarting it when exhausted."""
+        try:
+            return next(self._val_iter)  # type: ignore[arg-type]
+        except StopIteration:
+            self._val_iter = iter(self._val_loader)  # type: ignore[arg-type]
+            return next(self._val_iter)  # type: ignore[arg-type]
+
     def _collect_val_gradient(self) -> None:
         """Sample one val batch, run forward+backward, and store its Gradient.
 
@@ -565,12 +654,16 @@ class DataSelectionCallback(HookManagerCallback):
                 "add_callback): the val gradient is captured through the "
                 "manager's own hooks.",
             )
-        # Advance the val iterator, cycling when exhausted.
-        try:
-            batch = next(self._val_iter)  # type: ignore[arg-type]
-        except StopIteration:
-            self._val_iter = iter(self._val_loader)  # type: ignore[arg-type]
-            batch = next(self._val_iter)  # type: ignore[arg-type]
+        # Serve a target already computed by an earlier prefetch pass.
+        if self._val_targets:
+            self._pending_val_gradient = self._val_targets.pop(0)
+            return
+
+        # Advance the val iterator, cycling when exhausted.  With
+        # val_targets_per_pass > 1 several batches are drawn and run together, so
+        # the launch-bound cost of a batch-1 pass is paid once per k steps.
+        batches = [self._next_val_batch() for _ in range(self._val_targets_per_pass)]
+        batch = batches[0] if len(batches) == 1 else _concat_batches(batches)
 
         # Save the training step's parameter gradients (scoring/removal read
         # and edit them right after this returns).
@@ -594,6 +687,14 @@ class DataSelectionCallback(HookManagerCallback):
             # Restore the training parameter gradients.
             for n, p in self._root.named_parameters():
                 p.grad = saved_grads[n]
+
+        if self._pending_val_gradient is not None and self._val_targets_per_pass > 1:
+            # One pass covered several steps: split it into per-sample targets
+            # and hand back the first, keeping the rest for later steps.
+            captured = self._pending_val_gradient
+            rows = captured.batch_size
+            self._val_targets = [captured.slice("batch", [i]) for i in range(1, rows)]
+            self._pending_val_gradient = captured.slice("batch", [0])
 
         if self._pending_val_gradient is None:
             raise RuntimeError(
@@ -870,7 +971,9 @@ class DataSelectionCallback(HookManagerCallback):
         if bias is None or bias.grad is None:
             return
         channels = bias.shape[0]
-        g = g_d.float()
+        # fp32 floor: this reduces over every batch/token position, where bf16
+        # accumulation drifts, and the result is only (channels,) wide.
+        (g,) = ops.dtypes.align(g_d, minimum=torch.float32)
         if (
             ops.is_conv(layer_type)
             or ops.is_conv_transpose(layer_type)
@@ -1197,7 +1300,7 @@ class DataSelectionCallback(HookManagerCallback):
         channels: int,
     ) -> torch.Tensor:
         """Full bias-gradient contribution as a 1-D ``(channels,)`` tensor."""
-        g = g_d.float()
+        (g,) = ops.dtypes.align(g_d, minimum=torch.float32)
         if (
             ops.is_conv(layer_type)
             or ops.is_conv_transpose(layer_type)
