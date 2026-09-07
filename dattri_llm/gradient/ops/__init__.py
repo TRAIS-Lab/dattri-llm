@@ -15,6 +15,7 @@ keeps importing from ``dattri_llm.gradient.ops`` unchanged:
   and streaming accumulators.
 """
 
+from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.dot import (
     _cross_dot,
     _cross_gram,
@@ -30,6 +31,12 @@ from dattri_llm.gradient.ops.dot import (
     maybe_use_materialized_gram,
     maybe_use_materialized_norm,
     pairwise_dot,
+)
+from dattri_llm.gradient.ops.dtypes import (
+    as_float,
+    compute_dtype,
+    get_compute_dtype,
+    set_compute_dtype,
 )
 from dattri_llm.gradient.ops.kronecker import (
     FisherAccumulator,
@@ -150,16 +157,20 @@ __all__ = [
     "_project_factorized",
     "_project_materialized",
     "_to_3d",
+    "as_float",
     "canonical_class_name",
+    "compute_dtype",
     "cross_dot",
     "cross_dot_per_token",
     "dense_inverse",
     "dot",
+    "dtypes",
     "effective_dims",
     "ekfac_materialize",
     "ekfac_precondition",
     "extract_module_kwargs",
     "fim",
+    "get_compute_dtype",
     "grad_norm_sq",
     "is_conv",
     "is_conv_transpose",
@@ -182,5 +193,6 @@ __all__ = [
     "project_gradient",
     "project_layer",
     "project_materialized",
+    "set_compute_dtype",
     "sym_inverse",
 ]

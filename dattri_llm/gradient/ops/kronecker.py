@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.dot import _cross_gram
 from dattri_llm.gradient.ops.materialize import _materialize, materialize
 from dattri_llm.gradient.ops.preprocess import _preprocess_factorized
@@ -38,8 +39,9 @@ def _flatten_for_kfac(
         raise NotImplementedError("K-FAC is not defined for normalization layers")
     if is_embedding(layer_type):
         raise NotImplementedError("K-FAC is not defined for embedding layers")
-    a_f = a.float().reshape(-1, a.shape[-1])
-    g_f = g.float().reshape(-1, g.shape[-1])
+    a, g = dtypes.align(a, g)
+    a_f = a.reshape(-1, a.shape[-1])
+    g_f = g.reshape(-1, g.shape[-1])
     return a_f, g_f
 
 
@@ -88,8 +90,8 @@ def _kfac(
             "K-FAC factors are undefined: every token row carries a zero "
             "gradient (fully padded / masked input).",
         )
-    A = a_f.T @ a_f / N
-    G = g_f.T @ g_f / N
+    A = (a_f.T @ a_f).float() / N
+    G = (g_f.T @ g_f).float() / N
     return A, G
 
 
@@ -113,7 +115,7 @@ def _fim(
     """
     grad = _materialize(a, g, layer_type, module_kwargs, include_bias)  # (B, d)
     B = grad.shape[0]
-    return grad.T @ grad / B
+    return (grad.T @ grad).float() / B
 
 
 # ---------------------------------------------------------------------------
@@ -411,20 +413,22 @@ class LayerKroneckerAccumulator:
             a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
         N = a_f.shape[0]
         if self._A is None:
+            # fp32 buffers regardless of the operands' dtype: these are summed
+            # over the whole fit set, where bf16 accumulation drifts.
             self._A = torch.zeros(
                 a_f.shape[-1],
                 a_f.shape[-1],
-                dtype=a_f.dtype,
+                dtype=torch.float32,
                 device=a_f.device,
             )
             self._G = torch.zeros(
                 g_f.shape[-1],
                 g_f.shape[-1],
-                dtype=g_f.dtype,
+                dtype=torch.float32,
                 device=g_f.device,
             )
-        self._A += a_f.T @ a_f
-        self._G += g_f.T @ g_f
+        self._A += (a_f.T @ a_f).float()
+        self._G += (g_f.T @ g_f).float()
         self._n += N
 
     def result(self) -> tuple[torch.Tensor, torch.Tensor]:

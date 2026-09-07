@@ -1024,8 +1024,9 @@ class Gradient:
                 ov = ops.materialize(ov, other.layer_types[name])
 
         # Both plain materialized tensors: flatten non-batch dims and dot.
-        xf = sv.reshape(sv.shape[0], -1).float()
-        yf = ov.reshape(ov.shape[0], -1).float()
+        sv, ov = ops.dtypes.align(sv, ov)
+        xf = sv.reshape(sv.shape[0], -1)
+        yf = ov.reshape(ov.shape[0], -1)
         return xf @ yf.T
 
     def _layer_norm_sq(
@@ -1043,7 +1044,8 @@ class Gradient:
         """
         value = self.data[name]
         if not isinstance(value, Factorized):
-            flat = value.reshape(value.shape[0], -1).float()
+            (value,) = ops.dtypes.align(value)
+            flat = value.reshape(value.shape[0], -1)
             return (flat * flat).sum(-1)
         return ops.grad_norm_sq(value, self.layer_types[name], mode=mode)
 

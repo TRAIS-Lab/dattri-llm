@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.materialize import _materialize
 from dattri_llm.gradient.ops.preprocess import _preprocess_factorized, _to_3d
 from dattri_llm.gradient.ops.types import is_embedding, is_linear, is_norm
@@ -52,7 +53,10 @@ def _apply_projector(
     consistently across every gradient that will be compared.
     """
     lead = x.shape[:-1]
-    flat = x.reshape(-1, x.shape[-1]).float()  # (N, D)
+    # as_float, not align: dattri's projectors multiply by a random matrix, so
+    # an embedding's integer one-hot has to become floating point here.
+    (x,) = dtypes.as_float(x)
+    flat = x.reshape(-1, x.shape[-1])  # (N, D)
     device = proj_kwargs.setdefault("device", flat.device)
     flat = flat.to(device)
     out = projector(
@@ -140,8 +144,9 @@ def _project_factorized(
             a.long(),
             num_classes=module_kwargs["num_embeddings"],
         )
-    a_f = _to_3d(a.float())  # (B, T, d_in)
-    g_f = _to_3d(g.float())  # (B, T, d_out)
+    a, g = dtypes.align(a, g)
+    a_f = _to_3d(a)  # (B, T, d_in)
+    g_f = _to_3d(g)  # (B, T, d_out)
     g_p = _apply_projector(
         projector,
         g_f,
@@ -186,7 +191,7 @@ def project_activation(
         )
     if module_kwargs is not None and module_kwargs["has_bias"] and include_bias:
         a = torch.cat([a, torch.ones_like(a[..., :1])], dim=-1)
-    a_f = _to_3d(a.float())
+    a_f = _to_3d(dtypes.align(a)[0])
     return _apply_projector(
         projector,
         a_f,
@@ -217,7 +222,7 @@ def project_gradient(
         raise ValueError(
             f"project_gradient is for linear layers only, got {layer_type!r}.",
         )
-    g_f = _to_3d(g.float())
+    g_f = _to_3d(dtypes.align(g)[0])
     return _apply_projector(
         projector,
         g_f,

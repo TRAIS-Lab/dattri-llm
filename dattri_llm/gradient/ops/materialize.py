@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.preprocess import _preprocess_factorized, _to_3d
 from dattri_llm.gradient.ops.types import is_conv_transpose, is_embedding, is_norm
 
@@ -30,7 +31,7 @@ def _materialize_embedding(
     for every batch -- the property cross-batch operations rely on.
     """
     token_ids = a  # (B, T) int
-    grad = g.float()  # (B, T, embed_dim)
+    (grad,) = dtypes.align(g)  # (B, T, embed_dim)
     B, T = token_ids.shape
     embed_dim = grad.shape[-1]
     max_id = int(token_ids.max().item())
@@ -88,8 +89,9 @@ def _materialize(
             )
         return _materialize_embedding(a, g, module_kwargs["num_embeddings"])
 
-    a_f = _to_3d(a.float())  # (B, T, d_in)
-    g_f = _to_3d(g.float())  # (B, T, d_out)
+    a, g = dtypes.align(a, g)
+    a_f = _to_3d(a)  # (B, T, d_in)
+    g_f = _to_3d(g)  # (B, T, d_out)
 
     if is_norm(layer_type):
         prod = a_f * g_f  # (B, T, d) per-position gradient

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.preprocess import _preprocess_factorized, _to_3d
 from dattri_llm.gradient.ops.types import (
     is_conv,
@@ -52,7 +53,7 @@ def _cross_gram(
         # K[i,j] = sum_t g1_i[t] * G2_sum_j[tok1_i[t]]
         # where G2_sum_j[k] = sum_{s: tok2_j[s]==k} g2_j[s]
         tok1, tok2 = a1, a2  # (B1, T1), (B2, T2) int
-        g1_f, g2_f = g1.float(), g2.float()
+        g1_f, g2_f = dtypes.align(g1, g2)
         B1, T1 = tok1.shape
         B2, T2 = tok2.shape
         E = g1_f.shape[-1]
@@ -66,10 +67,9 @@ def _cross_gram(
             K[:, j] = (g1_f * gathered).sum((1, 2))
         return K
 
-    a1_f = _to_3d(a1.float())
-    g1_f = _to_3d(g1.float())
-    a2_f = _to_3d(a2.float())
-    g2_f = _to_3d(g2.float())
+    a1, g1, a2, g2 = dtypes.align(a1, g1, a2, g2)
+    a1_f, g1_f = _to_3d(a1), _to_3d(g1)
+    a2_f, g2_f = _to_3d(a2), _to_3d(g2)
 
     if is_norm(layer_type):
         # dW_i = sum_t x_hat_it * g_it: contract positions first so the dot is
@@ -171,7 +171,7 @@ def _cross_gram_per_token(
     """
     if is_embedding(layer_type):
         tok1, tok2 = a1, a2  # (B1, T1), (B2, T2) int
-        g1_f, g2_f = g1.float(), g2.float()
+        g1_f, g2_f = dtypes.align(g1, g2)
         B1, T1 = tok1.shape
         B2, T2 = tok2.shape
         E = g1_f.shape[-1]
@@ -185,10 +185,9 @@ def _cross_gram_per_token(
             out[:, :, j] = (g1_f * gathered).sum(-1)
         return out
 
-    a1_f = _to_3d(a1.float())
-    g1_f = _to_3d(g1.float())
-    a2_f = _to_3d(a2.float())
-    g2_f = _to_3d(g2.float())
+    a1, g1, a2, g2 = dtypes.align(a1, g1, a2, g2)
+    a1_f, g1_f = _to_3d(a1), _to_3d(g1)
+    a2_f, g2_f = _to_3d(a2), _to_3d(g2)
 
     if is_norm(layer_type):
         # dW2_j = sum_s x_hat2_js * g2_js (d-vector, diagonal). Query token t's
@@ -260,8 +259,7 @@ def _dot(
         T2 = a2.shape[1]  # the two sides may have different token counts
         E = g1.shape[-1]
         vocab = int(max(a1.max().item(), a2.max().item())) + 1
-        g1_f = g1.float()
-        g2_f = g2.float()
+        g1_f, g2_f = dtypes.align(g1, g2)
         result = torch.zeros(B, dtype=g1_f.dtype, device=g1_f.device)
         for i in range(B):
             G2_sum = torch.zeros(vocab, E, dtype=g2_f.dtype, device=g2_f.device)
@@ -270,10 +268,9 @@ def _dot(
             result[i] = (g1_f[i] * gathered).sum()
         return result
 
-    a1_f = _to_3d(a1.float())
-    g1_f = _to_3d(g1.float())
-    a2_f = _to_3d(a2.float())
-    g2_f = _to_3d(g2.float())
+    a1, g1, a2, g2 = dtypes.align(a1, g1, a2, g2)
+    a1_f, g1_f = _to_3d(a1), _to_3d(g1)
+    a2_f, g2_f = _to_3d(a2), _to_3d(g2)
 
     if is_norm(layer_type):
         # Contract positions into per-sample weight grads before the dot
@@ -314,8 +311,9 @@ def _grad_norm_sq(
     if is_embedding(layer_type):
         return _pairwise_dot(a, g, layer_type).diagonal()
 
-    a_f = _to_3d(a.float())  # (B, T, d_in)
-    g_f = _to_3d(g.float())  # (B, T, d_out)
+    a, g = dtypes.align(a, g)
+    a_f = _to_3d(a)  # (B, T, d_in)
+    g_f = _to_3d(g)  # (B, T, d_out)
 
     if is_norm(layer_type):
         # ||sum_t x_hat_it * g_it||^2 -- positions contracted first.
