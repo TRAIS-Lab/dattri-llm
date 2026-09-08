@@ -29,6 +29,84 @@ PROJECTION_STYLES = (
 )
 
 
+# Materialized projection matrices, one per (projector, D, proj_dim, seed,
+# device, dtype, projector kwargs).  A seeded random projection is a *fixed*
+# linear map, so the matrix is built once and every later call is a single
+# matmul.  Without the cache each call rebuilt it through the projector factory
+# (allocate, seed a generator, draw the Rademacher/Gaussian entries, scale):
+# ~12 dispatched ops per call, of which only the matmul does useful work, and
+# two calls per hooked layer per step -- a third of the per-layer capture cost
+# at batch 1, where capture is launch-bound.  A rank-64 matrix is D x 64, a few
+# MB even for the widest LLM layers, so the cache stays small.
+_PROJECTION_MATRICES: dict[tuple, torch.Tensor] = {}
+# Rows of the identity materialized per chunk while building a matrix, so the
+# largest layers (D ~ 50k) never allocate a D x D identity.
+_IDENTITY_CHUNK_ROWS = 8192
+
+
+def clear_projection_cache() -> None:
+    """Drop every cached projection matrix (e.g. to free device memory)."""
+    _PROJECTION_MATRICES.clear()
+
+
+def _projector_key(projector: Callable) -> str:
+    module = getattr(projector, "__module__", "")
+    name = getattr(projector, "__qualname__", repr(projector))
+    return f"{module}.{name}"
+
+
+def _projection_matrix(
+    projector: Callable,
+    d_in: int,
+    *,
+    proj_dim: int,
+    proj_seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    **proj_kwargs,
+) -> torch.Tensor:
+    """The ``(d_in, proj_dim)`` matrix *projector* applies, built once and cached.
+
+    The matrix is recovered exactly by projecting the identity through the
+    projector itself, chunked over rows, so it is the same map the projector
+    would apply directly (same seed, same device-specific generator).  It is
+    generated in float32 and stored in *dtype*: the entries of a scaled
+    Rademacher/Gaussian map are what the projector would hold in that dtype,
+    so applying it in the feature's dtype reproduces the projector's own
+    dtype behaviour (dattri projects in the feature's dtype).
+    """
+    key = (
+        _projector_key(projector),
+        d_in,
+        proj_dim,
+        proj_seed,
+        str(device),
+        dtype,
+        tuple(sorted((k, repr(v)) for k, v in proj_kwargs.items())),
+    )
+    matrix = _PROJECTION_MATRICES.get(key)
+    if matrix is None:
+        rows = []
+        for start in range(0, d_in, _IDENTITY_CHUNK_ROWS):
+            stop = min(start + _IDENTITY_CHUNK_ROWS, d_in)
+            block = torch.zeros(stop - start, d_in, device=device, dtype=torch.float32)
+            rows_idx = torch.arange(stop - start, device=device)
+            block[rows_idx, rows_idx + start] = 1.0
+            rows.append(
+                projector(
+                    block,
+                    block.shape[0],
+                    proj_dim=proj_dim,
+                    proj_seed=proj_seed,
+                    device=device,
+                    **proj_kwargs,
+                )(block),
+            )
+        matrix = torch.cat(rows, dim=0).to(dtype)
+        _PROJECTION_MATRICES[key] = matrix
+    return matrix
+
+
 def _apply_projector(
     projector: Callable,
     x: torch.Tensor,
@@ -45,6 +123,11 @@ def _apply_projector(
     axes of *x* (the batch, plus the token axis when projecting a factor) are
     folded into ``N`` and restored afterward.
 
+    The projector is only ever asked for its matrix (see
+    :func:`_projection_matrix`), once per ``(D, proj_dim, seed, device, dtype)``;
+    the projection itself is one matmul against the cached matrix, in *x*'s
+    floating dtype.
+
     ``device`` selects where the projection runs (dattri builds a
     device-specific projector for it) and defaults to *x*'s own device.  The
     feature is moved there before projecting and the result is returned on
@@ -57,16 +140,19 @@ def _apply_projector(
     # an embedding's integer one-hot has to become floating point here.
     (x,) = dtypes.as_float(x)
     flat = x.reshape(-1, x.shape[-1])  # (N, D)
-    device = proj_kwargs.setdefault("device", flat.device)
+    device = torch.device(proj_kwargs.pop("device", flat.device))
     flat = flat.to(device)
-    out = projector(
-        flat,
-        flat.shape[0],
+    matrix = _projection_matrix(
+        projector,
+        flat.shape[-1],
         proj_dim=proj_dim,
         proj_seed=proj_seed,
+        device=device,
+        dtype=flat.dtype,
         **proj_kwargs,
-    )(flat)  # (N, proj_dim), on the projection device
-    return out.reshape(*lead, proj_dim)
+    )
+    # (..., proj_dim), on the projection device
+    return (flat @ matrix).reshape(*lead, proj_dim)
 
 
 def _project_materialized(
