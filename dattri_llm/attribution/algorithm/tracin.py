@@ -1,150 +1,63 @@
-"""TracIn / GradCos attribution over on-disk gradients (workflow 2).
-
-This attributor consumes :class:`~dattri_llm.gradient.gradient.Gradient`
-records produced earlier by the gradient-collection pipeline and persisted to
-disk via :class:`~dattri_llm.gradient.storage_manager.GradientStorageManager`.  No
-forward/backward pass is performed at attribution time -- only inner products
-between pre-stored per-sample gradients.
+"""TracIn / GradCos attribution.
 
 Every train record is scored against every test record::
 
     score[i, j] = <g_train_i, g_test_j>
 
-i.e. the full ``(num_train, num_test)`` cross-gram, exactly mirroring the
-:class:`~dattri_llm.attribution.algorithm.kronecker.KFACAttributor` assembly -- there is
-no
+i.e. the full ``(num_train, num_test)`` gradient cross-gram -- there is no
 train/test step alignment.  With ``normalized_grad=True`` the inner product
-becomes a cosine similarity (the GradCos / CosIn variant);
-``GradCos`` is TracIn with ``normalized_grad=True`` passed to the attribute
-methods -- there is no separate subclass.
+becomes a cosine similarity (the GradCos / CosIn variant); ``GradCos`` is
+TracIn with ``normalized_grad=True`` passed to the attribute methods -- there
+is no separate subclass.
 
-The result is a :class:`~dattri_llm.attribution.score.AttributionScore`.  Rows are
-stamped with the step each train gradient was recorded at (read straight off the
-on-disk records), so a sample collected at several checkpoints contributes one
-row per checkpoint; summing a sample's rows over steps recovers the classic
-dattri ``(num_train, num_test)`` matrix.  Rows and columns are identified by
-content hash in on-disk order, so no reconstruction of the original DataLoader is
-required.
+TracIn is the plainest inner-product attributor: both transforms are the
+identity (the test side is merely materialized when that fits the cache
+budget, so every train block meets a dense test block) and the score is the
+layerwise cross-gram.  Everything else -- collection, the multi-checkpoint
+ensemble, the trajectory mode, the scoring loop -- is inherited from
+:class:`~dattri_llm.attribution.base.BaseInnerProductAttributor`.
+
+The result is a :class:`~dattri_llm.attribution.score.AttributionScore`.  Rows
+are stamped with the step each train gradient was recorded at, so a sample
+collected at several checkpoints contributes one row per checkpoint; summing a
+sample's rows over steps recovers the classic dattri ``(num_train, num_test)``
+matrix.  Rows and columns are identified by content hash in store order, so no
+reconstruction of the original DataLoader is required.
 """
 
 from __future__ import annotations
 
-import warnings
-import weakref
-from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
-from dattri_llm.attribution.base import BaseAttributor
-from dattri_llm.attribution.memory import DENSE_CACHE, can_cache, dense_nbytes
-from dattri_llm.attribution.score import AttributionScore
-from dattri_llm.attribution.utils import (
-    collect_to_disk,
-    normalize_layer_names,
-    score_sources,
-    task_loss_fn,
-)
-from dattri_llm.gradient.storage_manager import GradientStorageManager
-from dattri_llm.gradient.streaming import (
-    DiskGradientSource,
-    GradientSource,
-    GradientStreamer,
-)
+from dattri_llm.attribution.base import BaseInnerProductAttributor
+from dattri_llm.gradient import ops
+from dattri_llm.utils.cache import CacheBudget
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
     from dattri.task import AttributionTask
     from torch.utils.data import Dataset
 
     from dattri_llm.attribution.arguments import AttributionArguments
+    from dattri_llm.attribution.score import AttributionScore
     from dattri_llm.gradient.gradient import Gradient
     from dattri_llm.gradient.hooks import HookManagerConfig
+    from dattri_llm.gradient.storage_manager import GradientStorageManager
+    from dattri_llm.gradient.streaming import DiskGradientSource
+    from dattri_llm.utils.cache import TensorCache
 
 
-# Per-train-block cache of the materialized train gradient, so a factorized train
-# block is materialized once and dotted against every (fixed) cached test block
-# rather than re-materialized inside ``similarity`` on each train x test pair.
-# Keyed weakly on the block so entries evict when the block is dropped; a no-op
-# for blocks already stored materialized (``Gradient.materialize`` returns self).
-_TRAIN_MAT_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-
-
-def _register_dense(source: Gradient, dense: Gradient) -> Gradient:
-    """Charge ``dense`` to the shared budget and return it.
-
-    ``Gradient.materialize`` returns ``self`` for an already-dense block, which
-    is not a new allocation and must not be counted.
-    """
-    if dense is not source:
-        DENSE_CACHE.register(dense, dense_nbytes(source))
-    return dense
-
-
-def _cached_similarity(
-    train_g: Gradient,
-    test_rep: Gradient,
-    metric: str,
-    reuse: bool = True,
-) -> torch.Tensor:
-    """Cross-gram of a train block against a prepared test block.
-
-    When the dense form fits the caching budget, the train block is materialized
-    once here and reused across the fixed test blocks, so the score is a bare dot
-    instead of re-materializing both factorized sides per pair.
-
-    Over budget -- which at full dimension is ~1 GB *per sample* -- the block is
-    left factorized and scored through :meth:`Gradient.similarity`, whose kernel
-    materializes at most one layer at a time.  Caching is an optimization and must
-    never be the reason a run runs out of memory (see
-    :mod:`dattri_llm.attribution.memory`).
-    """
-    # Retaining a dense copy of the train block only pays off when it will be
-    # scored against another test block; with one test block it is written and
-    # never read (see ``score_sources``).
-    train_mat = _TRAIN_MAT_CACHE.get(train_g) if reuse else None
-    if (
-        reuse
-        and train_mat is None
-        and can_cache(
-            train_g,
-            train_g.device,
-            reserve=DENSE_CACHE.held(),
-        )
-    ):
-        train_mat = _register_dense(train_g, train_g.materialize())
-        _TRAIN_MAT_CACHE[train_g] = train_mat
-    source = train_mat if train_mat is not None else train_g
-    return source.similarity(test_rep, metric=metric, reduce="all")
-
-
-def _prepare_test_budgeted(test_g: Gradient) -> Gradient:
-    """Materialize the test block only if the dense form fits the budget.
-
-    Returning the factorized block when it does not keeps both sides factorized:
-    a dense test side would otherwise force ``similarity`` to materialize the
-    train side to match it, reintroducing the very allocation the budget avoids.
-    """
-    if not can_cache(test_g, test_g.device, reserve=DENSE_CACHE.held()):
-        return test_g
-    return _register_dense(test_g, test_g.materialize())
-
-
-class TracInAttributor(BaseAttributor):
-    """TracIn / GradCos attributor that consumes pre-collected on-disk gradients.
-
-    Scores every train record against every test record (the full
-    ``(num_train, num_test)`` gradient cross-gram), with no train/test step
-    alignment -- structurally identical to the K-FAC family, minus the Fisher
-    preconditioner.
+class TracInAttributor(BaseInnerProductAttributor):
+    """TracIn / GradCos attributor.
 
     Args:
         args: :class:`AttributionArguments` controlling DataLoader behaviour,
-            device placement, and the output directory where the score is
-            persisted.  Only the ``dataloader_*`` fields, ``device``, and
-            ``output_dir`` are consulted in this workflow.
-        task: Accepted for parity with the workflow-1 API but unused here.
+            device placement, and the output directory.
+        task: The attribution task; required by the live methods only.
 
     ``normalized_grad`` (cosine / GradCos vs raw inner product / TracIn) is a
     per-attribution choice passed to :meth:`attribute` /
@@ -156,422 +69,139 @@ class TracInAttributor(BaseAttributor):
     a ``layer_name`` read-time filter to score a subset of the stored layers.
     """
 
+    algorithm: ClassVar[str] = "TracIn"
+
     def __init__(
         self,
         args: AttributionArguments,
         *,
         task: AttributionTask | None = None,
     ) -> None:
-        self.args = args
-        self.task = task
+        super().__init__(args, task=task)
+        self._metric = "dot"
 
-    def cache(
-        self,
-        train_dataset: Dataset,
-        test_dataset: Dataset,
-        *,
-        cache_dir: str | None = None,
-        enable_update: bool = False,
-        hook_config: HookManagerConfig | None = None,
-    ) -> list[tuple[str, str]]:
-        """Collect the gradients TracIn/GradCos needs, live, to disk.
+    def _set_metric(self, normalized_grad: bool) -> None:
+        """Select the metric (and the algorithm name recorded in the score)."""
+        self._metric = "cosine" if normalized_grad else "dot"
+        self.algorithm = "GradCos" if normalized_grad else "TracIn"
 
-        Runs forward/backward over the data (from the task's model, loss, and
-        optional ``target_func``) and offloads the per-sample gradients so that
-        :meth:`attribute_from_cache` can score them.  Reproducing :meth:`attribute`
-        is then *cache + attribute_from_cache* -- scoring **each returned pair** and
-        **summing** the results (one pair per checkpoint, each internally aligned)::
+    # ------------------------------------------------------------------ #
+    # Hooks                                                               #
+    # ------------------------------------------------------------------ #
 
-            pairs = attr.cache(train_ds, test_ds)
-            total = sum(attr.attribute_from_cache(tr, te).agnostic_matrix()[1]
-                        for tr, te in pairs)
+    def transform_test_rep(self, test_rep: Gradient) -> Gradient:  # noqa: PLR6301
+        """Materialize the test block when its dense form fits the cache budget.
 
-        * ``enable_update=False`` (default): one ``(train, test)`` pair **per
-          checkpoint** the task provides, both sides collected **at that same
-          ``theta_k``** (so each pair's score is
-          ``<g_train@theta_k, g_test@theta_k>`` -- the
-          step-aligned term).  Summing the pairs is the multi-checkpoint ensemble.
-        * ``enable_update=True``: a single pair -- a training **trajectory** from
-          checkpoint 0 (train per optimizer step) with the test gradients taken
-          once at ``theta_0`` (mirroring :meth:`attribute`, which reads the test side
-          before training).
-
-        Args:
-            train_dataset: Training dataset to stream.
-            test_dataset: Test dataset to stream.
-            cache_dir: Parent dir; each pair goes under ``<cache_dir>/ckpt_<k>/``.
-                Defaults to ``args.output_dir``.
-            enable_update: Trajectory (train as it streams) vs. per-checkpoint.
-            hook_config: :class:`HookManagerConfig` for the internal streamers
-                (which layers to hook, per-layer projection, ...).  ``None`` uses
-                the streamer default (factorized hooks on every linear-family layer).
-
-        Returns:
-            A list of ``(train_gradients_dir, test_gradients_dir)`` pairs -- one per
-            checkpoint (frozen) or a single pair (trajectory).
+        A dense test side makes every train block's score a bare GEMM against
+        a train layer materialized once (see :meth:`inner_product`).  Over
+        budget -- at full dimension the dense form is ~1 GB *per sample* --
+        the block stays factorized, so both sides stay factorized and the
+        kernel materializes at most one layer at a time: caching is an
+        optimization and must never be the reason a run runs out of memory.
         """
-        if self.task is None:
-            raise ValueError(
-                "cache() (live collection) requires a ``task`` with a model; pass "
-                "pre-collected gradients to attribute_from_cache() instead.",
-            )
-        cache_dir = cache_dir if cache_dir is not None else self.args.output_dir
-        train_loss = task_loss_fn(self.task.original_loss_func)
-        test_loss = task_loss_fn(self.task.original_target_func)
-        tb = self.args.per_device_train_batch_size
-        vb = self.args.per_device_eval_batch_size
+        if CacheBudget(test_rep.device).fits(test_rep.materialized_nbytes):
+            return test_rep.materialize()
+        return test_rep
 
-        def _pair(k: int) -> tuple[str, str]:
-            train_dir = str(Path(cache_dir) / f"ckpt_{k}" / "train_grads")
-            test_dir = str(Path(cache_dir) / f"ckpt_{k}" / "test_grads")
-            return train_dir, test_dir
-
-        if enable_update:
-            n_ckpt = len(self.task.get_checkpoints())
-            if n_ckpt > 1:
-                warnings.warn(
-                    f"enable_update=True regenerates the trajectory from checkpoint "
-                    f"0; the other {n_ckpt - 1} provided checkpoint(s) are ignored.",
-                    stacklevel=2,
-                )
-            self.task._load_checkpoints(0)
-            model = self.task.get_model()
-            train_dir, test_dir = _pair(0)
-            # Test FIRST, at theta_0 -- mirroring attribute(), where score_sources reads
-            # the test side before the training pass advances the model.
-            collect_to_disk(
-                GradientStreamer(
-                    model,
-                    test_dataset,
-                    self.args,
-                    batch_size=vb,
-                    enable_update=False,
-                    loss_fn=test_loss,
-                    config=hook_config,
-                ),
-                GradientStorageManager(test_dir),
-            )
-            collect_to_disk(
-                GradientStreamer(
-                    model,
-                    train_dataset,
-                    self.args,
-                    batch_size=tb,
-                    enable_update=True,
-                    loss_fn=train_loss,
-                    config=hook_config,
-                ),
-                GradientStorageManager(train_dir),
-            )
-            return [(train_dir, test_dir)]
-
-        # Frozen: a self-contained, step-aligned pair per checkpoint.
-        pairs: list[tuple[str, str]] = []
-        for k in range(len(self.task.get_checkpoints())):
-            self.task._load_checkpoints(k)
-            model = self.task.get_model()
-            train_dir, test_dir = _pair(k)
-            collect_to_disk(
-                GradientStreamer(
-                    model,
-                    test_dataset,
-                    self.args,
-                    batch_size=vb,
-                    enable_update=False,
-                    loss_fn=test_loss,
-                    checkpoint_step=k,
-                    config=hook_config,
-                ),
-                GradientStorageManager(test_dir),
-            )
-            collect_to_disk(
-                GradientStreamer(
-                    model,
-                    train_dataset,
-                    self.args,
-                    batch_size=tb,
-                    enable_update=False,
-                    loss_fn=train_loss,
-                    checkpoint_step=k,
-                    config=hook_config,
-                ),
-                GradientStorageManager(train_dir),
-            )
-            pairs.append((train_dir, test_dir))
-        return pairs
+    def inner_product(
+        self,
+        train_rep: Gradient,
+        test_rep: Gradient,
+        *,
+        dense_cache: TensorCache | None = None,
+    ) -> torch.Tensor:
+        """Layerwise cross-gram, divided by the gradient norms for GradCos."""
+        dot = super().inner_product(train_rep, test_rep, dense_cache=dense_cache)
+        if self._metric == "dot":
+            return dot
+        shared = [name for name in train_rep.data if name in test_rep.data]
+        if not shared:
+            return dot
+        n_tr = self._norm(train_rep, shared, dense_cache)
+        n_te = self._norm(test_rep, shared, None)
+        return dot / (n_tr[:, None] * n_te[None, :] + 1e-8)
 
     @staticmethod
-    def _label(normalized_grad: bool) -> tuple[str, str]:
-        """(algorithm name, similarity metric) for the normalization choice."""
-        return ("GradCos", "cosine") if normalized_grad else ("TracIn", "dot")
+    def _norm(
+        rep: Gradient,
+        layers: list[str],
+        dense_cache: TensorCache | None,
+    ) -> torch.Tensor:
+        """Per-sample whole-model gradient norms over *layers* ``(B,)``.
 
-    def _run(
-        self,
-        train_source: GradientSource,
-        test_source: GradientSource,
-        *,
-        loop_over_test: bool = False,
-        algorithm_meta: dict | None = None,
-        layer_name: list[str] | None = None,
-        normalized_grad: bool = False,
-    ) -> AttributionScore:
-        """Score a train source against a test source -- the shared loop.
-
-        ``train_source`` is iterated **once**, so a single-shot trajectory stream
-        (``GradientStreamer`` with ``enable_update=True``) works as well as a
-        re-iterable disk
-        source.  TracIn uses the raw gradients with no preconditioner, so
-        ``prepare_test`` is the identity and ``score_block`` is the cross-gram
-        (``"dot"``, or ``"cosine"`` for GradCos).
+        Uses the dense copy of a layer already sitting in *dense_cache* when
+        there is one, so nothing is materialized twice.
         """
-        name, metric = self._label(normalized_grad)
-        scores, row_train_ids, row_steps, test_ids = score_sources(
-            train_source,
-            test_source,
-            self.args.device,
-            prepare_test=_prepare_test_budgeted,
-            score_block=lambda tr, te, _n, reuse=True: _cached_similarity(
-                tr,
-                te,
-                metric,
-                reuse=reuse,
-            ),
-            loop_over_test=loop_over_test,
-        )
-        result = AttributionScore(
-            scores=scores,
-            row_train_ids=row_train_ids,
-            row_steps=row_steps,
-            test_ids=test_ids,
-            algorithm_meta={
-                "normalized_grad": normalized_grad,
-                **(algorithm_meta or {}),
-            },
-            algorithm=name,
-            layer_name=layer_name,
-        )
-        result.save(self.args.output_path)
-        return result
-
-    def attribute_from_cache(
-        self,
-        train_gradients_dir: str,
-        test_gradients_dir: str,
-        *,
-        selected_training_steps: Iterable[int] | None = None,
-        loop_over_test: bool = False,
-        verbose: bool = False,
-        layer_name: str | list[str] | None = None,
-        normalized_grad: bool = False,
-    ) -> AttributionScore:
-        """Score pre-collected on-disk gradients (the *store-then-attribute* path).
-
-        Every train record is scored against every test record; rows/columns are
-        the train/test content hashes in on-disk order, each row stamped with the
-        step its gradient was recorded at.
-
-        Args:
-            train_gradients_dir: Directory written by :class:`GradientStorageManager`
-                during the training pass.
-            test_gradients_dir: Directory written during the test pass.
-            selected_training_steps: Restrict the training checkpoints (the output
-                rows) to these steps; ``None`` uses every step on disk
-                (over-specified ranges are intersected).  The test set always
-                supplies every column.
-            loop_over_test: Re-stream the test blocks per train block (low memory)
-                instead of caching them once (default).
-            verbose: Show tqdm progress bars on the logging process.
-            layer_name: Restrict scoring to this subset of the *stored* layers
-                (``str`` or list; unknown names raise).  ``None`` (default) scores
-                every stored layer.  This is a read-time filter -- the cache itself
-                is unchanged, so the same cache can be re-queried per layer.
-            normalized_grad: ``True`` scores by cosine similarity (GradCos);
-                ``False`` (default) by the raw inner product (TracIn / GradDot).
-
-        Returns:
-            An :class:`AttributionScore`, also persisted to ``args.output_dir``.
-        """
-        if train_gradients_dir is None or test_gradients_dir is None:
-            raise ValueError(
-                f"{type(self).__name__}.attribute_from_cache requires both "
-                "train_gradients_dir and test_gradients_dir.",
+        total = torch.zeros(rep.batch_size, device=rep.device)
+        for name in layers:
+            value = rep.data[name]
+            if dense_cache is not None and name in dense_cache:
+                value = dense_cache.get(name)
+            norm_sq = ops.grad_norm_sq(value, rep.layer_types[name])
+            total += (
+                norm_sq.expand(rep.batch_size) if norm_sq.shape[0] == 1 else norm_sq
             )
-        layer_name = normalize_layer_names(layer_name)
-        name, _ = self._label(normalized_grad)
-        train_fm = GradientStorageManager(train_gradients_dir)
-        test_fm = GradientStorageManager(test_gradients_dir)
-        train = DiskGradientSource(
-            train_fm,
-            self.args,
-            steps=selected_training_steps,
-            layer_name=layer_name,
-            desc=f"{name}: scoring",
-            verbose=verbose,
-        )
-        test = DiskGradientSource(
-            test_fm,
-            self.args,
-            layer_name=layer_name,
-            desc=f"{name}: loading test",
-            verbose=verbose,
-        )
-        return self._run(
-            train,
-            test,
-            loop_over_test=loop_over_test,
-            algorithm_meta={
-                "selected_training_steps": train._steps,
-                # The identifier scheme each store was collected under (None
-                # = content hashing) -- disambiguates the row/column ids.
-                "sample_id_key": {
-                    "train": train_fm.sample_id_key,
-                    "test": test_fm.sample_id_key,
-                },
-            },
-            layer_name=layer_name,
-            normalized_grad=normalized_grad,
-        )
+        return total.clamp_min(0).sqrt()
+
+    # ------------------------------------------------------------------ #
+    # Entry points                                                         #
+    # ------------------------------------------------------------------ #
 
     def attribute(
         self,
         train_dataset: Dataset,
         test_dataset: Dataset,
         *,
+        hook_config: HookManagerConfig | None = None,
+        verbose: bool = False,
         loop_over_test: bool = False,
         enable_update: bool = False,
-        hook_config: HookManagerConfig | None = None,
+        gradient_cache_residency: str | None = None,
         normalized_grad: bool = False,
     ) -> AttributionScore:
-        """Score by collecting gradients **live** (on-the-fly, workflow 1).
+        """Score by collecting gradients **live** (the on-the-fly workflow).
 
-        Everything but the data and these two flags comes from the
-        :class:`AttributionTask` (model, loss, optional ``target_func`` for the
-        test side, and the checkpoint list) and from ``args`` (batch sizes,
-        precision, and -- when ``enable_update`` -- the optimizer/scheduler, all
-        settled inside :class:`GradientStreamer`).
-
-        * ``enable_update=False`` (default) -- score at **every checkpoint** the
-          task provides (dattri's multi-checkpoint TracIn ensemble): one frozen
-          pass per checkpoint, the rows stamped with the checkpoint index, summed
-          over checkpoints at query time.
-        * ``enable_update=True`` -- a single training **trajectory** from the first
-          checkpoint; each optimizer step is its own checkpoint row.
-
-        Args:
-            train_dataset: Training dataset to stream (loader batches are
-                passed straight to the task's loss as its ``data``).
-            test_dataset: Test dataset to stream, likewise.
-            loop_over_test: As in :meth:`attribute_from_cache`.
-            enable_update: Train the model as it streams (trajectory) vs. frozen
-                multi-checkpoint scoring.
-            hook_config: :class:`HookManagerConfig` for the internal streamers
-                (which layers to hook, per-layer projection, ...).  ``None`` uses
-                the streamer default (factorized hooks on every linear-family
-                layer).  The test streamer shares the train streamer's hooks, so
-                one config governs both sides.
-            normalized_grad: ``True`` scores by cosine similarity (GradCos);
-                ``False`` (default) by the raw inner product (TracIn / GradDot).
+        See :meth:`BaseInnerProductAttributor.attribute` for the shared
+        arguments.  ``normalized_grad=True`` scores by cosine similarity
+        (GradCos); ``False`` (default) by the raw inner product (TracIn).
         """
-        if self.task is None:
-            raise ValueError(
-                "attribute() (live collection) requires a ``task`` with a model; "
-                "use attribute_from_cache() for pre-collected gradients.",
-            )
-        train_loss = task_loss_fn(self.task.original_loss_func)
-        # The test side is attributed against the task's target_func (which dattri
-        # defaults to the loss when none is given).
-        test_loss = task_loss_fn(self.task.original_target_func)
-        tb = self.args.per_device_train_batch_size
-        vb = self.args.per_device_eval_batch_size
-        device = self.args.device
-        name, metric = self._label(normalized_grad)
-
-        def score_block(
-            tr: Gradient,
-            te: Gradient,
-            _n: int,
-            reuse: bool = True,
-        ) -> torch.Tensor:
-            return _cached_similarity(tr, te, metric, reuse=reuse)
-
-        # Layer selection is the hook config's job; record what was hooked (the
-        # scored layer set) for the AttributionScore metadata.
-        hooked_layers: list[str] = []
-
-        def _score_one(checkpoint_step: int, update: bool) -> AttributionScore:
-            model = self.task.get_model()
-            train = GradientStreamer(
-                model,
-                train_dataset,
-                self.args,
-                batch_size=tb,
-                enable_update=update,
-                loss_fn=train_loss,
-                checkpoint_step=checkpoint_step,
-                config=hook_config,
-            )
-            test = GradientStreamer(
-                model,
-                test_dataset,
-                self.args,
-                batch_size=vb,
-                loss_fn=test_loss,
-                checkpoint_step=checkpoint_step,
-                hook_manager=train.hook_manager,  # one set of hooks over the model
-            )
-            hooked_layers[:] = train.hook_manager.layer_name
-            with train, test:
-                return score_sources(
-                    train,
-                    test,
-                    device,
-                    prepare_test=_prepare_test_budgeted,
-                    score_block=score_block,
-                    loop_over_test=loop_over_test,
-                )
-
-        row_blocks: list[torch.Tensor] = []
-        row_train_ids: list[str] = []
-        row_steps: list[int] = []
-        test_ids: list[str] | None = None
-        if enable_update:
-            # Single trajectory from the first checkpoint; steps are the optimizer
-            # steps (the streamer's own per-pass index).  The trajectory is
-            # regenerated live, so any other provided checkpoints are unused.
-            n_ckpt = len(self.task.get_checkpoints())
-            if n_ckpt > 1:
-                warnings.warn(
-                    f"enable_update=True regenerates the trajectory from checkpoint "
-                    f"0; the other {n_ckpt - 1} provided checkpoint(s) are ignored. "
-                    "Use enable_update=False for multi-checkpoint (frozen) TracIn.",
-                    stacklevel=2,
-                )
-            self.task._load_checkpoints(0)
-            sc, rids, rsteps, tids = _score_one(0, update=True)
-            row_blocks, row_train_ids, row_steps, test_ids = [sc], rids, rsteps, tids
-        else:
-            # One frozen pass per provided checkpoint; rows stamped with the
-            # checkpoint index, summed over checkpoints by the agnostic query.
-            for k in range(len(self.task.get_checkpoints())):
-                self.task._load_checkpoints(k)
-                sc, rids, _rs, tids = _score_one(k, update=False)
-                row_blocks.append(sc)
-                row_train_ids.extend(rids)
-                row_steps.extend([k] * len(rids))
-                test_ids = tids if test_ids is None else test_ids
-
-        scores = torch.cat(row_blocks, dim=0) if row_blocks else torch.zeros(0, 0)
-        result = AttributionScore(
-            scores=scores,
-            row_train_ids=row_train_ids,
-            row_steps=row_steps,
-            test_ids=test_ids or [],
-            algorithm_meta={
-                "n_checkpoints": len(self.task.get_checkpoints()),
-                "normalized_grad": normalized_grad,
-            },
-            algorithm=name,
-            layer_name=hooked_layers or None,  # what the hook manager captured
+        self._set_metric(normalized_grad)
+        return super().attribute(
+            train_dataset,
+            test_dataset,
+            hook_config=hook_config,
+            verbose=verbose,
+            loop_over_test=loop_over_test,
+            enable_update=enable_update,
+            gradient_cache_residency=gradient_cache_residency,
+            normalized_grad=normalized_grad,
         )
-        result.save(self.args.output_path)
-        return result
+
+    def attribute_from_cache(
+        self,
+        train_source: str | Path | GradientStorageManager | DiskGradientSource,
+        test_source: str | Path | GradientStorageManager | DiskGradientSource,
+        *,
+        selected_training_steps: Iterable[int] | None = None,
+        layer_name: str | list[str] | None = None,
+        verbose: bool = False,
+        loop_over_test: bool = False,
+        algorithm_meta: dict | None = None,
+        normalized_grad: bool = False,
+    ) -> AttributionScore:
+        """Score collected gradients; ``normalized_grad`` selects GradCos.
+
+        See :meth:`BaseInnerProductAttributor.attribute_from_cache` for the
+        shared arguments.
+        """
+        self._set_metric(normalized_grad)
+        return super().attribute_from_cache(
+            train_source,
+            test_source,
+            selected_training_steps=selected_training_steps,
+            layer_name=layer_name,
+            verbose=verbose,
+            loop_over_test=loop_over_test,
+            algorithm_meta=algorithm_meta,
+            normalized_grad=normalized_grad,
+        )

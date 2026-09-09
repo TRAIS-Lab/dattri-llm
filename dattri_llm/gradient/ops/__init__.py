@@ -1,36 +1,42 @@
 """Layer-type-aware gradient operations for per-sample gradient computation.
 
-This package re-exports the full surface of its submodules so existing code
-keeps importing from ``dattri_llm.gradient.ops`` unchanged:
+This package re-exports the public surface of its submodules so code imports
+from ``dattri_llm.gradient.ops``:
 
 * :mod:`~dattri_llm.gradient.ops.types` -- layer-type constants and predicates.
-* :mod:`~dattri_llm.gradient.ops.norm` -- normalization x_hat / bias augmentation.
 * :mod:`~dattri_llm.gradient.ops.preprocess` -- raw-capture preprocessing
   (incl. conv im2col) and module-kwargs extraction.
 * :mod:`~dattri_llm.gradient.ops.materialize` -- per-sample weight gradients.
-* :mod:`~dattri_llm.gradient.ops.dot` -- dot products, grams, norms, and the
-  factorized-vs-materialized routing heuristic.
-* :mod:`~dattri_llm.gradient.ops.projection` -- TRAK/LoGRA random projection.
+* :mod:`~dattri_llm.gradient.ops.dot` -- dot products, grams, norms, the
+  layerwise cross-gram, and the factorized-vs-materialized routing heuristic.
+* :mod:`~dattri_llm.gradient.ops.projection` -- TRAK/LoGRA random projection
+  and the :class:`DattriProjector` that owns the projection matrices.
 * :mod:`~dattri_llm.gradient.ops.kronecker` -- K-FAC / EK-FAC / Fisher kernels
   and streaming accumulators.
+
+Naming convention: a function suffixed ``_factors`` takes raw **batch-first**
+``(activation, pre_activation_grad)`` tensors; the unsuffixed name takes the
+:class:`~dattri_llm.gradient.gradient.Factorized` container (and, where noted,
+a dense tensor) and is the entry point to prefer.
 """
 
 from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.dot import (
-    _cross_dot,
-    _cross_gram,
-    _cross_gram_per_token,
-    _dot,
-    _grad_norm_sq,
-    _pairwise_dot,
     cross_dot,
+    cross_dot_factors,
     cross_dot_per_token,
+    cross_gram,
+    cross_gram_per_token,
     dot,
+    dot_factors,
     effective_dims,
     grad_norm_sq,
+    grad_norm_sq_factors,
+    layerwise_cross_dot,
     maybe_use_materialized_gram,
     maybe_use_materialized_norm,
     pairwise_dot,
+    pairwise_dot_factors,
 )
 from dattri_llm.gradient.ops.dtypes import (
     as_float,
@@ -43,60 +49,40 @@ from dattri_llm.gradient.ops.kronecker import (
     KroneckerAccumulator,
     LayerFisherAccumulator,
     LayerKroneckerAccumulator,
-    _drop_gradient_free_rows,
-    _ekfac_materialize,
-    _fim,
-    _flatten_for_kfac,
-    _kfac,
-    _kfac_cross,
     dense_inverse,
     ekfac_materialize,
+    ekfac_materialize_factors,
     ekfac_precondition,
     fim,
+    fim_factors,
     kfac,
     kfac_cross,
+    kfac_cross_factors,
     kfac_eigh,
+    kfac_factors,
     kfac_precondition,
     kfac_precondition_materialized,
     sym_inverse,
 )
-from dattri_llm.gradient.ops.materialize import (
-    _materialize,
-    _materialize_embedding,
-    materialize,
-)
-from dattri_llm.gradient.ops.norm import (
-    _augment_channel_norm,
-    _augment_token_norm,
-    _compute_group_norm_x_hat,
-    _compute_layer_norm_x_hat,
-    _compute_rms_x_hat,
-)
+from dattri_llm.gradient.ops.materialize import materialize, materialize_factors
 from dattri_llm.gradient.ops.preprocess import (
-    _CONV_IM2COL,
-    _conv1d_im2col,
-    _conv2d_im2col,
-    _conv3d_im2col,
-    _conv_spatial_rank,
-    _preprocess_conv_transpose,
-    _preprocess_embedding_bag,
-    _preprocess_factorized,
-    _to_3d,
     extract_module_kwargs,
     preprocess_factorized,
+    preprocess_factors,
+    to_3d,
 )
 from dattri_llm.gradient.ops.projection import (
     PROJECTION_STYLES,
-    _apply_projector,
-    _project_factorized,
-    _project_materialized,
-    clear_projection_cache,
+    DattriProjector,
+    apply_projection,
     maybe_materialize_projected,
     project_activation,
     project_factorized,
+    project_factors,
     project_gradient,
     project_layer,
     project_materialized,
+    project_materialized_factors,
 )
 from dattri_llm.gradient.ops.types import (
     ALL_LAYER_TYPES,
@@ -110,6 +96,7 @@ from dattri_llm.gradient.ops.types import (
     is_conv,
     is_conv_transpose,
     is_embedding,
+    is_kfac_eligible,
     is_linear,
     is_norm,
 )
@@ -123,78 +110,65 @@ __all__ = [
     "NORM_TYPES",
     "PARAM_GRAD_TYPES",
     "PROJECTION_STYLES",
-    "_CONV_IM2COL",
+    "DattriProjector",
     "FisherAccumulator",
     "KroneckerAccumulator",
     "LayerFisherAccumulator",
     "LayerKroneckerAccumulator",
-    "_apply_projector",
-    "_augment_channel_norm",
-    "_augment_token_norm",
-    "_compute_group_norm_x_hat",
-    "_compute_layer_norm_x_hat",
-    "_compute_rms_x_hat",
-    "_conv1d_im2col",
-    "_conv2d_im2col",
-    "_conv3d_im2col",
-    "_conv_spatial_rank",
-    "_cross_dot",
-    "_cross_gram",
-    "_cross_gram_per_token",
-    "_dot",
-    "_drop_gradient_free_rows",
-    "_ekfac_materialize",
-    "_fim",
-    "_flatten_for_kfac",
-    "_grad_norm_sq",
-    "_kfac",
-    "_kfac_cross",
-    "_materialize",
-    "_materialize_embedding",
-    "_pairwise_dot",
-    "_preprocess_conv_transpose",
-    "_preprocess_embedding_bag",
-    "_preprocess_factorized",
-    "_project_factorized",
-    "_project_materialized",
-    "_to_3d",
+    "apply_projection",
     "as_float",
     "canonical_class_name",
-    "clear_projection_cache",
     "compute_dtype",
     "cross_dot",
+    "cross_dot_factors",
     "cross_dot_per_token",
+    "cross_gram",
+    "cross_gram_per_token",
     "dense_inverse",
     "dot",
+    "dot_factors",
     "dtypes",
     "effective_dims",
     "ekfac_materialize",
+    "ekfac_materialize_factors",
     "ekfac_precondition",
     "extract_module_kwargs",
     "fim",
+    "fim_factors",
     "get_compute_dtype",
     "grad_norm_sq",
+    "grad_norm_sq_factors",
     "is_conv",
     "is_conv_transpose",
     "is_embedding",
+    "is_kfac_eligible",
     "is_linear",
     "is_norm",
     "kfac",
     "kfac_cross",
+    "kfac_cross_factors",
     "kfac_eigh",
+    "kfac_factors",
     "kfac_precondition",
     "kfac_precondition_materialized",
+    "layerwise_cross_dot",
     "materialize",
+    "materialize_factors",
     "maybe_materialize_projected",
     "maybe_use_materialized_gram",
     "maybe_use_materialized_norm",
     "pairwise_dot",
+    "pairwise_dot_factors",
     "preprocess_factorized",
+    "preprocess_factors",
     "project_activation",
     "project_factorized",
+    "project_factors",
     "project_gradient",
     "project_layer",
     "project_materialized",
+    "project_materialized_factors",
     "set_compute_dtype",
     "sym_inverse",
+    "to_3d",
 ]

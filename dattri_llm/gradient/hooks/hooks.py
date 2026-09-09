@@ -177,7 +177,7 @@ def register_linear_io_hooks(
     type_overrides: dict[str, str] | None = None,
     kwargs_overrides: dict[str, dict] | None = None,
     projection: dict[str, dict] | None = None,
-    projector: Callable | None = None,
+    projector: ops.DattriProjector | None = None,
     offload_to_cpu: bool = False,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
@@ -217,8 +217,9 @@ def register_linear_io_hooks(
             or CPU training).
         projection: Optional per-layer proj_kwargs map (a ``"__default__"``
             entry covers unlisted layers); ``None`` captures raw factors.
-        projector: Projection factory following dattri's ``random_project``
-            protocol; required when *projection* is given.
+        projector: The :class:`~dattri_llm.gradient.ops.DattriProjector`
+            applying the projection (it owns the projection-matrix cache);
+            required when *projection* is given.
         offload_to_cpu: When ``True``, move every buffered capture (the raw
             factors, or the projected result for a projected layer) to CPU.
             Default ``False``: buffers stay on the tensors' own device to
@@ -553,7 +554,7 @@ def _capture_projected(
     buf: LayerBuffer,
     g: torch.Tensor,
     dev_idx: int,
-    projector: Callable,
+    projector: ops.DattriProjector,
     offload_to_cpu: bool = False,
 ) -> tuple[bool, torch.Tensor | None]:
     """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
@@ -609,7 +610,7 @@ def _capture_projected(
                 buf["_grad_parts"].append((dev_idx, g_p))
                 buf["_pair_pos"].append(pair_pos)
             return True, g_p
-        mat = ops._materialize(a_p, g_p, "nn.Linear")
+        mat = ops.materialize_factors(a_p, g_p, "nn.Linear")
         if offload_to_cpu:
             mat = mat.cpu()
         with buf["_lock"]:
@@ -621,7 +622,7 @@ def _capture_projected(
         a, g = a.unsqueeze(0), g.unsqueeze(0)
 
     if style == "logra_factorized":
-        a_p, g_p = ops._project_factorized(
+        a_p, g_p = ops.project_factors(
             a,
             g,
             layer_type,
@@ -638,7 +639,7 @@ def _capture_projected(
         return True, None
 
     if style == "logra_materialized":
-        a_p, g_p = ops._project_factorized(
+        a_p, g_p = ops.project_factors(
             a,
             g,
             layer_type,
@@ -649,9 +650,9 @@ def _capture_projected(
         # Materialize the projected factors (token-summed outer product) in the
         # small projected space; they behave as a plain linear layer, so
         # module_kwargs=None avoids re-preprocessing.
-        mat = ops._materialize(a_p, g_p, "nn.Linear")
+        mat = ops.materialize_factors(a_p, g_p, "nn.Linear")
     else:  # "materialized" (TRAK)
-        mat = ops._project_materialized(
+        mat = ops.project_materialized_factors(
             a,
             g,
             layer_type,

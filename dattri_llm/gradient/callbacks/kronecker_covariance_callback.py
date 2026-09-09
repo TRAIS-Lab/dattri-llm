@@ -14,7 +14,7 @@ Two use sites share it:
   :class:`~dattri_llm.gradient.callbacks.OffloadCallback` when wrapping a
   training loop, so one pass both stores gradients and fits the covariances (no
   re-iterable source needed -- the training data streams by once).
-* **On-the-fly** -- an attributor's ``cache``/``collect_to_disk`` attaches it to
+* **On-the-fly** -- an attributor's ``cache``/``collect_gradients`` attaches it to
   the streamer's manager so the Fisher is fit in the collection pass.
 
 The factors are accumulated with the same
@@ -34,19 +34,6 @@ from dattri_llm.gradient.callbacks.base import HookManagerCallback
 
 if TYPE_CHECKING:
     import torch
-
-
-def _is_kfac_eligible(layer_type: str) -> bool:
-    """Whether a layer type carries K-FAC (Kronecker) covariances.
-
-    Matches ``KFACAttributor._kfac_layers``: linear and convolution layers.
-    Norm / embedding / ``param_grad`` layers are skipped.
-    """
-    return (
-        ops.is_linear(layer_type)
-        or ops.is_conv(layer_type)
-        or ops.is_conv_transpose(layer_type)
-    )
 
 
 class KroneckerCovarianceCallback(HookManagerCallback):
@@ -79,7 +66,7 @@ class KroneckerCovarianceCallback(HookManagerCallback):
         module_kwargs: dict | None,  # noqa: ARG002 - used at backward pairing
     ) -> None:
         """Buffer a K-FAC-eligible layer's activation for its backward."""
-        if not _is_kfac_eligible(layer_type):
+        if not ops.is_kfac_eligible(layer_type):
             return
         self._pending.setdefault(layer_name, []).append(activation)
 
@@ -91,7 +78,7 @@ class KroneckerCovarianceCallback(HookManagerCallback):
         module_kwargs: dict | None,
     ) -> None:
         """Pair with the buffered activation and fold ``(a, g)`` into ``(A, G)``."""
-        if not _is_kfac_eligible(layer_type):
+        if not ops.is_kfac_eligible(layer_type):
             return
         pending = self._pending.get(layer_name)
         if not pending:

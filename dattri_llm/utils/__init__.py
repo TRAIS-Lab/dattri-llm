@@ -7,11 +7,19 @@
   helpers, safe to call outside a distributed context.
 * :mod:`~dattri_llm.utils.autograd` -- guarded autograd-engine helpers for
   scheduling work at the end of the in-flight backward pass.
+* :mod:`~dattri_llm.utils.cache` -- the library-wide cache abstraction
+  (``CacheBudget``, ``TensorCache``, ``CACHE_RESIDENCIES``).
 """
 
 from dattri_llm.utils.autograd import (
     queue_after_backward_finalization,
     queue_backward_end_callback,
+)
+from dattri_llm.utils.cache import (
+    CACHE_RESIDENCIES,
+    CacheBudget,
+    TensorCache,
+    tensor_nbytes,
 )
 from dattri_llm.utils.distributed import (
     dist_rank,
@@ -21,6 +29,9 @@ from dattri_llm.utils.distributed import (
 from dattri_llm.utils.hashing import hash_batch, hash_sample
 
 __all__ = [
+    "CACHE_RESIDENCIES",
+    "CacheBudget",
+    "TensorCache",
     "dist_rank",
     "dist_world_size",
     "hash_batch",
@@ -28,4 +39,5 @@ __all__ = [
     "is_dist_initialized",
     "queue_after_backward_finalization",
     "queue_backward_end_callback",
+    "tensor_nbytes",
 ]

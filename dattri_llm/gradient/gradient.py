@@ -50,8 +50,7 @@ class Factorized:
         """Return a copy with both factors moved to *device* / cast to *dtype*.
 
         With ``non_blocking=True`` the copies are asynchronous (given pinned
-        memory); the caller owns the stream synchronization before reading
-        (see :mod:`dattri_llm.gradient.prefetch`).
+        memory); the caller owns the stream synchronization before reading.
         """
         return Factorized(
             activation=self.activation.to(
@@ -87,6 +86,14 @@ class Factorized:
             pre_activation_grad=pin(self.pre_activation_grad),
             module_kwargs=self.module_kwargs,
             batch_first=self.batch_first,
+        )
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes held by the two factors."""
+        return sum(
+            t.numel() * t.element_size()
+            for t in (self.activation, self.pre_activation_grad)
         )
 
     def as_batch_first(self) -> Factorized:
@@ -172,7 +179,7 @@ def _pad_to_common_tokens(
     return pad(a), pad(b)
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False)  # noqa: PLR0904 - the block's full data-model surface
 class Gradient:
     """A per-step, multi-layer container of per-sample gradients with metadata."""
 
@@ -254,6 +261,91 @@ class Gradient:
         """Dtype of the stored payloads."""
         x = next(iter(self.data.values()))
         return x.activation.dtype if isinstance(x, Factorized) else x.dtype
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes this block occupies **as stored** (factors or dense).
+
+        The right quantity for deciding how many blocks may be resident at
+        once; see :meth:`materialized_nbytes` for what materializing would
+        cost.
+        """
+        return sum(
+            v.nbytes if isinstance(v, Factorized) else v.numel() * v.element_size()
+            for v in self.data.values()
+        )
+
+    @property
+    def materialized_nbytes(self) -> int:
+        """Conservative byte count of :meth:`materialize`'s result.
+
+        Estimated from the factor shapes rather than by materializing
+        anything, so the check itself is free.  Per layer the dense weight
+        gradient is ``B x K x D`` for the linear/conv family, ``B x d`` for
+        normalization layers (whose token axis is contracted), and
+        ``B x vocab x E`` for embeddings; a dense layer counts as is.
+        """
+        total = 0
+        for name, val in self.data.items():
+            if not isinstance(val, Factorized):
+                total += val.numel() * val.element_size()
+                continue
+            bf = val.as_batch_first()
+            a, g = bf.activation, bf.pre_activation_grad
+            b = a.shape[0]
+            itemsize = g.element_size()
+            layer_type = self.layer_types.get(name, "nn.Linear")
+            if ops.is_norm(layer_type):
+                total += b * a.shape[-1] * itemsize
+            elif ops.is_embedding(layer_type):
+                mk = bf.module_kwargs or {}
+                vocab = mk.get("num_embeddings") or int(a.max().item()) + 1
+                total += b * vocab * g.shape[-1] * itemsize
+            else:
+                total += b * a.shape[-1] * g.shape[-1] * itemsize
+        return total
+
+    def map_layers(
+        self,
+        fn: Callable[[str, GradientData, str], GradientData | None],
+        *,
+        layers: Iterable[str] | None = None,
+    ) -> Gradient:
+        """Apply ``fn(name, value, layer_type)`` to every (selected) layer and
+        rebuild the block from the results.
+
+        The layerwise transform behind test-side preconditioning, dense
+        conversion, and similar per-layer maps: *fn* returns the layer's new
+        payload -- a :class:`Factorized` (kept ``"factorized"``) or a tensor
+        (marked ``"materialized"`` with ``"batch"`` indexing) -- or ``None`` to
+        drop the layer.  Layers outside *layers* pass through unchanged.
+        Layer types are preserved; validation is skipped because *fn* may
+        legitimately change a layer's width.
+        """
+        selected = set(self.data) if layers is None else set(layers)
+        new_data: dict[str, GradientData] = {}
+        new_repr: dict[str, GradientRepresentation] = {}
+        new_indexing: dict[str, Indexing] = {}
+        for name, old in self.data.items():
+            value = fn(name, old, self.layer_types[name]) if name in selected else old
+            if value is None:
+                continue
+            new_data[name] = value
+            if isinstance(value, Factorized):
+                new_repr[name] = "factorized"
+                new_indexing[name] = self.indexing[name]
+            else:
+                new_repr[name] = "materialized"
+                new_indexing[name] = (
+                    "batch" if name in selected else self.indexing[name]
+                )
+        return Gradient(
+            representation=new_repr,
+            data=new_data,
+            layer_types={k: v for k, v in self.layer_types.items() if k in new_data},
+            indexing=new_indexing,
+            validate_on_init=False,
+        )
 
     def validate(self) -> None:
         """Check internal consistency; raise ``ValueError`` on any violation."""
@@ -448,7 +540,11 @@ class Gradient:
             indexing=new_indexing,
         )
 
-    def project(self, projector: Callable, proj_kwargs: dict[str, dict]) -> Gradient:
+    def project(
+        self,
+        projector: Callable | ops.DattriProjector | None,
+        proj_kwargs: dict[str, dict],
+    ) -> Gradient:
         """Random-project each layer's per-sample gradient to a smaller dimension.
 
         Three styles, chosen per layer by ``proj_kwargs[name]["style"]``:
@@ -467,7 +563,12 @@ class Gradient:
         Args:
             projector: a projection factory following dattri's ``random_project``
                 protocol -- ``projector(feature, batch_size, proj_dim=..., **kw)``
-                returns a callable mapping ``(N, D) -> (N, proj_dim)``.
+                returns a callable mapping ``(N, D) -> (N, proj_dim)`` -- or a
+                :class:`~dattri_llm.gradient.ops.DattriProjector` wrapping one
+                (whose matrix cache is then shared across calls).  ``None``
+                uses dattri's projector.  A bare factory is wrapped for the
+                duration of this call, so the matrices are shared across
+                layers but released afterwards.
             proj_kwargs: ``{layer_name: dict}`` per-layer config.  Each dict carries
                 ``proj_dim`` and optionally ``style`` (default
                 ``"logra_factorized"``), ``proj_seed`` and any projector kwargs
@@ -483,6 +584,7 @@ class Gradient:
         new_repr: dict[str, GradientRepresentation] = {}
         new_types: dict[str, str] = {}
         new_indexing: dict[str, Indexing] = {}
+        projector = ops.DattriProjector.coerce(projector)
 
         for name, value in self.data.items():
             kw = proj_kwargs.get(name, proj_kwargs.get("__default__"))
@@ -858,7 +960,9 @@ class Gradient:
                 then matrix-multiply), or ``"auto"`` (choose per layer by the cost
                 heuristic in :func:`ops.maybe_use_materialized_gram` -- factorized
                 for small token/patch counts, materialized once the $S^2$ factor
-                dominates).  All three are numerically equivalent.
+                dominates).  All three are numerically equivalent.  The per-layer
+                work is :func:`ops.layerwise_cross_dot`, which attributors call
+                directly when they score layer by layer.
             eps: Numerical floor added to the cosine denominator.
 
         Returns:
@@ -879,42 +983,35 @@ class Gradient:
         if mode not in {"factorized", "materialized", "auto"}:
             raise ValueError("mode must be 'factorized', 'materialized', or 'auto'")
 
-        per_layer: dict[str, torch.Tensor] = {}
-        for name in self.layer_names:
-            if name not in other.data:
-                continue
-            matrix = self._layer_cross_matrix(other, name, mode)
-            if metric == "cosine" and reduce == "none":
-                # Per-layer cosine: normalise each layer independently.
-                n_s = self._layer_norm_sq(name, mode).clamp_min(0).sqrt()  # (B_self,)
-                n_o = other._layer_norm_sq(name, mode).clamp_min(0).sqrt()  # (B_other,)
-                matrix /= n_s[:, None] * n_o[None, :] + eps
-
-            per_layer[name] = matrix
-
+        per_layer = ops.layerwise_cross_dot(self, other, mode=mode, reduce="none")
         if reduce == "none":
+            if metric == "cosine":
+                # Per-layer cosine: normalise each layer independently.
+                for name in per_layer:
+                    n_s = self._layer_norm_sq(name, mode).clamp_min(0).sqrt()
+                    n_o = other._layer_norm_sq(name, mode).clamp_min(0).sqrt()
+                    per_layer[name] /= n_s[:, None] * n_o[None, :] + eps
             return per_layer
         # reduce == "all": full-model gradient cross-gram (sum the per-layer
         # matrices, since the whole-model gradient is the concatenation of layers).
         if not per_layer:
             raise ValueError("No shared layers to compute an overall similarity")
-        # A broadcast layer's shared row belongs to every sample: expand its
-        # size-1 batch axes to the full (B_self, B_other) before summing.
-        b_s, b_o = self.batch_size, other.batch_size
-
-        def _expand_matrix(m: torch.Tensor) -> torch.Tensor:
-            return m.expand(
-                b_s if m.shape[0] == 1 else m.shape[0],
-                b_o if m.shape[1] == 1 else m.shape[1],
-            )
-
-        def _expand_vec(v: torch.Tensor, b: int) -> torch.Tensor:
-            return v.expand(b) if v.shape[0] == 1 else v
-
-        total = torch.stack([_expand_matrix(m) for m in per_layer.values()]).sum(0)
+        total = ops.layerwise_cross_dot(
+            self,
+            other,
+            layers=list(per_layer),
+            mode=mode,
+            reduce="sum",
+        )
         if metric == "cosine":
             # Full-model cosine: normalise by the concatenated-gradient norms,
-            # i.e. sqrt(sum of per-layer squared norms).
+            # i.e. sqrt(sum of per-layer squared norms).  A broadcast layer's
+            # shared row belongs to every sample: expand its size-1 batch axis.
+            b_s, b_o = self.batch_size, other.batch_size
+
+            def _expand_vec(v: torch.Tensor, b: int) -> torch.Tensor:
+                return v.expand(b) if v.shape[0] == 1 else v
+
             norm_sq_s = (
                 torch.stack(
                     [_expand_vec(self._layer_norm_sq(n, mode), b_s) for n in per_layer],
@@ -997,57 +1094,15 @@ class Gradient:
         # concatenation of its layers.
         return torch.stack(list(per_layer.values())).sum(0)
 
-    def _layer_cross_matrix(
-        self,
-        other: Gradient,
-        name: str,
-        mode: Literal["factorized", "materialized", "auto"],
-    ) -> torch.Tensor:
-        """Return the ``(B_self, B_other)`` cross-gram for one layer.
-
-        The factorized<->materialized routing lives in :func:`ops.cross_dot` /
-        :func:`ops._cross_gram` (the shared kernel, also used by K-FAC), so this
-        method just forwards ``mode``; ``"auto"`` picks the cheaper path per layer
-        from :func:`ops.maybe_use_materialized_gram`.
-        """
-        sv = self.data[name]
-        ov = other.data[name]
-        layer_type = self.layer_types[name]
-
-        if isinstance(sv, Factorized) and isinstance(ov, Factorized):
-            return ops.cross_dot(sv, ov, layer_type, mode=mode)
-
-        if isinstance(sv, Factorized) or isinstance(ov, Factorized):
-            if isinstance(sv, Factorized):
-                sv = ops.materialize(sv, layer_type)
-            else:
-                ov = ops.materialize(ov, other.layer_types[name])
-
-        # Both plain materialized tensors: flatten non-batch dims and dot.
-        sv, ov = ops.dtypes.align(sv, ov)
-        xf = sv.reshape(sv.shape[0], -1)
-        yf = ov.reshape(ov.shape[0], -1)
-        return xf @ yf.T
-
     def _layer_norm_sq(
         self,
         name: str,
         mode: Literal["factorized", "materialized", "auto"],
     ) -> torch.Tensor:
-        """Per-sample squared gradient norms ``(B,)`` for one layer.
-
-        Used by :meth:`similarity` for the cosine denominator.  The factorized<->
-        materialized routing lives in :func:`ops.grad_norm_sq` /
-        :func:`ops._grad_norm_sq`; this method just forwards ``mode`` (``"auto"``
-        picks the cheaper path via :func:`ops.maybe_use_materialized_norm`).  The
-        value is identical across modes.
+        """Per-sample squared gradient norms ``(B,)`` for one layer (the cosine
+        denominator of :meth:`similarity`); see :func:`ops.grad_norm_sq`.
         """
-        value = self.data[name]
-        if not isinstance(value, Factorized):
-            (value,) = ops.dtypes.align(value)
-            flat = value.reshape(value.shape[0], -1)
-            return (flat * flat).sum(-1)
-        return ops.grad_norm_sq(value, self.layer_types[name], mode=mode)
+        return ops.grad_norm_sq(self.data[name], self.layer_types[name], mode=mode)
 
     def _check_compatible(
         self,

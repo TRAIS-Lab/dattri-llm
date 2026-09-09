@@ -2,7 +2,7 @@
 
 :class:`AsyncGradientWriter` decouples gradient collection from disk IO: the
 producer (a training loop under ``OffloadCallback``, or an attributor's
-``collect_to_disk`` pass) hands record groups to :meth:`submit` and keeps
+``collect_gradients`` pass) hands record groups to :meth:`submit` and keeps
 computing while a single background thread performs the device-to-host copy
 and the store write.  Ordering and crash safety are inherited unchanged from
 :class:`~dattri_llm.gradient.storage_manager.GradientStorageManager`: groups

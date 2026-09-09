@@ -460,19 +460,6 @@ class HookManagerConfig:
         )
 
 
-def _resolve_projector(projector: Callable | None) -> Callable:
-    """Return *projector*, or lazily fall back to dattri's ``random_project``.
-
-    The import is deferred so configuring projection is the only thing that pulls
-    in dattri's projection backend.
-    """
-    if projector is not None:
-        return projector
-    from dattri.func.projection import random_project
-
-    return random_project
-
-
 def _selector_matches(selector: Selector, name: str) -> bool:
     """Return ``True`` if *name* is selected by *selector*.
 

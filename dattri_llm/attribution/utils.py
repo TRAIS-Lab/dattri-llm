@@ -1,23 +1,36 @@
-"""Common utilities shared by the attribution algorithms."""
+"""Common utilities shared by the attribution algorithms.
+
+* :func:`normalize_layer_names` / :func:`task_loss_fn` -- small adapters.
+* :func:`collect_gradients` -- run a streamer to completion into a store
+  (the engine of every attributor's ``cache``).
+* :func:`score_sources` -- the inner-product scoring loop: every train block
+  against every (transformed) test block, with the dense-materialization
+  cache handled here so a method's ``inner_product`` never has to.
+"""
 
 from __future__ import annotations
 
-from itertools import chain
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 
-from dattri_llm.attribution.memory import safe_prefetch_depth
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
-from dattri_llm.gradient.prefetch import prefetch_to_device
+from dattri_llm.gradient.streaming import rebatch_blocks
+from dattri_llm.utils.cache import CacheBudget, TensorCache
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
 
     from torch import nn
 
     from dattri_llm.gradient.storage_manager import GradientStorageManager
     from dattri_llm.gradient.streaming import GradientStreamer
+
+# ``inner_product(train_rep, test_rep, dense_cache=...) -> (B_train, B_test)``
+InnerProduct = Callable[..., torch.Tensor]
+# ``transform(block) -> block``
+Transform = Callable[[Gradient], Gradient]
 
 
 def normalize_layer_names(
@@ -50,50 +63,51 @@ def task_loss_fn(func: Callable) -> Callable:
     return loss_fn
 
 
-def collect_to_disk(
+def collect_gradients(
     streamer: GradientStreamer,
-    file_manager: GradientStorageManager,
+    store: GradientStorageManager,
     *,
     offload_interval: int = 1,
     on_block: Callable[[int, Gradient, list[str]], None] | None = None,
     async_write: bool | None = None,
-) -> None:
-    """Run a gradient streamer to completion, persisting every block to disk.
+) -> GradientStorageManager:
+    """Run a gradient streamer to completion, persisting every block to *store*.
 
     Iterates ``streamer`` (entering/exiting its context here, so pass a freshly
     built one), saving each ``(step, Gradient, hashes)`` block as a
     :class:`GradientRecord` stamped with the streamer's *semantic* step label --
     the checkpoint index for a frozen probe, or the optimizer-step index for a
     training trajectory.  This is the shared engine of every attributor's
-    on-the-fly :meth:`cache`: an attributor drives its own streamer, so it
-    saves directly here.  (The passive :class:`OffloadCallback` is reserved for
-    the *manual* workflow -- offloading as a side effect of a training loop the
-    attributor does not control; it is not used for attributor-driven
-    collection.)  Reproducing :meth:`attribute` is then *cache +
-    attribute_from_cache*.
+    on-the-fly :meth:`cache`: an attributor drives its own streamer, so it saves
+    directly here.  (The passive :class:`OffloadCallback` is reserved for the
+    *manual* workflow -- offloading as a side effect of a training loop the
+    attributor does not control.)  The store may have any residency.
 
     Args:
         streamer: A freshly built (not yet entered) gradient streamer.
-        file_manager: Destination store.
+        store: Destination store.
         offload_interval: Number of ``(step)`` blocks accumulated per gradient
             file.  ``1`` (default) writes one file per step.  A larger value
             packs that many steps into each file -- amortising the per-file
             index rewrite over a long trajectory (``enable_update=True``) at the
             cost of holding that many blocks in memory before each flush.
         on_block: Optional ``(step, gradient, hashes)`` hook invoked on **every**
-            streamed block, before it is staged.  The OTF analogue of a manual
-            collection callback: because the attributor drives the streamer here
-            (not through a :class:`HookManager`), it accumulates side quantities
-            -- e.g. the K-FAC covariances a :class:`KroneckerAccumulator` builds
-            -- directly off the streamed blocks, so a re-pass over the store to
-            fit them is not needed.  Runs on the (single-shot) collection pass,
-            so it sees each block exactly once.
+            streamed block, before it is staged.  The on-the-fly analogue of a
+            manual collection callback: because the attributor drives the
+            streamer (not a :class:`HookManager`), side quantities -- e.g. the
+            K-FAC covariances a :class:`KroneckerAccumulator` builds -- are
+            accumulated straight off the streamed blocks, so no re-pass over
+            the store is needed.  Runs on the (single-shot) collection pass, so
+            it sees each block exactly once.
         async_write: Write flush groups through a background
             :class:`~dattri_llm.gradient.async_writer.AsyncGradientWriter`,
             overlapping D2H + disk IO with the next block's forward/backward.
             The writer is drained before this function returns, so the store
             is complete and identical to a synchronous run.  ``None``
             (default) reads ``async_disk_write`` off the streamer's args.
+
+    Returns:
+        *store*, for chaining.
     """
     if offload_interval < 1:
         raise ValueError(
@@ -101,16 +115,14 @@ def collect_to_disk(
         )
     if async_write is None:
         async_write = getattr(
-            getattr(streamer, "_args", None),
-            "async_disk_write",
-            False,
+            getattr(streamer, "args", None), "async_disk_write", False
         )
     writer = None
     if async_write:
         from dattri_llm.gradient.async_writer import AsyncGradientWriter
 
-        writer = AsyncGradientWriter(file_manager)
-    save = writer.submit if writer is not None else file_manager.save_bulk
+        writer = AsyncGradientWriter(store)
+    save = writer.submit if writer is not None else store.save_bulk
 
     id_key = streamer.hook_manager.sample_id_key
     staged: list[GradientRecord] = []
@@ -135,155 +147,47 @@ def collect_to_disk(
     finally:
         if writer is not None:
             writer.close()
+    return store
 
 
-def _score_one(
-    train_g: Gradient,
-    cached_test: list[tuple[object, list[str]]],
+def _identity(block: Gradient) -> Gradient:
+    return block
+
+
+def _fix_columns(
+    hashes: Iterable[str],
+    test_ids: list[str],
     test_index: dict[str, int],
-    num_test: int,
-    score_block: Callable[[Gradient, object, int, bool], torch.Tensor],
-) -> torch.Tensor:
-    """Cross-gram one device-resident train block against every cached test
-    block, returning its ``(B_train, num_test)`` CPU row chunk.
+) -> list[int]:
+    """Assign column indices to *hashes* in first-seen order; returns them."""
+    cols = []
+    for h in hashes:
+        if h not in test_index:
+            test_index[h] = len(test_ids)
+            test_ids.append(h)
+        cols.append(test_index[h])
+    return cols
+
+
+def _merge_dense_test(
+    cached_test: list[tuple[Gradient, list[int]]],
+) -> list[tuple[Gradient, list[int]]]:
+    """Concatenate the cached test reps into one block when they are all dense.
+
+    A dense test side is scored by one GEMM per layer per train block, so
+    ``n_test_blocks`` blocks cost ``n_test_blocks`` times the launches for the
+    same flops.  Stacking them (one ``cat`` per layer, like the train-side
+    re-batching) collapses that to a single block -- which also means no train
+    layer is ever materialized *for reuse*, so no dense cache is needed.
+    Factorized reps cannot be stacked and are left as they are.
     """
-    # A materialization cache on the train side only pays off when the same
-    # train block is scored against MORE THAN ONE test block: with a single
-    # block every layer is materialized once and used once, so caching it is
-    # pure retention (at full dimension, several GB per block held for nothing).
-    reuse = len(cached_test) > 1
-    row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
-    for test_rep, test_hashes in cached_test:
-        cols = [test_index[h] for h in test_hashes]
-        block = score_block(train_g, test_rep, len(cols), reuse)
-        row[:, cols] = block.detach().to("cpu", torch.float)
-    return row
-
-
-def _budgeted_prefetch(
-    blocks: Iterable,
-    device: object,
-    depth: int,
-) -> Iterable:
-    """:func:`prefetch_to_device` with the depth capped to what fits the device.
-
-    Prefetching keeps ``depth + 1`` blocks resident.  A projected block is a few
-    MB and the requested depth is always affordable, but a full-dimension block
-    is a sizeable fraction of the card -- there, double buffering is itself
-    enough to exhaust it before any scoring happens.
-
-    The first block is pulled to size the decision and then chained back, so the
-    stream is consumed exactly once.  Only pass a **host-resident** stream (e.g.
-    :func:`_rebatch_blocks` output): peeking a live :class:`GradientStreamer`
-    advances the shared hook manager's step counter before the prefetcher runs,
-    which desynchronizes a concurrently-running train pass.
-    """
-    it = iter(blocks)
-    first = next(it, None)
-    if first is None:
-        return
-    yield from prefetch_to_device(
-        chain([first], it),
-        device,
-        depth=safe_prefetch_depth(first[1], device, depth),
+    if len(cached_test) < 2:
+        return cached_test
+    stream = ((0, rep, cols) for rep, cols in cached_test)
+    merged = list(
+        rebatch_blocks(stream, batch_size=sum(len(c) for _, c in cached_test))
     )
-
-
-def _rebatch_blocks(
-    train_source: Iterable,
-    batch_size: int,
-) -> Iterable[tuple[list[int], Gradient, list[str]]]:
-    """Re-batch a source's collection blocks into ``batch_size``-sample scoring
-    batches.
-
-    Each layer's ``(B, D)`` materialized tensors are concatenated to ``(K, D)``
-    (one ``cat`` per layer, O(N) not pairwise), collapsing the tiny per-block
-    matmuls downstream into big GEMMs.  Factorized blocks can't be stacked
-    into a dense ``(B, D)``, so they are yielded one block at a time.  The
-    concatenation stays on the source device; the device move is the
-    consumer's job, so it can be overlapped
-    (:func:`~dattri_llm.gradient.prefetch.prefetch_to_device`).
-
-    Yields:
-        ``(per_row_steps, Gradient, per_row_ids)`` host-resident batches, in
-        the source's sample order.
-    """
-    pending: dict[str, list[torch.Tensor]] = {}
-    pending_ids: list[str] = []
-    pending_steps: list[int] = []
-    pending_n = 0
-    meta: Gradient | None = None
-
-    def build() -> tuple[list[int], Gradient, list[str]]:
-        nonlocal pending, pending_ids, pending_steps, pending_n
-        # One cat per layer (O(N) copies, not pairwise O(N^2)).
-        data = {name: torch.cat(tensors, dim=0) for name, tensors in pending.items()}
-        big = Gradient(
-            representation=meta.representation,
-            data=data,
-            layer_types=meta.layer_types,
-            indexing=meta.indexing,
-            validate_on_init=False,
-        )
-        batch = (pending_steps, big, pending_ids)
-        pending, pending_ids, pending_steps, pending_n = {}, [], [], 0
-        return batch
-
-    for step, block, hashes in train_source:
-        if not all(isinstance(v, torch.Tensor) for v in block.data.values()):
-            # Factorized: yield this block alone (flush any pending batch first;
-            # homogeneous stores never mix, but stay correct if they do).
-            if pending_n:
-                yield build()
-            yield [step] * block.batch_size, block, list(hashes)
-            continue
-        meta = block
-        for name, tensor in block.data.items():
-            pending.setdefault(name, []).append(tensor)
-        pending_ids.extend(hashes)
-        pending_steps.extend([step] * block.batch_size)
-        pending_n += block.batch_size
-        if pending_n >= batch_size:
-            yield build()
-    if pending_n:
-        yield build()
-
-
-def _batched_train_score(
-    train_source: Iterable,
-    device: object,
-    cached_test: list[tuple[object, list[str]]],
-    test_index: dict[str, int],
-    num_test: int,
-    score_block: Callable[[Gradient, object, int, bool], torch.Tensor],
-    batch_size: int,
-    prefetch_depth: int = 1,
-) -> tuple[torch.Tensor, list[str], list[int]]:
-    """Score the train side in ``batch_size``-sample batches -- one set of GEMMs
-    per batch instead of one per stored block.
-
-    Host-side re-batching (:func:`_rebatch_blocks`) feeds
-    :func:`~dattri_llm.gradient.prefetch.prefetch_to_device`, overlapping each
-    batch's host->device transfer with the previous batch's scoring GEMMs.
-    """
-    row_chunks: list[torch.Tensor] = []
-    row_train_ids: list[str] = []
-    row_steps: list[int] = []
-
-    batches = _rebatch_blocks(train_source, batch_size)
-    for steps, train_g, ids in _budgeted_prefetch(batches, device, prefetch_depth):
-        row_chunks.append(
-            _score_one(train_g, cached_test, test_index, num_test, score_block),
-        )
-        row_train_ids.extend(ids)
-        row_steps.extend(steps)
-
-    scores = (
-        torch.cat(row_chunks, dim=0)
-        if row_chunks
-        else torch.zeros(0, num_test, dtype=torch.float)
-    )
-    return scores, row_train_ids, row_steps
+    return [(rep, cols) for _steps, rep, cols in merged]
 
 
 def score_sources(
@@ -291,29 +195,35 @@ def score_sources(
     test_source: Iterable,
     device: object,
     *,
-    prepare_test: Callable[[Gradient], object],
-    score_block: Callable[[Gradient, object, int, bool], torch.Tensor],
+    inner_product: InnerProduct,
+    transform_train: Transform | None = None,
+    transform_test: Transform | None = None,
+    batch_size: int = 1,
     loop_over_test: bool = False,
+    cache_budget: CacheBudget | None = None,
 ) -> tuple[torch.Tensor, list[str], list[int], list[str]]:
-    """Shared scoring skeleton for the trajectory-agnostic attributors.
+    """The inner-product scoring loop shared by the trajectory-agnostic attributors.
 
-    Both train and test arrive as ``GradientSource`` objects (on-disk
+    Both sides are ``GradientSource`` objects (on-disk
     :class:`~dattri_llm.gradient.streaming.DiskGradientSource` or live
-    :class:`~dattri_llm.gradient.streaming.GradientStreamer`), yielding
-    ``(step, Gradient, hashes)`` blocks.  The skeleton fixes the test column order
-    from the first test pass, scores every train block against every (prepared)
-    test block, and returns the pieces an
-    :class:`~dattri_llm.attribution.score.AttributionScore` is assembled from -- the
-    per-method preparation/scoring lives in the two callables:
+    :class:`~dattri_llm.gradient.streaming.GradientStreamer`) yielding
+    ``(step, Gradient, hashes)`` blocks.  The loop fixes the test column order
+    from the first test pass, scores every train block against every
+    (transformed) test block, and returns the pieces an
+    :class:`~dattri_llm.attribution.score.AttributionScore` is assembled from.
+    The method-specific work lives in the three callables:
 
-    * ``prepare_test(test_g) -> rep`` turns a device-resident test block into the
-      representation ``score_block`` consumes (identity for TracIn; whitened /
-      FIM reps for K-FAC).
-    * ``score_block(train_g, rep, n_test, reuse) -> (B_train, n_test)`` is the actual
-      (preconditioned) cross-gram for one train block against one prepared test
-      block.  ``reuse`` is ``True`` only when this train block will be scored
-      against further test blocks, and is the sole licence to retain a
-      materialized copy of it.
+    * ``transform_train(block) -> rep`` / ``transform_test(block) -> rep``
+      turn a device-resident block into the representation to score
+      (identity by default; e.g. preconditioning on the test side).
+    * ``inner_product(train_rep, test_rep, dense_cache=cache) -> (B_train, B_test)``
+      scores one pair.  ``dense_cache`` is a
+      :class:`~dattri_llm.utils.cache.TensorCache` **scoped to the train block**
+      -- handed to :func:`~dattri_llm.gradient.ops.layerwise_cross_dot` it makes
+      a factorized train layer materialize once across all the test blocks it
+      is scored against.  It is ``None`` when the block meets exactly one test
+      block (nothing to reuse), and its budget bounds how much dense state
+      is ever retained, so a method never has to reason about memory.
 
     Args:
         train_source: Source of train blocks; iterated **once** (a single-shot
@@ -321,23 +231,20 @@ def score_sources(
         test_source: Source of test blocks; iterated once to cache, or repeatedly
             when ``loop_over_test`` (which then requires ``test_source.reusable``).
         device: Device the blocks are moved to before scoring.
-        prepare_test: The per-method preparation hook described above.
-        score_block: The per-method scoring hook described above.
-        loop_over_test: Re-stream + re-prepare the test blocks per train block
-            (low memory) instead of caching them once (default).  This path always
+        inner_product: The per-pair scoring hook described above.
+        transform_train: Per-block train transform (default identity).
+        transform_test: Per-block test transform (default identity).
+        batch_size: Dense train blocks are re-batched into this many samples
+            per scoring batch (:func:`~dattri_llm.gradient.streaming.rebatch_blocks`),
+            collapsing tiny per-block matmuls into big GEMMs.  Speed/memory
+            only -- scores are identical for every value.  Factorized blocks
+            are scored one block at a time regardless.  The cached test reps
+            are likewise stacked into a single block when they are all dense.
+        loop_over_test: Re-stream + re-transform the test blocks per train block
+            (low memory) instead of caching them once (default).  This path
             scores block-by-block (no train-side re-batching).
-
-    Notes:
-        The train side is always scored in ``per_device_train_batch_size``-sample
-        batches (read from ``train_source``'s args), collapsing the tiny per-block
-        matmuls into big GEMMs; the test side is already blocked at
-        ``per_device_eval_batch_size`` by its source.  For ``attribute`` (live
-        streamer) that batch matches the collection batch, so scoring memory
-        aligns with collection; for ``attribute_from_cache`` there is no
-        collection, so raise ``per_device_train_batch_size`` to score the whole
-        store at once.  The batch size only affects speed/memory -- scores are
-        identical for every value.  Factorized stores can't be stacked into a
-        dense batch, so they are scored one block at a time regardless.
+        cache_budget: Budget of the per-train-block dense cache; ``None`` uses
+            the default fraction of free memory on *device*.
 
     Returns:
         ``(scores, row_train_ids, row_steps, test_ids)`` -- ``scores`` is
@@ -353,72 +260,60 @@ def score_sources(
             "loop_over_test=True requires a re-iterable test source "
             "(reusable=True); got a single-shot source.",
         )
+    transform_train = transform_train or _identity
+    transform_test = transform_test or _identity
+    budget = cache_budget if cache_budget is not None else CacheBudget(device)
 
-    # Device prefetch depth for every block stream below, read off the
-    # source's args like the scoring batch size.
-    train_args = getattr(train_source, "_args", None)
-    prefetch_depth = getattr(train_args, "device_prefetch_depth", 1)
-
-    # One pass over the test blocks fixes the column order (hash order as yielded)
-    # and, unless looping, caches each block's prepared representation.
     test_ids: list[str] = []
-    test_index: dict = {}
-    cached_test: list[tuple[object, list[str]]] = []
-    test_iter = (
-        test_source
-        if loop_over_test
-        else prefetch_to_device(test_source, device, depth=prefetch_depth)
-    )
-    for _step, test_g, test_hashes in test_iter:
-        for h in test_hashes:
-            if h not in test_index:
-                test_index[h] = len(test_ids)
-                test_ids.append(h)
+    test_index: dict[str, int] = {}
+    cached_test: list[tuple[Gradient, list[int]]] = []
+    for _step, test_g, test_hashes in test_source:
+        cols = _fix_columns(test_hashes, test_ids, test_index)
         if not loop_over_test:
-            # test_g is device-resident (moved by the prefetcher).
-            cached_test.append((prepare_test(test_g), test_hashes))
+            cached_test.append((transform_test(test_g.to(device)), cols))
     num_test = len(test_ids)
+    cached_test = _merge_dense_test(cached_test)
 
-    if not loop_over_test:
-        # Batch the train side at per_device_train_batch_size (the scoring batch,
-        # read from the source's args); factorized blocks fall to per-block inside.
-        batch_size = getattr(train_args, "per_device_train_batch_size", 1) or 1
-        scores, row_train_ids, row_steps = _batched_train_score(
-            train_source,
-            device,
-            cached_test,
-            test_index,
-            num_test,
-            score_block,
-            batch_size,
-            prefetch_depth,
-        )
-        return scores, row_train_ids, row_steps, test_ids
+    def score_block(train_rep: Gradient, test_blocks: Iterable) -> torch.Tensor:
+        """Row chunk of one train rep against every test rep in *test_blocks*."""
+        row = torch.zeros(train_rep.batch_size, num_test, dtype=torch.float)
+        with TensorCache("memory", budget=budget) as dense_cache:
+            for test_rep, cols in test_blocks:
+                block = inner_product(train_rep, test_rep, dense_cache=dense_cache)
+                row[:, cols] = block.detach().to("cpu", torch.float)
+        return row
 
-    # loop_over_test: re-stream + re-prepare the test blocks per train block.
     row_chunks: list[torch.Tensor] = []
-    row_train_ids = []
-    row_steps = []
-    for train_step, train_g, train_hashes in prefetch_to_device(
-        train_source,
-        device,
-        depth=prefetch_depth,
-    ):
-        row = torch.zeros(train_g.batch_size, num_test, dtype=torch.float)
-        for _s, test_g, test_hashes in prefetch_to_device(
-            test_source,
-            device,
-            depth=prefetch_depth,
-        ):
-            test_rep = prepare_test(test_g)
-            cols = [test_index[h] for h in test_hashes]
-            # loop_over_test re-streams the test side per train block, so the
-            # same train block IS revisited -- retaining it is worthwhile here.
-            block = score_block(train_g, test_rep, len(cols), reuse=True)
-            row[:, cols] = block.detach().to("cpu", torch.float)
-        row_chunks.append(row)
-        row_train_ids.extend(train_hashes)
-        row_steps.extend([train_step] * train_g.batch_size)
+    row_train_ids: list[str] = []
+    row_steps: list[int] = []
+    if not loop_over_test:
+        # Retaining a dense copy of a train block only pays off when it is
+        # scored against more than one test block.
+        reuse = len(cached_test) > 1
+        for steps, train_g, ids in rebatch_blocks(train_source, batch_size):
+            train_rep = transform_train(train_g.to(device))
+            if reuse:
+                row_chunks.append(score_block(train_rep, cached_test))
+            else:
+                row = torch.zeros(train_rep.batch_size, num_test, dtype=torch.float)
+                for test_rep, cols in cached_test:
+                    block = inner_product(train_rep, test_rep, dense_cache=None)
+                    row[:, cols] = block.detach().to("cpu", torch.float)
+                row_chunks.append(row)
+            row_train_ids.extend(ids)
+            row_steps.extend(steps)
+    else:
+        for train_step, train_g, train_hashes in train_source:
+            train_rep = transform_train(train_g.to(device))
+
+            def test_blocks() -> Iterable:
+                for _s, test_g, test_hashes in test_source:
+                    cols = [test_index[h] for h in test_hashes]
+                    yield transform_test(test_g.to(device)), cols
+
+            row_chunks.append(score_block(train_rep, test_blocks()))
+            row_train_ids.extend(train_hashes)
+            row_steps.extend([train_step] * train_rep.batch_size)
 
     scores = (
         torch.cat(row_chunks, dim=0)

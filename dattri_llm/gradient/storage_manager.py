@@ -25,26 +25,22 @@ from __future__ import annotations
 import contextlib
 import json
 import operator
-import shutil
 import tempfile
 import warnings
-from contextlib import contextmanager
 from pathlib import Path
-from time import perf_counter
 from typing import TYPE_CHECKING
 
 import torch
 
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.utils.cache import CACHE_RESIDENCIES, TensorCache, available_host_bytes
 from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable
 
     from typing_extensions import Self
-
-RESIDENCIES = ("disk", "memory", "tiered")
 
 # On-disk serialization for the ``disk`` backend.  ``"pickle"`` writes one
 # ``torch.save`` file per group.  ``"memmap"`` (default) writes a flat ``.mmap.bin``
@@ -96,35 +92,9 @@ def _dtype_from_name(name: str) -> torch.dtype:
         ) from None
 
 
-def _gradient_nbytes(gradient: Gradient) -> int:
-    """Total bytes of a gradient block's tensor payloads (factors + dense)."""
-    total = 0
-    for value in gradient.data.values():
-        tensors = (
-            (value.activation, value.pre_activation_grad)
-            if isinstance(value, Factorized)
-            else (value,)
-        )
-        for t in tensors:
-            total += t.numel() * t.element_size()
-    return total
-
-
 def _records_nbytes(records: list[GradientRecord]) -> int:
-    return sum(_gradient_nbytes(r.gradient) for r in records)
-
-
-def _auto_budget_bytes() -> int:
-    """Half of currently-available RAM (from /proc/meminfo), or 8 GiB fallback."""
-    try:
-        with Path("/proc/meminfo").open(encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    kb = int(line.split()[1])
-                    return int(kb * 1024 * 0.5)
-    except (OSError, ValueError, IndexError):
-        pass
-    return 8 * 2**30
+    """Total payload bytes of a record group (the cache's budget unit)."""
+    return sum(r.gradient.nbytes for r in records)
 
 
 def _to_cpu_record(record: GradientRecord) -> GradientRecord:
@@ -175,77 +145,6 @@ def _expand_log_line(payload: dict) -> dict[str, list[dict]]:
                 },
             )
     return out
-
-
-class _PhaseTimings:
-    """Accumulated wall-clock time for the phases of a save.
-
-    A save splits into five phases:
-
-    * ``to_cpu`` -- moving the captured payloads off the GPU
-      (:func:`_to_cpu_record`).  Pure bandwidth; scales with gradient size.
-    * ``write_group`` -- handing the group to the residency backend:
-      ``torch.save``, a memmap write, or (``memory``/unspilled ``tiered``)
-      just stashing it in RAM.  Scales with gradient size, and is where the
-      ``disk_format`` choice shows up.
-    * ``index_update`` -- updating the in-memory hash index.  Cheap, but
-      scales with the number of samples in the flush.
-    * ``index_write`` -- persisting the index delta (``disk`` residency only;
-      a no-op for the ephemeral residencies).
-    * ``spill`` -- evicting in-RAM groups to disk once a ``tiered`` store is
-      over budget (:meth:`GradientStorageManager._maybe_spill`).  ~0 for every
-      other residency, but a full ``torch.save`` per evicted group when it
-      does fire, which is why it is timed rather than left off the report.
-
-    Every phase is entered once per save regardless of residency, so the call
-    counts stay uniform and a phase that did no work reads as 0 seconds.
-
-    Timing is always on; there is no flag to enable.
-    """
-
-    _PHASES = ("to_cpu", "write_group", "index_update", "index_write", "spill")
-
-    def __init__(self) -> None:
-        self._seconds: dict[str, float] = dict.fromkeys(self._PHASES, 0.0)
-        self._calls: dict[str, int] = dict.fromkeys(self._PHASES, 0)
-
-    @contextmanager
-    def phase(self, name: str) -> Iterator[None]:
-        """Time the wrapped block into phase *name* (counted even if it raises)."""
-        start = perf_counter()
-        try:
-            yield
-        finally:
-            self._seconds[name] += perf_counter() - start
-            self._calls[name] += 1
-
-    def as_dict(self) -> dict[str, dict[str, float]]:
-        """Per-phase ``{"seconds", "calls"}``, in the order phases run."""
-        return {
-            name: {"seconds": self._seconds[name], "calls": self._calls[name]}
-            for name in self._PHASES
-        }
-
-    def reset(self) -> None:
-        """Zero every counter (e.g. to exclude a warm-up phase)."""
-        for name in self._PHASES:
-            self._seconds[name] = 0.0
-            self._calls[name] = 0
-
-    def report(self) -> str:
-        """A human-readable table of the accumulated timings."""
-        saves = max(self._calls.values()) if self._calls else 0
-        lines = [f"GradientStorageManager save timings ({saves} saves):"]
-        for name in self._PHASES:
-            seconds = self._seconds[name]
-            calls = self._calls[name]
-            per_call = (seconds / calls * 1e3) if calls else 0.0
-            lines.append(
-                f"  {name:<13} {seconds:8.3f} s  ({calls} calls, "
-                f"{per_call:7.2f} ms/call)",
-            )
-        lines.append(f"  {'total':<13} {sum(self._seconds.values()):8.3f} s")
-        return "\n".join(lines)
 
 
 def _merge_index(dst: dict[str, list[dict]], src: dict[str, list[dict]]) -> None:
@@ -406,9 +305,10 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         budget_bytes: int | None = None,
         disk_format: str = "memmap",
     ) -> None:
-        if residency not in RESIDENCIES:
+        if residency not in CACHE_RESIDENCIES:
             raise ValueError(
-                f"residency must be one of {list(RESIDENCIES)}, got {residency!r}.",
+                f"residency must be one of {list(CACHE_RESIDENCIES)}, "
+                f"got {residency!r}.",
             )
         if disk_format not in DISK_FORMATS:
             raise ValueError(
@@ -418,28 +318,31 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         self._root_dir = Path(save_dir)
         self._residency = residency
         self._disk_format = disk_format
-        # Memory / tiered state: location handle -> in-RAM record group, plus a
-        # running byte count and (tiered only) the spill budget.  A group is
-        # spilled to the disk backend when the count exceeds the budget.
-        self._mem_groups: dict[str, list[GradientRecord]] = {}
-        self._mem_bytes = 0
-        self._group_seq = 0  # monotonic id for synthetic memory location handles
+        # Memory / tiered residency: the record groups live in a TensorCache
+        # keyed by their synthetic ``mem_*`` location handle.  Its budget
+        # (tiered only; ~half of available RAM unless given) decides when the
+        # oldest groups spill -- through this store's own ``disk_format`` --
+        # into a temp subdir of *save_dir* the cache removes on ``close()``.
         self._budget_bytes = (
             budget_bytes
             if budget_bytes is not None
-            else (_auto_budget_bytes() if residency == "tiered" else None)
+            else (available_host_bytes() // 2 if residency == "tiered" else None)
+        )
+        self._group_seq = 0  # monotonic id for synthetic memory location handles
+        self._groups = TensorCache(
+            residency if residency != "disk" else "memory",
+            budget=self._budget_bytes,
+            spill_dir=self._make_spill_dir,
+            writer=self._write_spilled_group,
+            reader=self._read_spilled_group,
+            on_spill=self._on_group_spilled,
+            nbytes_fn=_records_nbytes,
         )
         # Reverse map location -> its index entries, so a spill can rewrite the
         # entries' ``file`` handle in place (they are shared dicts, so updating
         # here updates the main index too).
         self._group_entries: dict[str, list[dict]] = {}
-        # Tiered residency spills to a dedicated temp subdir (created lazily on
-        # the first spill) that ``close()`` removes -- so a tiered store never
-        # litters ``save_dir`` with orphaned spill files.
-        self._spill_dir: Path | None = None
         self._closed: bool = False
-        # Per-phase save timings; see _PhaseTimings.
-        self._timings = _PhaseTimings()
         # Last settings payload written to the meta sidecar, so a save only
         # rewrites it when it actually changed; see _write_index_meta.
         self._meta_written: dict | None = None
@@ -500,6 +403,13 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         return self._save_dir
 
     @property
+    def save_dir(self) -> Path:
+        """The root directory of this store (all location handles are
+        relative to it).
+        """
+        return self._root_dir
+
+    @property
     def sample_id_key(self) -> str | int | None:
         """The identifier scheme of this store: the input field the capturing
         manager read sample ids from, or ``None`` for content hashing.
@@ -518,34 +428,6 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             return
         self._sample_id_key = key
         self._id_key_known = True
-
-    @property
-    def timing(self) -> dict[str, dict[str, float]]:
-        """Accumulated seconds and call counts for each save phase.
-
-        Phases are ``to_cpu`` (device-to-host transfer), ``write_group``
-        (the residency backend's write), ``index_update`` (in-memory index)
-        and ``index_write`` (index delta to disk) -- see
-        :class:`_PhaseTimings`::
-
-            with hookmanager.collect():
-                trainer.train()
-            print(storage_manager.timing_report())
-        """
-        return self._timings.as_dict()
-
-    def reset_timing(self) -> None:
-        """Zero the save timings, e.g. to exclude warm-up steps."""
-        self._timings.reset()
-
-    def timing_report(self) -> str:
-        """A printable per-phase breakdown of time spent saving.
-
-        Returns:
-            A table of accumulated seconds, call counts and per-call
-            milliseconds for each save phase.
-        """
-        return self._timings.report()
 
     @property
     def gradient_accumulation_steps(self) -> int:
@@ -600,18 +482,12 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
                 "save() takes a single-hash record; this record carries a "
                 "per-batch hash list -- use save_bulk([record]) instead.",
             )
-        with self._timings.phase("to_cpu"):
-            record = _to_cpu_record(record)
+        record = _to_cpu_record(record)
         base_name = f"step_{record.step:06d}_{record.input_hash}"
-        with self._timings.phase("write_group"):
-            location = self._write_group([record], base_name)
-        with self._timings.phase("index_update"):
-            self._index_entry(record, filename=location, idx=0)
-        with self._timings.phase("index_write"):
-            self._persist_index([record], location)
-        with self._timings.phase("spill"):
-            if self._residency == "tiered":
-                self._maybe_spill()
+        location = self._write_group([record], base_name)
+        self._index_entry(record, filename=location, idx=0)
+        self._persist_index([record], location)
+        self._commit_group(location, [record])
         return location
 
     def save_bulk(self, records: list[GradientRecord]) -> Path:
@@ -633,18 +509,12 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             The location handle of the written group (a relative file path for
             ``disk`` residency, a synthetic ``mem_*`` key for ``memory``).
         """
-        with self._timings.phase("to_cpu"):
-            records = [_to_cpu_record(r) for r in records]
-        with self._timings.phase("write_group"):
-            location = self._write_group(records, None)
-        with self._timings.phase("index_update"):
-            for idx, record in enumerate(records):
-                self._index_entry(record, filename=location, idx=idx)
-        with self._timings.phase("index_write"):
-            self._persist_index(records, location)
-        with self._timings.phase("spill"):
-            if self._residency == "tiered":
-                self._maybe_spill()
+        records = [_to_cpu_record(r) for r in records]
+        location = self._write_group(records, None)
+        for idx, record in enumerate(records):
+            self._index_entry(record, filename=location, idx=idx)
+        self._persist_index(records, location)
+        self._commit_group(location, records)
         return location
 
     # ---------------------------------------------------------------------- #
@@ -670,12 +540,23 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         ``mem_*`` key (``memory``/unspilled ``tiered``).
         """
         if self._residency in ("memory", "tiered"):
+            # The group enters the cache in _commit_group, once its index
+            # entries exist, so a spill triggered by the insert can repoint them.
             loc = f"mem_{self._group_seq:08d}"
             self._group_seq += 1
-            self._mem_groups[loc] = records
-            self._mem_bytes += _records_nbytes(records)
             return loc
         return self._write_group_to_disk(records, base_name)
+
+    def _commit_group(self, location: str, records: list[GradientRecord]) -> None:
+        """Hand an indexed in-RAM group to the residency cache (no-op for disk)."""
+        if self._residency in ("memory", "tiered"):
+            self._groups.put(location, records)
+
+    def _resident_group(self, location: str) -> list[GradientRecord] | None:
+        """The in-RAM record group at *location*, or ``None`` if it is on disk."""
+        if location in self._groups and self._groups.location(location) is None:
+            return self._groups.get(location)
+        return None
 
     def _write_group_to_disk(
         self,
@@ -870,45 +751,47 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         """This store's on-disk serialization (``"pickle"``/``"memmap"``)."""
         return self._disk_format
 
-    def _maybe_spill(self) -> None:
-        """Spill the oldest in-RAM groups to disk until under the byte budget."""
-        if self._budget_bytes is None:
-            return
-        # Oldest-first: mem_* keys are zero-padded and monotonically assigned.
-        for loc in sorted(self._mem_groups):
-            if self._mem_bytes <= self._budget_bytes:
-                break
-            self._spill_group(loc)
+    @property
+    def budget_bytes(self) -> int | None:
+        """The in-RAM byte budget of a ``tiered`` store (``None`` otherwise)."""
+        return self._budget_bytes
 
-    def _ensure_spill_dir(self) -> Path:
-        """Create (once) the temp subdir tiered spill files live in.
+    @property
+    def resident_bytes(self) -> int:
+        """Payload bytes of the record groups currently held in RAM."""
+        return self._groups.nbytes
 
-        A subdir of *save_dir* so spill I/O stays on the same filesystem and a
-        single :meth:`close` ``rmtree`` cleans it up; the ``mem_*`` group key
-        names each spill file, so they never collide.
+    def _make_spill_dir(self) -> Path:
+        """The temp subdir tiered spill files live in (created once, lazily).
+
+        A subdir of *save_dir* so spill I/O stays on the same filesystem; the
+        cache removes it on :meth:`close`, so a tiered store never litters
+        ``save_dir`` with orphaned spill files.
         """
-        if self._spill_dir is None:
-            self._root_dir.mkdir(parents=True, exist_ok=True)
-            self._spill_dir = Path(
-                tempfile.mkdtemp(prefix="tiered_spill_", dir=self._root_dir),
-            )
-        return self._spill_dir
+        self._root_dir.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="tiered_spill_", dir=self._root_dir))
 
-    def _spill_group(self, loc: str) -> None:
-        """Move one in-RAM group to the spill dir and repoint its index entries.
-
-        Written through the store's ``disk_format``, so a spilled group is
-        serialized the same way a directly-written one would be.
+    def _write_spilled_group(self, path: Path, records: list[GradientRecord]) -> Path:
+        """Cache writer: serialize a spilled group through the store's
+        ``disk_format`` (so it is written exactly like a directly-saved one)
+        and return the handle actually written.
         """
-        records = self._mem_groups.pop(loc)
-        self._mem_bytes -= _records_nbytes(records)
-        spill_dir = self._ensure_spill_dir()
-        handle = self._serialize_group(records, spill_dir, loc)
-        disk_loc = str((spill_dir / handle).relative_to(self._root_dir))
-        for entry in self._group_entries.get(loc, []):
+        handle = self._serialize_group(records, path.parent, path.stem)
+        return path.parent / handle
+
+    def _read_spilled_group(self, path: Path) -> list[GradientRecord]:
+        """Cache reader: a spilled group is an ordinary disk group."""
+        return self.load_records(str(path.relative_to(self._root_dir)))
+
+    def _on_group_spilled(self, location: str, path: Path) -> None:
+        """Repoint a spilled group's index entries from its ``mem_*`` key to
+        the root-relative disk path, so the read path finds it on disk.
+        """
+        disk_loc = str(path.relative_to(self._root_dir))
+        for entry in self._group_entries.get(location, []):
             entry["file"] = disk_loc  # shared dict -> also updates self._index
-        if loc in self._group_entries:
-            self._group_entries[disk_loc] = self._group_entries.pop(loc)
+        if location in self._group_entries:
+            self._group_entries[disk_loc] = self._group_entries.pop(location)
 
     def close(self) -> None:
         """Release an ephemeral store's resources; idempotent.
@@ -922,11 +805,7 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         if self._closed:
             return
         self._closed = True
-        self._mem_groups.clear()
-        self._mem_bytes = 0
-        if self._spill_dir is not None:
-            shutil.rmtree(self._spill_dir, ignore_errors=True)
-            self._spill_dir = None
+        self._groups.close()
 
     def __enter__(self) -> Self:
         return self
@@ -1225,8 +1104,9 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             a one-element list).  Served from RAM for an in-memory group, else
             ``torch.load``-ed from disk.
         """
-        if file_relpath in self._mem_groups:
-            return self._mem_groups[file_relpath]
+        resident = self._resident_group(file_relpath)
+        if resident is not None:
+            return resident
         if file_relpath.endswith(".mmap"):
             return self._read_group_memmap(self._root_dir / file_relpath)
         obj = torch.load(self._root_dir / file_relpath, weights_only=False)
@@ -1236,8 +1116,9 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         # "file" is a location handle: a synthetic mem_* key (in-RAM group) or a
         # path relative to _root_dir.
         loc = entry["file"]
-        if loc in self._mem_groups:
-            return self._mem_groups[loc][entry["idx"]]
+        resident = self._resident_group(loc)
+        if resident is not None:
+            return resident[entry["idx"]]
         if loc.endswith(".mmap"):
             return self._read_group_memmap(self._root_dir / loc)[entry["idx"]]
         obj = torch.load(self._root_dir / loc, weights_only=False)

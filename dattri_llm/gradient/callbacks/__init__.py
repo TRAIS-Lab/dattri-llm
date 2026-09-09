@@ -33,11 +33,7 @@ existing ``dattri_llm.gradient.callbacks`` imports keep working unchanged.
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
 from dattri_llm.gradient.callbacks.capture_callback import CaptureCallback
 from dattri_llm.gradient.callbacks.data_selection_callback import (
-    _SCORE_MODES,
-    _TARGET_MODES,
-    _THRESHOLD_MODES,
     DataSelectionCallback,
-    _ShardSpec,
 )
 from dattri_llm.gradient.callbacks.kronecker_covariance_callback import (
     KroneckerCovarianceCallback,
@@ -45,13 +41,9 @@ from dattri_llm.gradient.callbacks.kronecker_covariance_callback import (
 from dattri_llm.gradient.callbacks.offload_callback import OffloadCallback
 
 __all__ = [
-    "_SCORE_MODES",
-    "_TARGET_MODES",
-    "_THRESHOLD_MODES",
     "CaptureCallback",
     "DataSelectionCallback",
     "HookManagerCallback",
     "KroneckerCovarianceCallback",
     "OffloadCallback",
-    "_ShardSpec",
 ]

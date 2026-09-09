@@ -11,13 +11,13 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks.config import (
     INVASIVE_LINEAR_IO,
     LINEAR_IO,
     PARAM_GRAD,
     HookManagerConfig,
-    _resolve_projector,
     resolve_hook_assignments,
 )
 from dattri_llm.gradient.hooks.hooks import (
@@ -164,6 +164,9 @@ class HookManager:
         self._warned_broadcast: set[str] = set()
 
         self._config = config if config is not None else HookManagerConfig()
+        # The projector (and its projection-matrix cache) lives exactly as long
+        # as the hooks are registered: built in register(), closed in remove().
+        self._projector: ops.DattriProjector | None = None
 
         self._step_count: int = 0
         self._collecting: bool = False
@@ -1234,6 +1237,8 @@ class HookManager:
         self._n_layers = 0
         if self._has_linear_io:
             self._bwd_done = False
+            if self._config.projection is not None and self._projector is None:
+                self._projector = ops.DattriProjector(self._config.projector)
             self._buffers, self._handles = register_linear_io_hooks(
                 model,
                 layer_names=capture_layers,
@@ -1242,11 +1247,7 @@ class HookManager:
                 type_overrides=self._config.layer_types,
                 kwargs_overrides=self._config.module_kwargs,
                 projection=self._config.projection,
-                projector=(
-                    _resolve_projector(self._config.projector)
-                    if self._config.projection is not None
-                    else None
-                ),
+                projector=self._projector,
                 offload_to_cpu=self._offload_to_cpu,
             )
             self._n_layers = len(self._buffers)
@@ -1332,6 +1333,9 @@ class HookManager:
         self._param_handles = []
         self._param_buffers.clear()
         self._last_gradient = None
+        if self._projector is not None:
+            self._projector.close()
+            self._projector = None
         self._registered = False
 
     def add_callback(self, callback: HookManagerCallback) -> None:

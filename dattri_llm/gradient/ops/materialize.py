@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from dattri_llm.gradient.ops import dtypes
-from dattri_llm.gradient.ops.preprocess import _preprocess_factorized, _to_3d
+from dattri_llm.gradient.ops.preprocess import preprocess_factors, to_3d
 from dattri_llm.gradient.ops.types import is_conv_transpose, is_embedding, is_norm
 
 if TYPE_CHECKING:
@@ -53,7 +53,7 @@ def _materialize_embedding(
 # ---------------------------------------------------------------------------
 
 
-def _materialize(
+def materialize_factors(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -64,7 +64,7 @@ def _materialize(
     """Compute the per-sample weight gradient, returning shape (B, d).
 
     When *module_kwargs* is provided the raw hook captures are preprocessed
-    first via :func:`_preprocess_factorized` (im2col for Conv, x_hat for
+    first via :func:`preprocess_factors` (im2col for Conv, x_hat for
     LayerNorm, bias augmentation for Linear).  Pass ``module_kwargs=None``
     when the tensors are already in the preprocessed form -- except for
     embedding layers, which always require module_kwargs: the materialization
@@ -78,7 +78,7 @@ def _materialize(
     For every other layer type the token/spatial axis is already contracted by
     the gradient's structure, so ``per_token`` has no effect.
     """
-    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
 
     if is_embedding(layer_type):
         if module_kwargs is None:
@@ -90,8 +90,8 @@ def _materialize(
         return _materialize_embedding(a, g, module_kwargs["num_embeddings"])
 
     a, g = dtypes.align(a, g)
-    a_f = _to_3d(a)  # (B, T, d_in)
-    g_f = _to_3d(g)  # (B, T, d_out)
+    a_f = to_3d(a)  # (B, T, d_in)
+    g_f = to_3d(g)  # (B, T, d_out)
 
     if is_norm(layer_type):
         prod = a_f * g_f  # (B, T, d) per-position gradient
@@ -108,18 +108,26 @@ def _materialize(
 
 
 def materialize(
-    f: Factorized,
+    f: Factorized | torch.Tensor,
     layer_type: str,
     include_bias: bool = True,
     per_token: bool = False,
 ) -> torch.Tensor:
-    """:func:`_materialize` on a :class:`Factorized` (batch-first-safe).
+    """Per-sample weight gradient ``(B, d)`` of one layer, whatever its form.
+
+    A :class:`Factorized` layer goes through :func:`materialize_factors`
+    (batch-first-safe).  A layer already stored **dense** -- a plain tensor,
+    e.g. a projected capture -- is returned flattened to ``(B, d)``, so every
+    caller that needs the dense per-sample representation can pass a layer's
+    payload here without branching on its representation.
 
     ``per_token=False`` (default) sums a norm layer's token axis to the actual
     weight gradient; ``per_token=True`` keeps the per-position products.
     """
+    if isinstance(f, torch.Tensor):
+        return f.reshape(f.shape[0], -1)
     bf = f.as_batch_first()
-    return _materialize(
+    return materialize_factors(
         bf.activation,
         bf.pre_activation_grad,
         layer_type,

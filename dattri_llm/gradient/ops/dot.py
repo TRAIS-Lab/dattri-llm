@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from dattri_llm.gradient.ops import dtypes
-from dattri_llm.gradient.ops.preprocess import _preprocess_factorized, _to_3d
+from dattri_llm.gradient.ops.materialize import materialize
+from dattri_llm.gradient.ops.preprocess import preprocess_factors, to_3d
 from dattri_llm.gradient.ops.types import (
     is_conv,
     is_conv_transpose,
@@ -19,7 +20,10 @@ from dattri_llm.gradient.ops.types import (
 )
 
 if TYPE_CHECKING:
-    from dattri_llm.gradient.gradient import Factorized
+    from collections.abc import Iterable
+
+    from dattri_llm.gradient.gradient import Factorized, Gradient
+    from dattri_llm.utils.cache import TensorCache
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +31,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-def _cross_gram(
+def cross_gram(
     a1: torch.Tensor,
     g1: torch.Tensor,
     a2: torch.Tensor,
@@ -37,9 +41,9 @@ def _cross_gram(
 ) -> torch.Tensor:
     """Cross-gram ``K[i, j] = <dW1_i, dW2_j>`` on *already-preprocessed* factors.
 
-    Shared kernel behind :func:`_cross_dot`, :func:`_pairwise_dot`, and
-    :func:`_kfac_cross` (which whitens side 1 first).  Inputs must already be in
-    the form returned by :func:`_preprocess_factorized`.
+    Shared kernel behind :func:`cross_dot_factors`, :func:`pairwise_dot_factors`, and
+    :func:`kfac_cross_factors` (which whitens side 1 first).  Inputs must already be in
+    the form returned by :func:`preprocess_factors`.
 
     For the linear/conv family the result is computed either **factorized**
     (``sum_{t,s}`` ghost contraction, the ``(B1,T1,B2,S2)`` kernel) or
@@ -68,8 +72,8 @@ def _cross_gram(
         return K
 
     a1, g1, a2, g2 = dtypes.align(a1, g1, a2, g2)
-    a1_f, g1_f = _to_3d(a1), _to_3d(g1)
-    a2_f, g2_f = _to_3d(a2), _to_3d(g2)
+    a1_f, g1_f = to_3d(a1), to_3d(g1)
+    a2_f, g2_f = to_3d(a2), to_3d(g2)
 
     if is_norm(layer_type):
         # dW_i = sum_t x_hat_it * g_it: contract positions first so the dot is
@@ -99,7 +103,7 @@ def _cross_gram(
     return torch.einsum("btcs,btcs->bc", K_a, K_g)  # (B1, B2)
 
 
-def _cross_dot(
+def cross_dot_factors(
     a1: torch.Tensor,
     g1: torch.Tensor,
     a2: torch.Tensor,
@@ -112,24 +116,24 @@ def _cross_dot(
 ) -> torch.Tensor:
     """Return the (B1, B2) cross-gram ``K[i, j] = <dW1_i, dW2_j>``.
 
-    Generalises :func:`_pairwise_dot` (which is the self case
-    ``_cross_dot(a, g, a, g, ...)``) to two distinct sets of factorized
+    Generalises :func:`pairwise_dot_factors` (which is the self case
+    ``cross_dot_factors(a, g, a, g, ...)``) to two distinct sets of factorized
     gradients -- e.g. a training batch against a fixed target gradient.  Each
-    side is preprocessed independently via :func:`_preprocess_factorized`.
+    side is preprocessed independently via :func:`preprocess_factors`.
     ``mode`` (``"auto"``/``"factorized"``/``"materialized"``) selects the cross-gram
-    path; see :func:`_cross_gram`.
+    path; see :func:`cross_gram`.
 
     For norm layers the per-position (diagonal) convention is used, so the two
     sides must share the same flattened ``T * d`` dimension (equal token/spatial
     count); this holds whenever both gradients come from the same model run at
     the same sequence length.
     """
-    a1, g1 = _preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
-    a2, g2 = _preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
-    return _cross_gram(a1, g1, a2, g2, layer_type, mode)
+    a1, g1 = preprocess_factors(a1, g1, layer_type, module_kwargs1, include_bias)
+    a2, g2 = preprocess_factors(a2, g2, layer_type, module_kwargs2, include_bias)
+    return cross_gram(a1, g1, a2, g2, layer_type, mode)
 
 
-def _pairwise_dot(
+def pairwise_dot_factors(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -139,11 +143,11 @@ def _pairwise_dot(
 ) -> torch.Tensor:
     """Return (B, B) pairwise dot product matrix of per-sample gradients.
 
-    *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
-    Equivalent to the self case of :func:`_cross_dot`.
+    *module_kwargs* is passed to :func:`preprocess_factors` when provided.
+    Equivalent to the self case of :func:`cross_dot_factors`.
     """
-    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
-    return _cross_gram(a, g, a, g, layer_type, mode)
+    a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
+    return cross_gram(a, g, a, g, layer_type, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +155,7 @@ def _pairwise_dot(
 # ---------------------------------------------------------------------------
 
 
-def _cross_gram_per_token(
+def cross_gram_per_token(
     a1: torch.Tensor,
     g1: torch.Tensor,
     a2: torch.Tensor,
@@ -186,8 +190,8 @@ def _cross_gram_per_token(
         return out
 
     a1, g1, a2, g2 = dtypes.align(a1, g1, a2, g2)
-    a1_f, g1_f = _to_3d(a1), _to_3d(g1)
-    a2_f, g2_f = _to_3d(a2), _to_3d(g2)
+    a1_f, g1_f = to_3d(a1), to_3d(g1)
+    a2_f, g2_f = to_3d(a2), to_3d(g2)
 
     if is_norm(layer_type):
         # dW2_j = sum_s x_hat2_js * g2_js (d-vector, diagonal). Query token t's
@@ -211,24 +215,24 @@ def cross_dot_per_token(
     """Per-token-position cross-gram on two :class:`Factorized` (batch-first-safe).
 
     Returns ``(B1, T1, B2)`` -- side-1 token positions preserved; see
-    :func:`_cross_gram_per_token`.
+    :func:`cross_gram_per_token`.
     """
     b1, b2 = f1.as_batch_first(), f2.as_batch_first()
-    a1, g1 = _preprocess_factorized(
+    a1, g1 = preprocess_factors(
         b1.activation,
         b1.pre_activation_grad,
         layer_type,
         b1.module_kwargs,
         include_bias,
     )
-    a2, g2 = _preprocess_factorized(
+    a2, g2 = preprocess_factors(
         b2.activation,
         b2.pre_activation_grad,
         layer_type,
         b2.module_kwargs,
         include_bias,
     )
-    return _cross_gram_per_token(a1, g1, a2, g2, layer_type)
+    return cross_gram_per_token(a1, g1, a2, g2, layer_type)
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +240,7 @@ def cross_dot_per_token(
 # ---------------------------------------------------------------------------
 
 
-def _dot(
+def dot_factors(
     a1: torch.Tensor,
     g1: torch.Tensor,
     a2: torch.Tensor,
@@ -249,10 +253,10 @@ def _dot(
     """Return (B,) per-sample dot products <dW1_i, dW2_i>.
 
     *module_kwargs1* and *module_kwargs2* are passed to
-    :func:`_preprocess_factorized` for the respective tensor pairs when provided.
+    :func:`preprocess_factors` for the respective tensor pairs when provided.
     """
-    a1, g1 = _preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
-    a2, g2 = _preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
+    a1, g1 = preprocess_factors(a1, g1, layer_type, module_kwargs1, include_bias)
+    a2, g2 = preprocess_factors(a2, g2, layer_type, module_kwargs2, include_bias)
 
     if is_embedding(layer_type):
         B = g1.shape[0]
@@ -269,12 +273,12 @@ def _dot(
         return result
 
     a1, g1, a2, g2 = dtypes.align(a1, g1, a2, g2)
-    a1_f, g1_f = _to_3d(a1), _to_3d(g1)
-    a2_f, g2_f = _to_3d(a2), _to_3d(g2)
+    a1_f, g1_f = to_3d(a1), to_3d(g1)
+    a2_f, g2_f = to_3d(a2), to_3d(g2)
 
     if is_norm(layer_type):
         # Contract positions into per-sample weight grads before the dot
-        # (see the matching branch in _cross_gram).
+        # (see the matching branch in cross_gram).
         grad1 = (a1_f * g1_f).sum(1)  # (B, d)
         grad2 = (a2_f * g2_f).sum(1)  # (B, d)
         return (grad1 * grad2).sum(-1)  # (B,)
@@ -290,7 +294,7 @@ def _dot(
 # ---------------------------------------------------------------------------
 
 
-def _grad_norm_sq(
+def grad_norm_sq_factors(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -300,20 +304,20 @@ def _grad_norm_sq(
 ) -> torch.Tensor:
     """Return (B,) per-sample squared Frobenius norms of weight gradients.
 
-    *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
+    *module_kwargs* is passed to :func:`preprocess_factors` when provided.
     For the linear/conv family the norm is computed either **factorized** (the
     ``S^2`` ghost contraction) or **materialized** (token-contract to the per-sample
     weight gradient, then sum of squares); both are exact, and ``mode="auto"``
     picks the cheaper via :func:`maybe_use_materialized_norm`.
     """
-    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
 
     if is_embedding(layer_type):
-        return _pairwise_dot(a, g, layer_type).diagonal()
+        return pairwise_dot_factors(a, g, layer_type).diagonal()
 
     a, g = dtypes.align(a, g)
-    a_f = _to_3d(a)  # (B, T, d_in)
-    g_f = _to_3d(g)  # (B, T, d_out)
+    a_f = to_3d(a)  # (B, T, d_in)
+    g_f = to_3d(g)  # (B, T, d_out)
 
     if is_norm(layer_type):
         # ||sum_t x_hat_it * g_it||^2 -- positions contracted first.
@@ -333,17 +337,22 @@ def _grad_norm_sq(
 
 
 def grad_norm_sq(
-    f: Factorized,
+    f: Factorized | torch.Tensor,
     layer_type: str,
     include_bias: bool = True,
     mode: str = "auto",
 ) -> torch.Tensor:
-    """:func:`_grad_norm_sq` on a :class:`Factorized` (batch-first-safe).
+    """Per-sample squared gradient norms ``(B,)`` of one layer, whatever its form.
 
-    ``mode`` routes factorized vs materialized per :func:`_grad_norm_sq`.
+    A :class:`Factorized` layer goes through :func:`grad_norm_sq_factors`
+    (batch-first-safe; ``mode`` routes factorized vs materialized).  A dense
+    ``(B, d)`` layer is squared and summed directly.
     """
+    if isinstance(f, torch.Tensor):
+        (flat,) = dtypes.align(f.reshape(f.shape[0], -1))
+        return (flat * flat).sum(-1)
     bf = f.as_batch_first()
-    return _grad_norm_sq(
+    return grad_norm_sq_factors(
         bf.activation,
         bf.pre_activation_grad,
         layer_type,
@@ -359,9 +368,9 @@ def pairwise_dot(
     include_bias: bool = True,
     mode: str = "auto",
 ) -> torch.Tensor:
-    """:func:`_pairwise_dot` on a :class:`Factorized` (batch-first-safe)."""
+    """:func:`pairwise_dot_factors` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
-    return _pairwise_dot(
+    return pairwise_dot_factors(
         bf.activation,
         bf.pre_activation_grad,
         layer_type,
@@ -377,9 +386,9 @@ def dot(
     layer_type: str,
     include_bias: bool = True,
 ) -> torch.Tensor:
-    """:func:`_dot` on two :class:`Factorized` (batch-first-safe)."""
+    """:func:`dot_factors` on two :class:`Factorized` (batch-first-safe)."""
     b1, b2 = f1.as_batch_first(), f2.as_batch_first()
-    return _dot(
+    return dot_factors(
         b1.activation,
         b1.pre_activation_grad,
         b2.activation,
@@ -392,19 +401,35 @@ def dot(
 
 
 def cross_dot(
-    f1: Factorized,
-    f2: Factorized,
+    f1: Factorized | torch.Tensor,
+    f2: Factorized | torch.Tensor,
     layer_type: str,
     include_bias: bool = True,
     mode: str = "auto",
 ) -> torch.Tensor:
-    """:func:`_cross_dot` on two :class:`Factorized` (batch-first-safe).
+    """``(B1, B2)`` cross-gram ``K[i, j] = <dW1_i, dW2_j>`` of one layer, in
+    whatever form each side holds.
 
-    ``mode`` (``"auto"``/``"factorized"``/``"materialized"``) routes the cross-gram
-    per :func:`_cross_gram`; ``"auto"`` is the cost-optimal choice.
+    This is the single per-layer product entry point.  Each side may be
+
+    * a raw :class:`Factorized` capture (preprocessed here),
+    * *final* factors -- a :class:`Factorized` with ``module_kwargs=None``,
+      e.g. projected or K-FAC-whitened factors, used as they are, or
+    * a dense ``(B, d)`` tensor (a materialized or projected layer).
+
+    Two factorized sides go through :func:`cross_dot_factors`, where ``mode``
+    (``"auto"``/``"factorized"``/``"materialized"``) routes the ghost vs
+    materialized contraction (see :func:`cross_gram`).  When either side is
+    dense the other is materialized (:func:`materialize`) and the result is
+    one GEMM.
     """
+    if isinstance(f1, torch.Tensor) or isinstance(f2, torch.Tensor):
+        m1 = materialize(f1, layer_type, include_bias)
+        m2 = materialize(f2, layer_type, include_bias)
+        m1, m2 = dtypes.align(m1, m2)
+        return m1 @ m2.T
     b1, b2 = f1.as_batch_first(), f2.as_batch_first()
-    return _cross_dot(
+    return cross_dot_factors(
         b1.activation,
         b1.pre_activation_grad,
         b2.activation,
@@ -417,6 +442,91 @@ def cross_dot(
     )
 
 
+# ---------------------------------------------------------------------------
+# layerwise cross-gram over whole gradient blocks
+# ---------------------------------------------------------------------------
+
+
+def _expand_broadcast(m: torch.Tensor, b1: int, b2: int) -> torch.Tensor:
+    """Expand a broadcast (batch-1) layer's cross matrix to ``(b1, b2)``."""
+    return m.expand(
+        b1 if m.shape[0] == 1 else m.shape[0], b2 if m.shape[1] == 1 else m.shape[1]
+    )
+
+
+def layerwise_cross_dot(
+    train: Gradient,
+    test: Gradient,
+    *,
+    layers: Iterable[str] | None = None,
+    mode: str = "auto",
+    dense_cache: TensorCache | None = None,
+    reduce: str = "sum",
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    """Layer-by-layer cross-gram of two gradient blocks, summed over layers.
+
+    For every layer shared by *train* and *test* (or the given *layers*) this
+    forms the ``(B_train, B_test)`` cross matrix with :func:`cross_dot`, so each
+    side may hold the layer raw-factorized, as final factors, or dense -- and
+    the representation may differ between the two sides and between layers.
+    Only one layer is in flight at a time, so no whole-block materialization
+    ever happens: this is the kernel an attributor's ``inner_product`` should
+    call, and the reason it needs no cache logic of its own.
+
+    Args:
+        train: The row-side block.
+        test: The column-side block.  Typically the (transformed / preconditioned)
+            test representation.
+        layers: Restrict to these layer names; ``None`` scores every shared
+            layer.  Layers absent from either side are skipped.
+        mode: Factorized-vs-materialized routing for factor x factor layers
+            (see :func:`cross_gram`); ``"auto"`` picks the cheaper per layer.
+        dense_cache: A :class:`~dattri_llm.utils.cache.TensorCache` **scoped to
+            this train block**.  When a train layer has to be materialized
+            (because the test side of that layer is dense), the dense copy is
+            fetched from or stored in it under the layer name -- so a block
+            scored against several test blocks is materialized once, and the
+            cache's budget bounds how much dense state is retained.  ``None``
+            recomputes per call.
+        reduce: ``"sum"`` returns the ``(B_train, B_test)`` whole-model
+            cross-gram (per-layer matrices summed; a broadcast batch-1 layer's
+            shared row is expanded to every sample first).  ``"none"`` returns
+            ``{layer: matrix}``.
+
+    Raises:
+        ValueError: If ``reduce="sum"`` and no layer is shared.
+    """
+    if reduce not in {"sum", "none"}:
+        raise ValueError("reduce must be 'sum' or 'none'")
+    names = list(train.data) if layers is None else list(layers)
+    per_layer: dict[str, torch.Tensor] = {}
+    for name in names:
+        if name not in train.data or name not in test.data:
+            continue
+        layer_type = train.layer_types[name]
+        tr, te = train.data[name], test.data[name]
+        if isinstance(te, torch.Tensor) and not isinstance(tr, torch.Tensor):
+            tr = (
+                dense_cache.get_or_compute(
+                    name,
+                    lambda tr=tr, lt=layer_type: materialize(tr, lt),
+                )
+                if dense_cache is not None
+                else materialize(tr, layer_type)
+            )
+        per_layer[name] = cross_dot(tr, te, layer_type, mode=mode)
+    if reduce == "none":
+        return per_layer
+    if not per_layer:
+        raise ValueError("No shared layers between the two gradient blocks.")
+    b_tr, b_te = train.batch_size, test.batch_size
+    total = None
+    for matrix in per_layer.values():
+        expanded = _expand_broadcast(matrix, b_tr, b_te)
+        total = expanded.clone() if total is None else total + expanded
+    return total
+
+
 # --------------------------------------------------------------------------- #
 # Representation routing heuristic (factorized vs materialized)               #
 #                                                                             #
@@ -424,10 +534,10 @@ def cross_dot(
 # positions) can be dotted/normed either factorized ("ghost") or materialized.#
 # Which is cheaper is governed by S relative to H = DK/(D+K); see             #
 # docs/gradient_representation_complexity.md.  These predicates are consumed   #
-# *here at the bottom* -- _cross_gram / _grad_norm_sq route on them -- so every  #
-# caller (Gradient.similarity, K-FAC's _kfac_cross, ...) shares one routed       #
-# implementation; ``mode="auto"`` triggers the heuristic, and the explicit     #
-# "factorized"/"materialized" modes override it.                              #
+# *here at the bottom* -- cross_gram / grad_norm_sq_factors route on them -- so   #
+# every caller (Gradient.similarity, K-FAC's kfac_cross_factors, ...) shares     #
+# one routed implementation; ``mode="auto"`` triggers the heuristic, and the     #
+# explicit "factorized"/"materialized" modes override it.                        #
 # --------------------------------------------------------------------------- #
 
 

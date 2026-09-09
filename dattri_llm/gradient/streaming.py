@@ -135,6 +135,26 @@ class DiskGradientSource(GradientSource):
         """Disk is immutable for the run, so the source re-reads identically."""
         return True
 
+    @property
+    def args(self) -> AttributionArguments:
+        """The :class:`AttributionArguments` this source reads with."""
+        return self._args
+
+    @property
+    def file_manager(self) -> GradientStorageManager:
+        """The store this source reads from."""
+        return self._fm
+
+    @property
+    def steps(self) -> list[int]:
+        """The ascending stored steps this source yields."""
+        return list(self._steps)
+
+    @property
+    def layer_name(self) -> list[str] | None:
+        """The layer filter applied to every block (``None`` = all layers)."""
+        return None if self._layer_name is None else list(self._layer_name)
+
     def __len__(self) -> int:
         # One block per (file, step) pair -- matches what __iter__ yields.
         return sum(len(by_step) for _, by_step in self._fm.iter_steps(self._steps))
@@ -165,6 +185,63 @@ class DiskGradientSource(GradientSource):
             desc=self._desc,
             verbose=False,
         )
+
+
+def rebatch_blocks(
+    source: Iterable[StreamBatch],
+    batch_size: int,
+) -> Iterator[tuple[list[int], Gradient, list[str]]]:
+    """Re-batch a source's blocks into ``batch_size``-sample batches.
+
+    Dense (materialized) blocks are concatenated layer by layer -- one ``cat``
+    per layer, O(N) not pairwise -- so the tiny per-block matmuls downstream
+    collapse into big GEMMs.  Factorized blocks cannot be stacked into a dense
+    ``(B, D)`` and are yielded one block at a time (a pending dense batch is
+    flushed first, so a mixed source stays in order).  Nothing is moved
+    between devices.
+
+    Yields:
+        ``(per_row_steps, Gradient, per_row_ids)`` batches in the source's
+        sample order -- every row is stamped with the step it came from.
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
+    pending: dict[str, list[torch.Tensor]] = {}
+    pending_ids: list[str] = []
+    pending_steps: list[int] = []
+    pending_n = 0
+    meta: Gradient | None = None
+
+    def build() -> tuple[list[int], Gradient, list[str]]:
+        nonlocal pending, pending_ids, pending_steps, pending_n
+        data = {name: torch.cat(tensors, dim=0) for name, tensors in pending.items()}
+        big = Gradient(
+            representation=meta.representation,
+            data=data,
+            layer_types=meta.layer_types,
+            indexing=meta.indexing,
+            validate_on_init=False,
+        )
+        batch = (pending_steps, big, pending_ids)
+        pending, pending_ids, pending_steps, pending_n = {}, [], [], 0
+        return batch
+
+    for step, block, hashes in source:
+        if not all(isinstance(v, torch.Tensor) for v in block.data.values()):
+            if pending_n:
+                yield build()
+            yield [step] * block.batch_size, block, list(hashes)
+            continue
+        meta = block
+        for name, tensor in block.data.items():
+            pending.setdefault(name, []).append(tensor)
+        pending_ids.extend(hashes)
+        pending_steps.extend([step] * block.batch_size)
+        pending_n += block.batch_size
+        if pending_n >= batch_size:
+            yield build()
+    if pending_n:
+        yield build()
 
 
 def _build_auto_wrap_policy(
@@ -434,6 +511,11 @@ class GradientStreamer(GradientSource):
     # ------------------------------------------------------------------ #
     # GradientSource contract                                            #
     # ------------------------------------------------------------------ #
+
+    @property
+    def args(self) -> AttributionArguments:
+        """The :class:`AttributionArguments` this streamer runs under."""
+        return self._args
 
     @property
     def reusable(self) -> bool:
