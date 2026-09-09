@@ -130,8 +130,8 @@ class TestAsyncDiskWrite:
             attr = TracInAttributor(args, task=task)
             ((train_dir, test_dir),) = attr.cache(train_ds, test_ds)
             return attr.attribute_from_cache(
-                train_gradients_dir=train_dir,
-                test_gradients_dir=test_dir,
+                train_source=train_dir,
+                test_source=test_dir,
             )
 
         sync_res = run(tmp_path / "sync", async_write=False)
@@ -145,9 +145,9 @@ class TestAsyncDiskWrite:
 
 
 class TestCachedGradientsMatchLive:
-    """residency={memory,tiered} (collect the raw representations once into a
-    store, then replay the Fisher sweeps) must score identically to the default
-    residency=None re-streaming path.
+    """gradient_cache_residency={memory,tiered,disk} (collect the raw
+    representations once into a store, then replay the Fisher sweeps) must
+    score identically to the default re-streaming path.
     """
 
     @pytest.mark.parametrize("attr_cls", [KFACAttributor, EKFACAttributor])
@@ -175,7 +175,7 @@ class TestCachedGradientsMatchLive:
             train_ds,
             test_ds,
             damping=1e-3,
-            residency=residency,
+            gradient_cache_residency=residency,
             loop_over_test=loop_over_test,
         )
 
@@ -212,7 +212,7 @@ class TestDVEmbResidencyMatchesDisk:
         disk = DVEmbAttributor(_args(tmp_path / "disk"), task=task).attribute(
             train_ds,
             test_ds,
-            residency="disk",
+            gradient_cache_residency="disk",
             learning_rate=0.01,
         )
         task, train_ds, test_ds = _make_task_and_data()
@@ -220,7 +220,7 @@ class TestDVEmbResidencyMatchesDisk:
         ram = DVEmbAttributor(_args(tmp_path / "ram"), task=task).attribute(
             train_ds,
             test_ds,
-            residency=residency,
+            gradient_cache_residency=residency,
             learning_rate=0.01,
         )
         ids_d, m_d = disk.agnostic_matrix()
@@ -231,7 +231,7 @@ class TestDVEmbResidencyMatchesDisk:
 
 
 class TestCollectToDiskOnBlock:
-    """collect_to_disk's on_block hook is the OTF covariance path: accumulating
+    """collect_gradients's on_block hook is the OTF covariance path: accumulating
     K-FAC covariances off the streamed blocks (no callback, no re-pass) must
     reproduce KFACAttributor.fit's covariances over the resulting store.
     """
@@ -250,7 +250,7 @@ class TestCollectToDiskOnBlock:
         )
 
     def test_on_block_covariance_matches_fit(self, tmp_path):
-        from dattri_llm.attribution.utils import collect_to_disk
+        from dattri_llm.attribution.utils import collect_gradients
         from dattri_llm.gradient.ops import KroneckerAccumulator
         from dattri_llm.gradient.storage_manager import GradientStorageManager
         from dattri_llm.gradient.streaming import DiskGradientSource
@@ -265,19 +265,14 @@ class TestCollectToDiskOnBlock:
         def on_block(_step, grad, _hashes):
             nonlocal n_blocks
             n_blocks += 1
-            kron.update(grad, attr._kfac_layers(grad))
+            kron.update(grad, attr.kfac_layers(grad))
 
-        collect_to_disk(self._streamer(attr, train_ds), fm, on_block=on_block)
+        collect_gradients(self._streamer(attr, train_ds), fm, on_block=on_block)
         otf = kron.result()
         assert n_blocks > 0
 
         # Re-pass fit over the store the same collection just wrote.
-        raw_ctx, _ = attr._fit_raw_context(
-            DiskGradientSource(fm, attr.args),
-            attr.args.device,
-            "ignore",
-            4096,
-        )
+        raw_ctx, _ = attr.fit_raw(DiskGradientSource(fm, attr.args))
         assert set(otf) == set(raw_ctx)
         for layer in raw_ctx:
             a_o, g_o = otf[layer]
@@ -286,13 +281,13 @@ class TestCollectToDiskOnBlock:
             assert torch.allclose(g_o, g_f, atol=1e-5), f"G {layer}"
 
     def test_on_block_none_is_a_noop(self, tmp_path):
-        from dattri_llm.attribution.utils import collect_to_disk
+        from dattri_llm.attribution.utils import collect_gradients
         from dattri_llm.gradient.storage_manager import GradientStorageManager
 
         task, train_ds, _ = _make_task_and_data()
         attr = KFACAttributor(_args(tmp_path / "o"), task=task)
         fm = GradientStorageManager(str(tmp_path / "store"))
-        collect_to_disk(self._streamer(attr, train_ds), fm)  # no on_block
+        collect_gradients(self._streamer(attr, train_ds), fm)  # no on_block
         assert fm.index  # still collected the store
 
 
@@ -323,7 +318,7 @@ class TestCompactKFAC:
         )
 
     def _collect(self, attr, ds, out, style, cov=None):
-        from dattri_llm.attribution.utils import collect_to_disk, task_loss_fn
+        from dattri_llm.attribution.utils import collect_gradients, task_loss_fn
         from dattri_llm.gradient.storage_manager import GradientStorageManager
         from dattri_llm.gradient.streaming import GradientStreamer
 
@@ -339,7 +334,7 @@ class TestCompactKFAC:
         if cov is not None:
             streamer.hook_manager.add_callback(cov)
         fm = GradientStorageManager(str(out))
-        collect_to_disk(streamer, fm)
+        collect_gradients(streamer, fm)
         return str(out)
 
     def test_compact_matches_factorized(self, tmp_path):
@@ -413,27 +408,23 @@ class TestBatchedScoring:
         train_dir = self._materialized_store(tmp_path / "tr", 4, 3, "t")  # 12 docs
         test_dir = self._materialized_store(tmp_path / "te", 2, 2, "q")
 
-        def prep(test_g):
-            return {name: test_g.data[name] for name in test_g.data}
-
-        def score_block(train_g, rep, _n_test):
+        def inner_product(train_g, test_g, *, dense_cache=None):
             total = None
             for name in train_g.data:
-                b = train_g.data[name].float() @ rep[name].float().T
+                b = train_g.data[name].float() @ test_g.data[name].float().T
                 total = b if total is None else total + b
             return total
 
         def run(batch):
             args = _args(tmp_path / "o")
-            args.per_device_train_batch_size = batch  # the scoring batch
             train = DiskGradientSource(GradientStorageManager(train_dir), args)
             test = DiskGradientSource(GradientStorageManager(test_dir), args)
             return score_sources(
                 train,
                 test,
                 args.device,
-                prepare_test=prep,
-                score_block=score_block,
+                inner_product=inner_product,
+                batch_size=batch,  # the scoring batch
             )
 
         s1, ids1, steps1, tids1 = run(1)  # one stored (3-doc) block per batch
@@ -472,7 +463,6 @@ class TestBatchedScoring:
             train,
             test,
             args.device,
-            prepare_test=lambda g: g,
-            score_block=lambda _t, _r, n: torch.zeros(2, n),
+            inner_product=lambda t, r, dense_cache=None: torch.zeros(2, r.batch_size),
         )
         assert scores.shape[0] == len(ids) == 6

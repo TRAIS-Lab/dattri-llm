@@ -577,47 +577,8 @@ class TestGradientStorageManager:
             assert recovered.lookup_by_hash(self._HASH_A) == [(0, 0)]
             assert self._HASH_B not in recovered.index
 
-    def test_save_timings_recorded(self, tiny_model, tiny_batch):
-        """Every save phase is timed, so slow offloading can be attributed."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientStorageManager(tmpdir)
-            assert all(p["calls"] == 0 for p in manager.timing.values())
-
-            rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
-            manager.save_bulk([rec])
-
-            timing = manager.timing
-            assert set(timing) == {
-                "to_cpu",
-                "write_group",
-                "index_update",
-                "index_write",
-                "spill",
-            }
-            assert all(p["calls"] == 1 for p in timing.values())
-            assert all(p["seconds"] >= 0.0 for p in timing.values())
-            assert "write_group" in manager.timing_report()
-
-            manager.reset_timing()
-            assert all(p["calls"] == 0 for p in manager.timing.values())
-
-    def test_timings_recorded_for_every_residency(self, tiny_model, tiny_batch):
-        """Ephemeral residencies are timed too -- index_write is just ~0."""
-        for residency in ("memory", "tiered"):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                with GradientStorageManager(tmpdir, residency=residency) as manager:
-                    rec = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
-                    manager.save_bulk([rec])
-                    assert all(p["calls"] == 1 for p in manager.timing.values())
-                # No index persisted for the ephemeral residencies.
-                assert list(Path(tmpdir).rglob("index.jsonl")) == []
-
-    def test_tiered_spill_is_timed(self, tiny_model, tiny_batch):
-        """A tiered spill is a full torch.save per group, so it must be timed.
-
-        It runs after the four write phases; leaving it outside the report let
-        a spilling store look nearly free while doing real disk work.
-        """
+    def test_tiered_spills_at_zero_budget(self, tiny_model, tiny_batch):
+        """A tiered store over budget evicts every saved group to its spill dir."""
         # budget_bytes=0 -> every save immediately evicts to the spill dir.
         with (
             tempfile.TemporaryDirectory() as tmpdir,
@@ -639,18 +600,6 @@ class TestGradientStorageManager:
                     ],
                 )
             assert group_count(Path(tmpdir), "tiered_spill_*/*") > 0
-            assert manager.timing["spill"]["seconds"] > 0.0
-            assert manager.timing["spill"]["calls"] == 3
-
-    def test_spill_time_is_zero_without_spilling(self, tiny_model, tiny_batch):
-        """A disk store never spills, so the phase reads 0 rather than absent."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = GradientStorageManager(tmpdir)
-            manager.save_bulk(
-                [self._make_record(0, self._HASH_A, tiny_model, tiny_batch)],
-            )
-            assert manager.timing["spill"]["calls"] == 1
-            assert manager.timing["spill"]["seconds"] < 1e-3
 
     def test_index_write_is_atomic_under_crash(
         self,
@@ -1940,7 +1889,7 @@ class TestResidency:
             fm, tiered_blocks = self._collect("tiered", dt, budget_bytes=budget)
             spilled = group_count(Path(dt), "tiered_spill_*/*")
             assert spilled == 3  # 5 groups - 2 kept resident
-            assert fm._mem_bytes <= budget
+            assert fm.resident_bytes <= budget
             # Reads are transparent across the memory/disk split.
             for step in range(5):
                 assert torch.equal(disk_blocks[step], tiered_blocks[step])
@@ -1948,8 +1897,8 @@ class TestResidency:
     def test_tiered_auto_budget_when_unspecified(self):
         with tempfile.TemporaryDirectory() as d:
             fm = GradientStorageManager(d, residency="tiered")
-            assert fm._budget_bytes is not None
-            assert fm._budget_bytes > 0
+            assert fm.budget_bytes is not None
+            assert fm.budget_bytes > 0
 
     def test_tiered_close_removes_spill_files(self):
         with tempfile.TemporaryDirectory() as d:

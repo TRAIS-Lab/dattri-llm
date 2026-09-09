@@ -135,24 +135,62 @@ class TestObservedFireCounting:
         assert [r.gradient.batch_size for r in rec.records] == [CHUNK] * 3
 
 
+def _dp_devices_unavailable(min_free_gib: float = 2.0, devices=(0, 1)) -> bool:
+    """True when the cards this test needs are missing or too full to use.
+
+    The test's own tensors are tiny (~16 MiB), but a CUDA context plus cuBLAS
+    workspaces cost ~0.6 GiB per device before ``DataParallel`` scatters
+    anything, and the scatter allocates on top of that.  On a shared machine
+    the shortfall surfaces as a bare ``CUDA error: out of memory`` from inside
+    ``torch._C._scatter``, which reads like a library regression rather than a
+    busy box.  ``mem_get_info`` is itself allocating -- it establishes a
+    context -- so it is guarded too: a device with no room to hold a context
+    raises here rather than returning a small number.
+    """
+    if torch.cuda.device_count() < len(devices):
+        return True
+    need = min_free_gib * 2**30
+    try:
+        return any(torch.cuda.mem_get_info(d)[0] < need for d in devices)
+    except Exception:  # noqa: BLE001 - any CUDA failure means "cannot run here"
+        return True
+
+
+def _skip_if_oom(exc: BaseException) -> None:
+    """Turn an out-of-memory failure into a skip.
+
+    The free-memory precheck races other processes on a shared GPU: memory can
+    be ample at collection time and gone by the time the scatter runs.  This
+    test asserts *replica counting*, so an OOM says nothing about the library
+    either way -- report it as an unavailable environment, and let any other
+    error propagate.
+    """
+    if "out of memory" in str(exc).lower():
+        pytest.skip(f"insufficient free GPU memory for nn.DataParallel: {exc}")
+    raise exc
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="real nn.DataParallel needs 2+ CUDA devices",
+    _dp_devices_unavailable(),
+    reason="real nn.DataParallel needs 2+ CUDA devices with ~1 GiB free each",
 )
 class TestRealDataParallel:
     def test_short_final_batch(self):
         """DataParallel over 2 GPUs with a final 1-sample batch: scatter uses
         a single replica, and the step must still complete.
         """
-        inner = _inner().cuda()
-        dp = nn.DataParallel(inner, device_ids=[0, 1])
         gen = torch.Generator().manual_seed(3)
-        batches = [
-            torch.randn(4, IN_DIM, generator=gen).cuda(),
-            torch.randn(1, IN_DIM, generator=gen).cuda(),  # 1 < n_devices
-        ]
-        rec = _collect(dp, batches)
+        try:
+            inner = _inner().cuda()
+            dp = nn.DataParallel(inner, device_ids=[0, 1])
+            batches = [
+                torch.randn(4, IN_DIM, generator=gen).cuda(),
+                torch.randn(1, IN_DIM, generator=gen).cuda(),  # 1 < n_devices
+            ]
+            rec = _collect(dp, batches)
+        except RuntimeError as exc:  # torch.AcceleratorError subclasses this
+            _skip_if_oom(exc)
         assert [r.step for r in rec.records] == [0, 1]
         assert [r.gradient.batch_size for r in rec.records] == [4, 1]
 

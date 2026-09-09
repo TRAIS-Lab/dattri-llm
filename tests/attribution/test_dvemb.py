@@ -143,8 +143,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
             tmp_path / f"o_{lr}_{loop_over_test}",
             lr,
         ).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="test",
             loop_over_test=loop_over_test,
             final_step=2,
@@ -172,16 +172,16 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
 
     def test_loop_modes_agree(self, collected, tmp_path):
         a = _make_attr(tmp_path / "a", 0.3).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="test",
             loop_over_test=False,
             final_step=2,
             loss_reduction="sum",
         )
         b = _make_attr(tmp_path / "b", 0.3).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="test",
             loop_over_test=True,
             final_step=2,
@@ -199,8 +199,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         oracle as the test-side sweep.
         """
         res = _make_attr(tmp_path / f"tr_{lr}", lr).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="train",
             final_step=2,
             loss_reduction="sum",
@@ -229,15 +229,15 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         same bilinear form -- rows, columns, and scores must coincide.
         """
         a = _make_attr(tmp_path / "pt", 0.3).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="test",
             final_step=2,
             loss_reduction="sum",
         )
         b = _make_attr(tmp_path / "ptr", 0.3).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="train",
             final_step=2,
             loss_reduction="sum",
@@ -274,8 +274,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
 
         lr = 0.5
         res = _make_attr(tmp_path / f"o3_{propagation}", lr).attribute_from_cache(
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
             propagation=propagation,
             final_step=3,
             loss_reduction="sum",
@@ -313,8 +313,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         """
         lr = 0.5
         res = _make_attr(tmp_path / f"d_{propagation}", lr).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation=propagation,
             hessian_mode="diagonal",
             final_step=2,
@@ -348,8 +348,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         the last step (no factors applied) is identical in both modes.
         """
         kw = {
-            "train_gradients_dir": str(collected["train_dir"]),
-            "test_gradients_dir": str(collected["test_dir"]),
+            "train_source": str(collected["train_dir"]),
+            "test_source": str(collected["test_dir"]),
             "final_step": 2,
             "loss_reduction": "sum",
         }
@@ -370,8 +370,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
     def test_invalid_hessian_mode_raises(self, collected, tmp_path):
         with pytest.raises(ValueError, match="hessian_mode"):
             _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 hessian_mode="block",
                 final_step=2,
                 loss_reduction="sum",
@@ -386,16 +386,16 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
 
         dvemb_dir = tmp_path / "dvemb"
         res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="train",
             dvemb_dir=str(dvemb_dir),
             final_step=2,
             loss_reduction="sum",
         )
         tracin = TracInAttributor(_args(tmp_path / "t")).attribute_from_cache(
-            train_gradients_dir=str(dvemb_dir),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(dvemb_dir),
+            test_source=str(collected["test_dir"]),
         )
         # Same rows/columns up to ordering (TracIn reads steps ascending).
         assert sorted(
@@ -424,8 +424,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 
         res = _make_attr(tmp_path / "o", 0.3).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             propagation="train",
             final_step=2,
             loss_reduction="sum",
@@ -438,8 +438,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
             learning_rate=0.3,
         )
         tracin = TracInAttributor(_args(tmp_path / "t")).attribute_from_cache(
-            train_gradients_dir=dvemb_dir,
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=dvemb_dir,
+            test_source=str(collected["test_dir"]),
         )
         t_row = {
             key: i
@@ -455,8 +455,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
     def test_dvemb_dir_requires_train_propagation(self, collected, tmp_path):
         with pytest.raises(ValueError, match="dvemb_dir"):
             _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 propagation="test",
                 dvemb_dir=str(tmp_path / "d"),
                 final_step=2,
@@ -466,8 +466,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
     def test_train_side_rejects_loop_over_test(self, collected, tmp_path):
         with pytest.raises(ValueError, match="loop_over_test"):
             _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 propagation="train",
                 loop_over_test=True,
                 final_step=2,
@@ -477,8 +477,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
     def test_invalid_propagation_raises(self, collected, tmp_path):
         with pytest.raises(ValueError, match="propagation"):
             _make_attr(tmp_path / "x", 0.3).attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 propagation="both",
                 final_step=2,
                 loss_reduction="sum",
@@ -516,8 +516,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
 
         lr = 0.5
         common = {
-            "train_gradients_dir": str(collected["train_dir"]),
-            "test_gradients_dir": str(test_dir2),
+            "train_source": str(collected["train_dir"]),
+            "test_source": str(test_dir2),
             "final_step": 2,
             "loss_reduction": "sum",
             "propagation": "test",
@@ -558,8 +558,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         """
         lr = 0.4
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             final_step=2,
             loss_reduction="sum",
         )
@@ -588,8 +588,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         """
         lr = 0.5
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             selected_training_steps=[0],
             final_step=2,
             loss_reduction="sum",
@@ -628,8 +628,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         """
         lr = 0.3
         res = _make_attr(tmp_path / "o", lr).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             final_step=2,
             loss_reduction="mean",
         )
@@ -658,8 +658,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
     def test_invalid_loss_reduction_raises(self, collected, tmp_path):
         with pytest.raises(ValueError, match=r"loss_reduction"):
             _make_attr(tmp_path / "o", 0.1).attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 final_step=2,
                 loss_reduction="average",
             )
@@ -668,8 +668,8 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         """A {step: eta} mapping uses each step's own rate in score and Fisher."""
         lrs = {0: 0.3, 1: 0.6}
         res = DVEmbAttributor(_args(tmp_path / "o")).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             final_step=2,
             loss_reduction="sum",
             learning_rate=lrs,
@@ -705,14 +705,14 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
 
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o", 0.1)
-        with pytest.raises(TypeError, match=r"train_gradients_dir"):
+        with pytest.raises(TypeError, match=r"train_source"):
             attr.attribute_from_cache(
-                test_gradients_dir=str(collected["test_dir"]),
+                test_source=str(collected["test_dir"]),
                 final_step=2,
             )
-        with pytest.raises(TypeError, match=r"test_gradients_dir"):
+        with pytest.raises(TypeError, match=r"test_source"):
             attr.attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
+                train_source=str(collected["train_dir"]),
                 final_step=2,
             )
 
@@ -720,7 +720,7 @@ class TestDVEmbOnDisk:  # noqa: PLR0904 -- one method per correctness property
         attr = _make_attr(tmp_path / "o", 0.1)
         with pytest.raises(ValueError, match=r"step < final_step"):
             attr.attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 final_step=0,
             )

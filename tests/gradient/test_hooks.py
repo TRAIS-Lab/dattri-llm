@@ -14,13 +14,13 @@ from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
     HookManager,
     HookManagerConfig,
-    _is_linear_io_capable,
     default_hook_assignment,
     register_linear_io_hooks,
     register_param_grad_hooks,
     remove_hooks,
     resolve_hook_assignments,
 )
+from dattri_llm.gradient.hooks.hooks import _is_linear_io_capable
 
 # --------------------------------------------------------------------------- #
 # _is_linear_io_capable -- purely type-based, never name-based                  #

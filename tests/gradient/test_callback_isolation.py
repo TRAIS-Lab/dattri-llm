@@ -222,18 +222,16 @@ def _callback_factory(kind: str, tmp_path):
     if kind == "ds_batch":
         return lambda model: DataSelectionCallback(
             model=model,
-            threshold_mode="bottom_fraction",
-            threshold=0.5,
             target="batch",
+            selection_kwargs={"threshold_mode": "bottom_fraction", "threshold": 0.5},
         )
     if kind == "ds_fixed":
         target = _fixed_target()
         return lambda model: DataSelectionCallback(
             model=model,
-            threshold_mode="bottom_fraction",
-            threshold=0.5,
             target="fixed",
             target_gradient=target,
+            selection_kwargs={"threshold_mode": "bottom_fraction", "threshold": 0.5},
         )
     raise ValueError(kind)
 
@@ -278,11 +276,13 @@ class TestValLoaderException:
         def factory(model):
             return DataSelectionCallback(
                 model=model,
-                threshold_mode="bottom_fraction",
-                threshold=0.5,
                 target="val_loader",
                 val_loader=[VAL_BATCH],
                 val_loss_fn=_val_loss_fn,
+                selection_kwargs={
+                    "threshold_mode": "bottom_fraction",
+                    "threshold": 0.5,
+                },
             )
 
         fps, spy_before, spy_after, last = _run(factory)

@@ -183,8 +183,8 @@ class TestKFAC:
     def test_matches_kronecker_oracle(self, collected, tmp_path):
         res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         matrix = res.query(
             collected["train_hashes"],
@@ -207,8 +207,8 @@ class TestKFAC:
     def test_algorithm_label_and_shape(self, collected, tmp_path):
         res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         assert res.algorithm == "KFAC"
         assert res.scores.shape == (TT.N_TRAIN, TT.N_TEST)
@@ -218,8 +218,8 @@ class TestEKFAC:
     def test_matches_eigenbasis_oracle(self, collected, tmp_path):
         res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         matrix = res.query(
             collected["train_hashes"],
@@ -242,8 +242,8 @@ class TestEKFAC:
     def test_algorithm_label(self, collected, tmp_path):
         res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         assert res.algorithm == "EKFAC"
 
@@ -259,8 +259,8 @@ class TestEKFAC:
                 dataloader_pin_memory=False,
             ),
         ).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             damping=damping,
         )
         matrix = (
@@ -338,8 +338,8 @@ class TestEKFAC:
                 )
                 .attribute_from_cache(
                     damping=DAMPING,
-                    train_gradients_dir=str(collected["train_dir"]),
-                    test_gradients_dir=str(collected["test_dir"]),
+                    train_source=str(collected["train_dir"]),
+                    test_source=str(collected["test_dir"]),
                 )
                 .query(
                     collected["train_hashes"],
@@ -431,8 +431,8 @@ class TestKFACMultiToken:
             dataloader_pin_memory=False,
         )
         res = KFACAttributor(args).attribute_from_cache(
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
             damping=DAMPING,
         )
         matrix = res.query(train_hashes, test_hashes, trajectory="agnostic")
@@ -486,8 +486,8 @@ class TestRowStepsTracked:
     def test_row_steps_reflect_recorded_step(self, collected_step1, tmp_path, cls):
         res = _make(cls, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected_step1["train_dir"]),
-            test_gradients_dir=str(collected_step1["test_dir"]),
+            train_source=str(collected_step1["train_dir"]),
+            test_source=str(collected_step1["test_dir"]),
         )
         assert res.row_steps == [1] * TT.N_TRAIN
         # The hash->step pairing must be correct sample-by-sample, not just in bulk.
@@ -539,8 +539,8 @@ class TestStepSelection:
             )
             return attr.attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(train_dir),
-                test_gradients_dir=str(test_dir),
+                train_source=str(train_dir),
+                test_source=str(test_dir),
                 selected_training_steps=steps,
             )
 
@@ -558,8 +558,8 @@ class TestStepSelection:
         with pytest.raises(ValueError, match=r"requested steps"):
             attr.attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 selected_training_steps=[99],
             )
 
@@ -567,15 +567,15 @@ class TestStepSelection:
 class TestKroneckerShared:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")
-        with pytest.raises(TypeError, match=r"train_gradients_dir"):
+        with pytest.raises(TypeError, match=r"train_source"):
             attr.attribute_from_cache(
                 damping=DAMPING,
-                test_gradients_dir=str(collected["test_dir"]),
+                test_source=str(collected["test_dir"]),
             )
-        with pytest.raises(TypeError, match=r"test_gradients_dir"):
+        with pytest.raises(TypeError, match=r"test_source"):
             attr.attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
+                train_source=str(collected["train_dir"]),
             )
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
@@ -589,8 +589,8 @@ class TestKroneckerShared:
                 _make(cls, tmp_path / tag)
                 .attribute_from_cache(
                     damping=DAMPING,
-                    train_gradients_dir=str(collected["train_dir"]),
-                    test_gradients_dir=str(collected["test_dir"]),
+                    train_source=str(collected["train_dir"]),
+                    test_source=str(collected["test_dir"]),
                     loop_over_test=loop,
                 )
                 .query(
@@ -613,8 +613,8 @@ class TestKroneckerShared:
         for cls, label in ((KFACAttributor, "KFAC"), (EKFACAttributor, "EKFAC")):
             res = _make(cls, tmp_path / label).attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
             )
             m = res.query(
                 collected["train_hashes"],
@@ -738,8 +738,8 @@ class TestDirectFIM:
     def _run(self, collected, out_dir, **kw):
         res = _attr(KFACAttributor, out_dir).attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             **kw,
         )
         return res.query(
@@ -796,8 +796,8 @@ class TestDirectFIM:
                 _attr(cls, tmp_path / tag)
                 .attribute_from_cache(
                     damping=DAMPING,
-                    train_gradients_dir=str(norm_collected["train_dir"]),
-                    test_gradients_dir=str(norm_collected["test_dir"]),
+                    train_source=str(norm_collected["train_dir"]),
+                    test_source=str(norm_collected["test_dir"]),
                     non_kfac_strategy="direct",
                     loop_over_test=loop,
                 )
@@ -880,8 +880,8 @@ class TestDirectFIM:
         with pytest.warns(UserWarning, match="embedding"):
             _attr(KFACAttributor, tmp_path / "o").attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(tmp_path / "tr"),
-                test_gradients_dir=str(tmp_path / "te"),
+                train_source=str(tmp_path / "tr"),
+                test_source=str(tmp_path / "te"),
                 non_kfac_strategy="direct",
             ).query(train_hashes, test_hashes, trajectory="agnostic")
 
@@ -963,7 +963,7 @@ def _fim_score(g_tr: torch.Tensor, g_te: torch.Tensor) -> torch.Tensor:
 class TestMaterializedLayers:
     """K-FAC/EK-FAC over caches holding materialized (TRAK-projected) layers.
 
-    Regression: ``_kfac_layers`` selected by layer *type* only, so a
+    Regression: ``kfac_layers`` selected by layer *type* only, so a
     TRAK-projected layer (materialized tensor, original ``nn.Linear`` type)
     reached ``KroneckerAccumulator.update`` and crashed with
     ``AttributeError: 'Tensor' object has no attribute 'as_batch_first'``.
@@ -976,8 +976,8 @@ class TestMaterializedLayers:
         train_dir, test_dir = dirs
         return _attr(cls, out_dir).attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
             **kw,
         )
 
@@ -1096,8 +1096,8 @@ class TestPreconditionedTestSide:
             _make(cls, out)
             .attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
             )
             .query(
                 collected["train_hashes"],
@@ -1113,8 +1113,8 @@ class TestPreconditionedTestSide:
             _make(cls, tmp_path / "loop")
             .attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 loop_over_test=True,
             )
             .query(
@@ -1134,8 +1134,8 @@ class TestPreconditionedTestSide:
             _make(cls, tmp_path / "disk")
             .attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 loop_over_test=True,
                 preconditioned_test_dir=str(tmp_path / "pre_te"),
             )
@@ -1171,8 +1171,8 @@ class TestPreconditionedTestSide:
                 ),
             )
             .attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=pre_dir,
+                train_source=str(collected["train_dir"]),
+                test_source=pre_dir,
             )
             .query(
                 collected["train_hashes"],
@@ -1202,10 +1202,10 @@ class TestPreconditionedTestSide:
             _make(cls, tmp_path / f"res_{residency}")
             .attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 loop_over_test=True,
-                preconditioned_test_residency=residency,
+                preconditioned_test_cache_residency=residency,
             )
             .query(
                 collected["train_hashes"],
@@ -1221,8 +1221,8 @@ class TestPreconditionedTestSide:
         with pytest.raises(ValueError, match="loop_over_test=True"):
             _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 preconditioned_test_dir=str(tmp_path / "pre_te"),
             )
 
@@ -1230,19 +1230,19 @@ class TestPreconditionedTestSide:
         with pytest.raises(ValueError, match="loop_over_test=True"):
             _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
-                preconditioned_test_residency="memory",
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                preconditioned_test_cache_residency="memory",
             )
 
     def test_invalid_preconditioned_residency_raises(self, collected, tmp_path):
-        with pytest.raises(ValueError, match="preconditioned_test_residency"):
+        with pytest.raises(ValueError, match="preconditioned_test_cache_residency"):
             _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 loop_over_test=True,
-                preconditioned_test_residency="nope",
+                preconditioned_test_cache_residency="nope",
             )
 
 
@@ -1262,8 +1262,8 @@ class TestPersistedFisher:
 
     def _score(self, attr, collected, **kw):
         return attr.attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             **kw,
         ).query(
             collected["train_hashes"],
@@ -1322,8 +1322,8 @@ class TestPersistedFisher:
         def score(attr, **kw):
             return attr.attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(norm_collected["train_dir"]),
-                test_gradients_dir=str(norm_collected["test_dir"]),
+                train_source=str(norm_collected["train_dir"]),
+                test_source=str(norm_collected["test_dir"]),
                 **kw,
             ).query(
                 norm_collected["train_hashes"],

@@ -1,5 +1,5 @@
 """Unit tests for the async disk-write path: ``AsyncGradientWriter`` and its
-wiring into ``OffloadCallback`` and ``collect_to_disk``.
+wiring into ``OffloadCallback`` and ``collect_gradients``.
 
 The load-bearing property everywhere: a store produced asynchronously must be
 **indistinguishable** from one produced synchronously -- same steps, same
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from dattri_llm.attribution.utils import collect_to_disk
+from dattri_llm.attribution.utils import collect_gradients
 from dattri_llm.gradient.async_writer import AsyncGradientWriter
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.gradient import Gradient, GradientRecord
@@ -256,14 +256,14 @@ class TestOffloadCallbackAsync:
 
 
 # --------------------------------------------------------------------------- #
-# collect_to_disk(async_write=...)                                             #
+# collect_gradients(async_write=...)                                             #
 # --------------------------------------------------------------------------- #
 
 
 class FakeStreamer:
     def __init__(self, blocks, args=None):
         self._blocks = blocks
-        self._args = args
+        self.args = args
         self.hook_manager = SimpleNamespace(sample_id_key=None)
 
     def __enter__(self):
@@ -282,12 +282,12 @@ def make_blocks(n=4):
 
 class TestCollectToDiskAsync:
     def test_async_store_matches_sync(self, tmp_path):
-        collect_to_disk(
+        collect_gradients(
             FakeStreamer(make_blocks()),
             GradientStorageManager(str(tmp_path / "sync")),
             async_write=False,
         )
-        collect_to_disk(
+        collect_gradients(
             FakeStreamer(make_blocks()),
             GradientStorageManager(str(tmp_path / "async")),
             async_write=True,
@@ -309,7 +309,7 @@ class TestCollectToDiskAsync:
 
         monkeypatch.setattr(AsyncGradientWriter, "__init__", spy)
         args = SimpleNamespace(async_disk_write=True)
-        collect_to_disk(
+        collect_gradients(
             FakeStreamer(make_blocks(2), args=args),
             GradientStorageManager(str(tmp_path / "s")),
         )
@@ -319,7 +319,7 @@ class TestCollectToDiskAsync:
     def test_on_block_runs_on_producer_thread(self, tmp_path):
         main_thread = threading.current_thread()
         seen = []
-        collect_to_disk(
+        collect_gradients(
             FakeStreamer(make_blocks(3)),
             GradientStorageManager(str(tmp_path / "s")),
             async_write=True,

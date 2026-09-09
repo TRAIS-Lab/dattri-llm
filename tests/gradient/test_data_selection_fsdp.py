@@ -86,12 +86,20 @@ def _hooked_linear_grads(model: EmbeddingMLP):
 
 
 def _callback_kwargs(mode: str) -> dict:
+    """Constructor kwargs per regime.
+
+    ``threshold`` / ``threshold_mode`` live under ``selection_kwargs``.
+    """
     if mode == "none":
-        return {"threshold_mode": "bottom_fraction", "threshold": 0.0}
+        return {
+            "selection_kwargs": {"threshold_mode": "bottom_fraction", "threshold": 0.0}
+        }
     if mode == "half":
-        return {"threshold_mode": "bottom_fraction", "threshold": 0.5}
+        return {
+            "selection_kwargs": {"threshold_mode": "bottom_fraction", "threshold": 0.5}
+        }
     if mode == "hard0":
-        return {"threshold_mode": "hard", "threshold": 0.0}
+        return {"selection_kwargs": {"threshold_mode": "hard", "threshold": 0.0}}
     raise ValueError(mode)
 
 
@@ -132,9 +140,9 @@ def _fsdp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
         # layout; attach it after wrapping via the manager's add_callback().
         ds_cb = DataSelectionCallback(
             model=fsdp_model,
-            score_mode="ghost",
             target="batch",
             **_callback_kwargs(mode),
+            scoring_kwargs={"score_mode": "ghost"},
         )
         collector.add_callback(ds_cb)
 
