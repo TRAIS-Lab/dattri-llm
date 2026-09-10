@@ -39,6 +39,9 @@ from dattri_llm.gradient.callbacks.kronecker_covariance_callback import (
     KroneckerCovarianceCallback,
 )
 from dattri_llm.gradient.callbacks.offload_callback import OffloadCallback
+from dattri_llm.gradient.callbacks.optimizer_state_callback import (
+    OptimizerStateCallback,
+)
 
 __all__ = [
     "CaptureCallback",
@@ -46,4 +49,5 @@ __all__ = [
     "HookManagerCallback",
     "KroneckerCovarianceCallback",
     "OffloadCallback",
+    "OptimizerStateCallback",
 ]

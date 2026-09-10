@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+import pathlib
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -321,3 +323,31 @@ def score_sources(
         else torch.zeros(0, num_test, dtype=torch.float)
     )
     return scores, row_train_ids, row_steps, test_ids
+
+
+# --------------------------------------------------------------------------- #
+# The learning-rate schedule a trajectory collection records                   #
+# --------------------------------------------------------------------------- #
+
+LR_SCHEDULE_FILE = "lr_schedule.json"
+
+
+def write_lr_schedule(train_gradients_dir: str, lrs: Mapping[int, float]) -> None:
+    """Persist the per-step LR actually applied during a trajectory collection
+    (``GradientStreamer.learning_rates``) beside the train store.
+    """
+    root = pathlib.Path(train_gradients_dir)
+    root.mkdir(exist_ok=True, parents=True)
+    with (root / LR_SCHEDULE_FILE).open("w", encoding="utf-8") as f:
+        json.dump({str(k): float(v) for k, v in lrs.items()}, f)
+
+
+def read_lr_schedule(train_gradients_dir: str) -> dict[int, float] | None:
+    """The per-step LR recorded by :func:`write_lr_schedule`, or ``None`` if
+    absent (e.g. a directory produced outside the on-the-fly workflow).
+    """
+    path = pathlib.Path(train_gradients_dir) / LR_SCHEDULE_FILE
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as f:
+        return {int(k): float(v) for k, v in json.load(f).items()}

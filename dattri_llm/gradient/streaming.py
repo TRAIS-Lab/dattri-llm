@@ -387,6 +387,13 @@ class GradientStreamer(GradientSource):
         checkpoint_step: The step index stamped on every yielded block when the
             model is frozen (all batches share one checkpoint).  Ignored when
             ``enable_update`` (the per-batch optimizer-step index is used).
+        precondition: Capture the optimizer's per-sample update direction
+            instead of the raw gradient (see ``HookManager(optimizer=...)``):
+            the trajectory's own optimizer under ``enable_update``, else the
+            ``optimizer`` given, which must then be supplied.  A shared
+            ``hook_manager`` must have been built with an optimizer; the
+            flag is set on it per pass, so a raw test probe can share a
+            preconditioned train streamer's hooks.
     """
 
     def __init__(
@@ -404,6 +411,7 @@ class GradientStreamer(GradientSource):
         collate_fn: Callable | None = None,
         checkpoint_step: int = 0,
         hook_manager: HookManager | None = None,
+        precondition: bool = False,
     ) -> None:
         self._model = model
         self._dataset = dataset
@@ -415,8 +423,20 @@ class GradientStreamer(GradientSource):
         self._scheduler = scheduler
         self._collate_fn = collate_fn
         self._checkpoint_step = checkpoint_step
+        self._precondition = precondition
+        if precondition and not enable_update and optimizer is None:
+            raise ValueError(
+                "precondition=True needs an optimizer to read the state from: "
+                "pass optimizer= (a frozen probe at a checkpoint's optimizer) or "
+                "enable_update=True (the trajectory's own optimizer).",
+            )
 
         if hook_manager is not None:
+            if precondition and not hook_manager.supports_preconditioning:
+                raise ValueError(
+                    "precondition=True on a shared hook_manager that was built "
+                    "without an optimizer.",
+                )
             self._hm = hook_manager
             self._owns_hm = False
             shared = next(
@@ -445,6 +465,9 @@ class GradientStreamer(GradientSource):
                     linear_io=REGISTER_ALL,
                 ),
                 callbacks=[self._capture],
+                # Resolved on first use: an updating pass builds its optimizer
+                # below, after the hooks are registered.
+                optimizer=(lambda: self.optimizer) if precondition else None,
             )
             self._owns_hm = True
 
@@ -534,6 +557,18 @@ class GradientStreamer(GradientSource):
         the cleaner alternative to two managers cross-capturing each backward.
         """
         return self._hm
+
+    @property
+    def optimizer(self) -> torch.optim.Optimizer:
+        """The optimizer an updating pass advances (built at construction when
+        none was given), or the one a frozen probe was handed to precondition
+        with.  Optimizer-aware capture and callbacks read its state through it.
+        """
+        if self._optimizer is None:
+            raise RuntimeError(
+                "No optimizer: this streamer is a frozen probe built without one.",
+            )
+        return self._optimizer
 
     @property
     def learning_rates(self) -> dict[int, float]:
@@ -638,6 +673,10 @@ class GradientStreamer(GradientSource):
         # owning streamer's pass-local step, and the desync check below keeps
         # catching extra or missing captures within the batch.
         self._hm.reset_steps(self._batch_index)
+        # A shared manager serves passes of both kinds (a preconditioned train
+        # pass and a raw test pass), so each pass sets the mode per batch.
+        if self._hm.supports_preconditioning:
+            self._hm.precondition = self._precondition
         self._forward_backward(batch)
         if self.enable_update:
             # LR that the update consuming this micro-batch will apply (the

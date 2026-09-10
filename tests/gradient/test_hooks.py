@@ -784,6 +784,36 @@ class TestProjectionConfig:
             ref = ops.materialize(fac.data[n], "nn.Linear")
             assert torch.allclose(mat.data[n], ref, atol=1e-5), n
 
+    def test_subset_projection_keeps_exact_coordinates(self):
+        # "subset_materialized": a dense (B, k) block of exact gradient entries,
+        # equal to a gather on the materialized raw capture.
+        from dattri_llm.gradient import ops
+
+        cfg = {"style": "subset_materialized", "proj_dim": 12, "proj_seed": 7}
+        raw = self._run(None)
+        sub = self._run({"__default__": dict(cfg)})
+        proj = ops.DattriProjector()
+        for n in sub.layer_names:
+            assert sub.representation[n] == "materialized"
+            assert sub.data[n].shape == (4, 12)
+            full = ops.materialize(raw.data[n], "nn.Linear")
+            idx = proj.subset_indices(
+                full.shape[1], proj_dim=12, proj_seed=7, device=full.device
+            )
+            assert torch.allclose(sub.data[n], full[:, idx], atol=1e-5), n
+
+    def test_validation_rejects_projector_kwargs_for_subset(self):
+        with pytest.raises(ValueError, match="subset_materialized"):
+            HookManagerConfig(
+                projection={
+                    "__default__": {
+                        "style": "subset_materialized",
+                        "proj_dim": 8,
+                        "proj_type": "rademacher",
+                    },
+                },
+            )
+
     def test_off_by_default_keeps_factorized(self):
         g = self._run(None)
         assert all(g.representation[n] == "factorized" for n in g.layer_names)
@@ -822,7 +852,12 @@ class TestProjectionConfig:
 
     @pytest.mark.parametrize(
         "style",
-        ["logra_factorized", "logra_materialized", "materialized"],
+        [
+            "logra_factorized",
+            "logra_materialized",
+            "materialized",
+            "subset_materialized",
+        ],
     )
     def test_capture_time_equals_assembly_time_projection(self, style):
         # Projecting at capture (per micro-batch) must be bit-identical to
@@ -832,13 +867,9 @@ class TestProjectionConfig:
         from dattri_llm.gradient import ops
         from dattri_llm.gradient.gradient import Factorized
 
-        cfg = {
-            "style": style,
-            "proj_dim": 12,
-            "proj_max_batch_size": 8,
-            "proj_type": "rademacher",
-            "proj_seed": 7,
-        }
+        cfg = {"style": style, "proj_dim": 12, "proj_seed": 7}
+        if style != "subset_materialized":  # no projector behind a subset
+            cfg.update({"proj_max_batch_size": 8, "proj_type": "rademacher"})
         raw = self._run(None)  # un-projected capture
         ref = raw.project(random_project, {"__default__": dict(cfg)})
         cap = self._run({"__default__": dict(cfg)})  # capture-time projection

@@ -9,8 +9,9 @@ from ``dattri_llm.gradient.ops``:
 * :mod:`~dattri_llm.gradient.ops.materialize` -- per-sample weight gradients.
 * :mod:`~dattri_llm.gradient.ops.dot` -- dot products, grams, norms, the
   layerwise cross-gram, and the factorized-vs-materialized routing heuristic.
-* :mod:`~dattri_llm.gradient.ops.projection` -- TRAK/LoGRA random projection
-  and the :class:`DattriProjector` that owns the projection matrices.
+* :mod:`~dattri_llm.gradient.ops.projection` -- TRAK/LoGRA random projection,
+  fixed coordinate subsets, and the :class:`DattriProjector` that owns the
+  projection matrices and subsets.
 * :mod:`~dattri_llm.gradient.ops.kronecker` -- K-FAC / EK-FAC / Fisher kernels
   and streaming accumulators.
 
@@ -65,6 +66,14 @@ from dattri_llm.gradient.ops.kronecker import (
     sym_inverse,
 )
 from dattri_llm.gradient.ops.materialize import materialize, materialize_factors
+from dattri_llm.gradient.ops.optimizer import (
+    OPTIMIZER_STATE_KEYS,
+    adam_preconditioner,
+    adamw_influence_coupling,
+    adamw_influence_push,
+    adamw_influence_transition,
+    precondition,
+)
 from dattri_llm.gradient.ops.preprocess import (
     extract_module_kwargs,
     preprocess_factorized,
@@ -73,6 +82,7 @@ from dattri_llm.gradient.ops.preprocess import (
 )
 from dattri_llm.gradient.ops.projection import (
     PROJECTION_STYLES,
+    SUBSET_KEYS,
     DattriProjector,
     apply_projection,
     maybe_materialize_projected,
@@ -83,6 +93,10 @@ from dattri_llm.gradient.ops.projection import (
     project_layer,
     project_materialized,
     project_materialized_factors,
+    subset_coordinates,
+    subset_factorized,
+    subset_factors,
+    subset_materialized,
 )
 from dattri_llm.gradient.ops.types import (
     ALL_LAYER_TYPES,
@@ -108,13 +122,19 @@ __all__ = [
     "EMBEDDING_TYPES",
     "LINEAR_TYPES",
     "NORM_TYPES",
+    "OPTIMIZER_STATE_KEYS",
     "PARAM_GRAD_TYPES",
     "PROJECTION_STYLES",
+    "SUBSET_KEYS",
     "DattriProjector",
     "FisherAccumulator",
     "KroneckerAccumulator",
     "LayerFisherAccumulator",
     "LayerKroneckerAccumulator",
+    "adam_preconditioner",
+    "adamw_influence_coupling",
+    "adamw_influence_push",
+    "adamw_influence_transition",
     "apply_projection",
     "as_float",
     "canonical_class_name",
@@ -159,6 +179,7 @@ __all__ = [
     "maybe_use_materialized_norm",
     "pairwise_dot",
     "pairwise_dot_factors",
+    "precondition",
     "preprocess_factorized",
     "preprocess_factors",
     "project_activation",
@@ -169,6 +190,10 @@ __all__ = [
     "project_materialized",
     "project_materialized_factors",
     "set_compute_dtype",
+    "subset_coordinates",
+    "subset_factorized",
+    "subset_factors",
+    "subset_materialized",
     "sym_inverse",
     "to_3d",
 ]

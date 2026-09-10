@@ -206,11 +206,19 @@ class HookManagerConfig:
       * ``"materialized"`` -- materialize the per-sample weight gradient
         first, then project it (TRAK / single-sided) to a dense
         ``(B, proj_dim)`` block.
+      * ``"subset_materialized"`` -- keep ``proj_dim`` fixed random
+        coordinates of the per-sample weight gradient (drawn once from
+        ``proj_seed``), gathered straight from the factors without
+        materializing; a dense ``(B, proj_dim)`` block whose entries are
+        exact.  Takes only ``proj_dim``, ``proj_seed``, ``include_bias`` and
+        ``device`` -- there is no projector, so ``proj_type`` and the like are
+        rejected.
 
       The two ``logra_*`` styles are defined for outer-product gradients: the
       linear / conv families, and the embedding family (whose integer ids are
       expanded to one-hot inputs first).  **Norm layers must use**
-      ``"materialized"`` (their gradient is not an outer product).
+      ``"materialized"`` or ``"subset_materialized"`` (their gradient is not
+      an outer product).
     * ``proj_seed`` (int, default ``0``) -- base seed.  The ``logra_*`` styles
       use ``proj_seed`` for the output-gradient factor and ``proj_seed + 1``
       for the activation factor (dattri's LoGRA convention).  Keep it fixed
@@ -322,7 +330,7 @@ class HookManagerConfig:
     def _validate_projection(
         projection: dict[str, dict] | None,
     ) -> dict[str, dict] | None:
-        from dattri_llm.gradient.ops import PROJECTION_STYLES
+        from dattri_llm.gradient.ops import PROJECTION_STYLES, SUBSET_KEYS
 
         if projection is None:
             return None
@@ -349,6 +357,13 @@ class HookManagerConfig:
                 raise ValueError(
                     f"projection[{name!r}]['style'] = {style!r} is not a valid "
                     f"projection style. Valid styles: {list(PROJECTION_STYLES)}.",
+                )
+            if style == "subset_materialized" and set(kw) - SUBSET_KEYS:
+                raise ValueError(
+                    f"projection[{name!r}] is 'subset_materialized', which keeps "
+                    "coordinates rather than projecting and takes only "
+                    f"{sorted(SUBSET_KEYS - {'style'})}; got unexpected "
+                    f"{sorted(set(kw) - SUBSET_KEYS)}.",
                 )
         return {
             k: HookManagerConfig._resolve_auto_style(k, dict(v))

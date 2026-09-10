@@ -47,11 +47,14 @@ _LAZY_EXPORTS = {
     "KFACAttributor": "dattri_llm.attribution",
     "EKFACAttributor": "dattri_llm.attribution",
     "DVEmbAttributor": "dattri_llm.attribution",
+    "LESSAttributor": "dattri_llm.attribution",
+    "AdamWInfluenceAttributor": "dattri_llm.attribution",
 }
 
 __all__ = [
     "REGISTER_ALL",
     # lazily resolved (see _LAZY_EXPORTS):
+    "AdamWInfluenceAttributor",
     "AttributionArguments",
     "AttributionScore",
     "BaseAttributor",
@@ -71,6 +74,7 @@ __all__ = [
     "HookManagerConfig",
     "KFACAttributor",
     "KroneckerAttributor",
+    "LESSAttributor",
     "OffloadCallback",
     "TracInAttributor",
     "default_hook_assignment",

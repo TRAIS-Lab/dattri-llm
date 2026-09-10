@@ -58,6 +58,8 @@ from dattri_llm.gradient.ops import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from dattri_llm.gradient.optimizer_state import GradientPreconditioner
+
 try:
     from transformers.pytorch_utils import Conv1D as HF_Conv1D
 except ImportError:
@@ -179,6 +181,7 @@ def register_linear_io_hooks(
     projection: dict[str, dict] | None = None,
     projector: ops.DattriProjector | None = None,
     offload_to_cpu: bool = False,
+    preconditioner: GradientPreconditioner | None = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
@@ -237,6 +240,20 @@ def register_linear_io_hooks(
             declared-type overrides on classes whose attributes do not follow
             the standard names (e.g. HF ``LlamaRMSNorm``).  Layers absent from
             the mapping are extracted as usual.
+        preconditioner: Optional
+            :class:`~dattri_llm.gradient.optimizer_state.GradientPreconditioner`.
+            While it is ``enabled``, every layer's capture is the optimizer's
+            per-sample update direction instead of the raw gradient: the
+            per-sample gradient is formed on the captured coordinates (the
+            whole layer when unprojected, the kept subset under
+            ``"subset_materialized"``, the whole layer *before* a
+            ``"materialized"`` projection) and mapped through the optimizer
+            state, and only that dense result is buffered.  Like projection,
+            it runs inside the backward hook, so the state read is the one
+            the coming ``optimizer.step()`` updates from.  The ``logra_*``
+            styles cannot be preconditioned (the map does not commute with a
+            factor-side projection).  The flag must not change between a
+            layer's forward and its backward.
 
     Returns:
         ``(buffers, handles)`` where ``buffers`` maps layer name to a
@@ -290,7 +307,7 @@ def register_linear_io_hooks(
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
                 buf = buffers[layer_name]
                 emit_type, emit_kwargs = buf["_class_name"], buf["_module_kwargs"]
-                if buf["_proj_kw"] is None:
+                if buf["_proj_kw"] is None and not _preconditioning(preconditioner):
                     if offload_to_cpu:
                         a = a.cpu()
                     with buf["_lock"]:
@@ -301,15 +318,19 @@ def register_linear_io_hooks(
                         buf["_fwd_fires"] += 1
                     buf["activation"] = a
                 else:
-                    # Projected layer.  For linear (a-side independent of g) the
-                    # activation is projected *here*, so the buffer holds only the
-                    # small a_p and the callback sees the projected factor; other
-                    # types keep the raw activation for the joint backward
-                    # projection.  A per-device *stack* pairs each call's a with
-                    # its g even when a layer is invoked multiple times per forward
-                    # (weight tying / RNN unroll) -- backward pops LIFO.
-                    style = buf["_proj_kw"].get("style", "logra_factorized")
-                    if _preprojects_activation(buf["_class_name"], style):
+                    # Projected and/or preconditioned layer: the dense result is
+                    # formed at backward.  For linear (a-side independent of g)
+                    # under a LoGRA style the activation is projected *here*, so
+                    # the buffer holds only the small a_p and the callback sees
+                    # the projected factor; other cases keep the raw activation
+                    # for the joint backward capture.  A per-device *stack* pairs
+                    # each call's a with its g even when a layer is invoked
+                    # multiple times per forward (weight tying / RNN unroll) --
+                    # backward pops LIFO.
+                    style = _capture_style(buf)
+                    if style is not None and _preprojects_activation(
+                        buf["_class_name"], style
+                    ):
                         proj_kw = {
                             k: v for k, v in buf["_proj_kw"].items() if k != "style"
                         }
@@ -343,7 +364,7 @@ def register_linear_io_hooks(
                     buf["_class_name"],
                     buf["_module_kwargs"],
                 )
-                if buf["_proj_kw"] is None:
+                if buf["_proj_kw"] is None and not _preconditioning(preconditioner):
                     if offload_to_cpu:
                         g = g.cpu()
                     with buf["_lock"]:
@@ -366,6 +387,8 @@ def register_linear_io_hooks(
                         dev_idx,
                         projector,
                         offload_to_cpu,
+                        preconditioner=preconditioner,
+                        layer_name=layer_name,
                     )
                     if not matched:
                         _warn_orphan_backward(layer_name)
@@ -550,18 +573,33 @@ def _preprojects_activation(layer_type: str, style: str) -> bool:
     )
 
 
+def _preconditioning(preconditioner: GradientPreconditioner | None) -> bool:
+    """Whether captures are currently mapped through the optimizer."""
+    return preconditioner is not None and preconditioner.enabled
+
+
+def _capture_style(buf: LayerBuffer) -> str | None:
+    """The layer's projection style, ``None`` for an unprojected layer."""
+    if buf["_proj_kw"] is None:
+        return None
+    return buf["_proj_kw"].get("style", "logra_factorized")
+
+
 def _capture_projected(
     buf: LayerBuffer,
     g: torch.Tensor,
     dev_idx: int,
-    projector: ops.DattriProjector,
+    projector: ops.DattriProjector | None,
     offload_to_cpu: bool = False,
+    *,
+    preconditioner: GradientPreconditioner | None = None,
+    layer_name: str = "",
 ) -> tuple[bool, torch.Tensor | None]:
-    """Project one micro-batch's ``(activation, grad_output)`` into the buffer.
+    """Reduce one micro-batch's ``(activation, grad_output)`` into the buffer.
 
-    Called from the backward hook of a projected layer, pairing ``g`` with the
-    matching per-replica forward activation.  The ``style`` of the projection
-    config decides what is buffered:
+    Called from the backward hook of a projected or preconditioned layer,
+    pairing ``g`` with the matching per-replica forward activation.  The
+    ``style`` of the projection config decides what is buffered:
 
     * ``"logra_factorized"`` -- the projected factors go to
       ``_act_parts``/``_grad_parts``.
@@ -570,12 +608,20 @@ def _capture_projected(
       block appended to ``_proj_parts``.
     * ``"materialized"`` (TRAK) -- the materialize-then-project per-sample block
       goes to ``_proj_parts``.
+    * ``"subset_materialized"`` -- the kept coordinates, gathered from the raw
+      factors without materializing, go to ``_proj_parts``.
+    * no projection (a preconditioned layer) -- the materialized per-sample
+      gradient goes to ``_proj_parts``.
+
+    With an enabled *preconditioner* the per-sample entries are mapped through
+    the optimizer before buffering -- after the subset gather, and before a
+    ``"materialized"`` projection.
 
     When the layer pre-projected its activation at forward
     (:func:`_preprojects_activation`), the popped ``a`` is already the projected
     factor ``a_p``, so only ``g`` is projected here.
 
-    Only the small projected result is retained (moved to CPU when
+    Only the small reduced result is retained (moved to CPU when
     *offload_to_cpu*) -- the raw factors are discarded here, so the buffer never
     holds the full gradient.
 
@@ -592,14 +638,16 @@ def _capture_projected(
     if a is None:
         return False, None
 
-    kw = dict(buf["_proj_kw"])
-    style = kw.pop("style", "logra_factorized")
+    proj_kw = buf["_proj_kw"]
+    kw = dict(proj_kw or {})
+    style = kw.pop("style", "logra_factorized") if proj_kw is not None else None
+    precondition = preconditioner if _preconditioning(preconditioner) else None
     layer_type = buf["_class_name"]
     module_kwargs = buf["_module_kwargs"]
 
     # Activation pre-projected at forward: ``a`` is already ``a_p``; project only
     # ``g``.  The stored factors are identical to the joint path (same seeds).
-    if _preprojects_activation(layer_type, style):
+    if style is not None and _preprojects_activation(layer_type, style):
         a_p = a
         g_p = ops.project_gradient(g, layer_type, projector, module_kwargs, **kw)
         if style == "logra_factorized":
@@ -651,7 +699,24 @@ def _capture_projected(
         # small projected space; they behave as a plain linear layer, so
         # module_kwargs=None avoids re-preprocessing.
         mat = ops.materialize_factors(a_p, g_p, "nn.Linear")
-    else:  # "materialized" (TRAK)
+    elif style == "subset_materialized":
+        mat = ops.subset_factors(
+            a,
+            g,
+            layer_type,
+            projector,
+            module_kwargs,
+            **kw,
+        )
+        if precondition is not None:
+            mat = precondition(layer_name, mat, proj_kw)
+    elif style == "materialized" and precondition is not None:
+        # Precondition the whole gradient, then project it (TRAK order).
+        include_bias = bool(kw.pop("include_bias", True))
+        mat = ops.materialize_factors(a, g, layer_type, module_kwargs, include_bias)
+        mat = precondition(layer_name, mat, proj_kw)
+        mat = ops.apply_projection(projector, mat, **kw)
+    elif style == "materialized":
         mat = ops.project_materialized_factors(
             a,
             g,
@@ -660,6 +725,9 @@ def _capture_projected(
             module_kwargs,
             **kw,
         )
+    else:  # unprojected, preconditioned: the whole per-sample gradient
+        mat = ops.materialize_factors(a, g, layer_type, module_kwargs)
+        mat = precondition(layer_name, mat, None)  # type: ignore[misc]
     if offload_to_cpu:
         mat = mat.cpu()
     with buf["_lock"]:

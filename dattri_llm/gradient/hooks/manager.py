@@ -28,11 +28,15 @@ from dattri_llm.gradient.hooks.hooks import (
     remove_hooks,
 )
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, is_embedding
+from dattri_llm.gradient.optimizer_state import (
+    GradientPreconditioner,
+    OptimizerSnapshot,
+)
 from dattri_llm.utils.autograd import queue_backward_end_callback
 from dattri_llm.utils.hashing import hash_batch
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
 
     from dattri_llm.gradient.callbacks import HookManagerCallback
 
@@ -141,6 +145,23 @@ class HookManager:
             happens, at the cost of keeping one step's captures in device
             memory until the next step completes.  A no-op either way when
             training on CPU.
+        optimizer: Optional optimizer over the model's parameters (or a
+            zero-argument callable returning one, resolved on first use).
+            When given, every ``linear_io`` layer captures the optimizer's
+            **per-sample update direction** (the
+            :func:`~dattri_llm.gradient.ops.precondition` of the sample's
+            gradient with the state the coming
+            ``optimizer.step()`` will update from) instead of the raw
+            gradient -- the representation optimizer-aware methods such as
+            LESS score.  Like a projection it happens inside the capture, so
+            only the preconditioned copy exists: dense on the captured
+            coordinates (the whole layer, or a ``"subset_materialized"``
+            subset; a ``"materialized"`` projection is applied after the
+            map).  The ``logra_*`` styles and ``param_grad`` layers are
+            incompatible.  :attr:`precondition` switches the map off and on
+            between passes (a raw test probe sharing the hooks).  Every
+            coordinate-wise ``torch.optim`` optimizer is supported under
+            single-process or DDP training; FSDP's sharded state is not.
     """
 
     def __init__(
@@ -151,9 +172,24 @@ class HookManager:
         sample_id_key: str | int | None = None,
         non_batch_first_layers: Iterable[str] | None = None,
         offload_to_cpu: bool = False,
+        optimizer: torch.optim.Optimizer
+        | Callable[[], torch.optim.Optimizer]
+        | None = None,
     ) -> None:
         self._model = model
         self._callbacks: list[HookManagerCallback] = callbacks or []
+        # Optimizer-aware capture: the map every layer's entries go through
+        # (see the ``optimizer`` argument).  The snapshot resolves on first use
+        # so an optimizer built after the hooks (a streamer's) can be passed
+        # as a callable.
+        self._preconditioner: GradientPreconditioner | None = None
+        if optimizer is not None:
+            root = getattr(model, "module", model)
+            self._preconditioner = GradientPreconditioner(
+                lambda: OptimizerSnapshot(
+                    root, optimizer() if callable(optimizer) else optimizer
+                )
+            )
         self._sample_id_key = sample_id_key
         self._offload_to_cpu = offload_to_cpu
         self._non_batch_first_layers: set[str] = (
@@ -783,7 +819,16 @@ class HookManager:
         acts: list[list] = [[] for _ in range(n_inv)]
         grads: list[list] = [[] for _ in range(n_inv)]
         projs: list[list] = [[] for _ in range(n_inv)]
-        if buf["_proj_kw"] is None:
+        if buf["_proj_parts"]:
+            # Dense captures (materialized styles, or a preconditioned layer)
+            # were appended at match time, aligned with pair_pos.
+            for (dev, part), (_, pos) in zip(
+                buf["_proj_parts"],
+                pair_pos,
+                strict=True,
+            ):
+                projs[pos].append((dev, part))
+        elif buf["_proj_kw"] is None:
             # Raw path: an act entry's invocation is its rank among its own
             # device's entries (forward append order); grads carry pair_pos.
             seen: dict[int, int] = {}
@@ -797,7 +842,7 @@ class HookManager:
                 strict=True,
             ):
                 grads[pos].append((dev, part))
-        elif buf["_proj_kw"].get("style", "logra_factorized") == "logra_factorized":
+        else:
             # Projected factorized: both factors were appended together at
             # match time, aligned with pair_pos.
             for (dev, part), (_, pos) in zip(
@@ -812,13 +857,6 @@ class HookManager:
                 strict=True,
             ):
                 grads[pos].append((dev, part))
-        else:
-            for (dev, part), (_, pos) in zip(
-                buf["_proj_parts"],
-                pair_pos,
-                strict=True,
-            ):
-                projs[pos].append((dev, part))
         return list(zip(acts, grads, projs, strict=True))
 
     def _assemble_gradient(self) -> Gradient:
@@ -850,15 +888,18 @@ class HookManager:
             ):
                 out_name = layer_name if inv_k == 0 else f"{layer_name}@{inv_k + 1}"
 
-                # Materialized styles ("materialized"/TRAK and
-                # "logra_materialized"): the projected per-sample gradient was
-                # assembled into _proj_parts at capture time.
+                # Dense captures -- the materialized styles ("materialized"/TRAK,
+                # "logra_materialized", "subset_materialized") and any
+                # preconditioned layer: the per-sample block was assembled into
+                # _proj_parts at capture time.
                 proj_style = (
                     proj_kw.get("style", "logra_factorized")
                     if proj_kw is not None
                     else "logra_factorized"
                 )
-                if proj_kw is not None and proj_style != "logra_factorized":
+                if proj_parts or (
+                    proj_kw is not None and proj_style != "logra_factorized"
+                ):
                     if not proj_parts:
                         raise RuntimeError(
                             f"Layer '{layer_name}' has no buffered data. "
@@ -1235,10 +1276,14 @@ class HookManager:
         self._bwd_done = True
         self._n_mlp_params = 0
         self._n_layers = 0
+        if self._preconditioner is not None:
+            self._validate_preconditioning(root, param_grad_layers)
         if self._has_linear_io:
             self._bwd_done = False
             if self._config.projection is not None and self._projector is None:
                 self._projector = ops.DattriProjector(self._config.projector)
+            if self._preconditioner is not None:
+                self._preconditioner.projector = self._projector
             self._buffers, self._handles = register_linear_io_hooks(
                 model,
                 layer_names=capture_layers,
@@ -1249,6 +1294,7 @@ class HookManager:
                 projection=self._config.projection,
                 projector=self._projector,
                 offload_to_cpu=self._offload_to_cpu,
+                preconditioner=self._preconditioner,
             )
             self._n_layers = len(self._buffers)
             # The weight.grad post-accumulate barrier (sub-condition b) only
@@ -1337,6 +1383,54 @@ class HookManager:
             self._projector.close()
             self._projector = None
         self._registered = False
+
+    def _validate_preconditioning(
+        self, root: nn.Module, param_grad_layers: set[str]
+    ) -> None:
+        """Reject configurations the optimizer map cannot serve."""
+        if param_grad_layers:
+            raise ValueError(
+                "HookManager(optimizer=...) preconditions per-sample (linear_io) "
+                "captures; these layers are assigned param_grad: "
+                f"{sorted(param_grad_layers)[:5]}.",
+            )
+        for name, kw in (self._config.projection or {}).items():
+            style = kw.get("style", "logra_factorized")
+            if style in ("logra_factorized", "logra_materialized"):
+                raise ValueError(
+                    f"projection[{name!r}] uses style {style!r}, which cannot be "
+                    "preconditioned: the optimizer map needs exact gradient "
+                    "entries. Use no projection, 'subset_materialized', or "
+                    "'materialized'.",
+                )
+        for module in root.modules():
+            names = {c.__name__ for c in type(module).__mro__}
+            if "FullyShardedDataParallel" in names or "FSDPModule" in names:
+                raise NotImplementedError(
+                    "HookManager(optimizer=...) does not support FSDP: the "
+                    "optimizer state is sharded across ranks.",
+                )
+
+    @property
+    def supports_preconditioning(self) -> bool:
+        """Whether the manager was built with an optimizer."""
+        return self._preconditioner is not None
+
+    @property
+    def precondition(self) -> bool:
+        """Whether captures currently go through the optimizer map."""
+        return self._preconditioner is not None and self._preconditioner.enabled
+
+    @precondition.setter
+    def precondition(self, enabled: bool) -> None:
+        if self._preconditioner is None:
+            if enabled:
+                raise ValueError(
+                    "This HookManager has no optimizer; pass optimizer= at "
+                    "construction to precondition captures.",
+                )
+            return
+        self._preconditioner.enabled = bool(enabled)
 
     def add_callback(self, callback: HookManagerCallback) -> None:
         """Attach a callback after construction and run its ``on_register``.

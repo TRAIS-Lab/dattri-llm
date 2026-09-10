@@ -545,9 +545,9 @@ class Gradient:
         projector: Callable | ops.DattriProjector | None,
         proj_kwargs: dict[str, dict],
     ) -> Gradient:
-        """Random-project each layer's per-sample gradient to a smaller dimension.
+        """Reduce each layer's per-sample gradient to a smaller dimension.
 
-        Three styles, chosen per layer by ``proj_kwargs[name]["style"]``:
+        Four styles, chosen per layer by ``proj_kwargs[name]["style"]``:
 
         * ``"logra_factorized"`` (default, LoGRA) -- project the factorized
           factors, keeping the Kronecker structure at width ``proj_dim``; the
@@ -557,8 +557,13 @@ class Gradient:
           projected factors into one dense ``(B, k_g*k_a)`` block per sample
           (token-summed outer product, formed in the small projected space).
         * ``"materialized"`` (TRAK) -- materialize the per-sample weight gradient
-          first, then project it to a dense ``(B, proj_dim)`` block.  The only
-          style available for norm layers and for already-materialized inputs.
+          first, then project it to a dense ``(B, proj_dim)`` block.
+        * ``"subset_materialized"`` -- keep ``proj_dim`` fixed random
+          coordinates of the per-sample weight gradient, gathered from the
+          factors without materializing (exact entries, no projector).
+
+        The last two are the styles available for norm layers and for
+        already-materialized inputs.
 
         Args:
             projector: a projection factory following dattri's ``random_project``

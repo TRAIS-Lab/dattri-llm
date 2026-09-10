@@ -656,6 +656,116 @@ class TestProjection:
 
 
 # ---------------------------------------------------------------------------
+# Coordinate subsets -- "subset_materialized"
+# ---------------------------------------------------------------------------
+
+
+class TestSubsetProjection:
+    """``subset_factors(a, g, lt)`` == ``materialize_factors(a, g, lt)[:, S]``."""
+
+    K = 20
+
+    @staticmethod
+    def _mk(lt):
+        return _EMB_MK if lt in ("nn.Embedding", "nn.EmbeddingBag") else None
+
+    @pytest.mark.parametrize(("lt", "a", "g"), _PARAMS)
+    def test_matches_gathered_materialized(self, lt, a, g):
+        proj = ops.DattriProjector()
+        full = _mat(a, g, lt)
+        k = min(self.K, full.shape[1])
+        # Both embedding cases hold per-token Embedding-form data (see _mat).
+        lt_ops = "nn.Embedding" if lt == "nn.EmbeddingBag" else lt
+        got = ops.subset_factors(
+            a, g, lt_ops, proj, self._mk(lt), proj_dim=k, proj_seed=3
+        )
+        idx = proj.subset_indices(
+            full.shape[1], proj_dim=k, proj_seed=3, device=full.device
+        )
+        assert got.shape == (B, k)
+        assert torch.allclose(got, full[:, idx], atol=1e-5), lt
+
+    def test_indices_are_a_sorted_subset_and_deterministic(self):
+        p1, p2 = ops.DattriProjector(), ops.DattriProjector()
+        idx = p1.subset_indices(
+            1000, proj_dim=64, proj_seed=5, device=torch.device("cpu")
+        )
+        assert idx.shape == (64,)
+        assert torch.equal(idx, idx.sort().values)
+        assert idx.unique().numel() == 64
+        assert idx.max() < 1000
+        # Same (seed, width, size) -> same subset, in a fresh projector too.
+        again = p2.subset_indices(
+            1000, proj_dim=64, proj_seed=5, device=torch.device("cpu")
+        )
+        assert torch.equal(idx, again)
+        other = p2.subset_indices(
+            1000, proj_dim=64, proj_seed=6, device=torch.device("cpu")
+        )
+        assert not torch.equal(idx, other)
+
+    def test_subset_too_large_raises(self):
+        with pytest.raises(ValueError, match="proj_dim <= d"):
+            ops.DattriProjector().subset_indices(
+                10, proj_dim=11, proj_seed=0, device=torch.device("cpu")
+            )
+
+    def test_rejects_projector_kwargs(self):
+        a, g = _linear_3d()
+        with pytest.raises(ValueError, match="unexpected"):
+            ops.subset_factors(
+                a, g, "nn.Linear", None, proj_dim=4, proj_type="rademacher"
+            )
+
+    def test_dense_input_is_gathered(self):
+        dense = torch.randn(B, 100)
+        proj = ops.DattriProjector()
+        out = ops.subset_materialized(dense, proj, proj_dim=16, proj_seed=2)
+        idx = proj.subset_indices(100, proj_dim=16, proj_seed=2, device=dense.device)
+        assert torch.equal(out, dense[:, idx])
+
+    def test_project_layer_routes_both_inputs(self):
+        a, g = _linear_3d()
+        f = Factorized(a, g, {"has_bias": True})
+        proj = ops.DattriProjector()
+        payload, is_fac = ops.project_layer(
+            f, "nn.Linear", proj, style="subset_materialized", proj_dim=16, proj_seed=1
+        )
+        assert not is_fac
+        full = ops.materialize(f, "nn.Linear")  # bias column included
+        idx = proj.subset_indices(
+            full.shape[1], proj_dim=16, proj_seed=1, device=full.device
+        )
+        assert torch.allclose(payload, full[:, idx], atol=1e-5)
+        # A dense (already materialized) input is subset directly.
+        dense_payload, is_fac = ops.project_layer(
+            full,
+            "nn.Linear",
+            proj,
+            style="subset_materialized",
+            proj_dim=16,
+            proj_seed=1,
+        )
+        assert not is_fac
+        assert torch.equal(dense_payload, full[:, idx])
+
+    def test_exact_inner_products_on_the_subset(self):
+        # Kept entries are exact, so the subset dot equals the full dot restricted to S.
+        torch.manual_seed(0)
+        a1, g1 = _linear_3d()
+        a2, g2 = _linear_3d()
+        proj = ops.DattriProjector()
+        s1 = ops.subset_factors(a1, g1, "nn.Linear", proj, proj_dim=32, proj_seed=0)
+        s2 = ops.subset_factors(a2, g2, "nn.Linear", proj, proj_dim=32, proj_seed=0)
+        idx = proj.subset_indices(
+            D_OUT * D_IN, proj_dim=32, proj_seed=0, device=s1.device
+        )
+        m1 = materialize_factors(a1, g1, "nn.Linear")[:, idx]
+        m2 = materialize_factors(a2, g2, "nn.Linear")[:, idx]
+        assert torch.allclose(s1 @ s2.T, m1 @ m2.T, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
 # Multi-layer accumulators -- fan a Gradient block out to per-layer estimators
 # ---------------------------------------------------------------------------
 

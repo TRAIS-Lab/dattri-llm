@@ -82,7 +82,6 @@ store order -- identical bookkeeping to TracIn and the K-FAC family.
 
 from __future__ import annotations
 
-import json
 import pathlib
 import tempfile
 import warnings
@@ -93,6 +92,7 @@ import torch
 from tqdm.auto import tqdm
 
 from dattri_llm.attribution.base import BaseInnerProductAttributor
+from dattri_llm.attribution.utils import read_lr_schedule, write_lr_schedule
 from dattri_llm.gradient.datasets import resolve_steps
 from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.storage_manager import GradientStorageManager
@@ -107,8 +107,6 @@ if TYPE_CHECKING:
 
 LearningRate = float | Mapping[int, float]
 StreamBlock = tuple[int, Gradient, list[str]]
-
-_LR_SCHEDULE_FILE = "lr_schedule.json"
 
 
 def _dense_float(block: Gradient) -> Gradient:
@@ -207,7 +205,7 @@ class DVEmbAttributor(BaseInnerProductAttributor):
             hook_config=hook_config,
             offload_interval=offload_interval,
         )
-        self._write_lr_schedule(train_dir, recorded_lr)
+        write_lr_schedule(train_dir, recorded_lr)
         return [(train_dir, test_dir)]
 
     def collect_trajectory(
@@ -308,7 +306,7 @@ class DVEmbAttributor(BaseInnerProductAttributor):
         train_store = GradientStorageManager(train_gradients_dir)
         prop_steps, output_steps, _final, learning_rate = self._resolve_sweep(
             train_store,
-            self._read_lr_schedule(train_gradients_dir),
+            read_lr_schedule(train_gradients_dir),
             selected_training_steps,
             final_step,
             learning_rate,
@@ -362,25 +360,6 @@ class DVEmbAttributor(BaseInnerProductAttributor):
                     f"Provided steps: {sorted(learning_rate)}.",
                 ) from None
         return learning_rate
-
-    @staticmethod
-    def _write_lr_schedule(train_gradients_dir: str, lrs: Mapping[int, float]) -> None:
-        """Persist the per-step LR actually applied during training."""
-        root = pathlib.Path(train_gradients_dir)
-        root.mkdir(exist_ok=True, parents=True)
-        with (root / _LR_SCHEDULE_FILE).open("w", encoding="utf-8") as f:
-            json.dump({str(k): float(v) for k, v in lrs.items()}, f)
-
-    @staticmethod
-    def _read_lr_schedule(train_gradients_dir: str) -> dict[int, float] | None:
-        """The per-step LR recorded by :meth:`cache`, or ``None`` if absent (e.g.
-        a directory produced outside the on-the-fly workflow).
-        """
-        path = pathlib.Path(train_gradients_dir) / _LR_SCHEDULE_FILE
-        if not path.exists():
-            return None
-        with path.open(encoding="utf-8") as f:
-            return {int(k): float(v) for k, v in json.load(f).items()}
 
     def _warn_on_lr_mismatch(
         self,
@@ -939,7 +918,7 @@ class DVEmbAttributor(BaseInnerProductAttributor):
         train_store = self.resolve_store(train_source)
         test_store = self.resolve_store(test_source)
         if recorded_lr is None:
-            recorded_lr = self._read_lr_schedule(str(train_store.save_dir))
+            recorded_lr = read_lr_schedule(str(train_store.save_dir))
         prop_steps, output_steps, final_step, learning_rate = self._resolve_sweep(
             train_store,
             recorded_lr,

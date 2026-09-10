@@ -1,4 +1,6 @@
-"""Random projection -- TRAK-style (materialized) and LoGRA-style (factorized)."""
+"""Dimension reduction of per-sample gradients: random projection -- TRAK-style
+(materialized) and LoGRA-style (factorized) -- and fixed coordinate subsets.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +11,12 @@ import torch
 from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.materialize import materialize_factors
 from dattri_llm.gradient.ops.preprocess import preprocess_factors, to_3d
-from dattri_llm.gradient.ops.types import is_embedding, is_linear, is_norm
+from dattri_llm.gradient.ops.types import (
+    is_conv_transpose,
+    is_embedding,
+    is_linear,
+    is_norm,
+)
 from dattri_llm.utils.cache import TensorCache
 
 if TYPE_CHECKING:
@@ -20,16 +27,29 @@ if TYPE_CHECKING:
     from dattri_llm.gradient.gradient import Factorized
 
 
-# The three capture/projection styles (the ``style`` key of a projection
-# config).  ``logra_*`` are the double-sided (Kronecker) factor projection --
-# keeping the factors, or materializing them into a compact per-sample block;
-# ``materialized`` is the single-sided (TRAK) materialize-then-project.
+# The capture/projection styles (the ``style`` key of a projection config).
+# ``logra_*`` are the double-sided (Kronecker) factor projection -- keeping the
+# factors, or materializing them into a compact per-sample block;
+# ``materialized`` is the single-sided (TRAK) materialize-then-project; and
+# ``subset_materialized`` keeps a fixed random subset of the gradient's
+# coordinates -- a dimension reduction in its own right, next to the random
+# projections, that leaves every kept entry exact.
 PROJECTION_STYLES = (
     "auto",
     "logra_factorized",
     "logra_materialized",
     "materialized",
+    "subset_materialized",
 )
+
+# Keys a ``subset_materialized`` projection config may carry: there is no
+# projection matrix, so the projector kwargs (``proj_type``, ...) have no
+# meaning and are rejected rather than ignored.
+SUBSET_KEYS = frozenset({"style", "proj_dim", "proj_seed", "include_bias", "device"})
+
+# Coordinates gathered per chunk in :func:`subset_factors`, bounding the
+# ``(B, T, chunk)`` temporaries the coordinate trick forms.
+_SUBSET_CHUNK_ELEMS = 1 << 24
 
 
 # Rows of the identity materialized per chunk while building a projection
@@ -41,6 +61,21 @@ def _projector_key(projector: Callable) -> str:
     module = getattr(projector, "__module__", "")
     name = getattr(projector, "__qualname__", repr(projector))
     return f"{module}.{name}"
+
+
+def _subset_seed(proj_seed: int, d: int, proj_dim: int) -> int:
+    """Generator seed of a coordinate subset: one per ``(seed, width, size)``."""
+    return ((proj_seed * 1_000_003 + d) * 1_000_003 + proj_dim) & ((1 << 63) - 1)
+
+
+def _check_subset_kwargs(proj_kwargs: dict) -> None:
+    extra = set(proj_kwargs) - SUBSET_KEYS
+    if extra:
+        raise ValueError(
+            "subset_materialized keeps coordinates rather than projecting, so it "
+            f"takes only {sorted(SUBSET_KEYS - {'style'})}; got unexpected "
+            f"{sorted(extra)}.",
+        )
 
 
 class DattriProjector:
@@ -154,6 +189,39 @@ class DattriProjector:
         matrix = torch.cat(rows, dim=0).to(dtype)
         self._cache.put(key, matrix)
         return matrix
+
+    def subset_indices(
+        self,
+        d: int,
+        *,
+        proj_dim: int,
+        proj_seed: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """The ``proj_dim`` coordinates a ``subset_materialized`` layer keeps.
+
+        A sorted ``(proj_dim,)`` index tensor into a flattened width-``d``
+        gradient, drawn once without replacement from a CPU generator seeded
+        by ``(proj_seed, d, proj_dim)`` -- so, like a projection matrix, the
+        same seed and width give the same subset on every device and in every
+        process, and two sides of a score can only be compared when they were
+        reduced with the same subset.  Cached like the matrices.
+        """
+        if not 0 < proj_dim <= d:
+            raise ValueError(
+                f"subset_materialized needs 0 < proj_dim <= d, got proj_dim="
+                f"{proj_dim} for a width-{d} layer.",
+            )
+        key = ("subset", d, proj_dim, proj_seed, str(device))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        gen = torch.Generator(device="cpu").manual_seed(
+            _subset_seed(proj_seed, d, proj_dim)
+        )
+        idx = torch.randperm(d, generator=gen)[:proj_dim].sort().values.to(device)
+        self._cache.put(key, idx)
+        return idx
 
     def apply(
         self,
@@ -457,6 +525,205 @@ def project_factorized(
     )
 
 
+def subset_coordinates(
+    projection: dict[str, dict] | None,
+    layer_name: str,
+    width: int,
+    projector: Callable | DattriProjector | None,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor | None:
+    """The coordinates a ``"subset_materialized"`` capture keeps for a layer.
+
+    Regenerated from the projection config the gradients were captured with
+    (``proj_dim``, ``proj_seed``) and the layer's flat *width*, exactly as
+    the capture drew them.  ``None`` when the layer is not subset -- its
+    entries are then the whole flat gradient.  Any other projection style
+    raises: the entries of a projected gradient are not coordinates.
+    """
+    if projection is None:
+        return None
+    kw = projection.get(layer_name, projection.get("__default__"))
+    if kw is None:
+        return None
+    if kw.get("style") != "subset_materialized":
+        raise ValueError(
+            f"layer {layer_name!r} is captured with style {kw.get('style')!r}; "
+            "coordinate-wise maps need exact gradient entries, i.e. no "
+            "projection or 'subset_materialized'.",
+        )
+    return DattriProjector.coerce(projector).subset_indices(
+        width,
+        proj_dim=kw["proj_dim"],
+        proj_seed=kw.get("proj_seed", 0),
+        device=torch.device(device),
+    )
+
+
+def subset_materialized(
+    x: torch.Tensor,
+    projector: Callable | DattriProjector | None,
+    *,
+    proj_dim: int,
+    proj_seed: int = 0,
+    **proj_kwargs,
+) -> torch.Tensor:
+    """Keep ``proj_dim`` fixed random coordinates of a dense ``(..., D)`` tensor.
+
+    The subset is :meth:`DattriProjector.subset_indices` for ``(D, proj_dim,
+    proj_seed)``; ``device`` selects where the result lives (default: *x*'s).
+    """
+    _check_subset_kwargs(proj_kwargs)
+    device = torch.device(proj_kwargs.get("device", x.device))
+    x = x.to(device)
+    idx = DattriProjector.coerce(projector).subset_indices(
+        x.shape[-1],
+        proj_dim=proj_dim,
+        proj_seed=proj_seed,
+        device=device,
+    )
+    return x.index_select(-1, idx)
+
+
+def subset_factors(
+    a: torch.Tensor,
+    g: torch.Tensor,
+    layer_type: str,
+    projector: Callable | DattriProjector | None,
+    module_kwargs: dict | None = None,
+    include_bias: bool = True,
+    *,
+    proj_dim: int,
+    proj_seed: int = 0,
+    **proj_kwargs,
+) -> torch.Tensor:
+    """``materialize_factors(...)[:, subset]`` without materializing.
+
+    An entry of the per-sample weight gradient of an outer-product layer is a
+    contraction of one output-gradient column with one activation column over
+    the token axis -- ``dW[b, o, i] = sum_t g[b, t, o] * a[b, t, i]`` -- so the
+    kept coordinates are gathered straight from the factors at ``O(B*T*k)``,
+    never forming the ``(B, d_out*d_in)`` gradient.  The subset indexes the
+    **flattened** gradient exactly as :func:`materialize_factors` lays it out
+    (``o * d_in + i`` for linear/conv, ``c * P + p`` for transposed conv,
+    ``v * E + e`` for embeddings), so the result equals a gather on the
+    materialized gradient.  Norm layers are tiny and are materialized and
+    gathered directly.
+
+    Returns a dense ``(B, proj_dim)`` tensor.
+    """
+    _check_subset_kwargs(proj_kwargs)
+    a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
+    projector = DattriProjector.coerce(projector)
+    device = torch.device(proj_kwargs.get("device", g.device))
+
+    if is_embedding(layer_type):
+        if module_kwargs is None:
+            raise ValueError(
+                "Subsetting an embedding gradient requires module_kwargs with "
+                "'num_embeddings' (the flattened width is vocab x embed_dim).",
+            )
+        ids = a.to(device)  # (B, T) int
+        (grad,) = dtypes.align(g)
+        grad = grad.to(device)  # (B, T, E)
+        vocab, embed = module_kwargs["num_embeddings"], grad.shape[-1]
+        idx = projector.subset_indices(
+            vocab * embed, proj_dim=proj_dim, proj_seed=proj_seed, device=device
+        )
+        rows, cols = idx // embed, idx % embed
+        # Entry (v, e) is the sum over tokens equal to v of the gradient column e.
+        return _gather_pairs(
+            (ids.unsqueeze(-1) == rows).to(grad.dtype), grad, rows, cols, one_hot=True
+        )
+
+    a, g = dtypes.align(a, g)
+    a_f, g_f = to_3d(a).to(device), to_3d(g).to(device)
+
+    if is_norm(layer_type):
+        dense = (a_f * g_f).sum(1)  # (B, d): elementwise, cheap
+        idx = projector.subset_indices(
+            dense.shape[-1], proj_dim=proj_dim, proj_seed=proj_seed, device=device
+        )
+        return dense.index_select(-1, idx)
+
+    if is_conv_transpose(layer_type):
+        # materialize: einsum("blc,blp->bcp") -> flat index c * P + p
+        n_cols = g_f.shape[-1]
+        idx = projector.subset_indices(
+            a_f.shape[-1] * n_cols,
+            proj_dim=proj_dim,
+            proj_seed=proj_seed,
+            device=device,
+        )
+        return _gather_pairs(a_f, g_f, idx // n_cols, idx % n_cols)
+
+    # Linear and Conv: einsum("bto,bti->boi") -> flat index o * d_in + i
+    n_cols = a_f.shape[-1]
+    idx = projector.subset_indices(
+        g_f.shape[-1] * n_cols, proj_dim=proj_dim, proj_seed=proj_seed, device=device
+    )
+    return _gather_pairs(g_f, a_f, idx // n_cols, idx % n_cols)
+
+
+def _gather_pairs(
+    rows_src: torch.Tensor,
+    cols_src: torch.Tensor,
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    *,
+    one_hot: bool = False,
+) -> torch.Tensor:
+    """``sum_t rows_src[b, t, rows[k]] * cols_src[b, t, cols[k]]`` -> ``(B, k)``.
+
+    Chunked over ``k`` so the ``(B, T, chunk)`` products stay bounded.  With
+    ``one_hot`` the row source is already the gathered ``(B, T, k)`` indicator
+    (embeddings), so only the column source is gathered.
+    """
+    B, T = cols_src.shape[:2]
+    chunk = max(1, _SUBSET_CHUNK_ELEMS // max(1, B * T))
+    out = []
+    for start in range(0, rows.numel(), chunk):
+        r, c = rows[start : start + chunk], cols[start : start + chunk]
+        left = (
+            rows_src[..., start : start + chunk]
+            if one_hot
+            else rows_src.index_select(-1, r)
+        )
+        out.append((left * cols_src.index_select(-1, c)).sum(1))
+    return torch.cat(out, dim=-1)
+
+
+def subset_factorized(
+    f: Factorized | torch.Tensor,
+    layer_type: str,
+    projector: Callable | DattriProjector | None,
+    *,
+    proj_dim: int,
+    include_bias: bool = True,
+    proj_seed: int = 0,
+    **proj_kwargs,
+) -> torch.Tensor:
+    """:func:`subset_factors` on a :class:`Factorized` (batch-first-safe).
+
+    Also accepts an already-dense ``(B, D)`` tensor, which is subset directly.
+    """
+    if isinstance(f, torch.Tensor):
+        return subset_materialized(
+            f, projector, proj_dim=proj_dim, proj_seed=proj_seed, **proj_kwargs
+        )
+    bf = f.as_batch_first()
+    return subset_factors(
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        projector,
+        bf.module_kwargs,
+        include_bias,
+        proj_dim=proj_dim,
+        proj_seed=proj_seed,
+        **proj_kwargs,
+    )
+
+
 def maybe_materialize_projected(
     seq_len: int,
     k_a: int,
@@ -496,7 +763,7 @@ def project_layer(
     style: str = "logra_factorized",
     **proj_kwargs,
 ) -> tuple[object, bool]:
-    """Route one layer to one of the three projection styles.
+    """Route one layer to one of the projection styles.
 
     Returns ``(payload, is_factorized)``:
 
@@ -515,9 +782,17 @@ def project_layer(
       per-sample weight gradient **first**, then project it to ``(B, proj_dim)``.
       payload is a dense tensor, ``is_factorized`` False.
 
-    A materialized input tensor can only take the ``"materialized"`` path (there
-    are no factors to project), whatever the requested style.
+    * ``"subset_materialized"`` -- keep ``proj_dim`` fixed random coordinates
+      of the per-sample weight gradient, gathered from the factors without
+      materializing (:func:`subset_factors`).  payload is a dense
+      ``(B, proj_dim)`` tensor, ``is_factorized`` False.
+
+    A materialized input tensor can only take the ``"materialized"`` or
+    ``"subset_materialized"`` path (there are no factors to project), whatever
+    the requested style.
     """
+    if style == "subset_materialized":
+        return subset_factorized(f, layer_type, projector, **proj_kwargs), False
     if not isinstance(f, torch.Tensor):
         if style == "auto":
             a_p, g_p = project_factorized(f, layer_type, projector, **proj_kwargs)
