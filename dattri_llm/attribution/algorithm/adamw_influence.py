@@ -14,8 +14,8 @@ Every use of the propagation is linear, so it can be carried on either side
 
 * ``"train"`` -- the paper's summary ``W = [W_theta | W_m | W_v]``, a
   ``(p, 3p)`` matrix over the ``p`` captured coordinates, test-independent;
-  memory ``3 p^2``, so it needs the coordinate mask (a
-  ``"subset_materialized"`` capture) or small layers.
+  memory ``3 p^2``, so it needs the coordinate mask (a ``"mask"`` capture)
+  or small layers.
 * ``"test"`` -- ``U = Q W``, the propagation applied to the ``n_test``
   query gradients ``Q`` directly, ``(n_test, 3p)``; matrix-free in ``p``,
   so it runs on every coordinate of the model (no mask), at a cost linear
@@ -105,8 +105,8 @@ class AdamWInfluenceAttributor(TrajectoryAttributor):
             its optimizer settings, exactly as the updating streamer mirrors
             the HF ``Trainer``.
         task: The attribution task; its first checkpoint starts the trajectory.
-        projection: The projection config the gradients are captured with
-            (``"subset_materialized"``, the coordinate mask); read off the
+        projection_kwargs: The projection config the gradients are captured
+            with (``"mask"``, the coordinate mask); read off the
             ``hook_config`` of :meth:`cache` when unset.  ``None`` keeps every
             coordinate of the hooked layers.
     """
@@ -118,10 +118,10 @@ class AdamWInfluenceAttributor(TrajectoryAttributor):
         args: AttributionArguments,
         *,
         task: AttributionTask | None = None,
-        projection: dict[str, dict] | None = None,
+        projection_kwargs: dict[str, dict] | None = None,
     ) -> None:
         super().__init__(args, task=task)
-        self._projection = projection
+        self._projection = projection_kwargs
         self._recorder: OptimizerStateCallback | None = None
 
     # ------------------------------------------------------------------ #
@@ -137,11 +137,11 @@ class AdamWInfluenceAttributor(TrajectoryAttributor):
         recomputing.
         """
         if self._projection is None and self._hook_config is not None:
-            self._projection = self._hook_config.projection
+            self._projection = self._hook_config.projection_kwargs
         self._recorder = OptimizerStateCallback(
             model,
             lambda: streamer.optimizer,
-            projection=self._projection,
+            projection_kwargs=self._projection,
             snapshots=snapshots,
         )
         return [self._recorder]

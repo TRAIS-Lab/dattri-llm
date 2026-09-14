@@ -235,8 +235,8 @@ class TestGradientPreconditioner:
         snap = OptimizerSnapshot(model, opt)
         proj = ops.DattriProjector()
         precond = GradientPreconditioner(snap, proj)
-        kw = {"style": "subset_materialized", "proj_dim": 6, "proj_seed": 3}
-        idx = proj.subset_indices(
+        kw = {"style": "mask", "proj_dim": 6, "proj_seed": 3}
+        idx = proj.mask_indices(
             snap.width("fc1"), proj_dim=6, proj_seed=3, device=torch.device("cpu")
         )
         entries = torch.randn(4, 6)
@@ -262,15 +262,17 @@ class TestGradientPreconditioner:
 
 class TestOptimizerStateCallback:
     @staticmethod
-    def _run(projection=None, steps: int = 3):
+    def _run(projection_kwargs=None, steps: int = 3):
         torch.manual_seed(0)
         model = MLP()
         opt = torch.optim.AdamW(model.parameters(), lr=0.05, betas=(0.8, 0.99))
-        cb = OptimizerStateCallback(model, opt, projection=projection)
+        cb = OptimizerStateCallback(model, opt, projection_kwargs=projection_kwargs)
         capture = CaptureCallback()
         hm = HookManager(
             model,
-            config=HookManagerConfig(linear_io=REGISTER_ALL, projection=projection),
+            config=HookManagerConfig(
+                linear_io=REGISTER_ALL, projection_kwargs=projection_kwargs
+            ),
             callbacks=[capture, cb],
         )
         before, grads, records = [], [], []
@@ -335,17 +337,17 @@ class TestOptimizerStateCallback:
     def test_subset_projection_reads_the_captured_coordinates(self):
         projection = {
             "__default__": {
-                "style": "subset_materialized",
+                "style": "mask",
                 "proj_dim": 6,
                 "proj_seed": 3,
             }
         }
-        model, opt, cb, before, _, records = self._run(projection=projection)
+        model, opt, cb, before, _, records = self._run(projection_kwargs=projection)
         snap = OptimizerSnapshot(model, opt)
         proj = ops.DattriProjector()
         for layer in ("fc1", "fc2"):
             width = snap.width(layer)
-            idx = proj.subset_indices(
+            idx = proj.mask_indices(
                 width, proj_dim=6, proj_seed=3, device=torch.device("cpu")
             )
             assert torch.equal(cb.coordinates(layer), idx)

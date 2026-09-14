@@ -33,9 +33,9 @@ class OptimizerStateCallback(HookManagerCallback):
         model: The model the optimizer trains (the hooked module tree).
         optimizer: The optimizer to read, or a zero-argument callable
             returning it (for a streamer that builds its optimizer lazily).
-        projection: The projection config the gradients are captured with,
-            to regenerate each layer's ``"subset_materialized"`` coordinates;
-            ``None`` reads every coordinate of every layer.
+        projection_kwargs: The projection config the gradients are captured
+            with, to regenerate each layer's ``"mask"`` coordinates; ``None``
+            reads every coordinate of every layer.
         layers: Restrict to these layer names (default: every layer in the
             record).
         snapshots: Write each side of every step's moments to this
@@ -49,14 +49,14 @@ class OptimizerStateCallback(HookManagerCallback):
         model: nn.Module,
         optimizer: torch.optim.Optimizer | Callable[[], torch.optim.Optimizer],
         *,
-        projection: dict[str, dict] | None = None,
+        projection_kwargs: dict[str, dict] | None = None,
         layers: Iterable[str] | None = None,
         snapshots: TrajectorySnapshots | None = None,
     ) -> None:
         self._model = model
         self._optimizer_src = optimizer
         self._snapshot: OptimizerSnapshot | None = None
-        self._projection = projection
+        self._projection = projection_kwargs
         self._layers = None if layers is None else set(layers)
         self._projector = ops.DattriProjector()
         self._coords: dict[str, torch.Tensor | None] = {}
@@ -82,7 +82,7 @@ class OptimizerStateCallback(HookManagerCallback):
     def coordinates(self, layer_name: str) -> torch.Tensor | None:
         """Coordinates read for *layer_name* (``None`` = all)."""
         if layer_name not in self._coords:
-            self._coords[layer_name] = ops.subset_coordinates(
+            self._coords[layer_name] = ops.mask_coordinates(
                 self._projection,
                 layer_name,
                 self.snapshot.width(layer_name),

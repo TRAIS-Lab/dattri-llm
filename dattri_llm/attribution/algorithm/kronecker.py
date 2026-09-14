@@ -61,7 +61,7 @@ from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.cache import CACHE_RESIDENCIES
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from dattri.task import AttributionTask
     from torch.utils.data import Dataset
@@ -78,6 +78,17 @@ NonKfacStrategy = Literal["ignore", "direct"]
 RawFit = tuple[dict, dict[str, torch.Tensor]]
 # The damped, scoring-ready form of a RawFit.
 Preconditioner = tuple[dict, dict[str, torch.Tensor]]
+
+
+def _map_tensors(obj: object, fn: Callable[[torch.Tensor], torch.Tensor]) -> object:
+    """*obj* with *fn* applied to every tensor inside its dicts, lists and tuples."""
+    if isinstance(obj, torch.Tensor):
+        return fn(obj)
+    if isinstance(obj, dict):
+        return {k: _map_tensors(v, fn) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_map_tensors(v, fn) for v in obj)
+    return obj
 
 
 class KroneckerAttributor(BaseInnerProductAttributor):
@@ -245,7 +256,9 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         rather than the eigendecomposition :meth:`damp` uses for the small
         K-FAC factors.
         """
-        raw_factors, raw_fisher = raw_fit
+        raw_factors, raw_fisher = _map_tensors(
+            raw_fit, lambda t: t.to(self.args.device)
+        )
         return (
             self.damp(raw_factors, damping),
             {layer: ops.dense_inverse(F, damping) for layer, F in raw_fisher.items()},
@@ -262,6 +275,10 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         if self._raw_fit is None:
             self._raw_fit = self.fit_raw(train_source)
         self._preconditioner = self.damp_fit(self._raw_fit, self._damping)
+        # Only the damped preconditioner takes part in scoring; the raw fit is
+        # kept for re-damping (see :meth:`damp_fit`), but on the host, so it
+        # does not sit on the device beside its inverses for the whole pass.
+        self._raw_fit = _map_tensors(self._raw_fit, lambda t: t.to("cpu"))
 
     def _set_options(
         self,
@@ -456,7 +473,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         (on-the-fly) -- or, for EK-FAC, that attributor's own raw factors.
         Writing them in the format :meth:`fit` uses lets later attribution
         re-damp and score **without a Fisher pre-pass**; when the gradients
-        were captured ``logra_materialized``, the ``(A, G)`` are the compact
+        were captured materialized under ``"logra"``, the ``(A, G)`` are the compact
         projected covariances that precondition that compact store directly.
 
         Args:

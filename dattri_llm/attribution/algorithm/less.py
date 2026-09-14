@@ -21,8 +21,8 @@ gradients with a cosine metric, in either of TracIn's two forms:
 
 The map is coordinate-wise, so it applies exactly to whatever entries are
 captured -- every entry of the hooked layers (LESS's LoRA setting), a
-``"subset_materialized"`` subset, or, projected after the map, a
-``"materialized"`` random projection (the paper's 8192-dimensional features).
+``"mask"`` subset, or, projected after the map, a ``"dense"`` random
+projection (the paper's 8192-dimensional features).
 """
 
 from __future__ import annotations
@@ -265,8 +265,8 @@ class LESSAttributor(BaseInnerProductAttributor):
             train_dataset: Training dataset to stream.
             test_dataset: Query dataset to stream.
             hook_config: Capture configuration.  Any projection must be
-                ``"subset_materialized"`` or ``"materialized"`` (the map
-                needs exact gradient entries; a ``"materialized"`` projection
+                ``"mask"`` or ``"dense"`` (the map
+                needs exact gradient entries; a ``"dense"`` projection
                 is applied after it).
             verbose: Accepted for API parity.
             loop_over_test: Re-stream the test blocks per train block.  In the

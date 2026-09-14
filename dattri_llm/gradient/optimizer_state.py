@@ -323,7 +323,7 @@ class GradientPreconditioner:
             callable building it on first use (a streamer's optimizer exists
             only once its pass starts).
         projector: The manager's :class:`~dattri_llm.gradient.ops.DattriProjector`,
-            needed to regenerate a ``"subset_materialized"`` layer's coordinates.
+            needed to regenerate a ``"mask"`` layer's coordinates.
     """
 
     def __init__(
@@ -355,16 +355,16 @@ class GradientPreconditioner:
     ) -> torch.Tensor:
         """Precondition a layer's ``(B, k)`` entries captured under *proj_kw*.
 
-        *proj_kw* is the layer's projection config: ``None`` or a
-        ``"materialized"`` config means *entries* is the whole flat gradient;
-        ``"subset_materialized"`` means the coordinates that config draws.
+        *proj_kw* is the layer's projection config: ``None`` or a ``"dense"``
+        config means *entries* is the whole flat gradient; ``"mask"`` means the
+        coordinates that config draws.
         """
         include_bias = (
             True if proj_kw is None else bool(proj_kw.get("include_bias", True))
         )
         idx = None
-        if proj_kw is not None and proj_kw.get("style") == "subset_materialized":
-            idx = ops.subset_coordinates(
+        if proj_kw is not None and proj_kw.get("style", "logra") == "mask":
+            idx = ops.mask_coordinates(
                 {layer_name: proj_kw},
                 layer_name,
                 self.snapshot.width(layer_name, include_bias),

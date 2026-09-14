@@ -146,6 +146,7 @@ def _make_layer_buffer() -> LayerBuffer:
         # replica threads and drop calls for layers invoked more than once.
         "_proj_parts": [],
         "_proj_kw": None,
+        "_capture_style": "factorized",
         "_device_id": {},
         # Grad-enabled forward invocations observed this step.  Each forward
         # produces exactly one backward, so this is the per-step target for
@@ -178,7 +179,8 @@ def register_linear_io_hooks(
     on_layer_backward: Callable[[str, torch.Tensor], None] | None = None,
     type_overrides: dict[str, str] | None = None,
     kwargs_overrides: dict[str, dict] | None = None,
-    projection: dict[str, dict] | None = None,
+    projection_kwargs: dict[str, dict] | None = None,
+    capture_style: str = "factorized",
     projector: ops.DattriProjector | None = None,
     offload_to_cpu: bool = False,
     preconditioner: GradientPreconditioner | None = None,
@@ -218,11 +220,18 @@ def register_linear_io_hooks(
             capture.  Signature: ``(layer_name: str, grad_output: Tensor)``.
             The tensor is on the capture device (CPU iff *offload_to_cpu*
             or CPU training).
-        projection: Optional per-layer proj_kwargs map (a ``"__default__"``
+        projection_kwargs: Optional per-layer proj_kwargs map (a ``"__default__"``
             entry covers unlisted layers); ``None`` captures raw factors.
         projector: The :class:`~dattri_llm.gradient.ops.DattriProjector`
             applying the projection (it owns the projection-matrix cache);
-            required when *projection* is given.
+            required when *projection_kwargs* is given.
+        capture_style: The representation a layer is buffered in where there
+            is a choice -- ``"factorized"`` (the raw or logra-projected
+            factors), ``"materialized"`` (the dense per-sample gradient, formed
+            in the backward hook), or ``"auto"`` (the cheaper of the two by
+            :func:`~dattri_llm.gradient.ops.should_materialize`, per layer and
+            micro-batch; a layer's choice is fixed by its first micro-batch of
+            a step).
         offload_to_cpu: When ``True``, move every buffered capture (the raw
             factors, or the projected result for a projected layer) to CPU.
             Default ``False``: buffers stay on the tensors' own device to
@@ -245,9 +254,9 @@ def register_linear_io_hooks(
             While it is ``enabled``, every layer's capture is the optimizer's
             per-sample update direction instead of the raw gradient: the
             per-sample gradient is formed on the captured coordinates (the
-            whole layer when unprojected, the kept subset under
-            ``"subset_materialized"``, the whole layer *before* a
-            ``"materialized"`` projection) and mapped through the optimizer
+            whole layer when unprojected, the kept subset under ``"mask"``,
+            the whole layer *before* a ``"dense"`` projection) and mapped
+            through the optimizer
             state, and only that dense result is buffered.  Like projection,
             it runs inside the backward hook, so the state read is the one
             the coming ``optimizer.step()`` updates from.  The ``logra_*``
@@ -289,11 +298,12 @@ def register_linear_io_hooks(
             buffers[name]["_module_kwargs"] = dict(kwargs_overrides[name])
         else:
             buffers[name]["_module_kwargs"] = extract_module_kwargs(module, layer_type)
-        if projection is not None:
-            buffers[name]["_proj_kw"] = projection.get(
+        if projection_kwargs is not None:
+            buffers[name]["_proj_kw"] = projection_kwargs.get(
                 name,
-                projection.get("__default__"),
+                projection_kwargs.get("__default__"),
             )
+        buffers[name]["_capture_style"] = capture_style
 
         def _make_forward_hook(layer_name: str) -> Callable:
             def _fwd(_module: nn.Module, inp: tuple, _out: object) -> None:
@@ -307,7 +317,7 @@ def register_linear_io_hooks(
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
                 buf = buffers[layer_name]
                 emit_type, emit_kwargs = buf["_class_name"], buf["_module_kwargs"]
-                if buf["_proj_kw"] is None and not _preconditioning(preconditioner):
+                if _raw_capture(buf, preconditioner):
                     if offload_to_cpu:
                         a = a.cpu()
                     with buf["_lock"]:
@@ -327,9 +337,8 @@ def register_linear_io_hooks(
                     # each call's a with its g even when a layer is invoked
                     # multiple times per forward (weight tying / RNN unroll) --
                     # backward pops LIFO.
-                    style = _capture_style(buf)
-                    if style is not None and _preprojects_activation(
-                        buf["_class_name"], style
+                    if _preprojects_activation(
+                        buf["_class_name"], _projection_style(buf)
                     ):
                         proj_kw = {
                             k: v for k, v in buf["_proj_kw"].items() if k != "style"
@@ -364,7 +373,7 @@ def register_linear_io_hooks(
                     buf["_class_name"],
                     buf["_module_kwargs"],
                 )
-                if buf["_proj_kw"] is None and not _preconditioning(preconditioner):
+                if _raw_capture(buf, preconditioner):
                     if offload_to_cpu:
                         g = g.cpu()
                     with buf["_lock"]:
@@ -557,20 +566,18 @@ def _warn_orphan_backward(layer_name: str) -> None:
     )
 
 
-def _preprojects_activation(layer_type: str, style: str) -> bool:
+def _preprojects_activation(layer_type: str, style: str | None) -> bool:
     """Whether a projected layer's activation is projected in the *forward* hook.
 
-    ``True`` for linear layers under the double-sided (LoGRA) styles: the a-side
-    projection does not depend on the gradient, so it can run at forward -- the
-    buffer then holds the small ``(B, T, proj_dim)`` factor instead of the full
-    activation, and the projected factors reach the per-layer callbacks.  Other
-    types stay on the joint backward projection (e.g. an embedding's g-masking
-    reads the raw activation's padding ids, which are gone once projected).
+    ``True`` for linear layers under the double-sided (``"logra"``) style: the
+    a-side projection does not depend on the gradient, so it can run at forward
+    -- the buffer then holds the small ``(B, T, proj_dim)`` factor instead of
+    the full activation, and the projected factors reach the per-layer
+    callbacks.  Other types stay on the joint backward projection (e.g. an
+    embedding's g-masking reads the raw activation's padding ids, which are
+    gone once projected).
     """
-    return ops.is_linear(layer_type) and style in (
-        "logra_factorized",
-        "logra_materialized",
-    )
+    return ops.is_linear(layer_type) and style == "logra"
 
 
 def _preconditioning(preconditioner: GradientPreconditioner | None) -> bool:
@@ -578,11 +585,37 @@ def _preconditioning(preconditioner: GradientPreconditioner | None) -> bool:
     return preconditioner is not None and preconditioner.enabled
 
 
-def _capture_style(buf: LayerBuffer) -> str | None:
+def _projection_style(buf: LayerBuffer) -> str | None:
     """The layer's projection style, ``None`` for an unprojected layer."""
     if buf["_proj_kw"] is None:
         return None
-    return buf["_proj_kw"].get("style", "logra_factorized")
+    return buf["_proj_kw"].get("style", "logra")
+
+
+def _raw_capture(
+    buf: LayerBuffer, preconditioner: GradientPreconditioner | None
+) -> bool:
+    """Whether the layer takes the raw path: factors buffered as they appear,
+    with nothing to decide at backward -- unprojected, ``"factorized"`` capture
+    style, and no optimizer map.
+    """
+    return (
+        buf["_proj_kw"] is None
+        and buf["_capture_style"] == "factorized"
+        and not _preconditioning(preconditioner)
+    )
+
+
+def _keep_factors(buf: LayerBuffer, seq_len: int, k_a: int, k_g: int) -> bool:
+    """Whether this micro-batch keeps the factors, under the layer's capture
+    style -- fixed by the step's first micro-batch so a step never mixes the
+    two representations.
+    """
+    if buf["_act_parts"]:
+        return True
+    if buf["_proj_parts"]:
+        return False
+    return not ops.should_materialize(buf["_capture_style"], seq_len, k_a, k_g)
 
 
 def _capture_projected(
@@ -597,33 +630,33 @@ def _capture_projected(
 ) -> tuple[bool, torch.Tensor | None]:
     """Reduce one micro-batch's ``(activation, grad_output)`` into the buffer.
 
-    Called from the backward hook of a projected or preconditioned layer,
-    pairing ``g`` with the matching per-replica forward activation.  The
-    ``style`` of the projection config decides what is buffered:
+    Called from the backward hook of every layer that is not on the raw path
+    (see :func:`_raw_capture`), pairing ``g`` with the matching per-replica
+    forward activation.  The projection ``style`` and the capture style decide
+    what is buffered:
 
-    * ``"logra_factorized"`` -- the projected factors go to
-      ``_act_parts``/``_grad_parts``.
-    * ``"logra_materialized"`` -- the projected factors are materialized (token
-      -summed outer product in the small projected space) into one per-sample
-      block appended to ``_proj_parts``.
-    * ``"materialized"`` (TRAK) -- the materialize-then-project per-sample block
-      goes to ``_proj_parts``.
-    * ``"subset_materialized"`` -- the kept coordinates, gathered from the raw
-      factors without materializing, go to ``_proj_parts``.
-    * no projection (a preconditioned layer) -- the materialized per-sample
-      gradient goes to ``_proj_parts``.
+    * ``"logra"`` -- the projected factors go to ``_act_parts``/``_grad_parts``
+      when the factors are kept, else their token-summed outer product (formed
+      in the small projected space) is appended to ``_proj_parts``.
+    * ``"dense"`` -- the materialize-then-project per-sample block goes to
+      ``_proj_parts``.
+    * ``"mask"`` -- the kept coordinates, gathered from the raw factors
+      without materializing, go to ``_proj_parts``.
+    * no projection -- the raw factors are kept, or (``"materialized"``, or
+      ``"auto"`` when the dense gradient is smaller) the materialized
+      per-sample gradient goes to ``_proj_parts``; a preconditioned layer is
+      always materialized.
 
     With an enabled *preconditioner* the per-sample entries are mapped through
-    the optimizer before buffering -- after the subset gather, and before a
-    ``"materialized"`` projection.
+    the optimizer before buffering -- after the mask gather, and before a
+    ``"dense"`` projection.
 
     When the layer pre-projected its activation at forward
     (:func:`_preprojects_activation`), the popped ``a`` is already the projected
     factor ``a_p``, so only ``g`` is projected here.
 
-    Only the small reduced result is retained (moved to CPU when
-    *offload_to_cpu*) -- the raw factors are discarded here, so the buffer never
-    holds the full gradient.
+    Only the reduced result is retained (moved to CPU when *offload_to_cpu*),
+    so a materializing layer never holds its factors beyond this call.
 
     Returns:
         ``(matched, g_p)`` -- ``matched`` is ``False`` for an orphan backward
@@ -640,99 +673,87 @@ def _capture_projected(
 
     proj_kw = buf["_proj_kw"]
     kw = dict(proj_kw or {})
-    style = kw.pop("style", "logra_factorized") if proj_kw is not None else None
+    style = kw.pop("style", "logra") if proj_kw is not None else None
     precondition = preconditioner if _preconditioning(preconditioner) else None
     layer_type = buf["_class_name"]
     module_kwargs = buf["_module_kwargs"]
 
-    # Activation pre-projected at forward: ``a`` is already ``a_p``; project only
-    # ``g``.  The stored factors are identical to the joint path (same seeds).
-    if style is not None and _preprojects_activation(layer_type, style):
-        a_p = a
-        g_p = ops.project_gradient(g, layer_type, projector, module_kwargs, **kw)
-        if style == "logra_factorized":
-            if offload_to_cpu:
-                a_p, g_p = a_p.cpu(), g_p.cpu()
-            with buf["_lock"]:
-                buf["_act_parts"].append((dev_idx, a_p))
-                buf["_grad_parts"].append((dev_idx, g_p))
-                buf["_pair_pos"].append(pair_pos)
-            return True, g_p
-        mat = ops.materialize_factors(a_p, g_p, "nn.Linear")
+    def keep_factors(a_f: torch.Tensor, g_f: torch.Tensor) -> None:
+        if offload_to_cpu:
+            a_f, g_f = a_f.cpu(), g_f.cpu()
+        with buf["_lock"]:
+            buf["_act_parts"].append((dev_idx, a_f))
+            buf["_grad_parts"].append((dev_idx, g_f))
+            buf["_pair_pos"].append(pair_pos)
+
+    def keep_dense(mat: torch.Tensor) -> None:
         if offload_to_cpu:
             mat = mat.cpu()
         with buf["_lock"]:
             buf["_proj_parts"].append((dev_idx, mat))
             buf["_pair_pos"].append(pair_pos)
-        return True, g_p
+
+    if style == "logra":
+        # Activation pre-projected at forward: ``a`` is already ``a_p``;
+        # project only ``g``.  The stored factors are identical to the joint
+        # path (same seeds).
+        if _preprojects_activation(layer_type, style):
+            a_p = a
+            g_p = ops.project_gradient(g, layer_type, projector, module_kwargs, **kw)
+            emit = g_p
+        else:
+            if a.ndim == 1 and is_embedding(layer_type):
+                a, g = a.unsqueeze(0), g.unsqueeze(0)
+            a_p, g_p = ops.project_factors(
+                a, g, layer_type, projector, module_kwargs, **kw
+            )
+            emit = None
+        seq_len = a_p.shape[1] if a_p.ndim == 3 else 1
+        if _keep_factors(buf, seq_len, a_p.shape[-1], g_p.shape[-1]):
+            keep_factors(a_p, g_p)
+        else:
+            # Projected outer-product factors behave as a plain linear layer;
+            # module_kwargs=None avoids re-preprocessing.
+            keep_dense(ops.materialize_factors(a_p, g_p, "nn.Linear"))
+        return True, emit
 
     if a.ndim == 1 and is_embedding(layer_type):
         a, g = a.unsqueeze(0), g.unsqueeze(0)
 
-    if style == "logra_factorized":
-        a_p, g_p = ops.project_factors(
-            a,
-            g,
-            layer_type,
-            projector,
-            module_kwargs,
-            **kw,
-        )
-        if offload_to_cpu:
-            a_p, g_p = a_p.cpu(), g_p.cpu()
-        with buf["_lock"]:
-            buf["_act_parts"].append((dev_idx, a_p))
-            buf["_grad_parts"].append((dev_idx, g_p))
-            buf["_pair_pos"].append(pair_pos)
-        return True, None
-
-    if style == "logra_materialized":
-        a_p, g_p = ops.project_factors(
-            a,
-            g,
-            layer_type,
-            projector,
-            module_kwargs,
-            **kw,
-        )
-        # Materialize the projected factors (token-summed outer product) in the
-        # small projected space; they behave as a plain linear layer, so
-        # module_kwargs=None avoids re-preprocessing.
-        mat = ops.materialize_factors(a_p, g_p, "nn.Linear")
-    elif style == "subset_materialized":
-        mat = ops.subset_factors(
-            a,
-            g,
-            layer_type,
-            projector,
-            module_kwargs,
-            **kw,
-        )
+    if style == "mask":
+        mat = ops.mask_factors(a, g, layer_type, projector, module_kwargs, **kw)
         if precondition is not None:
             mat = precondition(layer_name, mat, proj_kw)
-    elif style == "materialized" and precondition is not None:
-        # Precondition the whole gradient, then project it (TRAK order).
-        include_bias = bool(kw.pop("include_bias", True))
-        mat = ops.materialize_factors(a, g, layer_type, module_kwargs, include_bias)
-        mat = precondition(layer_name, mat, proj_kw)
-        mat = ops.apply_projection(projector, mat, **kw)
-    elif style == "materialized":
-        mat = ops.project_materialized_factors(
-            a,
-            g,
-            layer_type,
-            projector,
-            module_kwargs,
-            **kw,
-        )
-    else:  # unprojected, preconditioned: the whole per-sample gradient
+        keep_dense(mat)
+        return True, None
+    if style == "dense":
+        if precondition is not None:
+            # Precondition the whole gradient, then project it.
+            include_bias = bool(kw.pop("include_bias", True))
+            mat = ops.materialize_factors(a, g, layer_type, module_kwargs, include_bias)
+            mat = precondition(layer_name, mat, proj_kw)
+            mat = ops.apply_projection(projector, mat, **kw)
+        else:
+            mat = ops.project_materialized_factors(
+                a, g, layer_type, projector, module_kwargs, **kw
+            )
+        keep_dense(mat)
+        return True, None
+
+    # Unprojected.  Preconditioned: the whole per-sample gradient, mapped.
+    if precondition is not None:
         mat = ops.materialize_factors(a, g, layer_type, module_kwargs)
-        mat = precondition(layer_name, mat, None)  # type: ignore[misc]
-    if offload_to_cpu:
-        mat = mat.cpu()
-    with buf["_lock"]:
-        buf["_proj_parts"].append((dev_idx, mat))
-        buf["_pair_pos"].append(pair_pos)
+        keep_dense(precondition(layer_name, mat, None))
+        return True, None
+    # Otherwise the capture style decides: the raw factors, or the dense
+    # per-sample gradient when it is the smaller (or requested) form.
+    seq_len = a.shape[1] if a.ndim == 3 else 1
+    n_in = a.shape[-1] + 1  # the bias column materialize adds
+    n_out = g.shape[-1]
+    if _keep_factors(buf, seq_len, n_in, n_out):
+        keep_factors(a, g)
+    else:
+        keep_dense(ops.materialize_factors(a, g, layer_type, module_kwargs))
     return True, None
 
 

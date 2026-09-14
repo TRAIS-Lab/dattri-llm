@@ -165,7 +165,7 @@ class TestAdamWInfluence:
             None,
             {
                 "__default__": {
-                    "style": "subset_materialized",
+                    "style": "mask",
                     "proj_dim": 4,
                     "proj_seed": 1,
                 }
@@ -177,7 +177,7 @@ class TestAdamWInfluence:
         args = _args(tmp_path)
         attr = AdamWInfluenceAttributor(args, task=task)
         hook_config = HookManagerConfig(
-            linear_io=[f"{n}$" for n in LAYERS], projection=projection
+            linear_io=[f"{n}$" for n in LAYERS], projection_kwargs=projection
         )
         score = attr.attribute(
             train, test, hook_config=hook_config, loss_reduction="sum"

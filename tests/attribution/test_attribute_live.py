@@ -292,21 +292,22 @@ class TestCollectToDiskOnBlock:
 
 
 class TestCompactKFAC:
-    """K-FAC over a logra_materialized (compact) store, preconditioned by the
+    """K-FAC over a materialized "logra" (compact) store, preconditioned by the
     projected (A, G) collected at capture, must match K-FAC over a
-    logra_factorized store of the same projected gradients -- the logix-style
+    factorized logra store of the same projected gradients -- the logix-style
     compact path.
     """
 
     PROJ = 4
     DAMP = 1e-3
 
-    def _proj(self, style):
+    def _proj(self, style, capture_style="factorized"):
         from dattri_llm.gradient.hooks import REGISTER_ALL, HookManagerConfig
 
         return HookManagerConfig(
             linear_io=REGISTER_ALL,
-            projection={
+            capture_style=capture_style,
+            projection_kwargs={
                 "__default__": {
                     "style": style,
                     "proj_dim": self.PROJ,
@@ -317,7 +318,7 @@ class TestCompactKFAC:
             },
         )
 
-    def _collect(self, attr, ds, out, style, cov=None):
+    def _collect(self, attr, ds, out, style, capture_style="factorized", cov=None):
         from dattri_llm.attribution.utils import collect_gradients, task_loss_fn
         from dattri_llm.gradient.storage_manager import GradientStorageManager
         from dattri_llm.gradient.streaming import GradientStreamer
@@ -329,7 +330,7 @@ class TestCompactKFAC:
             attr.args,
             batch_size=attr.args.per_device_train_batch_size,
             loss_fn=task_loss_fn(attr.task.original_loss_func),
-            config=self._proj(style),
+            config=self._proj(style, capture_style),
         )
         if cov is not None:
             streamer.hook_manager.add_callback(cov)
@@ -343,8 +344,8 @@ class TestCompactKFAC:
         # -- factorized reference: fit covariances in a re-pass --
         task, tr, te = _make_task_and_data()
         attr_f = KFACAttributor(_args(tmp_path / "f"), task=task)
-        train_f = self._collect(attr_f, tr, tmp_path / "tr_f", "logra_factorized")
-        test_f = self._collect(attr_f, te, tmp_path / "te_f", "logra_factorized")
+        train_f = self._collect(attr_f, tr, tmp_path / "tr_f", "logra")
+        test_f = self._collect(attr_f, te, tmp_path / "te_f", "logra")
         ids_f, s_fac = attr_f.attribute_from_cache(
             train_f,
             test_f,
@@ -359,10 +360,11 @@ class TestCompactKFAC:
             attr_m,
             tr,
             tmp_path / "tr_m",
-            "logra_materialized",
+            "logra",
+            "materialized",
             cov=cov,
         )
-        test_m = self._collect(attr_m, te, tmp_path / "te_m", "logra_materialized")
+        test_m = self._collect(attr_m, te, tmp_path / "te_m", "logra", "materialized")
         fisher = attr_m.save_fisher(cov.result(), str(tmp_path / "fisher"))
         ids_m, s_mat = attr_m.attribute_from_cache(
             train_m,

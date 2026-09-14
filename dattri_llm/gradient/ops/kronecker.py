@@ -326,7 +326,7 @@ def kfac_precondition_materialized(
     """Two-sided K-FAC preconditioning of a **compact materialized** block.
 
     *block* is one per-sample gradient matrix flattened to ``(B, k_g * k_a)`` --
-    e.g. a ``logra_materialized`` capture, ``dW = sum_t (P_g g_t)(P_a a_t)^T`` in
+    e.g. a materialized ``"logra"`` capture, ``dW = sum_t (P_g g_t)(P_a a_t)^T`` in
     the projected space, laid out ``(k_g, k_a)`` row-major (see
     :func:`materialize_factors`).  With the projected inverse covariances ``A_inv``
     (``k_a x k_a``) and ``G_inv`` (``k_g x k_g``) this applies

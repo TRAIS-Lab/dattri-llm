@@ -195,7 +195,7 @@ class TestLESSFrozen:
         model, task, train, test, ckpts, opts = setup
         projection = {
             "__default__": {
-                "style": "subset_materialized",
+                "style": "mask",
                 "proj_dim": 7,
                 "proj_seed": 2,
             }
@@ -205,13 +205,13 @@ class TestLESSFrozen:
             train,
             test,
             hook_config=HookManagerConfig(
-                linear_io=[f"{n}$" for n in LAYERS], projection=projection
+                linear_io=[f"{n}$" for n in LAYERS], projection_kwargs=projection
             ),
         )
         proj = ops.DattriProjector()
         widths = {"fc1": HID * (IN + 1), "fc2": OUT * (HID + 1)}
         subset = {
-            layer: proj.subset_indices(
+            layer: proj.mask_indices(
                 widths[layer], proj_dim=7, proj_seed=2, device=torch.device("cpu")
             )
             for layer in LAYERS
@@ -255,7 +255,7 @@ class TestLESSFrozen:
         _, task, train, test, _, opts = setup
         projection = {
             "__default__": {
-                "style": "logra_factorized",
+                "style": "logra",
                 "proj_dim": 4,
                 "proj_max_batch_size": 8,
             }
@@ -266,7 +266,7 @@ class TestLESSFrozen:
                 train,
                 test,
                 hook_config=HookManagerConfig(
-                    linear_io=[f"{n}$" for n in LAYERS], projection=projection
+                    linear_io=[f"{n}$" for n in LAYERS], projection_kwargs=projection
                 ),
             )
 

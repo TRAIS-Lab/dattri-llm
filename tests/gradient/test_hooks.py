@@ -685,38 +685,60 @@ class TestTrainabilityFilter:
 
 
 # --------------------------------------------------------------------------- #
-# HookManagerConfig(projection=...) -- per-layer random projection on capture    #
+# HookManagerConfig(projection_kwargs=...) -- per-layer projection on capture   #
 # --------------------------------------------------------------------------- #
 
 
 class TestProjectionConfig:
     def test_validation_rejects_non_dict(self):
-        with pytest.raises(TypeError, match="projection must be a dict"):
-            HookManagerConfig(projection=[{"proj_dim": 8}])  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="projection_kwargs must be a dict"):
+            HookManagerConfig(projection_kwargs=[{"proj_dim": 8}])  # type: ignore[arg-type]
 
     def test_validation_rejects_non_dict_values(self):
-        with pytest.raises(TypeError, match="projection must be a dict"):
-            HookManagerConfig(projection={"__default__": 8})  # type: ignore[dict-item]
+        with pytest.raises(TypeError, match="projection_kwargs must be a dict"):
+            HookManagerConfig(projection_kwargs={"__default__": 8})  # type: ignore[dict-item]
 
     def test_validation_rejects_unknown_style(self):
         with pytest.raises(ValueError, match="not a valid projection style"):
             HookManagerConfig(
-                projection={"__default__": {"style": "bogus", "proj_dim": 8}},
+                projection_kwargs={"__default__": {"style": "bogus", "proj_dim": 8}},
             )
 
-    def test_validation_rejects_removed_factorize_key(self):
-        with pytest.raises(ValueError, match="removed 'factorize' key"):
+    @pytest.mark.parametrize(
+        "old",
+        [
+            "logra_factorized",
+            "logra_materialized",
+            "materialized",
+            "subset_materialized",
+            "auto",
+        ],
+    )
+    def test_validation_rejects_old_style_names(self, old):
+        with pytest.raises(ValueError, match="no longer a style"):
             HookManagerConfig(
-                projection={"__default__": {"factorize": True, "proj_dim": 8}},
+                projection_kwargs={"__default__": {"style": old, "proj_dim": 8}},
             )
+
+    def test_validation_rejects_seq_len(self):
+        with pytest.raises(ValueError, match="seq_len"):
+            HookManagerConfig(
+                projection_kwargs={"__default__": {"proj_dim": 8, "seq_len": 64}},
+            )
+
+    def test_validation_rejects_unknown_capture_style(self):
+        with pytest.raises(ValueError, match="capture_style"):
+            HookManagerConfig(capture_style="bogus")
 
     def test_none_keeps_projection_off(self):
-        assert HookManagerConfig().projection is None
+        assert HookManagerConfig().projection_kwargs is None
 
     def test_projection_does_not_affect_is_default(self):
-        assert HookManagerConfig(projection={"__default__": {"proj_dim": 8}}).is_default
+        assert HookManagerConfig(
+            projection_kwargs={"__default__": {"proj_dim": 8}}
+        ).is_default
 
-    def _run(self, projection, projector=None):
+    def _run(self, projection, projector=None, capture_style="factorized"):
         torch.manual_seed(0)  # identical weights + input across calls, for comparisons
         model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8))
         cb = _Recording()
@@ -724,8 +746,9 @@ class TestProjectionConfig:
             model,
             config=HookManagerConfig(
                 linear_io=REGISTER_ALL,
-                projection=projection,
+                projection_kwargs=projection,
                 projector=projector,
+                capture_style=capture_style,
             ),
             callbacks=[cb],
         )
@@ -737,7 +760,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "__default__": {
-                    "style": "materialized",
+                    "style": "dense",
                     "proj_dim": 64,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -752,7 +775,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "__default__": {
-                    "style": "logra_factorized",
+                    "style": "logra",
                     "proj_dim": 16,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -763,11 +786,11 @@ class TestProjectionConfig:
             assert g.representation[n] == "factorized"
             assert g.data[n].activation.shape[-1] == 16
 
-    def test_logra_materialized_is_materialized_factors(self):
-        # P1: "logra_materialized" stores exactly the token-summed outer product
-        # of the "logra_factorized" projected factors -- one compact
-        # (B, proj_dim*proj_dim) block, and scoring by dot equals the factorized
-        # cross-gram.
+    def test_materialized_logra_is_materialized_factors(self):
+        # P1: a materialized "logra" capture stores exactly the token-summed
+        # outer product of the factorized "logra" projected factors -- one
+        # compact (B, proj_dim*proj_dim) block, and scoring by dot equals the
+        # factorized cross-gram.
         from dattri_llm.gradient import ops
 
         cfg = {
@@ -776,8 +799,10 @@ class TestProjectionConfig:
             "proj_type": "rademacher",
             "proj_seed": 5,
         }
-        fac = self._run({"__default__": {"style": "logra_factorized", **cfg}})
-        mat = self._run({"__default__": {"style": "logra_materialized", **cfg}})
+        fac = self._run({"__default__": {"style": "logra", **cfg}})
+        mat = self._run(
+            {"__default__": {"style": "logra", **cfg}}, capture_style="materialized"
+        )
         for n in mat.layer_names:
             assert mat.representation[n] == "materialized"
             assert mat.data[n].shape == (4, 16 * 16)  # compact outer product
@@ -785,11 +810,11 @@ class TestProjectionConfig:
             assert torch.allclose(mat.data[n], ref, atol=1e-5), n
 
     def test_subset_projection_keeps_exact_coordinates(self):
-        # "subset_materialized": a dense (B, k) block of exact gradient entries,
+        # "mask": a dense (B, k) block of exact gradient entries,
         # equal to a gather on the materialized raw capture.
         from dattri_llm.gradient import ops
 
-        cfg = {"style": "subset_materialized", "proj_dim": 12, "proj_seed": 7}
+        cfg = {"style": "mask", "proj_dim": 12, "proj_seed": 7}
         raw = self._run(None)
         sub = self._run({"__default__": dict(cfg)})
         proj = ops.DattriProjector()
@@ -797,17 +822,17 @@ class TestProjectionConfig:
             assert sub.representation[n] == "materialized"
             assert sub.data[n].shape == (4, 12)
             full = ops.materialize(raw.data[n], "nn.Linear")
-            idx = proj.subset_indices(
+            idx = proj.mask_indices(
                 full.shape[1], proj_dim=12, proj_seed=7, device=full.device
             )
             assert torch.allclose(sub.data[n], full[:, idx], atol=1e-5), n
 
     def test_validation_rejects_projector_kwargs_for_subset(self):
-        with pytest.raises(ValueError, match="subset_materialized"):
+        with pytest.raises(ValueError, match="mask"):
             HookManagerConfig(
-                projection={
+                projection_kwargs={
                     "__default__": {
-                        "style": "subset_materialized",
+                        "style": "mask",
                         "proj_dim": 8,
                         "proj_type": "rademacher",
                     },
@@ -823,7 +848,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "0": {
-                    "style": "materialized",
+                    "style": "dense",
                     "proj_dim": 64,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -843,7 +868,7 @@ class TestProjectionConfig:
             return lambda x, ensemble_id=0: x[:, :proj_dim]
 
         g = self._run(
-            {"__default__": {"style": "materialized", "proj_dim": 4}},
+            {"__default__": {"style": "dense", "proj_dim": 4}},
             projector=fake_projector,
         )
         assert called["n"] > 0
@@ -851,15 +876,15 @@ class TestProjectionConfig:
             assert g.data[n].shape == (4, 4)
 
     @pytest.mark.parametrize(
-        "style",
+        ("style", "capture_style"),
         [
-            "logra_factorized",
-            "logra_materialized",
-            "materialized",
-            "subset_materialized",
+            ("logra", "factorized"),
+            ("logra", "materialized"),
+            ("dense", "factorized"),
+            ("mask", "factorized"),
         ],
     )
-    def test_capture_time_equals_assembly_time_projection(self, style):
+    def test_capture_time_equals_assembly_time_projection(self, style, capture_style):
         # Projecting at capture (per micro-batch) must be bit-identical to
         # projecting the fully-assembled gradient -- project(cat) == cat(project).
         from dattri.func.projection import random_project
@@ -868,11 +893,15 @@ class TestProjectionConfig:
         from dattri_llm.gradient.gradient import Factorized
 
         cfg = {"style": style, "proj_dim": 12, "proj_seed": 7}
-        if style != "subset_materialized":  # no projector behind a subset
+        if style != "mask":  # no projector behind a subset
             cfg.update({"proj_max_batch_size": 8, "proj_type": "rademacher"})
         raw = self._run(None)  # un-projected capture
-        ref = raw.project(random_project, {"__default__": dict(cfg)})
-        cap = self._run({"__default__": dict(cfg)})  # capture-time projection
+        ref = raw.project(
+            random_project, {"__default__": dict(cfg)}, capture_style=capture_style
+        )
+        cap = self._run(
+            {"__default__": dict(cfg)}, capture_style=capture_style
+        )  # capture-time projection
         for n in cap.layer_names:
             a, b = cap.data[n], ref.data[n]
             if isinstance(a, Factorized):
@@ -899,9 +928,9 @@ class TestProjectionConfig:
             m,
             config=HookManagerConfig(
                 linear_io=REGISTER_ALL,
-                projection={
+                projection_kwargs={
                     "__default__": {
-                        "style": "materialized",
+                        "style": "dense",
                         "proj_dim": 12,
                         "proj_max_batch_size": 8,
                         "proj_type": "rademacher",

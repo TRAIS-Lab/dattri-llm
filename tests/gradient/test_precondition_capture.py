@@ -50,12 +50,14 @@ def _trained(make, steps: int = 2):
     return model, opt
 
 
-def _capture(model, opt, projection=None, precondition=True):
+def _capture(model, opt, projection_kwargs=None, precondition=True):
     """One step's captured Gradient (preconditioned or raw) at the same input."""
     cb = CaptureCallback()
     hm = HookManager(
         model,
-        config=HookManagerConfig(linear_io=REGISTER_ALL, projection=projection),
+        config=HookManagerConfig(
+            linear_io=REGISTER_ALL, projection_kwargs=projection_kwargs
+        ),
         callbacks=[cb],
         optimizer=opt,
     )
@@ -89,17 +91,17 @@ class TestPreconditionedCapture:
         snap = OptimizerSnapshot(model, opt)
         projection = {
             "__default__": {
-                "style": "subset_materialized",
+                "style": "mask",
                 "proj_dim": 5,
                 "proj_seed": 2,
             }
         }
-        got = _capture(model, opt, projection=projection)
+        got = _capture(model, opt, projection_kwargs=projection)
         raw = _capture(model, opt, precondition=False)
         proj = ops.DattriProjector()
         for layer in LAYERS:
             full = ops.materialize(raw.data[layer], raw.layer_types[layer])
-            idx = proj.subset_indices(
+            idx = proj.mask_indices(
                 full.shape[1], proj_dim=5, proj_seed=2, device=torch.device("cpu")
             )
             want = snap.precondition(layer, full[:, idx], idx)
@@ -110,8 +112,8 @@ class TestPreconditionedCapture:
         model, opt = _trained(OPTIMIZERS["adamw"])
         snap = OptimizerSnapshot(model, opt)
         kw = {"proj_dim": 4, "proj_seed": 3, "proj_max_batch_size": 8}
-        projection = {"__default__": {"style": "materialized", **kw}}
-        got = _capture(model, opt, projection=projection)
+        projection = {"__default__": {"style": "dense", **kw}}
+        got = _capture(model, opt, projection_kwargs=projection)
         raw = _capture(model, opt, precondition=False)
         proj = ops.DattriProjector()
         for layer in LAYERS:
@@ -191,7 +193,7 @@ class TestPreconditionedCapture:
         model, opt = _trained(OPTIMIZERS["adamw"])
         projection = {
             "__default__": {
-                "style": "logra_factorized",
+                "style": "logra",
                 "proj_dim": 4,
                 "proj_max_batch_size": 8,
             }
@@ -199,7 +201,9 @@ class TestPreconditionedCapture:
         with pytest.raises(ValueError, match="cannot be preconditioned"):
             HookManager(
                 model,
-                config=HookManagerConfig(linear_io=REGISTER_ALL, projection=projection),
+                config=HookManagerConfig(
+                    linear_io=REGISTER_ALL, projection_kwargs=projection
+                ),
                 optimizer=opt,
             )
 

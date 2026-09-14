@@ -92,21 +92,33 @@ def test_invasive_matches_linear_io_unprojected(shape):
     _assert_gradients_identical(g_lin, g_inv)
 
 
-@pytest.mark.parametrize("style", ["logra_factorized", "logra_materialized"])
+@pytest.mark.parametrize("capture_style", ["factorized", "materialized"])
 @pytest.mark.parametrize("shape", [(5, 8), (3, 4, 8)], ids=["2d", "3d"])
-def test_invasive_matches_linear_io_projected(style, shape):
+def test_invasive_matches_linear_io_projected(capture_style, shape):
     x = torch.randn(*shape)
     proj = {
         "__default__": {
-            "style": style,
+            "style": "logra",
             "proj_dim": 4,
             "proj_max_batch_size": 32,
             "proj_type": "rademacher",
             "proj_seed": 0,
         },
     }
-    g_lin, _ = _collect(_seeded_mlp(), x, linear_io=[r"fc"], projection=proj)
-    g_inv, _ = _collect(_seeded_mlp(), x, invasive_linear_io=[r"fc"], projection=proj)
+    g_lin, _ = _collect(
+        _seeded_mlp(),
+        x,
+        linear_io=[r"fc"],
+        projection_kwargs=proj,
+        capture_style=capture_style,
+    )
+    g_inv, _ = _collect(
+        _seeded_mlp(),
+        x,
+        invasive_linear_io=[r"fc"],
+        projection_kwargs=proj,
+        capture_style=capture_style,
+    )
     _assert_gradients_identical(g_lin, g_inv)
 
 

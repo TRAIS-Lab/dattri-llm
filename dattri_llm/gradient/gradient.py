@@ -544,23 +544,25 @@ class Gradient:
         self,
         projector: Callable | ops.DattriProjector | None,
         proj_kwargs: dict[str, dict],
+        *,
+        capture_style: str = "factorized",
     ) -> Gradient:
         """Reduce each layer's per-sample gradient to a smaller dimension.
 
-        Four styles, chosen per layer by ``proj_kwargs[name]["style"]``:
+        Three styles, chosen per layer by ``proj_kwargs[name]["style"]``:
 
-        * ``"logra_factorized"`` (default, LoGRA) -- project the factorized
-          factors, keeping the Kronecker structure at width ``proj_dim``; the
-          layer stays *factorized*.  Defined for outer-product gradients (linear
-          / conv, and embeddings via one-hot inputs); norm layers cannot use it.
-        * ``"logra_materialized"`` -- LoGRA project, then materialize the
-          projected factors into one dense ``(B, k_g*k_a)`` block per sample
-          (token-summed outer product, formed in the small projected space).
-        * ``"materialized"`` (TRAK) -- materialize the per-sample weight gradient
-          first, then project it to a dense ``(B, proj_dim)`` block.
-        * ``"subset_materialized"`` -- keep ``proj_dim`` fixed random
-          coordinates of the per-sample weight gradient, gathered from the
-          factors without materializing (exact entries, no projector).
+        * ``"logra"`` (default) -- project the two factors, keeping the
+          Kronecker structure at width ``proj_dim``.  The layer stays
+          *factorized* unless *capture_style* materializes it
+          (``"materialized"``, or ``"auto"`` when the token-summed outer
+          product of the projected factors is the smaller form).  Defined for
+          outer-product gradients (linear / conv, and embeddings via one-hot
+          inputs); norm layers cannot use it.
+        * ``"dense"`` -- materialize the per-sample weight gradient first, then
+          project it with one matrix to a dense ``(B, proj_dim)`` block.
+        * ``"mask"`` -- keep ``proj_dim`` fixed random coordinates of the
+          per-sample weight gradient, gathered from the factors without
+          materializing (exact entries, no projector).
 
         The last two are the styles available for norm layers and for
         already-materialized inputs.
@@ -575,12 +577,15 @@ class Gradient:
                 duration of this call, so the matrices are shared across
                 layers but released afterwards.
             proj_kwargs: ``{layer_name: dict}`` per-layer config.  Each dict carries
-                ``proj_dim`` and optionally ``style`` (default
-                ``"logra_factorized"``), ``proj_seed`` and any projector kwargs
+                ``proj_dim`` and optionally ``style`` (default ``"logra"``),
+                ``proj_seed`` and any projector kwargs
                 (``proj_type``, ``proj_max_batch_size``, ``device``, ...).  A
                 ``"__default__"`` entry supplies the config for layers without
                 their own; layers with **neither** an entry nor ``"__default__"``
                 are left unchanged.
+            capture_style: The representation of ``"logra"`` layers --
+                ``"factorized"`` (default), ``"materialized"`` or ``"auto"``
+                (see :func:`~dattri_llm.gradient.ops.should_materialize`).
 
         Returns:
             A new :class:`Gradient` holding each layer's projection.
@@ -601,12 +606,13 @@ class Gradient:
                 new_indexing[name] = self.indexing[name]
                 continue
             kw = dict(kw)
-            style = kw.pop("style", "logra_factorized")
+            style = kw.pop("style", "logra")
             payload, is_factorized = ops.project_layer(
                 value,
                 self.layer_types[name],
                 projector,
                 style=style,
+                capture_style=capture_style,
                 **kw,
             )
             if is_factorized:

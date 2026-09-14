@@ -903,7 +903,7 @@ class _TrakMLP(nn.Module):
 
 def _collect_trak_mixed(tmp_path):
     """Collect a cache where ``fc1`` is LoGRA-projected (stays factorized) and
-    ``fc2`` is TRAK-projected (``style="materialized"`` -> a materialized
+    ``fc2`` is TRAK-projected (``style="dense"`` -> a materialized
     ``(B, proj_dim)`` tensor that keeps its ``nn.Linear`` layer type).
     """
     torch.manual_seed(0)
@@ -919,9 +919,9 @@ def _collect_trak_mixed(tmp_path):
     }
     cfg = HookManagerConfig(
         linear_io=[r"fc"],
-        projection={
-            "fc1": dict(proj, style="logra_factorized"),
-            "fc2": dict(proj, style="materialized"),
+        projection_kwargs={
+            "fc1": dict(proj, style="logra"),
+            "fc2": dict(proj, style="dense"),
         },
     )
 
@@ -1033,11 +1033,11 @@ class TestMaterializedLayers:
             "proj_max_batch_size": 8,
             "proj_type": "rademacher",
             "proj_seed": 3,
-            "style": "materialized",
+            "style": "dense",
         }
         cfg = HookManagerConfig(
             linear_io=[r"fc"],
-            projection={"__default__": proj},
+            projection_kwargs={"__default__": proj},
         )
         gen = torch.Generator().manual_seed(1)
         for split, n in (("tr", 6), ("te", 4)):

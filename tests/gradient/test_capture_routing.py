@@ -71,10 +71,11 @@ class TestAutoStyle:
         """
         return lambda x, ensemble_id=0: x[..., :proj_dim]
 
-    def _project(self, block: Gradient, style: str) -> Gradient:
+    def _project(self, block: Gradient, capture_style: str) -> Gradient:
         return block.project(
             self._projector,
-            {"__default__": {"style": style, "proj_dim": P, "proj_seed": 0}},
+            {"__default__": {"style": "logra", "proj_dim": P, "proj_seed": 0}},
+            capture_style=capture_style,
         )
 
     def test_auto_materializes_past_the_crossover(self):
@@ -91,7 +92,7 @@ class TestAutoStyle:
 
     def test_auto_matches_the_explicit_style_it_selects(self):
         auto = self._project(_block(1), "auto")
-        explicit = self._project(_block(1), "logra_materialized")
+        explicit = self._project(_block(1), "materialized")
         assert auto.representation["l"] == explicit.representation["l"]
         torch.testing.assert_close(auto.data["l"], explicit.data["l"])
 
@@ -101,10 +102,10 @@ class TestAutoStyle:
         A factorized projected block and its materialized counterpart are the
         same gradient in two encodings, so the cross-gram must agree.
         """
-        tr_f = self._project(_block(2), "logra_factorized")
-        te_f = self._project(_block(3), "logra_factorized")
-        tr_m = self._project(_block(2), "logra_materialized")
-        te_m = self._project(_block(3), "logra_materialized")
+        tr_f = self._project(_block(2), "factorized")
+        te_f = self._project(_block(3), "factorized")
+        tr_m = self._project(_block(2), "materialized")
+        te_m = self._project(_block(3), "materialized")
 
         s_fact = tr_f.similarity(te_f, metric="dot", reduce="all")
         s_mat = tr_m.similarity(te_m, metric="dot", reduce="all")

@@ -18,7 +18,6 @@ from dattri_llm.gradient.hooks.hooks import (
 from dattri_llm.gradient.ops import (
     ALL_LAYER_TYPES,
     canonical_class_name,
-    maybe_materialize_projected,
 )
 
 if TYPE_CHECKING:
@@ -178,51 +177,62 @@ class HookManagerConfig:
             }},
         )
 
-    **Per-layer projection** -- :attr:`projection` enables capture-time random
-    projection: instead of buffering a layer's raw factors, each backward pass
-    projects them down to ``proj_dim`` on the training device, and only the
-    small projected result is kept (on CPU).  It maps a layer name -- or
-    ``"__default__"``, covering every hooked layer without its own entry -- to
-    that layer's ``proj_kwargs`` dict.  A layer with neither an entry nor a
-    ``"__default__"`` is captured raw (unprojected), so mixed configs are
-    fine.  :attr:`projector` is the projection factory, following dattri's
-    ``random_project`` protocol; ``None`` (the default) lazily imports
-    dattri's ``random_project``.
+    **Capture style** -- :attr:`capture_style` decides the representation a
+    layer's per-sample gradient is buffered in wherever there is a choice:
+
+    * ``"factorized"`` (default) -- keep the factors ``(a, g)`` (raw, or
+      projected under ``"logra"``).
+    * ``"materialized"`` -- contract them into the dense per-sample gradient
+      (or its projected counterpart) in the backward hook, so the factors are
+      released at once.
+    * ``"auto"`` -- per layer and micro-batch, the cheaper of the two by the
+      cost rule of :func:`~dattri_llm.gradient.ops.should_materialize`: the
+      factors cost ``T (N_i + N_o)`` values per sample and the dense gradient
+      ``N_i N_o`` (projected widths for a ``"logra"`` layer).
+
+    A layer projected with ``"dense"`` or ``"mask"`` is dense by construction,
+    whatever the capture style.  A layer's representation is fixed by its
+    first micro-batch of a step, so accumulation windows never mix the two.
+
+    **Per-layer projection** -- :attr:`projection_kwargs` enables
+    capture-time random projection: instead of buffering a layer's raw
+    factors, each backward pass projects them down to ``proj_dim`` on the
+    training device, and only the small projected result is kept.  It maps a
+    layer name -- or ``"__default__"``, covering every hooked layer without
+    its own entry -- to that layer's ``proj_kwargs`` dict.  A layer with
+    neither an entry nor a ``"__default__"`` is captured unprojected, so
+    mixed configs are fine.  :attr:`projector` is the projection factory,
+    following dattri's ``random_project`` protocol; ``None`` (the default)
+    lazily imports dattri's ``random_project``.
 
     Keys consumed by the library:
 
     * ``proj_dim`` (int, **required**) -- target width of the projection.
-    * ``style`` (str, default ``"logra_factorized"``) -- how the projected
-      gradient is represented:
+    * ``style`` (str, default ``"logra"``) -- how the layer is projected, i.e.
+      in which order projection and materialization happen:
 
-      * ``"logra_factorized"`` -- project the two factors independently
-        (LoGRA / double-sided): the layer stays *factorized* at width
-        ``proj_dim`` and is relabelled ``"nn.Linear"``.
-      * ``"logra_materialized"`` -- LoGRA project, then materialize the
-        projected factors into one compact ``(B, proj_dim*proj_dim)``
-        per-sample block (token-summed outer product formed cheaply in the
-        projected space).  Smaller on disk than the factors, but loses
-        per-token structure.
-      * ``"materialized"`` -- materialize the per-sample weight gradient
-        first, then project it (TRAK / single-sided) to a dense
+      * ``"logra"`` -- project the two factors independently (double-sided,
+        a Kronecker projection of the gradient); the layer is relabelled
+        ``"nn.Linear"`` at width ``proj_dim`` and its representation follows
+        :attr:`capture_style`.
+      * ``"dense"`` -- materialize the per-sample weight gradient first,
+        then project it with one matrix (single-sided) to a dense
         ``(B, proj_dim)`` block.
-      * ``"subset_materialized"`` -- keep ``proj_dim`` fixed random
-        coordinates of the per-sample weight gradient (drawn once from
-        ``proj_seed``), gathered straight from the factors without
-        materializing; a dense ``(B, proj_dim)`` block whose entries are
-        exact.  Takes only ``proj_dim``, ``proj_seed``, ``include_bias`` and
-        ``device`` -- there is no projector, so ``proj_type`` and the like are
-        rejected.
+      * ``"mask"`` -- keep ``proj_dim`` fixed random coordinates of the
+        per-sample weight gradient (drawn once from ``proj_seed``), gathered
+        straight from the factors without materializing; a dense
+        ``(B, proj_dim)`` block whose entries are exact.  Takes only
+        ``proj_dim``, ``proj_seed``, ``include_bias`` and ``device`` -- there
+        is no projector, so ``proj_type`` and the like are rejected.
 
-      The two ``logra_*`` styles are defined for outer-product gradients: the
-      linear / conv families, and the embedding family (whose integer ids are
-      expanded to one-hot inputs first).  **Norm layers must use**
-      ``"materialized"`` or ``"subset_materialized"`` (their gradient is not
-      an outer product).
-    * ``proj_seed`` (int, default ``0``) -- base seed.  The ``logra_*`` styles
-      use ``proj_seed`` for the output-gradient factor and ``proj_seed + 1``
-      for the activation factor (dattri's LoGRA convention).  Keep it fixed
-      per layer so gradients captured at different steps stay comparable.
+      ``"logra"`` is defined for outer-product gradients: the linear / conv
+      families, and the embedding family (whose integer ids are expanded to
+      one-hot inputs first).  **Norm layers must use** ``"dense"`` or
+      ``"mask"`` (their gradient is not an outer product).
+    * ``proj_seed`` (int, default ``0``) -- base seed.  ``"logra"`` uses
+      ``proj_seed`` for the output-gradient factor and ``proj_seed + 1`` for
+      the activation factor (dattri's LoGRA convention).  Keep it fixed per
+      layer so gradients captured at different steps stay comparable.
     * ``device`` -- where the projection runs.  The factors are moved to this
       device before projecting (dattri builds a device-specific projector for
       it); the small projected result is then buffered to CPU as usual.
@@ -244,22 +254,23 @@ class HookManagerConfig:
 
     Example -- LoGRA projection on a GPT-2-style model.  The regexes hook the
     attention/MLP linears plus the token embedding; both fall through to
-    ``"__default__"`` (embeddings project factorized too, via one-hot inputs),
-    while a per-layer entry demonstrates overriding one layer to the
-    materialize-then-project (TRAK) style::
+    ``"__default__"`` (embeddings project double-sided too, via one-hot
+    inputs), while a per-layer entry overrides one layer to the
+    materialize-then-project style::
 
         HookManagerConfig(
             linear_io=[r"transformer\.h\.\d+\.(attn|mlp)\.", r"wte$"],
-            projection={
-                "__default__": {          # project both factors (LoGRA)
-                    "style": "logra_factorized",
+            capture_style="auto",
+            projection_kwargs={
+                "__default__": {          # project both factors
+                    "style": "logra",
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
                     "device": "cuda",
                 },
-                "transformer.wte": {      # materialize-then-project (TRAK)
-                    "style": "materialized",
+                "transformer.wte": {      # materialize, then project
+                    "style": "dense",
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
                     "device": "cuda",
@@ -267,10 +278,10 @@ class HookManagerConfig:
             },
         )
 
-    Note that a ``"__default__"`` entry with a ``logra_*`` style combined with a
+    Note that a ``"__default__"`` entry with style ``"logra"`` combined with a
     hook selection that includes norm layers (e.g. ``linear_io=REGISTER_ALL``)
     raises inside the first backward pass -- give those layers explicit
-    ``style="materialized"`` entries, or exclude them from hooking.
+    ``"dense"`` or ``"mask"`` entries, or exclude them from hooking.
     """
 
     def __init__(
@@ -281,8 +292,9 @@ class HookManagerConfig:
         invasive_linear_io: Selector = None,
         layer_types: dict[str, str] | None = None,
         module_kwargs: dict[str, dict] | None = None,
-        projection: dict[str, dict] | None = None,
+        projection_kwargs: dict[str, dict] | None = None,
         projector: Callable | None = None,
+        capture_style: str = "factorized",
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
@@ -298,12 +310,14 @@ class HookManagerConfig:
         )
         self.layer_types = self._validate_layer_types(layer_types)
         self.module_kwargs = self._validate_module_kwargs(module_kwargs)
-        # Optional per-layer random projection applied to every assembled step
-        # gradient (see :meth:`Gradient.project`).  ``projection`` is the per-layer
-        # proj_kwargs map ``{layer_name: {factorize, proj_dim, ...}}`` (a
-        # ``"__default__"`` entry covers unlisted layers); ``projector`` is the
-        # projection factory, defaulting to dattri's ``random_project``.
-        self.projection = self._validate_projection(projection)
+        # Optional per-layer random projection applied at capture (see
+        # :meth:`Gradient.project` for the post-hoc form).  ``projection_kwargs``
+        # is the per-layer proj_kwargs map (``"__default__"`` covers unlisted
+        # layers); ``projector`` is the projection factory, defaulting to
+        # dattri's ``random_project``; ``capture_style`` the buffered
+        # representation.
+        self.projection_kwargs = self._validate_projection(projection_kwargs)
+        self.capture_style = self._validate_capture_style(capture_style)
         self.projector = projector
 
     @staticmethod
@@ -330,7 +344,7 @@ class HookManagerConfig:
     def _validate_projection(
         projection: dict[str, dict] | None,
     ) -> dict[str, dict] | None:
-        from dattri_llm.gradient.ops import PROJECTION_STYLES, SUBSET_KEYS
+        from dattri_llm.gradient.ops import MASK_KEYS, PROJECTION_STYLES
 
         if projection is None:
             return None
@@ -338,80 +352,57 @@ class HookManagerConfig:
             isinstance(v, dict) for v in projection.values()
         ):
             raise TypeError(
-                "projection must be a dict mapping layer name (or '__default__') "
-                "to a proj_kwargs dict, e.g. "
-                "{'__default__': {'style': 'logra_factorized', 'proj_dim': 512}}.",
+                "projection_kwargs must be a dict mapping layer name (or "
+                "'__default__') to a proj_kwargs dict, e.g. "
+                "{'__default__': {'style': 'logra', 'proj_dim': 512}}.",
             )
+        removed = {
+            "logra_factorized": "style='logra' with capture_style='factorized'",
+            "logra_materialized": "style='logra' with capture_style='materialized'",
+            "materialized": "style='dense'",
+            "subset_materialized": "style='mask'",
+            "auto": "style='logra' with capture_style='auto'",
+        }
         for name, kw in projection.items():
-            if "factorize" in kw:
+            style = kw.get("style", "logra")
+            if style in removed:
                 raise ValueError(
-                    f"projection[{name!r}] uses the removed 'factorize' key. "
-                    "Use 'style' instead: 'logra_factorized' (was factorize=True), "
-                    "'materialized' (was factorize=False), or the new "
-                    "'logra_materialized' (project the factors, then materialize "
-                    f"them into a compact per-sample block). Valid styles: "
-                    f"{list(PROJECTION_STYLES)}.",
+                    f"projection_kwargs[{name!r}]['style'] = {style!r} is no "
+                    f"longer a style; use {removed[style]} (the style names how "
+                    "the layer is projected, capture_style how it is "
+                    f"represented). Valid styles: {list(PROJECTION_STYLES)}.",
                 )
-            style = kw.get("style", "logra_factorized")
             if style not in PROJECTION_STYLES:
                 raise ValueError(
-                    f"projection[{name!r}]['style'] = {style!r} is not a valid "
-                    f"projection style. Valid styles: {list(PROJECTION_STYLES)}.",
+                    f"projection_kwargs[{name!r}]['style'] = {style!r} is not a "
+                    f"valid projection style. Valid styles: "
+                    f"{list(PROJECTION_STYLES)}.",
                 )
-            if style == "subset_materialized" and set(kw) - SUBSET_KEYS:
+            if "seq_len" in kw:
                 raise ValueError(
-                    f"projection[{name!r}] is 'subset_materialized', which keeps "
-                    "coordinates rather than projecting and takes only "
-                    f"{sorted(SUBSET_KEYS - {'style'})}; got unexpected "
-                    f"{sorted(set(kw) - SUBSET_KEYS)}.",
+                    f"projection_kwargs[{name!r}] carries 'seq_len', which is no "
+                    "longer used: capture_style='auto' decides from the actual "
+                    "shapes at capture.",
                 )
-        return {
-            k: HookManagerConfig._resolve_auto_style(k, dict(v))
-            for k, v in projection.items()
-        }
+            if style == "mask" and set(kw) - MASK_KEYS:
+                raise ValueError(
+                    f"projection_kwargs[{name!r}] is 'mask', which keeps "
+                    "coordinates rather than projecting and takes only "
+                    f"{sorted(MASK_KEYS - {'style'})}; got unexpected "
+                    f"{sorted(set(kw) - MASK_KEYS)}.",
+                )
+        return {k: dict(v) for k, v in projection.items()}
 
     @staticmethod
-    def _resolve_auto_style(name: str, kw: dict) -> dict:
-        """Resolve ``style="auto"`` to a concrete style, once, here.
+    def _validate_capture_style(capture_style: str) -> str:
+        from dattri_llm.gradient.ops import CAPTURE_STYLES
 
-        ``auto`` is a *request* ("pick the cheaper representation"), not a
-        representation.  The capture path decides several things from the style
-        -- most importantly whether a linear layer's activation is projected in
-        the forward hook (:func:`hooks._preprojects_activation`), which is what
-        keeps the buffer at ``(B, T, proj_dim)`` instead of the full width.
-        Those consumers pattern-match the style *name*, so an unresolved
-        ``"auto"`` silently missed every fast path and made a projected capture
-        ~13x slower than the style it would have chosen.
-
-        Resolving here means nothing downstream ever sees ``"auto"``: the rest
-        of the library only handles concrete styles, and a new consumer cannot
-        forget one.
-
-        The rule needs the sequence length (materializing wins once
-        ``S >= k_a*k_g/(k_a+k_g)``), which the config does not otherwise carry,
-        so ``auto`` requires an explicit ``seq_len``.
-        """
-        if kw.get("style") != "auto":
-            return kw
-        seq_len = kw.pop("seq_len", None)
-        proj_dim = kw.get("proj_dim")
-        if seq_len is None or proj_dim is None:
+        if capture_style not in CAPTURE_STYLES:
             raise ValueError(
-                f"projection[{name!r}] uses style='auto', which needs both "
-                "'proj_dim' and 'seq_len' to choose a representation: "
-                "materializing the projected factors wins once "
-                "seq_len >= proj_dim/2. Pass seq_len (the block/sequence "
-                "length you capture at), or name the style explicitly "
-                "('logra_factorized' / 'logra_materialized').",
+                f"capture_style must be one of {list(CAPTURE_STYLES)}, got "
+                f"{capture_style!r}.",
             )
-        k_a = kw.get("proj_dim_a", proj_dim)
-        k_g = kw.get("proj_dim_g", proj_dim)
-        kw["style"] = (
-            "logra_materialized"
-            if maybe_materialize_projected(seq_len, k_a, k_g)
-            else "logra_factorized"
-        )
-        return kw
+        return capture_style
 
     @staticmethod
     def _validate_layer_types(

@@ -2282,17 +2282,18 @@ class TestProjectedCovarianceCallback:
     """Under a LoGRA projection, the covariance callback receives the *projected*
     factors (a-side projected in the forward hook), so it fits compact
     ``(proj_dim, proj_dim)`` covariances -- the logix-style factors that match a
-    ``logra_materialized`` compact store.
+    materialized ``"logra"`` compact store.
     """
 
     PROJ = 4
 
-    def _config(self, style):
+    def _config(self, style, capture_style="factorized"):
         from dattri_llm.gradient.hooks import REGISTER_ALL, HookManagerConfig
 
         return HookManagerConfig(
             linear_io=REGISTER_ALL,
-            projection={
+            capture_style=capture_style,
+            projection_kwargs={
                 "__default__": {
                     "style": style,
                     "proj_dim": self.PROJ,
@@ -2303,14 +2304,16 @@ class TestProjectedCovarianceCallback:
             },
         )
 
-    def _collect(self, style):
+    def _collect(self, style, capture_style="factorized"):
         from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
 
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 8))
         rec = RecordingCallback()
         cov = KroneckerCovarianceCallback()
-        hm = HookManager(model, config=self._config(style), callbacks=[rec, cov])
+        hm = HookManager(
+            model, config=self._config(style, capture_style), callbacks=[rec, cov]
+        )
         with hm.collect():
             model(torch.randn(5, 16)).pow(2).sum().backward()
         return rec, cov
@@ -2318,9 +2321,10 @@ class TestProjectedCovarianceCallback:
     def test_covariances_are_compact_and_match_blocks(self):
         from dattri_llm.gradient.ops import KroneckerAccumulator
 
-        # logra_factorized keeps the projected factors in the block, so the block
+        # a factorized logra capture keeps the projected factors in the block,
+        # so the block
         # KroneckerAccumulator is the reference for the compact covariance.
-        rec, cov = self._collect("logra_factorized")
+        rec, cov = self._collect("logra")
         got = cov.result()
         assert got, "no covariances collected"
         for layer, (a_cov, g_cov) in got.items():
@@ -2342,10 +2346,11 @@ class TestProjectedCovarianceCallback:
             assert torch.allclose(g_got, g_ref, atol=1e-5), f"G {layer}"
 
     def test_compact_store_still_gets_projected_covariance(self):
-        # logra_materialized stores a compact (B, k*k) block (no factors), yet the
+        # a materialized logra capture stores a compact (B, k*k) block (no
+        # factors), yet the
         # callback still fits the compact (k, k) covariances from the projected
         # factors emitted at capture -- the whole point of the logix-style path.
-        _rec, cov = self._collect("logra_materialized")
+        _rec, cov = self._collect("logra", "materialized")
         got = cov.result()
         assert got
         for layer, (a_cov, g_cov) in got.items():

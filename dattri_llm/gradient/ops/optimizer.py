@@ -4,7 +4,7 @@ Optimizer-aware attribution scores the *update* a sample induces rather than
 its raw gradient.  For every coordinate-wise optimizer that update is a
 function of the raw per-sample gradient and the optimizer's state at the same
 coordinates, so once the gradient is available on a coordinate set -- the
-whole layer, or a ``"subset_materialized"`` subset -- the map applies
+whole layer, or a ``"mask"`` subset -- the map applies
 exactly, entry by entry.  :func:`precondition` is that map for every
 coordinate-wise optimizer in ``torch.optim`` (plus Lion), and the
 ``adamw_influence_*`` kernels are the pieces of AdamW-influence's trajectory

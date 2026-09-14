@@ -9,7 +9,7 @@ from ``dattri_llm.gradient.ops``:
 * :mod:`~dattri_llm.gradient.ops.materialize` -- per-sample weight gradients.
 * :mod:`~dattri_llm.gradient.ops.dot` -- dot products, grams, norms, the
   layerwise cross-gram, and the factorized-vs-materialized routing heuristic.
-* :mod:`~dattri_llm.gradient.ops.projection` -- TRAK/LoGRA random projection,
+* :mod:`~dattri_llm.gradient.ops.projection` -- projection (logra, dense, mask),
   fixed coordinate subsets, and the :class:`DattriProjector` that owns the
   projection matrices and subsets.
 * :mod:`~dattri_llm.gradient.ops.kronecker` -- K-FAC / EK-FAC / Fisher kernels
@@ -81,10 +81,15 @@ from dattri_llm.gradient.ops.preprocess import (
     to_3d,
 )
 from dattri_llm.gradient.ops.projection import (
+    CAPTURE_STYLES,
+    MASK_KEYS,
     PROJECTION_STYLES,
-    SUBSET_KEYS,
     DattriProjector,
     apply_projection,
+    mask_coordinates,
+    mask_factorized,
+    mask_factors,
+    mask_materialized,
     maybe_materialize_projected,
     project_activation,
     project_factorized,
@@ -93,10 +98,7 @@ from dattri_llm.gradient.ops.projection import (
     project_layer,
     project_materialized,
     project_materialized_factors,
-    subset_coordinates,
-    subset_factorized,
-    subset_factors,
-    subset_materialized,
+    should_materialize,
 )
 from dattri_llm.gradient.ops.types import (
     ALL_LAYER_TYPES,
@@ -117,15 +119,16 @@ from dattri_llm.gradient.ops.types import (
 
 __all__ = [
     "ALL_LAYER_TYPES",
+    "CAPTURE_STYLES",
     "CONV_TRANSPOSE_TYPES",
     "CONV_TYPES",
     "EMBEDDING_TYPES",
     "LINEAR_TYPES",
+    "MASK_KEYS",
     "NORM_TYPES",
     "OPTIMIZER_STATE_KEYS",
     "PARAM_GRAD_TYPES",
     "PROJECTION_STYLES",
-    "SUBSET_KEYS",
     "DattriProjector",
     "FisherAccumulator",
     "KroneckerAccumulator",
@@ -172,6 +175,10 @@ __all__ = [
     "kfac_precondition",
     "kfac_precondition_materialized",
     "layerwise_cross_dot",
+    "mask_coordinates",
+    "mask_factorized",
+    "mask_factors",
+    "mask_materialized",
     "materialize",
     "materialize_factors",
     "maybe_materialize_projected",
@@ -190,10 +197,7 @@ __all__ = [
     "project_materialized",
     "project_materialized_factors",
     "set_compute_dtype",
-    "subset_coordinates",
-    "subset_factorized",
-    "subset_factors",
-    "subset_materialized",
+    "should_materialize",
     "sym_inverse",
     "to_3d",
 ]

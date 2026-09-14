@@ -155,9 +155,9 @@ class HookManager:
             gradient -- the representation optimizer-aware methods such as
             LESS score.  Like a projection it happens inside the capture, so
             only the preconditioned copy exists: dense on the captured
-            coordinates (the whole layer, or a ``"subset_materialized"``
-            subset; a ``"materialized"`` projection is applied after the
-            map).  The ``logra_*`` styles and ``param_grad`` layers are
+            coordinates (the whole layer, or a ``"mask"`` subset; a
+            ``"dense"`` projection is applied after the map).  The
+            ``"logra"`` style and ``param_grad`` layers are
             incompatible.  :attr:`precondition` switches the map off and on
             between passes (a raw test probe sharing the hooks).  Every
             coordinate-wise ``torch.optim`` optimizer is supported under
@@ -888,17 +888,15 @@ class HookManager:
             ):
                 out_name = layer_name if inv_k == 0 else f"{layer_name}@{inv_k + 1}"
 
-                # Dense captures -- the materialized styles ("materialized"/TRAK,
-                # "logra_materialized", "subset_materialized") and any
-                # preconditioned layer: the per-sample block was assembled into
-                # _proj_parts at capture time.
-                proj_style = (
-                    proj_kw.get("style", "logra_factorized")
-                    if proj_kw is not None
-                    else "logra_factorized"
-                )
-                if proj_parts or (
-                    proj_kw is not None and proj_style != "logra_factorized"
+                # Dense captures -- the "dense" and "mask" styles, a
+                # "materialized" capture style, an "auto" capture that
+                # materialized, and any preconditioned layer: the per-sample
+                # block was assembled into _proj_parts at capture time.
+                proj_style = proj_kw.get("style", "logra") if proj_kw else None
+                if (
+                    proj_parts
+                    or proj_style in ("dense", "mask")
+                    or (self._config.capture_style == "materialized")
                 ):
                     if not proj_parts:
                         raise RuntimeError(
@@ -1280,7 +1278,7 @@ class HookManager:
             self._validate_preconditioning(root, param_grad_layers)
         if self._has_linear_io:
             self._bwd_done = False
-            if self._config.projection is not None and self._projector is None:
+            if self._config.projection_kwargs is not None and self._projector is None:
                 self._projector = ops.DattriProjector(self._config.projector)
             if self._preconditioner is not None:
                 self._preconditioner.projector = self._projector
@@ -1291,7 +1289,8 @@ class HookManager:
                 on_layer_backward=self._check_step_bwd_complete,
                 type_overrides=self._config.layer_types,
                 kwargs_overrides=self._config.module_kwargs,
-                projection=self._config.projection,
+                projection_kwargs=self._config.projection_kwargs,
+                capture_style=self._config.capture_style,
                 projector=self._projector,
                 offload_to_cpu=self._offload_to_cpu,
                 preconditioner=self._preconditioner,
@@ -1394,14 +1393,13 @@ class HookManager:
                 "captures; these layers are assigned param_grad: "
                 f"{sorted(param_grad_layers)[:5]}.",
             )
-        for name, kw in (self._config.projection or {}).items():
-            style = kw.get("style", "logra_factorized")
-            if style in ("logra_factorized", "logra_materialized"):
+        for name, kw in (self._config.projection_kwargs or {}).items():
+            style = kw.get("style", "logra")
+            if style == "logra":
                 raise ValueError(
-                    f"projection[{name!r}] uses style {style!r}, which cannot be "
-                    "preconditioned: the optimizer map needs exact gradient "
-                    "entries. Use no projection, 'subset_materialized', or "
-                    "'materialized'.",
+                    f"projection_kwargs[{name!r}] uses style 'logra', which "
+                    "cannot be preconditioned: the optimizer map needs exact "
+                    "gradient entries. Use no projection, 'mask', or 'dense'.",
                 )
         for module in root.modules():
             names = {c.__name__ for c in type(module).__mro__}
