@@ -42,6 +42,9 @@ from dattri_llm.gradient.callbacks.offload_callback import OffloadCallback
 from dattri_llm.gradient.callbacks.optimizer_state_callback import (
     OptimizerStateCallback,
 )
+from dattri_llm.gradient.callbacks.parameter_snapshot_callback import (
+    ParameterSnapshotCallback,
+)
 
 __all__ = [
     "CaptureCallback",
@@ -50,4 +53,5 @@ __all__ = [
     "KroneckerCovarianceCallback",
     "OffloadCallback",
     "OptimizerStateCallback",
+    "ParameterSnapshotCallback",
 ]

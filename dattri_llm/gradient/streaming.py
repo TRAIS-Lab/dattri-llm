@@ -7,6 +7,11 @@ concrete implementations so the same scoring loop serves both workflows:
 * :class:`DiskGradientSource` -- *store-then-attribute*: reads pre-collected
   gradients off disk via a :class:`GradientStorageManager`.
   ``reusable=True``.
+* :class:`ReplayGradientSource` -- *snapshot-then-recompute*: re-runs each
+  stored step of a trajectory (its parameters and batch, from a
+  :class:`~dattri_llm.gradient.snapshots.TrajectorySnapshots`) under the
+  capture hooks and yields the recomputed block.  ``reusable=True``.
+
 * :class:`GradientStreamer` -- *on-the-fly*: runs a forward+backward pass over a
   dataset and yields each per-step block on demand, never persisting it.  Its
   ``enable_update`` flag selects the two regimes:
@@ -45,6 +50,7 @@ from dattri_llm.gradient.callbacks import CaptureCallback
 from dattri_llm.gradient.datasets import iter_gradient_blocks, resolve_steps
 from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.snapshots import TrajectorySnapshots
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -394,6 +400,10 @@ class GradientStreamer(GradientSource):
             ``hook_manager`` must have been built with an optimizer; the
             flag is set on it per pass, so a raw test probe can share a
             preconditioned train streamer's hooks.
+        snapshots: Under ``enable_update``, store every step's parameters
+            (before its update) and its batch here, so the step can be
+            replayed later by a :class:`ReplayGradientSource` instead of
+            storing its gradients.  Not supported under FSDP.
     """
 
     def __init__(
@@ -412,12 +422,26 @@ class GradientStreamer(GradientSource):
         checkpoint_step: int = 0,
         hook_manager: HookManager | None = None,
         precondition: bool = False,
+        snapshots: TrajectorySnapshots | str | None = None,
     ) -> None:
         self._model = model
         self._dataset = dataset
         self._args = args
         self._batch_size = batch_size
         self.enable_update = enable_update
+        if snapshots is not None and not isinstance(snapshots, TrajectorySnapshots):
+            snapshots = TrajectorySnapshots(snapshots)
+        if snapshots is not None and not enable_update:
+            raise ValueError(
+                "snapshots= records a trajectory; needs enable_update=True."
+            )
+        if snapshots is not None and args.fsdp:
+            raise NotImplementedError(
+                "parameter snapshots are not supported under FSDP (the "
+                "parameters are sharded); use DDP or a single device.",
+            )
+        self._snapshots = snapshots
+        self._window_start: int = 0
         self._loss_fn = loss_fn if loss_fn is not None else _default_loss_fn
         self._optimizer = optimizer
         self._scheduler = scheduler
@@ -665,6 +689,17 @@ class GradientStreamer(GradientSource):
             raise RuntimeError("Call iter(streamer) before next(streamer).")
         batch = next(self._batch_iter)  # raises StopIteration at the end
         batch = self._to_device(batch)
+        if self._snapshots is not None:
+            # The parameters this micro-batch's gradient is taken at: those of
+            # the window start under accumulation (no update in between).
+            if self._accum_count == 0:
+                self._window_start = self._batch_index
+                self._snapshots.save_parameters(self._batch_index, self._model)
+            else:
+                self._snapshots.save_parameters(
+                    self._batch_index, self._model, same_as=self._window_start
+                )
+            self._snapshots.save_batch(self._batch_index, batch)
 
         # Re-align the (possibly shared) capture counter to THIS streamer's
         # next index: another streamer riding the same hooks may have advanced
@@ -731,12 +766,7 @@ class GradientStreamer(GradientSource):
         ``autocast_smart_context_manager`` / accelerate autocast).  No-op in
         full precision.
         """
-        if self._amp_dtype is None:
-            return contextlib.nullcontext()
-        device_type = (
-            "cuda" if (torch.cuda.is_available() and not self._args.use_cpu) else "cpu"
-        )
-        return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
+        return autocast_for(self._args)
 
     def _forward_backward(self, batch: object) -> torch.Tensor:
         """One forward + backward, mirroring ``Trainer.training_step``.
@@ -984,16 +1014,255 @@ class GradientStreamer(GradientSource):
         return model
 
     def _to_device(self, batch: object) -> object:
-        device = self._args.device
-        if isinstance(batch, dict):
-            return {
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                for k, v in batch.items()
-            }
-        if isinstance(batch, (list, tuple)):
-            return type(batch)(
-                v.to(device) if isinstance(v, torch.Tensor) else v for v in batch
+        return move_batch(batch, self._args.device)
+
+
+def autocast_for(args: AttributionArguments) -> AbstractContextManager:
+    """The mixed-precision context ``args`` asks for (``bf16``/``fp16``), or a
+    no-op in full precision.
+    """
+    dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else None
+    if dtype is None:
+        return contextlib.nullcontext()
+    device_type = "cuda" if (torch.cuda.is_available() and not args.use_cpu) else "cpu"
+    return torch.autocast(device_type=device_type, dtype=dtype)
+
+
+def move_batch(batch: object, device: torch.device | str) -> object:
+    """*batch* (a tensor, or a dict / list / tuple of them) on *device*."""
+    if isinstance(batch, dict):
+        return {
+            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+            for k, v in batch.items()
+        }
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(
+            v.to(device) if isinstance(v, torch.Tensor) else v for v in batch
+        )
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    return batch
+
+
+class _ReplayState:
+    """The hooks and the original parameters shared by every view of a replay."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: HookManagerConfig | None,
+        device: torch.device | str,
+    ) -> None:
+        self.model = model.to(device)
+        self.capture = CaptureCallback()
+        self.hm = HookManager(
+            model,
+            config=config
+            if config is not None
+            else HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[self.capture],
+        )
+        self.original = {
+            n: p.detach().to("cpu", copy=True)
+            for n, p in model.named_parameters()
+            if p.requires_grad
+        }
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.hm.remove()
+        with torch.no_grad():
+            for n, p in self.model.named_parameters():
+                if n in self.original:
+                    p.copy_(self.original[n].to(p.device, p.dtype))
+        self.model.zero_grad(set_to_none=True)
+        self.closed = True
+
+
+class ReplayGradientSource(GradientSource):
+    """Per-step blocks recomputed from a trajectory's snapshots.
+
+    For every requested step the stored parameters are loaded into *model*,
+    the stored batch is run forward and backward under the capture hooks,
+    and the resulting per-sample block is yielded -- the same block the
+    trajectory pass would have stored, at the cost of one backward pass per
+    step per iteration instead of ``batch x parameters`` values on disk.
+    ``reusable=True``: every pass reloads the same snapshots.
+
+    The hooks are registered on first use and stay registered across passes
+    (a sweep pulls one step at a time through :meth:`for_steps`); call
+    :meth:`close` -- or use the source as a context manager -- to remove
+    them and restore the parameters the model had before the first replay.
+    The model's ``.grad`` fields are overwritten by every replayed step.
+
+    Args:
+        model: The **unwrapped** model the trajectory was trained on, with
+            the same trainable parameters.
+        args: :class:`AttributionArguments`; supplies the device and the
+            mixed-precision setting the trajectory ran under.
+        snapshots: The snapshot store (or its directory).
+        loss_fn: ``(model, batch) -> scalar``, the training loss the
+            trajectory used; defaults to ``model(**batch).loss``.
+        config: Capture configuration; use the one the trajectory was
+            captured with so the blocks carry the same layers and reduction.
+        steps: Restrict to these stored steps (``None`` = all), replayed in
+            the order given.
+        layer_name: Restrict every block to these layers (``None`` = all).
+        train_mode: Run the forward in ``train()`` mode, as the trajectory
+            did (``False``: ``eval()``).  Layers that draw randomness
+            (dropout) redraw it, so their blocks reproduce the trajectory's
+            only in expectation.
+        desc: Progress-bar label (shown when *verbose*).
+        verbose: Show a per-step progress bar.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        args: AttributionArguments,
+        snapshots: TrajectorySnapshots | str,
+        *,
+        loss_fn: LossFn | None = None,
+        config: HookManagerConfig | None = None,
+        steps: Iterable[int] | None = None,
+        layer_name: str | list[str] | None = None,
+        train_mode: bool = True,
+        desc: str | None = None,
+        verbose: bool = False,
+        _state: _ReplayState | None = None,
+    ) -> None:
+        if args.world_size > 1:
+            raise NotImplementedError(
+                "ReplayGradientSource runs single-process; the replayed steps "
+                "are not sharded across ranks.",
             )
-        if isinstance(batch, torch.Tensor):
-            return batch.to(device)
-        return batch
+        if not isinstance(snapshots, TrajectorySnapshots):
+            snapshots = TrajectorySnapshots(snapshots)
+        self._model = model
+        self._args = args
+        self._snapshots = snapshots
+        self._loss_fn = loss_fn if loss_fn is not None else _default_loss_fn
+        self._config = config
+        available = snapshots.steps()
+        if steps is None:
+            self._steps = list(available)
+        else:
+            have = set(available)
+            self._steps = [int(t) for t in steps if int(t) in have]
+            if not self._steps:
+                raise ValueError(
+                    f"none of the requested steps {sorted(set(steps))[:10]} has "
+                    f"a snapshot; available: {available[:10]}...",
+                )
+        self._layer_name = (
+            [layer_name]
+            if isinstance(layer_name, str)
+            else (None if layer_name is None else list(layer_name))
+        )
+        self._train_mode = train_mode
+        self._desc = desc
+        self._verbose = verbose
+        self._state = _state
+
+    @property
+    def reusable(self) -> bool:
+        """Always ``True``: every pass reloads the same snapshots."""
+        return True
+
+    @property
+    def args(self) -> AttributionArguments:
+        """The :class:`AttributionArguments` the replay runs under."""
+        return self._args
+
+    @property
+    def snapshots(self) -> TrajectorySnapshots:
+        """The snapshot store the steps are replayed from."""
+        return self._snapshots
+
+    @property
+    def steps(self) -> list[int]:
+        """The steps this source replays, in replay order."""
+        return list(self._steps)
+
+    @property
+    def layer_name(self) -> list[str] | None:
+        """The layer restriction applied to every block (``None`` = all)."""
+        return None if self._layer_name is None else list(self._layer_name)
+
+    def __len__(self) -> int:
+        return len(self._steps)
+
+    def for_steps(self, steps: Iterable[int]) -> ReplayGradientSource:
+        """A view replaying only *steps* (in the order given), sharing this
+        source's hooks.
+        """
+        return ReplayGradientSource(
+            self._model,
+            self._args,
+            self._snapshots,
+            loss_fn=self._loss_fn,
+            config=self._config,
+            steps=steps,
+            layer_name=self._layer_name,
+            train_mode=self._train_mode,
+            desc=self._desc,
+            verbose=self._verbose,
+            _state=self._ensure_state(),
+        )
+
+    def _ensure_state(self) -> _ReplayState:
+        if self._state is None or self._state.closed:
+            self._state = _ReplayState(self._model, self._config, self._args.device)
+        return self._state
+
+    def __iter__(self) -> Iterator[StreamBatch]:
+        state = self._ensure_state()
+        model = state.model
+        steps: Iterable[int] = self._steps
+        if self._verbose and self._args.should_log:
+            from tqdm.auto import tqdm
+
+            steps = tqdm(
+                self._steps, desc=self._desc or "replay", unit="step", leave=False
+            )
+        with state.hm.collect():
+            state.hm.reset_steps()
+            for step in steps:
+                self._snapshots.load_parameters(step, model)
+                batch = move_batch(self._snapshots.load_batch(step), self._args.device)
+                model.train(self._train_mode)
+                model.zero_grad(set_to_none=True)
+                state.capture.record = None
+                with autocast_for(self._args):
+                    loss = self._loss_fn(model, batch)
+                loss.backward()
+                record = state.capture.record
+                if record is None:
+                    raise RuntimeError(
+                        f"No gradient was captured replaying step {step}. Ensure "
+                        "loss_fn runs the model on the batch and backward flows "
+                        "through the hooked layers.",
+                    )
+                grad = record.gradient
+                if self._layer_name is not None:
+                    grad = grad.select_layers(self._layer_name)
+                hashes = (
+                    list(record.input_hash)
+                    if isinstance(record.input_hash, list)
+                    else [record.input_hash]
+                )
+                yield step, grad, hashes
+
+    def close(self) -> None:
+        """Remove the hooks and restore the model's original parameters."""
+        if self._state is not None:
+            self._state.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.close()
+        return False

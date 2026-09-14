@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
     from dattri_llm.attribution.arguments import AttributionArguments
     from dattri_llm.gradient.hooks import HookManagerConfig
+    from dattri_llm.gradient.snapshots import TrajectorySnapshots
     from dattri_llm.gradient.streaming import GradientSource
     from dattri_llm.utils.cache import TensorCache
 
@@ -261,6 +262,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         checkpoint_step: int = 0,
         enable_update: bool = False,
         hook_config: HookManagerConfig | None = None,
+        snapshots: TrajectorySnapshots | None = None,
     ) -> GradientStreamer:
         """Live train gradients: a streamer over *train_dataset*.
 
@@ -272,6 +274,8 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             enable_update: Train the model as it streams (a trajectory; each
                 optimizer step is its own step label) instead of a frozen probe.
             hook_config: Capture configuration; ``None`` uses the default.
+            snapshots: Under ``enable_update``, record every step's
+                parameters and batch here so the trajectory can be replayed.
         """
         return GradientStreamer(
             self.require_task("attribute").get_model(),
@@ -282,6 +286,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             loss_fn=self.train_loss_fn(),
             checkpoint_step=checkpoint_step,
             config=hook_config,
+            snapshots=snapshots,
         )
 
     def generate_test_rep(

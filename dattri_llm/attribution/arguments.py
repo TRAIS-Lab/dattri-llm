@@ -364,6 +364,21 @@ class AttributionArguments:
         },
     )
 
+    recompute_gradients: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Trajectory attributors (DVEmb, AdamW-influence): store each "
+                "step's parameters and batch during the trajectory and "
+                "recompute its per-sample gradients at attribution time, "
+                "instead of storing the gradients.  Trades one backward pass "
+                "per step per sweep for a store that is independent of the "
+                "batch size and holds no gradients -- what makes an "
+                "unprojected sweep affordable."
+            ),
+        },
+    )
+
     # -- Distributed / large-model --------------------------------------------
 
     ddp_find_unused_parameters: bool | None = field(

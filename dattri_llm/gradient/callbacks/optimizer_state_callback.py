@@ -9,9 +9,10 @@ import torch
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
 from dattri_llm.gradient.optimizer_state import OptimizerSnapshot
+from dattri_llm.gradient.snapshots import LazyDynamics, TrajectorySnapshots
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
 
     from torch import nn
 
@@ -37,6 +38,10 @@ class OptimizerStateCallback(HookManagerCallback):
             ``None`` reads every coordinate of every layer.
         layers: Restrict to these layer names (default: every layer in the
             record).
+        snapshots: Write each side of every step's moments to this
+            :class:`~dattri_llm.gradient.snapshots.TrajectorySnapshots` as
+            it is read, instead of holding all of them in memory; the
+            dynamics are then read back from disk one step at a time.
     """
 
     def __init__(
@@ -46,6 +51,7 @@ class OptimizerStateCallback(HookManagerCallback):
         *,
         projection: dict[str, dict] | None = None,
         layers: Iterable[str] | None = None,
+        snapshots: TrajectorySnapshots | None = None,
     ) -> None:
         self._model = model
         self._optimizer_src = optimizer
@@ -54,6 +60,8 @@ class OptimizerStateCallback(HookManagerCallback):
         self._layers = None if layers is None else set(layers)
         self._projector = ops.DattriProjector()
         self._coords: dict[str, torch.Tensor | None] = {}
+        self._store = snapshots
+        self._layers_at: dict[int, list[str]] = {}
         self.pre: dict[int, dict] = {}
         self.post: dict[int, dict] = {}
 
@@ -105,30 +113,47 @@ class OptimizerStateCallback(HookManagerCallback):
 
     def on_step_end(self, record: GradientRecord) -> None:
         """Pre-step moments of every hooked layer, keyed by the record's step."""
-        self.pre[record.step] = self._read(record.gradient.data.keys())
+        entry = self._read(record.gradient.data.keys())
+        if self._store is not None:
+            self._store.save_dynamics(record.step, "pre", entry)
+            self._layers_at[record.step] = list(entry["layers"])
+        else:
+            self.pre[record.step] = entry
 
     def record_post(self, step: int) -> None:
         """Post-step moments of the layers seen at *step* (call after ``step()``)."""
+        if self._store is not None:
+            layers = self._layers_at.get(step)
+            if layers is None:
+                raise KeyError(f"no pre-step snapshot recorded for step {step}.")
+            self._store.save_dynamics(step, "post", self._read(layers))
+            return
         if step not in self.pre:
             raise KeyError(f"no pre-step snapshot recorded for step {step}.")
         self.post[step] = self._read(self.pre[step]["layers"].keys())
 
-    def dynamics(self) -> dict[int, dict]:
+    def dynamics(self) -> Mapping[int, dict]:
         """``{step: {"pre", "post", "step", "lr", "betas", "eps", "weight_decay"}}``
-        for every step with both snapshots.
+        for every step with both snapshots -- a plain dict, or a mapping
+        that reads each step from the snapshot store on access.
         """
-        out = {}
-        for step, pre in self.pre.items():
-            if step not in self.post:
-                continue
-            post = self.post[step]
-            out[step] = {
-                "pre": pre["layers"],
-                "post": post["layers"],
-                "step": post["step"],
-                "lr": pre["lr"],
-                "betas": tuple(pre["betas"]),
-                "eps": pre["eps"],
-                "weight_decay": pre["weight_decay"],
-            }
-        return out
+        if self._store is not None:
+            return LazyDynamics(self._store, assemble_dynamics)
+        return {
+            step: assemble_dynamics(pre, self.post[step])
+            for step, pre in self.pre.items()
+            if step in self.post
+        }
+
+
+def assemble_dynamics(pre: dict, post: dict) -> dict:
+    """One step's dynamics entry from its two moment snapshots."""
+    return {
+        "pre": pre["layers"],
+        "post": post["layers"],
+        "step": post["step"],
+        "lr": pre["lr"],
+        "betas": tuple(pre["betas"]),
+        "eps": pre["eps"],
+        "weight_decay": pre["weight_decay"],
+    }
