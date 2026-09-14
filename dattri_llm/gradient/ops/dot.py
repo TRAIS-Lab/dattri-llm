@@ -206,18 +206,54 @@ def cross_gram_per_token(
     return torch.einsum("btk,btd,ckd->btc", a1_f, g1_f, m2)  # (B1, T1, B2)
 
 
+def cross_gram_per_token_dense(
+    a1: torch.Tensor,
+    g1: torch.Tensor,
+    m2: torch.Tensor,
+    layer_type: str,
+) -> torch.Tensor:
+    """:func:`cross_gram_per_token` with side 2 already **dense**: *m2* is the
+    ``(B2, D)`` per-sample gradient block in :func:`materialize`'s layout --
+    e.g. a materialized test block, or one preconditioned by an attributor
+    (K-FAC's ``G^-1 dW A^-1``), which is what makes every bilinear score
+    decompose over side 1's token positions the same way.  Returns
+    ``(B1, T1, B2)``.
+    """
+    b2 = m2.shape[0]
+    if is_embedding(layer_type):
+        tok1 = a1  # (B1, T1) int
+        g1_f, m2 = dtypes.align(to_3d(g1), m2)
+        e = g1_f.shape[-1]
+        rows = m2.reshape(b2, -1, e)[:, tok1.reshape(-1)]  # (B2, B1*T1, E)
+        rows = rows.reshape(b2, *tok1.shape, e)
+        return torch.einsum("bte,cbte->btc", g1_f, rows)
+
+    a1_f, g1_f, m2 = dtypes.align(to_3d(a1), to_3d(g1), m2)
+    if is_norm(layer_type):
+        return torch.einsum("btd,cd->btc", a1_f * g1_f, m2)
+    if is_conv_transpose(layer_type):
+        c_in, p = a1_f.shape[-1], g1_f.shape[-1]
+        m2 = m2.reshape(b2, c_in, p)
+        return torch.einsum("blc,blp,ncp->bln", a1_f, g1_f, m2)
+    d_out, d_in = g1_f.shape[-1], a1_f.shape[-1]
+    m2 = m2.reshape(b2, d_out, d_in)
+    return torch.einsum("btk,btd,cdk->btc", a1_f, g1_f, m2)
+
+
 def cross_dot_per_token(
     f1: Factorized,
-    f2: Factorized,
+    f2: Factorized | torch.Tensor,
     layer_type: str,
     include_bias: bool = True,
 ) -> torch.Tensor:
-    """Per-token-position cross-gram on two :class:`Factorized` (batch-first-safe).
+    """Per-token-position cross-gram of a :class:`Factorized` side 1 against
+    side 2 in whatever form it holds (batch-first-safe).
 
-    Returns ``(B1, T1, B2)`` -- side-1 token positions preserved; see
-    :func:`cross_gram_per_token`.
+    Returns ``(B1, T1, B2)`` -- side-1 token positions preserved.  A factorized
+    side 2 goes through :func:`cross_gram_per_token`, a dense ``(B2, D)`` side 2
+    through :func:`cross_gram_per_token_dense`.
     """
-    b1, b2 = f1.as_batch_first(), f2.as_batch_first()
+    b1 = f1.as_batch_first()
     a1, g1 = preprocess_factors(
         b1.activation,
         b1.pre_activation_grad,
@@ -225,6 +261,11 @@ def cross_dot_per_token(
         b1.module_kwargs,
         include_bias,
     )
+    if isinstance(f2, torch.Tensor):
+        return cross_gram_per_token_dense(
+            a1, g1, f2.reshape(f2.shape[0], -1), layer_type
+        )
+    b2 = f2.as_batch_first()
     a2, g2 = preprocess_factors(
         b2.activation,
         b2.pre_activation_grad,
@@ -525,6 +566,69 @@ def layerwise_cross_dot(
         expanded = _expand_broadcast(matrix, b_tr, b_te)
         total = expanded.clone() if total is None else total + expanded
     return total
+
+
+def layerwise_cross_dot_per_token(
+    train: Gradient,
+    test: Gradient,
+    *,
+    layers: Iterable[str] | None = None,
+    reduce: str = "sum",
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    """Layer-by-layer per-token cross-gram of two gradient blocks: the
+    ``(B_train, T_train, B_test)`` contribution of every *train* token position
+    to :func:`layerwise_cross_dot`, which it sums back to exactly over ``T``.
+
+    The train side must hold every scored layer **factorized with a token
+    axis** (``"batch_token"`` indexing): a materialized, projected-dense or
+    batch-level layer has contracted the positions away and raises, rather
+    than silently dropping out of the score.  The test side may be factorized
+    or dense per layer -- so a transformed (materialized, preconditioned) test
+    block scores exactly as in the instance-level loop.
+
+    Args:
+        train: The row-side block.
+        test: The column-side block, typically the transformed test rep.
+        layers: Restrict to these layer names; ``None`` scores every shared
+            layer.
+        reduce: ``"sum"`` returns the whole-model ``(B_train, T_train, B_test)``
+            tensor (every layer must agree on ``T``); ``"none"`` returns
+            ``{layer: tensor}``.
+
+    Raises:
+        ValueError: On a train layer without a token axis, on layers that
+            disagree on the token axis under ``reduce="sum"``, or when no layer
+            is shared.
+    """
+    if reduce not in {"sum", "none"}:
+        raise ValueError("reduce must be 'sum' or 'none'")
+    names = list(train.data) if layers is None else list(layers)
+    per_layer: dict[str, torch.Tensor] = {}
+    for name in names:
+        if name not in train.data or name not in test.data:
+            continue
+        tr = train.data[name]
+        if isinstance(tr, torch.Tensor) or train.indexing[name] != "batch_token":
+            raise ValueError(
+                f"layer {name!r} has no token axis on the train side "
+                f"(stored {train.representation[name]}, indexing "
+                f"{train.indexing[name]!r}); token-level attribution needs the "
+                "train gradients captured factorized.",
+            )
+        per_layer[name] = cross_dot_per_token(
+            tr, test.data[name], train.layer_types[name]
+        )
+    if reduce == "none":
+        return per_layer
+    if not per_layer:
+        raise ValueError("No shared layers between the two gradient blocks.")
+    shapes = {tuple(v.shape) for v in per_layer.values()}
+    if len(shapes) > 1:
+        raise ValueError(
+            "Layers disagree on the token axis, so their per-token contributions "
+            f"cannot be summed: {sorted(shapes)}.  Use reduce='none'.",
+        )
+    return torch.stack(list(per_layer.values())).sum(0)
 
 
 # --------------------------------------------------------------------------- #

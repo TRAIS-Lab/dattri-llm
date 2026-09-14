@@ -10,6 +10,8 @@ identical to the cached (``loop_over_test=False``) path.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 from dattri.task import AttributionTask
@@ -379,6 +381,73 @@ class TestCompactKFAC:
         )
 
 
+class TestCompactEKFAC(TestCompactKFAC):
+    """EK-FAC over a materialized "logra" store: the eigenbases come from the
+    projected (A, G) collected at capture (``fit(covariances=...)``), the
+    corrected spectrum from one sweep over the compact store.  Must match
+    EK-FAC over a factorized logra store of the same projected gradients.
+    """
+
+    def test_compact_matches_factorized(self, tmp_path):
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        # -- factorized reference: two sweeps over the per-token factors --
+        task, tr, te = _make_task_and_data()
+        attr_f = EKFACAttributor(_args(tmp_path / "f"), task=task)
+        train_f = self._collect(attr_f, tr, tmp_path / "tr_f", "logra")
+        test_f = self._collect(attr_f, te, tmp_path / "te_f", "logra")
+        ids_f, s_fac = attr_f.attribute_from_cache(
+            train_f,
+            test_f,
+            damping=self.DAMP,
+        ).agnostic_matrix()
+
+        # -- compact: covariances at capture, spectrum from the dense store --
+        task, tr, te = _make_task_and_data()
+        attr_m = EKFACAttributor(_args(tmp_path / "m"), task=task)
+        cov = KroneckerCovarianceCallback()
+        train_m = self._collect(
+            attr_m,
+            tr,
+            tmp_path / "tr_m",
+            "logra",
+            "materialized",
+            cov=cov,
+        )
+        test_m = self._collect(attr_m, te, tmp_path / "te_m", "logra", "materialized")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # no "stored materialized" fallback
+            fisher = attr_m.fit(
+                train_m, str(tmp_path / "fisher"), covariances=cov.result()
+            )
+        ids_m, s_mat = attr_m.attribute_from_cache(
+            train_m,
+            test_m,
+            damping=self.DAMP,
+            fisher_dir=fisher,
+        ).agnostic_matrix()
+
+        assert ids_f == ids_m
+        assert torch.allclose(s_fac, s_mat, atol=1e-4, rtol=1e-3), (
+            f"max diff {(s_fac - s_mat).abs().max():.2e}"
+        )
+
+    def test_supplied_covariances_must_cover_the_store(self, tmp_path):
+        # Supplied covariances replace the covariance sweep, so a factorized
+        # layer they leave out has no eigenbasis: an error, not a silent drop.
+        # (A materialized layer they leave out keeps the documented
+        # dense-Fisher fallback of ``kfac_layers``.)
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        task, tr, _te = _make_task_and_data()
+        attr = EKFACAttributor(_args(tmp_path / "m"), task=task)
+        cov = KroneckerCovarianceCallback()
+        train = self._collect(attr, tr, tmp_path / "tr", "logra", cov=cov)
+        partial = dict(list(cov.result().items())[:1])
+        with pytest.raises(ValueError, match="must cover every K-FAC-eligible"):
+            attr.fit(train, str(tmp_path / "fisher"), covariances=partial)
+
+
 class TestBatchedScoring:
     """score_sources always re-batches the train side into
     ``per_device_train_batch_size`` groups; the batch size only affects
@@ -429,9 +498,9 @@ class TestBatchedScoring:
                 batch_size=batch,  # the scoring batch
             )
 
-        s1, ids1, steps1, tids1 = run(1)  # one stored (3-doc) block per batch
-        s5, ids5, steps5, _ = run(5)  # 5-doc batches (regroups 3-doc blocks)
-        sn, idsn, stepsn, tidsn = run(100)  # whole 12-doc store as one batch
+        s1, ids1, steps1, tids1, _ = run(1)  # one stored (3-doc) block per batch
+        s5, ids5, steps5, _, _ = run(5)  # 5-doc batches (regroups 3-doc blocks)
+        sn, idsn, stepsn, tidsn, _ = run(100)  # whole 12-doc store as one batch
         assert (ids1, steps1, tids1) == (idsn, stepsn, tidsn)
         assert (ids1, steps1) == (ids5, steps5)
 
@@ -461,7 +530,7 @@ class TestBatchedScoring:
         args = _args(tmp_path / "o")
         train = DiskGradientSource(GradientStorageManager(str(tmp_path / "fac")), args)
         test = DiskGradientSource(GradientStorageManager(str(tmp_path / "fac")), args)
-        scores, ids, _steps, _tids = score_sources(
+        scores, ids, _steps, _tids, _ = score_sources(
             train,
             test,
             args.device,

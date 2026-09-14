@@ -277,7 +277,7 @@ class TestScoreSources:
 
     def test_scores_match_oracle(self):
         train, test = self._sources()
-        scores, row_ids, row_steps, test_ids = score_sources(
+        scores, row_ids, row_steps, test_ids, _ = score_sources(
             train,
             test,
             "cpu",
@@ -293,7 +293,7 @@ class TestScoreSources:
         t_a, t_b = make_materialized_block(seed=1), make_materialized_block(seed=2)
         # Column order is the order hashes are first seen across test blocks.
         test = FakeSource([(0, t_a, ["a0", "a1"]), (0, t_b, ["b0", "b1"])])
-        scores, _, _, test_ids = score_sources(
+        scores, _, _, test_ids, _ = score_sources(
             train,
             test,
             "cpu",
@@ -307,7 +307,7 @@ class TestScoreSources:
     @pytest.mark.parametrize("batch_size", [1, 3, 100])
     def test_scores_and_rows_invariant_to_batch_size(self, batch_size):
         train, test = self._sources(n_train=4, n_test=1)
-        scores, ids, steps, _ = score_sources(
+        scores, ids, steps, _, _ = score_sources(
             train,
             test,
             "cpu",
@@ -329,7 +329,7 @@ class TestScoreSources:
         test = FakeSource(
             [(0, make_materialized_block(seed=99, b=3), ["t0", "t1", "t2"])]
         )
-        scores, ids, steps, _ = score_sources(
+        scores, ids, steps, _, _ = score_sources(
             train,
             test,
             "cpu",
@@ -342,7 +342,7 @@ class TestScoreSources:
 
     def test_empty_train_source(self):
         train, test = self._sources(n_train=0, n_test=1)
-        scores, ids, steps, test_ids = score_sources(
+        scores, ids, steps, test_ids, _ = score_sources(
             train,
             test,
             "cpu",
@@ -421,7 +421,7 @@ class TestScoreSources:
             return _dot_inner_product(train_rep, test_rep)
 
         train, test = self._sources(n_train=2, n_test=3)
-        scores, _, _, test_ids = score_sources(
+        scores, _, _, test_ids, _ = score_sources(
             train,
             test,
             "cpu",

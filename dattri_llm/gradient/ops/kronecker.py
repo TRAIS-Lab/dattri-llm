@@ -273,13 +273,24 @@ def kfac_cross(
 
 
 def ekfac_materialize(
-    f: Factorized,
+    f: Factorized | torch.Tensor,
     layer_type: str,
     U_A: torch.Tensor,
     U_G: torch.Tensor,
     include_bias: bool = True,
 ) -> torch.Tensor:
-    """:func:`ekfac_materialize_factors` on a :class:`Factorized` (batch-first-safe)."""
+    """:func:`ekfac_materialize_factors` on a :class:`Factorized` (batch-first-safe),
+    or the same rotation applied to an already **materialized** block.
+
+    A dense *f* is one per-sample gradient matrix per row, flattened in the
+    layout :func:`materialize_factors` uses for *layer_type* -- e.g. a
+    materialized ``"logra"`` capture, ``(B, k_g * k_a)`` laid out ``(k_g, k_a)``
+    row-major.  Rotating the token-summed matrix, ``U_G^T dW U_A``, equals
+    rotating each token's factors and summing, so the result is the same
+    ``(B, D)`` eigenbasis coordinates either way.
+    """
+    if isinstance(f, torch.Tensor):
+        return _ekfac_rotate_materialized(f, layer_type, U_A, U_G)
     bf = f.as_batch_first()
     return ekfac_materialize_factors(
         bf.activation,
@@ -290,6 +301,31 @@ def ekfac_materialize(
         bf.module_kwargs,
         include_bias,
     )
+
+
+def _ekfac_rotate_materialized(
+    block: torch.Tensor,
+    layer_type: str,
+    U_A: torch.Tensor,
+    U_G: torch.Tensor,
+) -> torch.Tensor:
+    """``vec(U_G^T dW U_A)`` per row of a materialized ``(B, D)`` block.
+
+    The inverse of the rotation :func:`ekfac_precondition` undoes, in the
+    same per-family layout: linear/conv blocks are ``(d_out, d_in)``-major
+    (``U_G`` on the left), conv-transpose blocks ``(C_in, P)``-major (``U_A``
+    on the left).
+    """
+    batch = block.shape[0]
+    if is_conv_transpose(layer_type):
+        c_in, p = U_A.shape[0], U_G.shape[0]
+        d_w = block.reshape(batch, c_in, p).float()
+        M = torch.einsum("ce,bcp,pf->bef", U_A.float(), d_w, U_G.float())
+        return M.reshape(batch, c_in * p)
+    d_out, d_in = U_G.shape[0], U_A.shape[0]
+    d_w = block.reshape(batch, d_out, d_in).float()
+    M = torch.einsum("oe,boi,if->bef", U_G.float(), d_w, U_A.float())
+    return M.reshape(batch, d_out * d_in)
 
 
 def kfac_precondition(

@@ -224,6 +224,7 @@ class TestTracInOnDisk:
             "normalized_grad": False,
             "selected_training_steps": [0],
             "sample_id_key": {"train": None, "test": None},
+            "attribution_granularity": "instance",
         }
 
         gradcos = _make_attr(tmp_path / "b").attribute_from_cache(

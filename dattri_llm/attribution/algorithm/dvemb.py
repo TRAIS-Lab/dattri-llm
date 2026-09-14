@@ -829,7 +829,7 @@ class DVEmbAttributor(TrajectoryAttributor):
                 # The embeddings are an ordinary single-shot source; the
                 # score is the inherited inner product against the dense
                 # test gradients.
-                scores, row_train_ids, row_steps, test_ids = self.score_sources(
+                scores, row_train_ids, row_steps, test_ids, _ = self.score_sources(
                     embeddings,
                     test,
                     transform_test=_dense_float,

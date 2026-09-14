@@ -71,28 +71,30 @@ class CustomNet(nn.Module):
 
 # Per-layer projection config.  Three styles exist, chosen per layer by
 # ``style``:
-#   * "logra_factorized" (LoGRA) projects the two factors independently and the
-#     layer stays factorized at width proj_dim -- defined for outer-product
-#     gradients (linear/conv families, embeddings via one-hot inputs);
-#   * "logra_materialized" LoGRA-projects then materializes the factors into a
-#     compact (B, proj_dim*proj_dim) block (smaller on disk, no per-token
-#     structure);
-#   * "materialized" (TRAK) materializes the per-sample weight gradient and
-#     projects it to a dense (B, proj_dim) block -- required for norm layers.
+#   * "logra" projects the two factors independently (a Kronecker projection
+#     of the gradient) -- defined for outer-product gradients (linear/conv
+#     families, embeddings via one-hot inputs).  Whether the layer then stays
+#     factorized at width proj_dim or is materialized into a compact
+#     (B, proj_dim*proj_dim) block is the config's ``capture_style``
+#     ("factorized", "materialized", or "auto" for the cheaper of the two);
+#   * "dense" materializes the per-sample weight gradient and projects it
+#     with one matrix to a dense (B, proj_dim) block -- required for norm
+#     layers;
+#   * "mask" keeps proj_dim fixed random coordinates of the gradient.
 # "__default__" covers every hooked layer without its own entry.  Keep
 # ``proj_seed`` fixed and the projection device consistent across everything
 # scored together: different seeds (or dattri's CPU vs CUDA projectors) are
 # different projections.
 PROJ_KWARGS = {
-    "__default__": {  # LoGRA: project both factors, stay factorized
-        "style": "logra_factorized",
+    "__default__": {  # project both factors, stay factorized
+        "style": "logra",
         "proj_dim": PROJ_DIM,
         "proj_max_batch_size": 8,
         "proj_type": "rademacher",
         "proj_seed": 7,
     },
-    "norm": {  # TRAK: materialize the per-sample gradient, then project
-        "style": "materialized",
+    "norm": {  # materialize the per-sample gradient, then project
+        "style": "dense",
         "proj_dim": PROJ_DIM,
         "proj_max_batch_size": 8,
         "proj_type": "rademacher",
@@ -152,12 +154,12 @@ if __name__ == "__main__":
     # factors on the fly, so the raw factors are never buffered and every
     # projected layer's stored width becomes proj_dim regardless of its size.
     projected = collect_one_step(
-        HookManagerConfig(linear_io=REGISTER_ALL, projection=PROJ_KWARGS),
+        HookManagerConfig(linear_io=REGISTER_ALL, projection_kwargs=PROJ_KWARGS),
         batch,
     )
     n_proj = describe(
         projected,
-        "2. Capture-time projection (LoGRA default, TRAK norm)",
+        "2. Capture-time projection (logra default, dense norm)",
     )
     print(
         f"stored payload: {n_proj}/{n_raw} elements ({n_proj / n_raw:.0%}); "
@@ -198,16 +200,16 @@ if __name__ == "__main__":
     mixed = collect_one_step(
         HookManagerConfig(
             linear_io=REGISTER_ALL,
-            projection={
+            projection_kwargs={
                 "mlp.fc1": {  # wide layer, generous budget
-                    "style": "logra_factorized",
+                    "style": "logra",
                     "proj_dim": 128,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
                     "proj_seed": 7,
                 },
                 "mlp.fc2": {  # same family, tighter budget
-                    "style": "logra_factorized",
+                    "style": "logra",
                     "proj_dim": 32,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -252,4 +254,4 @@ if __name__ == "__main__":
 
     # Declared layers flow through projection like any native layer.
     custom_projected = custom.project(random_project, {"norm": PROJ_KWARGS["norm"]})
-    print(f"norm projected (TRAK): {tuple(custom_projected.data['norm'].shape)}")
+    print(f"norm projected (dense): {tuple(custom_projected.data['norm'].shape)}")

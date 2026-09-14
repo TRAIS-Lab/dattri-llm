@@ -30,3 +30,21 @@ persisted. The full `(num_train, num_test)` matrix is read back with
 ```bash
 python examples/attribution/attribution_on_the_fly.py
 ```
+
+## `token_attribution.py` — token-level attribution
+
+The factorized gradient keeps the token axis, so a training text's score
+against a query decomposes exactly over the training text's token positions —
+for every inner-product attributor, since each score is bilinear in the
+training gradient. Passing `attribution_granularity="token"` to `attribute`
+(or `attribute_from_cache`) returns one score row per training token
+position instead of one per training text; `score.token_scores(train_hash)`
+reads a text's positions back, and the instance-level accessors
+(`agnostic_matrix`, ...) of such a score sum the positions, so they give the
+ordinary scores. The example runs TracIn (GradDot) and K-FAC on tiny GPT-2
+against one query and prints each training text as a heatmap in the
+terminal: red tokens push the query's loss down, blue tokens push it up.
+
+```bash
+python examples/attribution/token_attribution.py
+```

@@ -133,6 +133,10 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         self._fisher_saw_embedding: set[str] = set()
         self._skipped_materialized: set[str] = set()
         self._direct_norm_layers: bool = False
+        # Covariances handed to :meth:`fit` (collected at capture); the layers
+        # they cover are K-FAC-eligible even when the store is materialized.
+        self._capture_covariances: dict[str, tuple[torch.Tensor, torch.Tensor]] | None
+        self._capture_covariances = None
 
     # ------------------------------------------------------------------ #
     # Subclass hooks                                                      #
@@ -227,8 +231,10 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 "to build the Kronecker covariances from.  Preconditioning "
                 "them with the direct dense empirical Fisher (FIM) instead, "
                 f"bounded by direct_fim_max_params={max_params}: "
-                f"{sorted(self._skipped_materialized)}.  Collect with "
-                "factorize=True (LoGRA) to keep them K-FAC-eligible.",
+                f"{sorted(self._skipped_materialized)}.  Capture them "
+                "factorized, or hand their capture-time covariances "
+                "(KroneckerCovarianceCallback) to fit(covariances=...), to "
+                "keep them K-FAC-eligible.",
                 stacklevel=2,
             )
         raw_fisher = self._finalize_fisher_raw(fisher_acc, max_params)
@@ -343,19 +349,23 @@ class KroneckerAttributor(BaseInnerProductAttributor):
     # ------------------------------------------------------------------ #
 
     def kfac_layers(self, grad: Gradient) -> list[str]:
-        """Layer names eligible for K-FAC: linear/conv **stored factorized**.
+        """Layer names eligible for K-FAC: linear/conv **stored factorized**,
+        or stored materialized with covariances supplied to :meth:`fit`.
 
-        A layer of eligible type stored materialized -- e.g. a TRAK-projected
+        A layer of eligible type stored materialized -- e.g. a ``"dense"``
         capture, which keeps its layer type but holds a dense ``(B, proj_dim)``
         tensor -- has no ``(a, g)`` factors to build the covariances from.
-        Such layers are recorded (warned about once per fit) and left to the
-        direct-Fisher fallback.
+        Unless its covariances were collected at capture and handed to
+        :meth:`fit` (a materialized ``"logra"`` store), such a layer is
+        recorded (warned about once per fit) and left to the direct-Fisher
+        fallback.
         """
+        supplied = self._capture_covariances or {}
         names = []
         for name, value in grad.data.items():
             if not ops.is_kfac_eligible(grad.layer_types[name]):
                 continue
-            if isinstance(value, Factorized):
+            if isinstance(value, Factorized) or name in supplied:
                 names.append(name)
             else:
                 self._skipped_materialized.add(name)
@@ -369,11 +379,14 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         ``non_kfac_strategy="direct"``.  Batch-level ``param_grad`` tensors
         carry no per-sample axis and are excluded.
         """
+        supplied = self._capture_covariances or {}
         names = []
         for name, value in grad.data.items():
             lt = grad.layer_types[name]
             if lt == ops.PARAM_GRAD_TYPES:
                 continue
+            if isinstance(value, torch.Tensor) and name in supplied:
+                continue  # materialized but K-FAC-preconditioned (see kfac_layers)
             if isinstance(value, torch.Tensor) or (
                 self._direct_norm_layers and ops.is_norm(lt)
             ):
@@ -540,6 +553,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         direct_fim_max_params: int = 4096,
         layer_name: str | list[str] | None = None,
         verbose: bool = False,
+        covariances: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> str:
         """Fit and persist the **damping-free** Fisher factors, once.
 
@@ -561,6 +575,17 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             direct_fim_max_params: Parameter-count cap for the dense Fisher.
             layer_name: Restrict the fit to this subset of the stored layers.
             verbose: Show progress bars on the logging process.
+            covariances: Raw ``{layer: (A, G)}`` Kronecker covariances collected
+                during capture by a
+                :class:`~dattri_llm.gradient.callbacks.KroneckerCovarianceCallback`.
+                They replace the covariance sweep over the store: K-FAC takes
+                them as its factors, EK-FAC eigendecomposes them and sweeps the
+                store once for the corrected spectrum.  The layers they cover
+                may be stored **materialized** (a materialized ``"logra"``
+                capture holds the ``k_g x k_a`` projected gradient the
+                projected covariances precondition), so a compact store is
+                enough for either method.  Every K-FAC-eligible layer of the
+                store must be covered.
 
         Returns:
             ``fisher_dir``.
@@ -573,7 +598,15 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             verbose=verbose,
             desc=f"{self.algorithm}: fitting Fisher",
         )
-        raw_factors, raw_fisher = self.fit_raw(train)
+        self._capture_covariances = (
+            None
+            if covariances is None
+            else self._move_raw(covariances, self.args.device)
+        )
+        try:
+            raw_factors, raw_fisher = self.fit_raw(train)
+        finally:
+            self._capture_covariances = None
         return self.save_fisher(raw_factors, fisher_dir, fisher=raw_fisher)
 
     # ------------------------------------------------------------------ #
@@ -589,6 +622,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         verbose: bool = False,
         loop_over_test: bool = False,
         gradient_cache_residency: str | None = None,
+        attribution_granularity: str = "instance",
         damping: float = 1e-3,
         non_kfac_strategy: NonKfacStrategy = "ignore",
         direct_fim_max_params: int = 4096,
@@ -611,6 +645,9 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             verbose: Accepted for API parity.
             loop_over_test: Re-stream the test blocks per train block.
             gradient_cache_residency: See above.
+            attribution_granularity: ``"instance"`` (default) or ``"token"``
+                (one row per training token position: the preconditioned
+                query against each position's factors).
             damping: Tikhonov term added to each covariance factor (K-FAC) or
                 to the corrected eigenvalues (EK-FAC) before inversion.
             non_kfac_strategy: ``"ignore"`` (default) skips norm layers;
@@ -629,6 +666,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             loop_over_test=loop_over_test,
             enable_update=False,
             gradient_cache_residency=gradient_cache_residency,
+            attribution_granularity=attribution_granularity,
             damping=damping,
             non_kfac_strategy=non_kfac_strategy,
             direct_fim_max_params=direct_fim_max_params,
@@ -645,6 +683,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         verbose: bool = False,
         loop_over_test: bool = False,
         algorithm_meta: dict | None = None,
+        attribution_granularity: str = "instance",
         damping: float = 1e-3,
         preconditioned_test_dir: str | None = None,
         preconditioned_test_cache_residency: str | None = None,
@@ -668,6 +707,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             loop_over_test: Re-stream + rebuild the test reps per train block
                 (low memory) instead of caching them once (default).
             algorithm_meta: Extra entries for the score's metadata.
+            attribution_granularity: As in :meth:`attribute`.
             damping: As in :meth:`attribute`.
             preconditioned_test_dir: With ``loop_over_test=True``, persist the
                 preconditioned test representations to this **on-disk**
@@ -725,6 +765,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 verbose=verbose,
                 loop_over_test=loop_over_test,
                 algorithm_meta=meta,
+                attribution_granularity=attribution_granularity,
             )
             return self._stamp_direct_layers(result)
 
@@ -756,11 +797,14 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 store,
                 desc=f"{self.algorithm}: preconditioned test",
             )
-            scores, row_train_ids, row_steps, test_ids = self.score_sources(
-                train,
-                precond,
-                loop_over_test=True,
-                transform_test=lambda block: block,  # already preconditioned
+            scores, row_train_ids, row_steps, test_ids, row_token_ids = (
+                self.score_sources(
+                    train,
+                    precond,
+                    loop_over_test=True,
+                    transform_test=lambda block: block,  # already preconditioned
+                    attribution_granularity=attribution_granularity,
+                )
             )
         result = self.build_score(
             scores,
@@ -770,9 +814,11 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             algorithm_meta={
                 "selected_training_steps": train.steps,
                 **self.stores_meta(train_store, test_store),
+                "attribution_granularity": attribution_granularity,
                 **meta,
             },
             layer_name=train.layer_name,
+            row_token_ids=row_token_ids,
         )
         return self._stamp_direct_layers(result)
 
@@ -871,14 +917,21 @@ class KFACAttributor(KroneckerAttributor):
         train_source: GradientSource,
         fisher_acc: ops.FisherAccumulator,
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """One sweep: the raw ``{layer: (A, G)}`` covariances (undamped)."""
+        """One sweep: the raw ``{layer: (A, G)}`` covariances (undamped).
+
+        Layers whose covariances were handed to :meth:`fit` are taken as
+        given; the sweep accumulates the others and feeds the direct Fisher.
+        """
+        supplied = self._capture_covariances or {}
         kron = ops.KroneckerAccumulator()
         for _step, train_block, _ in train_source:
             train_g = train_block.to(self.args.device)
-            kron.update(train_g, self.kfac_layers(train_g))
+            layers = [n for n in self.kfac_layers(train_g) if n not in supplied]
+            kron.update(train_g, layers)
             # Reuse this single sweep to fit the direct Fisher.
             self.accumulate_fisher(fisher_acc, train_g)
-        return kron.result()  # {layer: (A, G)} raw covariances (undamped)
+        # {layer: (A, G)} raw covariances (undamped)
+        return {**kron.result(), **supplied}
 
     def damp(  # noqa: PLR6301 - subclass hook
         self,
@@ -959,26 +1012,46 @@ class EKFACAttributor(KroneckerAttributor):
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Two sweeps: ``{layer: (U_A, U_G, lambda_raw)}`` -- the Kronecker
         eigenbases and the undamped empirical spectrum in that basis.
+
+        With covariances handed to :meth:`fit` the first sweep is skipped:
+        the eigenbases come from them, and the single remaining sweep fits
+        the spectrum (and the direct Fisher).  That sweep accepts a
+        materialized store, since the rotation into the eigenbasis of a
+        token-summed gradient equals the summed rotation of its tokens.
         """
         device = self.args.device
-        # Pass 1 -- Kronecker covariance factors and their eigenbases (and the
-        # direct Fisher from the same sweep).
-        kron = ops.KroneckerAccumulator()
-        for _step, train_block, _ in train_source:
-            train_g = train_block.to(device)
-            kron.update(train_g, self.kfac_layers(train_g))
-            self.accumulate_fisher(fisher_acc, train_g)
+        supplied = self._capture_covariances
         eig: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer, (A, G) in kron.result().items():
+        if supplied is None:
+            # Pass 1 -- Kronecker covariance factors and their eigenbases (and
+            # the direct Fisher from the same sweep).
+            kron = ops.KroneckerAccumulator()
+            for _step, train_block, _ in train_source:
+                train_g = train_block.to(device)
+                kron.update(train_g, self.kfac_layers(train_g))
+                self.accumulate_fisher(fisher_acc, train_g)
+            covariances = kron.result()
+        else:
+            covariances = supplied
+        for layer, (A, G) in covariances.items():
             _, U_A, _, U_G = ops.kfac_eigh(A, G)
             eig[layer] = (U_A, U_G)
 
         # Pass 2 -- empirical second moments of the projected gradients (Lambda).
-        # Skipped entirely when no K-FAC layer is present.
+        # Skipped entirely when no K-FAC layer is present (and no supplied
+        # covariances made this the sweep that feeds the direct Fisher).
         lam_sum: dict[str, torch.Tensor] = {}
         counts: dict[str, int] = {}
-        for _step, train_block, _ in train_source if eig else ():
+        for _step, train_block, _ in train_source if (eig or supplied) else ():
             train_g = train_block.to(device)
+            if supplied is not None:
+                missing = [n for n in self.kfac_layers(train_g) if n not in eig]
+                if missing:
+                    raise ValueError(
+                        "fit(covariances=...) must cover every K-FAC-eligible "
+                        f"layer of the store; missing: {sorted(missing)}.",
+                    )
+                self.accumulate_fisher(fisher_acc, train_g)
             for layer, (U_A, U_G) in eig.items():
                 if layer not in train_g.data:
                     continue

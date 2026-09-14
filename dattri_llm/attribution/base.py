@@ -51,6 +51,17 @@ if TYPE_CHECKING:
     from dattri_llm.utils.cache import TensorCache
 
 
+ATTRIBUTION_GRANULARITIES = ("instance", "token")
+
+
+def _check_granularity(granularity: str) -> None:
+    if granularity not in ATTRIBUTION_GRANULARITIES:
+        raise ValueError(
+            "attribution_granularity must be one of "
+            f"{ATTRIBUTION_GRANULARITIES}, got {granularity!r}.",
+        )
+
+
 class BaseAttributor(ABC):
     """Base class for all attributors.
 
@@ -565,6 +576,29 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             return torch.zeros(train_rep.batch_size, test_rep.batch_size)
         return ops.layerwise_cross_dot(train_rep, test_rep, dense_cache=dense_cache)
 
+    def inner_product_per_token(  # noqa: PLR6301 - overridable hook
+        self,
+        train_rep: Gradient,
+        test_rep: Gradient,
+    ) -> torch.Tensor:
+        """``(B_train, T_train, B_test)`` decomposition of :meth:`inner_product`
+        over the train rep's token positions (``attribution_granularity="token"``).
+
+        Every score of this family is bilinear in the train gradient, so the
+        train side's factorized ``dW = sum_t g_t a_t^T`` splits the score over
+        ``t`` exactly, whatever transform the test side carries -- the default
+        is :func:`~dattri_llm.gradient.ops.layerwise_cross_dot_per_token`
+        against the same transformed test rep the instance-level kernel sees,
+        and summing it over ``t`` gives :meth:`inner_product`.  A method whose
+        score is not bilinear in the train gradient (a normalization, say)
+        overrides this alongside :meth:`inner_product`.
+        """
+        if not any(name in test_rep.data for name in train_rep.data):
+            tokens = [t for t in train_rep.token_dim.values() if t is not None]
+            t = max(tokens) if tokens else 1
+            return torch.zeros(train_rep.batch_size, t, test_rep.batch_size)
+        return ops.layerwise_cross_dot_per_token(train_rep, test_rep)
+
     # ------------------------------------------------------------------ #
     # Scoring                                                             #
     # ------------------------------------------------------------------ #
@@ -576,13 +610,16 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         *,
         loop_over_test: bool = False,
         transform_test: Callable[[Gradient], Gradient] | None = None,
-    ) -> tuple[torch.Tensor, list[str], list[int], list[str]]:
+        attribution_granularity: str = "instance",
+    ) -> tuple[torch.Tensor, list[str], list[int], list[str], list[int] | None]:
         """Score every train block against every test block with this
         attributor's hooks (see :func:`~dattri_llm.attribution.utils.score_sources`).
 
         Runs :meth:`prepare_scoring` first.  *transform_test* overrides
         :meth:`transform_test_rep` -- e.g. the identity when the test source
         already holds preconditioned representations.
+        ``attribution_granularity="token"`` scores with
+        :meth:`inner_product_per_token`, one row per training token position.
         """
         self.prepare_scoring(train_source, test_source)
         return score_sources(
@@ -598,6 +635,8 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             ),
             batch_size=self.args.per_device_train_batch_size or 1,
             loop_over_test=loop_over_test,
+            granularity=attribution_granularity,
+            inner_product_per_token=self.inner_product_per_token,
         )
 
     def build_score(
@@ -609,6 +648,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         *,
         algorithm_meta: dict | None = None,
         layer_name: list[str] | None = None,
+        row_token_ids: list[int] | None = None,
     ) -> AttributionScore:
         """Assemble the :class:`AttributionScore` and persist it to
         ``args.output_dir``.
@@ -621,6 +661,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             algorithm_meta=dict(algorithm_meta or {}),
             algorithm=self.algorithm,
             layer_name=layer_name,
+            row_token_ids=row_token_ids,
         )
         result.save(self.args.output_path)
         return result
@@ -654,6 +695,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         loop_over_test: bool = False,
         enable_update: bool = False,
         gradient_cache_residency: str | None = None,
+        attribution_granularity: str = "instance",
         **attribution_kwargs: object,
     ) -> AttributionScore:
         """Attribute **on the fly** over the task's checkpoints.
@@ -681,11 +723,16 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 re-reads the train gradients (K-FAC) or the captures are
                 cheap to hold (projected).  Ephemeral stores are released on
                 return; ``"disk"`` persists under ``args.output_dir``.
+            attribution_granularity: ``"instance"`` (default) gives one score
+                row per training sample; ``"token"`` one row per training
+                token position (see :meth:`inner_product_per_token`), which
+                needs the train gradients captured factorized.
             **attribution_kwargs: Method-specific options (those of
                 :meth:`attribute_from_cache`), recorded in the score's
                 metadata.
         """
         self.require_task("attribute")
+        _check_granularity(attribution_granularity)
         if gradient_cache_residency is not None:
             if gradient_cache_residency not in CACHE_RESIDENCIES:
                 raise ValueError(
@@ -700,6 +747,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 hook_config=hook_config,
                 loop_over_test=loop_over_test,
                 enable_update=enable_update,
+                attribution_granularity=attribution_granularity,
                 **attribution_kwargs,
             )
 
@@ -716,6 +764,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         row_blocks: list[torch.Tensor] = []
         row_train_ids: list[str] = []
         row_steps: list[int] = []
+        row_token_ids: list[int] = []
         test_ids: list[str] | None = None
         hooked_layers: list[str] = []
         for k in checkpoints:
@@ -733,14 +782,16 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             )
             hooked_layers = list(train.hook_manager.layer_name)
             with train, test:
-                sc, rids, rsteps, tids = self.score_sources(
+                sc, rids, rsteps, tids, rtoks = self.score_sources(
                     train,
                     test,
                     loop_over_test=loop_over_test,
+                    attribution_granularity=attribution_granularity,
                 )
             row_blocks.append(sc)
             row_train_ids.extend(rids)
             row_steps.extend(rsteps)
+            row_token_ids.extend(rtoks or [])
             test_ids = tids if test_ids is None else test_ids
         return self.build_score(
             torch.cat(row_blocks, dim=0) if row_blocks else torch.zeros(0, 0),
@@ -750,9 +801,13 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             algorithm_meta={
                 "n_checkpoints": len(checkpoints),
                 "enable_update": enable_update,
+                "attribution_granularity": attribution_granularity,
                 **attribution_kwargs,
             },
             layer_name=hooked_layers or None,
+            row_token_ids=(
+                row_token_ids if attribution_granularity == "token" else None
+            ),
         )
 
     def _attribute_via_stores(
@@ -847,6 +902,11 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             first.test_ids,
             algorithm_meta={**first.algorithm_meta, "n_checkpoints": n_checkpoints},
             layer_name=first.layer_name,
+            row_token_ids=(
+                None
+                if first.row_token_ids is None
+                else [t for r in results for t in r.row_token_ids]
+            ),
         )
 
     @staticmethod
@@ -875,6 +935,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         verbose: bool = False,
         loop_over_test: bool = False,
         algorithm_meta: dict | None = None,
+        attribution_granularity: str = "instance",
         **attribution_kwargs: object,
     ) -> AttributionScore:
         """Score previously collected gradients (the *store-then-attribute* path).
@@ -900,9 +961,12 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             loop_over_test: Re-stream the test blocks per train block (low
                 memory) instead of caching them once (default).
             algorithm_meta: Extra entries for the score's metadata.
+            attribution_granularity: ``"instance"`` (default) or ``"token"``
+                (one row per training token position; see :meth:`attribute`).
             **attribution_kwargs: Recorded in the score's metadata; a method
                 with its own options consumes them before calling ``super()``.
         """
+        _check_granularity(attribution_granularity)
         train_store = self.resolve_store(train_source)
         test_store = self.resolve_store(test_source)
         layer_name = normalize_layer_names(layer_name)
@@ -919,10 +983,11 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             verbose=verbose,
             desc=f"{self.algorithm}: loading test",
         )
-        scores, row_train_ids, row_steps, test_ids = self.score_sources(
+        scores, row_train_ids, row_steps, test_ids, row_token_ids = self.score_sources(
             train,
             test,
             loop_over_test=loop_over_test,
+            attribution_granularity=attribution_granularity,
         )
         return self.build_score(
             scores,
@@ -932,8 +997,10 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             algorithm_meta={
                 "selected_training_steps": train.steps,
                 **self.stores_meta(train_store, test_store),
+                "attribution_granularity": attribution_granularity,
                 **(algorithm_meta or {}),
                 **attribution_kwargs,
             },
             layer_name=layer_name,
+            row_token_ids=row_token_ids,
         )

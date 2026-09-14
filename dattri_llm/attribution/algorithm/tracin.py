@@ -121,6 +121,24 @@ class TracInAttributor(BaseInnerProductAttributor):
         n_te = self._norm(test_rep, shared, None)
         return dot / (n_tr[:, None] * n_te[None, :] + 1e-8)
 
+    def inner_product_per_token(
+        self,
+        train_rep: Gradient,
+        test_rep: Gradient,
+    ) -> torch.Tensor:
+        """Per-token cross-gram; for GradCos each position's share of the
+        cosine (the per-token dots over the two whole-sample norms).
+        """
+        dot = super().inner_product_per_token(train_rep, test_rep)
+        if self._metric == "dot":
+            return dot
+        shared = [name for name in train_rep.data if name in test_rep.data]
+        if not shared:
+            return dot
+        n_tr = self._norm(train_rep, shared, None)
+        n_te = self._norm(test_rep, shared, None)
+        return dot / (n_tr[:, None, None] * n_te[None, None, :] + 1e-8)
+
     @staticmethod
     def _norm(
         rep: Gradient,
@@ -157,6 +175,7 @@ class TracInAttributor(BaseInnerProductAttributor):
         loop_over_test: bool = False,
         enable_update: bool = False,
         gradient_cache_residency: str | None = None,
+        attribution_granularity: str = "instance",
         normalized_grad: bool = False,
     ) -> AttributionScore:
         """Score by collecting gradients **live** (the on-the-fly workflow).
@@ -174,6 +193,7 @@ class TracInAttributor(BaseInnerProductAttributor):
             loop_over_test=loop_over_test,
             enable_update=enable_update,
             gradient_cache_residency=gradient_cache_residency,
+            attribution_granularity=attribution_granularity,
             normalized_grad=normalized_grad,
         )
 
@@ -187,6 +207,7 @@ class TracInAttributor(BaseInnerProductAttributor):
         verbose: bool = False,
         loop_over_test: bool = False,
         algorithm_meta: dict | None = None,
+        attribution_granularity: str = "instance",
         normalized_grad: bool = False,
     ) -> AttributionScore:
         """Score collected gradients; ``normalized_grad`` selects GradCos.
@@ -203,5 +224,6 @@ class TracInAttributor(BaseInnerProductAttributor):
             verbose=verbose,
             loop_over_test=loop_over_test,
             algorithm_meta=algorithm_meta,
+            attribution_granularity=attribution_granularity,
             normalized_grad=normalized_grad,
         )

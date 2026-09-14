@@ -8,6 +8,15 @@
   finer representation loses no information.  The test side stays
   trajectory-agnostic: one column per test sample.
 
+* **Token-level rows.**  A score attributed at ``"token"`` granularity keeps
+  one row per ``(train_hash, step, position)``: :attr:`row_token_ids` names
+  the training sample's token position each row belongs to.  Summing a
+  sample's rows over positions recovers its instance-level row exactly, so
+  every instance-level accessor below (:meth:`agnostic_matrix`,
+  :meth:`step_matrix`, :meth:`score_at`, ...) returns the same values it
+  would for an instance-level score, and :meth:`token_scores` exposes the
+  positions.
+
 * **Hash identifiers.**  Rows and columns are keyed by the content hash of a
   sample's inputs (:func:`~dattri_llm.utils.hashing.hash_sample`), not by a
   dataset index.  Hashes are stable under reshuffling and independent of the
@@ -55,6 +64,11 @@ class AttributionScore:
             the K-FAC family, ``"normalized_grad"`` for TracIn/GradCos,
             ``"learning_rate"`` for DVEmb.
         layer_name: Layers the inner product was restricted to, or ``None``.
+        row_token_ids: ``None`` for an instance-level score.  For a
+            token-level one, the length-``num_rows`` list giving the token
+            position (within its training sample) each row belongs to;
+            ``(row_train_ids[r], row_steps[r], row_token_ids[r])`` is then
+            unique across rows.
     """
 
     scores: torch.Tensor
@@ -65,6 +79,7 @@ class AttributionScore:
     algorithm: str
     algorithm_meta: dict[str, Any]
     layer_name: list[str] | None
+    row_token_ids: list[int] | None = None
 
     # Rebuilt from the lists above; never persisted directly.
     train_index: dict[str, list[tuple[int, int]]] = field(init=False, repr=False)
@@ -85,7 +100,17 @@ class AttributionScore:
                 f"test_ids ({len(self.test_ids)}) must equal num_test "
                 f"({self.scores.shape[1]}).",
             )
+        if self.row_token_ids is not None and len(self.row_token_ids) != n_rows:
+            raise ValueError(
+                f"row_token_ids ({len(self.row_token_ids)}) must equal num_rows "
+                f"({n_rows}).",
+            )
         self._build_indices()
+
+    @property
+    def granularity(self) -> str:
+        """``"token"`` when rows are token positions, else ``"instance"``."""
+        return "instance" if self.row_token_ids is None else "token"
 
     def _build_indices(self) -> None:
         train_index: dict[str, list[tuple[int, int]]] = {}
@@ -144,9 +169,59 @@ class AttributionScore:
             KeyError: If ``train_hash`` is not present.  # noqa: DAR402
         """
         entries = self._require_train(train_hash)
-        steps = [step for step, _ in entries]
-        rows = self.scores[[row_idx for _, row_idx in entries]]
+        if self.row_token_ids is None:
+            steps = [step for step, _ in entries]
+            return steps, self.scores[[row_idx for _, row_idx in entries]]
+        # Token-level rows: one row per (step, position) -> sum the positions.
+        by_step: dict[int, list[int]] = {}
+        for step, row_idx in entries:
+            by_step.setdefault(step, []).append(row_idx)
+        steps = sorted(by_step)
+        rows = torch.stack([self.scores[by_step[s]].sum(dim=0) for s in steps])
         return steps, rows
+
+    def token_scores(
+        self,
+        train_hash: str,
+        step: int | None = None,
+    ) -> tuple[list[int], torch.Tensor]:
+        """Per-token-position scores of one training sample against every test
+        sample -- the token-level view a heatmap is drawn from.
+
+        Args:
+            train_hash: The training sample's input hash.
+            step: The training step to read; ``None`` (default) sums the
+                positions over every step the sample appears at.
+
+        Returns:
+            ``(positions, matrix)`` with ``positions`` ascending and ``matrix``
+            of shape ``(len(positions), num_test)``.  Summing ``matrix`` over
+            positions gives :meth:`trajectory_agnostic` (or the step's row).
+
+        Raises:
+            ValueError: If the score is instance-level.
+            KeyError: If the training hash is absent, or has no row at
+                ``step``.  # noqa: DAR402
+        """
+        if self.row_token_ids is None:
+            raise ValueError(
+                "token_scores() needs a token-level score; attribute with "
+                "attribution_granularity='token'.",
+            )
+        entries = self._require_train(train_hash)
+        rows = [r for s, r in entries if step is None or s == step]
+        if not rows:
+            known = sorted({s for s, _ in entries})
+            raise KeyError(
+                f"train sample {train_hash[:16]}... has no row at step {step}; "
+                f"known steps: {known}",
+            )
+        by_pos: dict[int, list[int]] = {}
+        for r in rows:
+            by_pos.setdefault(self.row_token_ids[r], []).append(r)
+        positions = sorted(by_pos)
+        matrix = torch.stack([self.scores[by_pos[p]].sum(dim=0) for p in positions])
+        return positions, matrix
 
     def trajectory_agnostic(self, train_hash: str) -> torch.Tensor:
         """Step-summed score row for one training sample.
@@ -215,8 +290,16 @@ class AttributionScore:
         rows = [i for i, s in enumerate(self.row_steps) if s == step]
         if not rows:
             raise KeyError(f"step {step} not present in scores.")
-        train_ids = [self.row_train_ids[i] for i in rows]
-        return train_ids, self.scores[rows]
+        if self.row_token_ids is None:
+            train_ids = [self.row_train_ids[i] for i in rows]
+            return train_ids, self.scores[rows]
+        # Token-level rows: sum each sample's positions at this step.
+        by_hash: dict[str, list[int]] = {}
+        for i in rows:
+            by_hash.setdefault(self.row_train_ids[i], []).append(i)
+        train_ids = list(by_hash)
+        matrix = torch.stack([self.scores[by_hash[h]].sum(dim=0) for h in train_ids])
+        return train_ids, matrix
 
     def step_matrices(self) -> dict[int, tuple[list[str], torch.Tensor]]:
         """Every step's score matrix, keyed by step.
@@ -250,10 +333,14 @@ class AttributionScore:
                 or the training sample has no row at ``step``.
         """
         col = self._require_test(test_hash)
-        for s, row_idx in self._require_train(train_hash):
-            if s == step:
-                return self.scores[row_idx, col]
-        known = sorted(s for s, _ in self.train_index[train_hash])
+        rows = [row_idx for s, row_idx in self._require_train(train_hash) if s == step]
+        if rows:
+            return (
+                self.scores[rows, col].sum()
+                if len(rows) > 1
+                else self.scores[rows[0], col]
+            )
+        known = sorted({s for s, _ in self.train_index[train_hash]})
         raise KeyError(
             f"train sample {train_hash[:16]}... has no row at step {step}; "
             f"known steps: {known}",
@@ -275,7 +362,8 @@ class AttributionScore:
             trajectory: ``"agnostic"`` (default) returns one step-summed row per
                 training sample, shape ``(len(train_hashes), len(test_hashes))``.
                 ``"aware"`` returns one row per ``(train_hash, step)`` pair,
-                shape ``(num_selected_rows, len(test_hashes))``.
+                shape ``(num_selected_rows, len(test_hashes))`` -- for a
+                token-level score, one row per ``(train_hash, step, position)``.
 
         Returns:
             The requested submatrix.
@@ -341,6 +429,8 @@ class AttributionScore:
             "algorithm": self.algorithm,
             "algorithm_meta": self.algorithm_meta,
             "layer_name": self.layer_name,
+            "row_token_ids": self.row_token_ids,
+            "granularity": self.granularity,
             "num_train": self.num_train,
             "num_test": self.num_test,
             "num_rows": self.num_rows,
@@ -375,4 +465,5 @@ class AttributionScore:
             algorithm=meta["algorithm"],
             algorithm_meta=algorithm_meta,
             layer_name=meta["layer_name"],
+            row_token_ids=meta.get("row_token_ids"),
         )

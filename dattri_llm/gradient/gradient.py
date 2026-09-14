@@ -1062,9 +1062,11 @@ class Gradient:
         backward gradient is taken over all positions as usual (autograd offers no
         cheaper single-position gradient), and we merely pick out each position's
         component of the already-captured factorized gradient.  Only factorized
-        (``"batch_token"``-indexed) layers carry a token axis; layers stored
-        materialized -- or captured with ``"batch"`` indexing -- have already
-        contracted it away and are skipped.
+        (``"batch_token"``-indexed) layers of ``self`` carry a token axis; layers
+        stored materialized -- or captured with ``"batch"`` indexing -- have
+        already contracted it away and are skipped.  ``other`` may hold a layer
+        factorized or dense (a materialized or preconditioned block); the
+        decomposition is the same either way.
 
         Args:
             other: Gradient to attribute against (a target/reference batch).
@@ -1088,7 +1090,6 @@ class Gradient:
             # A token axis exists only for factorized batch_token layers on self.
             if not (
                 isinstance(sv, Factorized)
-                and isinstance(ov, Factorized)
                 and self._layer_indexing(name) == "batch_token"
             ):
                 continue

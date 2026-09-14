@@ -203,7 +203,9 @@ def score_sources(
     batch_size: int = 1,
     loop_over_test: bool = False,
     cache_budget: CacheBudget | None = None,
-) -> tuple[torch.Tensor, list[str], list[int], list[str]]:
+    granularity: str = "instance",
+    inner_product_per_token: InnerProduct | None = None,
+) -> tuple[torch.Tensor, list[str], list[int], list[str], list[int] | None]:
     """The inner-product scoring loop shared by the trajectory-agnostic attributors.
 
     Both sides are ``GradientSource`` objects (on-disk
@@ -247,21 +249,38 @@ def score_sources(
             scores block-by-block (no train-side re-batching).
         cache_budget: Budget of the per-train-block dense cache; ``None`` uses
             the default fraction of free memory on *device*.
+        granularity: ``"instance"`` (default) scores one row per training
+            sample; ``"token"`` one row per training token position, scored
+            by *inner_product_per_token* instead of *inner_product*.
+        inner_product_per_token: ``(train_rep, test_rep) -> (B_train, T,
+            B_test)`` -- the per-position decomposition of *inner_product*;
+            required under ``granularity="token"``.
 
     Returns:
-        ``(scores, row_train_ids, row_steps, test_ids)`` -- ``scores`` is
-        ``(num_train_rows, num_test)`` on CPU, ``row_steps`` stamps each row with
-        the step its train gradient came from, ``test_ids`` is the column order.
+        ``(scores, row_train_ids, row_steps, test_ids, row_token_ids)`` --
+        ``scores`` is ``(num_rows, num_test)`` on CPU, ``row_steps`` stamps
+        each row with the step its train gradient came from, ``test_ids`` is
+        the column order, and ``row_token_ids`` is ``None`` at instance
+        granularity or the token position of each row at token granularity
+        (a training sample of ``T`` positions contributes ``T`` consecutive
+        rows; padded positions score zero).
 
     Raises:
         ValueError: If ``loop_over_test`` is requested with a single-shot
-            test source.
+            test source, or on an unknown *granularity*.
     """
     if loop_over_test and not getattr(test_source, "reusable", False):
         raise ValueError(
             "loop_over_test=True requires a re-iterable test source "
             "(reusable=True); got a single-shot source.",
         )
+    if granularity not in {"instance", "token"}:
+        raise ValueError(
+            f"granularity must be 'instance' or 'token', got {granularity!r}.",
+        )
+    per_token = granularity == "token"
+    if per_token and inner_product_per_token is None:
+        raise ValueError("granularity='token' needs inner_product_per_token.")
     transform_train = transform_train or _identity
     transform_test = transform_test or _identity
     budget = cache_budget if cache_budget is not None else CacheBudget(device)
@@ -276,34 +295,67 @@ def score_sources(
     num_test = len(test_ids)
     cached_test = _merge_dense_test(cached_test)
 
-    def score_block(train_rep: Gradient, test_blocks: Iterable) -> torch.Tensor:
+    def n_rows(train_rep: Gradient) -> int:
+        """Rows one train rep contributes: its samples, or samples x positions."""
+        if not per_token:
+            return train_rep.batch_size
+        tokens = [t for t in train_rep.token_dim.values() if t is not None]
+        return train_rep.batch_size * (max(tokens) if tokens else 1)
+
+    def score_pair(
+        train_rep: Gradient,
+        test_rep: Gradient,
+        dense_cache: TensorCache | None,
+    ) -> torch.Tensor:
+        """``(rows, B_test)`` block of one train rep against one test rep."""
+        if per_token:
+            block = inner_product_per_token(train_rep, test_rep)  # (B, T, B_test)
+            return block.reshape(-1, block.shape[-1])
+        return inner_product(train_rep, test_rep, dense_cache=dense_cache)
+
+    def score_block(
+        train_rep: Gradient,
+        test_blocks: Iterable,
+        dense_cache: TensorCache | None,
+    ) -> torch.Tensor:
         """Row chunk of one train rep against every test rep in *test_blocks*."""
-        row = torch.zeros(train_rep.batch_size, num_test, dtype=torch.float)
-        with TensorCache("memory", budget=budget) as dense_cache:
-            for test_rep, cols in test_blocks:
-                block = inner_product(train_rep, test_rep, dense_cache=dense_cache)
-                row[:, cols] = block.detach().to("cpu", torch.float)
+        row = torch.zeros(n_rows(train_rep), num_test, dtype=torch.float)
+        for test_rep, cols in test_blocks:
+            block = score_pair(train_rep, test_rep, dense_cache)
+            row[:, cols] = block.detach().to("cpu", torch.float)
         return row
 
     row_chunks: list[torch.Tensor] = []
     row_train_ids: list[str] = []
     row_steps: list[int] = []
+    row_token_ids: list[int] = []
+
+    def stamp_rows(ids: list[str], steps: list[int], chunk: torch.Tensor) -> None:
+        """Label *chunk*'s rows: one per sample, or ``T`` per sample."""
+        if not per_token:
+            row_train_ids.extend(ids)
+            row_steps.extend(steps)
+            return
+        t = chunk.shape[0] // max(len(ids), 1)
+        for h, s in zip(ids, steps, strict=True):
+            row_train_ids.extend([h] * t)
+            row_steps.extend([s] * t)
+            row_token_ids.extend(range(t))
+
     if not loop_over_test:
         # Retaining a dense copy of a train block only pays off when it is
-        # scored against more than one test block.
-        reuse = len(cached_test) > 1
+        # scored against more than one test block (and only the instance-level
+        # kernel materializes the train side at all).
+        reuse = len(cached_test) > 1 and not per_token
         for steps, train_g, ids in rebatch_blocks(train_source, batch_size):
             train_rep = transform_train(train_g.to(device))
             if reuse:
-                row_chunks.append(score_block(train_rep, cached_test))
+                with TensorCache("memory", budget=budget) as dense_cache:
+                    chunk = score_block(train_rep, cached_test, dense_cache)
             else:
-                row = torch.zeros(train_rep.batch_size, num_test, dtype=torch.float)
-                for test_rep, cols in cached_test:
-                    block = inner_product(train_rep, test_rep, dense_cache=None)
-                    row[:, cols] = block.detach().to("cpu", torch.float)
-                row_chunks.append(row)
-            row_train_ids.extend(ids)
-            row_steps.extend(steps)
+                chunk = score_block(train_rep, cached_test, None)
+            row_chunks.append(chunk)
+            stamp_rows(ids, steps, chunk)
     else:
         for train_step, train_g, train_hashes in train_source:
             train_rep = transform_train(train_g.to(device))
@@ -313,16 +365,23 @@ def score_sources(
                     cols = [test_index[h] for h in test_hashes]
                     yield transform_test(test_g.to(device)), cols
 
-            row_chunks.append(score_block(train_rep, test_blocks()))
-            row_train_ids.extend(train_hashes)
-            row_steps.extend([train_step] * train_rep.batch_size)
+            with TensorCache("memory", budget=budget) as dense_cache:
+                chunk = score_block(train_rep, test_blocks(), dense_cache)
+            row_chunks.append(chunk)
+            stamp_rows(list(train_hashes), [train_step] * train_rep.batch_size, chunk)
 
     scores = (
         torch.cat(row_chunks, dim=0)
         if row_chunks
         else torch.zeros(0, num_test, dtype=torch.float)
     )
-    return scores, row_train_ids, row_steps, test_ids
+    return (
+        scores,
+        row_train_ids,
+        row_steps,
+        test_ids,
+        (row_token_ids if per_token else None),
+    )
 
 
 # --------------------------------------------------------------------------- #

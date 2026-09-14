@@ -937,6 +937,25 @@ class TestFactorizedWrappers:
             atol=1e-4,
         )
 
+    def test_ekfac_materialize_dense_block_equals_factors(self):
+        # Rotating the token-summed weight gradient into the eigenbasis must
+        # equal rotating each token's factors and summing (linearity), so a
+        # materialized block (e.g. a materialized "logra" store) fits and
+        # scores EK-FAC exactly like its factorized capture.
+        bf = Factorized(*_linear_3d())
+        A, G = kfac_factors(bf.activation, bf.pre_activation_grad, "nn.Linear")
+        _sA, U_A, _sG, U_G = ops.kfac_eigh(A, G)
+        dense = ops.materialize(bf, "nn.Linear")
+        assert torch.allclose(
+            ops.ekfac_materialize(dense, "nn.Linear", U_A, U_G),
+            ops.ekfac_materialize(bf, "nn.Linear", U_A, U_G),
+            atol=1e-4,
+        )
+        # ekfac_precondition with lam = 1 is the inverse rotation.
+        M = ops.ekfac_materialize(dense, "nn.Linear", U_A, U_G)
+        back = ops.ekfac_precondition(M, U_A, U_G, torch.ones(M.shape[1]), "nn.Linear")
+        assert torch.allclose(back, dense.float(), atol=1e-4)
+
 
 class TestDenseInverse:
     """``dense_inverse`` (Cholesky) is the damped inverse and matches the

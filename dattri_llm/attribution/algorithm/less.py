@@ -214,7 +214,8 @@ class LESSAttributor(BaseInnerProductAttributor):
         *,
         loop_over_test: bool = False,
         transform_test: Callable[[Gradient], Gradient] | None = None,
-    ) -> tuple[torch.Tensor, list[str], list[int], list[str]]:
+        attribution_granularity: str = "instance",
+    ) -> tuple[torch.Tensor, list[str], list[int], list[str], list[int] | None]:
         """Score with the train blocks unit-normalized and weighted per step,
         so the plain layerwise inner product is the weighted cosine.
         """
@@ -243,6 +244,7 @@ class LESSAttributor(BaseInnerProductAttributor):
             test_source,
             loop_over_test=loop_over_test,
             transform_test=transform_test,
+            attribution_granularity=attribution_granularity,
         )
 
     # ------------------------------------------------------------------ #
@@ -258,6 +260,7 @@ class LESSAttributor(BaseInnerProductAttributor):
         loop_over_test: bool = False,
         enable_update: bool = False,
         gradient_cache_residency: str | None = None,
+        attribution_granularity: str = "instance",
     ) -> AttributionScore:
         """Score live, in the per-step or the frozen-checkpoint form.
 
@@ -278,6 +281,7 @@ class LESSAttributor(BaseInnerProductAttributor):
                 checkpoints with their ``optimizers`` and
                 ``checkpoint_weights``.
             gradient_cache_residency: As in the base class.
+            attribution_granularity: As in the base class.
         """
         self._enable_update = enable_update
         self._step_weights = (
@@ -293,6 +297,7 @@ class LESSAttributor(BaseInnerProductAttributor):
             loop_over_test=loop_over_test,
             enable_update=enable_update,
             gradient_cache_residency=gradient_cache_residency,
+            attribution_granularity=attribution_granularity,
         )
 
     def attribute_from_cache(
