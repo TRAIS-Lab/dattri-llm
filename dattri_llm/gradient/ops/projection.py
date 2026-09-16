@@ -240,6 +240,7 @@ class DattriProjector:
         *,
         proj_dim: int,
         proj_seed: int = 0,
+        include_bias: bool = False,
         **proj_kwargs,
     ) -> torch.Tensor:
         """Random-project the last axis of *x* from ``D`` to ``proj_dim``.
@@ -251,6 +252,13 @@ class DattriProjector:
         that device.  Note that dattri's CPU and CUDA projectors do **not**
         produce the same projection for the same seed -- use one device
         consistently across every gradient that will be compared.
+
+        ``include_bias=True`` projects ``x`` as the activation of a linear
+        layer with a bias, i.e. *as if* the bias ones column had been appended
+        (the convention of :func:`preprocess_factors`): the ``(D + 1,
+        proj_dim)`` matrix is used, and the ones column contributes its row
+        as a broadcast add, so the augmented activation -- a full copy of
+        *x* per layer and step -- is never formed.
         """
         lead = x.shape[:-1]
         # as_float, not align: the factory multiplies by a random matrix, so
@@ -260,14 +268,18 @@ class DattriProjector:
         device = torch.device(proj_kwargs.pop("device", flat.device))
         flat = flat.to(device)
         matrix = self.matrix(
-            flat.shape[-1],
+            flat.shape[-1] + (1 if include_bias else 0),
             proj_dim=proj_dim,
             proj_seed=proj_seed,
             device=device,
             dtype=flat.dtype,
             **proj_kwargs,
         )
-        return (flat @ matrix).reshape(*lead, proj_dim)
+        if include_bias:
+            out = torch.addmm(matrix[-1], flat, matrix[:-1])
+        else:
+            out = flat @ matrix
+        return out.reshape(*lead, proj_dim)
 
     def clear(self) -> None:
         """Drop every cached projection matrix (e.g. to free device memory)."""
@@ -293,6 +305,7 @@ def apply_projection(
     *,
     proj_dim: int,
     proj_seed: int = 0,
+    include_bias: bool = False,
     **proj_kwargs,
 ) -> torch.Tensor:
     """:meth:`DattriProjector.apply` for a factory **or** a projector.
@@ -304,6 +317,7 @@ def apply_projection(
         x,
         proj_dim=proj_dim,
         proj_seed=proj_seed,
+        include_bias=include_bias,
         **proj_kwargs,
     )
 
@@ -428,14 +442,17 @@ def project_activation(
         raise ValueError(
             f"project_activation is for linear layers only, got {layer_type!r}.",
         )
-    if module_kwargs is not None and module_kwargs["has_bias"] and include_bias:
-        a = torch.cat([a, torch.ones_like(a[..., :1])], dim=-1)
+    # The bias ones-column is folded into the projection (a broadcast add of
+    # the matrix's last row) rather than appended to the activation, which
+    # would copy the whole ``(B, T, d_in)`` tensor once per layer and step.
+    with_bias = module_kwargs is not None and module_kwargs["has_bias"] and include_bias
     a_f = to_3d(dtypes.align(a)[0])
     return apply_projection(
         projector,
         a_f,
         proj_dim=proj_dim,
         proj_seed=proj_seed + 1,
+        include_bias=with_bias,
         **proj_kwargs,
     )
 
