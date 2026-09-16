@@ -30,8 +30,9 @@ import pytest
 import torch
 from torch import nn
 
-from dattri_llm.gradient.callbacks import DataSelectionCallback
+from dattri_llm.gradient.callbacks import CaptureCallback, DataSelectionCallback
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 
 # --------------------------------------------------------------------------- #
 # Minimal model fixture                                                         #
@@ -582,6 +583,69 @@ class TestScoreModeEquivalence:
 # --------------------------------------------------------------------------- #
 # Normalization-layer consistency (regression: ghost vs materialized for norms) #
 # --------------------------------------------------------------------------- #
+
+
+class _OpaqueNorm(nn.Module):
+    """A normalization the per-sample hooks do not recognise (a custom class,
+    like Llama's RMSNorm), so the default config captures its weight only at
+    batch level (``param_grad``).
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+
+
+class _OpaqueNormMLP(nn.Module):
+    def __init__(self, vocab_size=32, embed_dim=8, hidden=16, out_features=4):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.norm = _OpaqueNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden), nn.ReLU(), nn.Linear(hidden, out_features)
+        )
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.norm(self.embedding(token_ids)))
+
+
+class TestBatchLevelLayersAreNotScored:
+    """Under the zero-argument ``HookManagerConfig`` a layer the per-sample
+    hooks cannot capture is hooked with ``param_grad``: one summed gradient for
+    the batch.  It carries no per-sample information, so scoring must leave it
+    out (it used to contribute a ``(d,)`` term that broke the layer sum) and
+    the step must still drop and correct on the per-sample layers.
+    """
+
+    def test_default_config_with_opaque_norm(self):
+        torch.manual_seed(0)
+        model = _OpaqueNormMLP()
+        B, T = 8, 6
+        cb = DataSelectionCallback(
+            model,
+            target="batch",
+            selection_kwargs={"threshold": 0.5, "threshold_mode": "bottom_fraction"},
+        )
+        capture = CaptureCallback()
+        hm = HookManager(model, callbacks=[cb, capture])  # the default assignment
+        with hm.collect():
+            model(_make_token_ids(B, T)).sum().backward()
+        hm.remove()
+        grad = capture.record.gradient
+        batch_level = [
+            n for n in grad.layer_names if grad.layer_types[n] == PARAM_GRAD_TYPES
+        ]
+        assert batch_level == ["norm.weight"]
+        assert cb.last_scores is not None
+        assert tuple(cb.last_scores.shape) == (B,)
+        assert len(cb.last_dropped) == B // 2
+        # Scoring reports only the per-sample layers, each with one score per sample.
+        scores = cb.compute_scores(grad)
+        assert "norm.weight" not in scores
+        assert all(tuple(v.shape) == (B,) for v in scores.values())
 
 
 class _NormMLP(nn.Module):

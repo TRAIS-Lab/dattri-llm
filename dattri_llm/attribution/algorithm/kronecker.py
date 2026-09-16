@@ -178,9 +178,14 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         value: Factorized | torch.Tensor,
         layer_type: str,
         factors: object,
-    ) -> torch.Tensor:
-        """Dense ``(B_te, D)`` representation of one test layer with the damped
-        inverse Fisher of *factors* applied.
+    ) -> Factorized | torch.Tensor:
+        """One test layer with the damped inverse Fisher of *factors* applied.
+
+        Returned in whatever form the preconditioner preserves: K-FAC keeps a
+        factorized layer factorized (the Kronecker inverse acts on the two
+        factors separately), so the scoring loop's cost rule can still route
+        it; EK-FAC's per-eigenvalue correction only exists in the dense
+        ``(B_te, D)`` form.  A dense input stays dense.
         """
 
     # ------------------------------------------------------------------ #
@@ -317,8 +322,9 @@ class KroneckerAttributor(BaseInnerProductAttributor):
     def transform_test_rep(self, test_rep: Gradient) -> Gradient:
         """Apply the **entire** preconditioner to a test block, once.
 
-        Every K-FAC layer becomes its dense preconditioned ``(B_te, D)`` rep
-        (:meth:`precondition_test_layer`), every direct-Fisher layer its
+        Every K-FAC layer becomes its preconditioned rep
+        (:meth:`precondition_test_layer`; factorized for K-FAC, dense
+        ``(B_te, D)`` for EK-FAC), every direct-Fisher layer its
         ``F^-1``-multiplied dense weight gradient, and layers under neither
         are dropped.  Scoring against a raw train block is then the plain
         layerwise inner product -- no per-train-block whitening or rotation.
@@ -333,7 +339,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             name: str,
             value: Factorized | torch.Tensor,
             layer_type: str,
-        ) -> torch.Tensor | None:
+        ) -> Factorized | torch.Tensor | None:
             if name in factors:
                 return self.precondition_test_layer(value, layer_type, factors[name])
             if name in fisher_inverse:
@@ -951,17 +957,23 @@ class KFACAttributor(KroneckerAttributor):
         value: Factorized | torch.Tensor,
         layer_type: str,
         factors: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """``vec(G_inv dW A_inv)`` per test sample, as a dense ``(B_te, D)``."""
-        # Materialize the (fixed) test layer ONCE -- token-sum the factors to
-        # the full weight gradient (or take the compact materialized block as
-        # is) -- then apply the whole inverse two-sided in that space.
+    ) -> Factorized | torch.Tensor:
+        """``G_inv dW A_inv`` per test sample, in the layer's own form.
+
+        A factorized layer stays factorized: since ``dW = sum_t g_t a_t^T``
+        and both inverses are symmetric, ``G_inv dW A_inv = sum_t (G_inv g_t)
+        (A_inv a_t)^T``, so the whole inverse is paid once on the two
+        (preprocessed) factors (:func:`~dattri_llm.gradient.ops.kfac_precondition`)
+        and the result is a final-factor layer the cost rule can still route
+        -- one query against a batch of eight scores by the ghost contraction
+        with no train-side materialization.  A compact materialized block
+        (e.g. a ``"logra"`` capture) takes the two-sided dense product.
+        """
         A_inv, G_inv = factors
-        return ops.kfac_precondition_materialized(
-            ops.materialize(value, layer_type),
-            A_inv,
-            G_inv,
-        )
+        if isinstance(value, torch.Tensor):
+            return ops.kfac_precondition_materialized(value, A_inv, G_inv)
+        a, g = ops.kfac_precondition(value, layer_type, A_inv, G_inv)
+        return Factorized(a, g, module_kwargs=None, batch_first=True)
 
 
 class EKFACAttributor(KroneckerAttributor):
@@ -1036,6 +1048,9 @@ class EKFACAttributor(KroneckerAttributor):
         for layer, (A, G) in covariances.items():
             _, U_A, _, U_G = ops.kfac_eigh(A, G)
             eig[layer] = (U_A, U_G)
+        # Only the eigenbases are needed from here on; the covariances are as
+        # large again (~4 GB for Pythia-410M) and must not sit through pass 2.
+        del covariances
 
         # Pass 2 -- empirical second moments of the projected gradients (Lambda).
         # Skipped entirely when no K-FAC layer is present (and no supplied

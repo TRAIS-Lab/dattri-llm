@@ -33,7 +33,6 @@ import torch
 
 from dattri_llm.attribution.base import BaseInnerProductAttributor
 from dattri_llm.gradient import ops
-from dattri_llm.utils.cache import CacheBudget
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -88,20 +87,6 @@ class TracInAttributor(BaseInnerProductAttributor):
     # ------------------------------------------------------------------ #
     # Hooks                                                               #
     # ------------------------------------------------------------------ #
-
-    def transform_test_rep(self, test_rep: Gradient) -> Gradient:  # noqa: PLR6301
-        """Materialize the test block when its dense form fits the cache budget.
-
-        A dense test side makes every train block's score a bare GEMM against
-        a train layer materialized once (see :meth:`inner_product`).  Over
-        budget -- at full dimension the dense form is ~1 GB *per sample* --
-        the block stays factorized, so both sides stay factorized and the
-        kernel materializes at most one layer at a time: caching is an
-        optimization and must never be the reason a run runs out of memory.
-        """
-        if CacheBudget(test_rep.device).fits(test_rep.materialized_nbytes):
-            return test_rep.materialize()
-        return test_rep
 
     def inner_product(
         self,

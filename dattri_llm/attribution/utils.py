@@ -292,6 +292,9 @@ def score_sources(
         cols = _fix_columns(test_hashes, test_ids, test_index)
         if not loop_over_test:
             cached_test.append((transform_test(test_g.to(device)), cols))
+    # The loop variable would otherwise keep the last raw test block alive
+    # for the whole scoring loop, next to its transformed copy.
+    test_g = None
     num_test = len(test_ids)
     cached_test = _merge_dense_test(cached_test)
 

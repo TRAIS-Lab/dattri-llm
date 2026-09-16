@@ -308,6 +308,32 @@ class TestTo:
 # --------------------------------------------------------------------------- #
 
 
+class TestMapLayersConsume:
+    def test_consume_releases_selected_layers_from_source(self):
+        g = make_gradient(repr_type="factorized")
+        names = list(g.layer_names)
+        keep, convert = names[0], names[1:]
+        expected = {n: ops.materialize(g.data[n], "nn.Linear") for n in convert}
+        out = g.map_layers(
+            lambda _n, v, t: ops.materialize(v, t), layers=convert, consume=True
+        )
+        # The source gave up the converted layers and kept the rest.
+        assert set(g.data) == {keep}
+        assert isinstance(g.data[keep], Factorized)
+        # The result holds every layer, converted ones dense.
+        assert set(out.data) == set(names)
+        assert isinstance(out.data[keep], Factorized)
+        for n in convert:
+            assert out.representation[n] == "materialized"
+            assert torch.equal(out.data[n], expected[n])
+
+    def test_default_leaves_source_intact(self):
+        g = make_gradient(repr_type="factorized")
+        before = dict(g.data)
+        g.map_layers(lambda _n, v, t: ops.materialize(v, t))
+        assert g.data == before
+
+
 class TestMaterialize:
     def test_factorized_becomes_materialized(self):
         g = make_gradient(repr_type="factorized")

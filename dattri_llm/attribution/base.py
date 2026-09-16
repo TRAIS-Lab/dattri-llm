@@ -32,10 +32,10 @@ from dattri_llm.attribution.utils import (
     task_loss_fn,
 )
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
-from dattri_llm.utils.cache import CACHE_RESIDENCIES
+from dattri_llm.utils.cache import CACHE_RESIDENCIES, CacheBudget
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -552,9 +552,83 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
 
         This is ``T_test`` -- e.g. multiplication by an inverse Fisher.  The
         result may hold layers factorized (raw or final factors) or dense;
-        :meth:`inner_product` handles every combination.
+        :meth:`inner_product` handles every combination, and the scoring
+        loop routes whatever stays factorized (:meth:`_route_test_rep`).
         """
         return test_rep
+
+    def _route_test_rep(self, test_rep: Gradient) -> Gradient:
+        """Give each factorized test layer the representation the cross-gram
+        cost rule picks for it (Sec. 3.2), once, before the scoring loop.
+
+        Runs on the output of :meth:`transform_test_rep`, so a method's own
+        transform stays what it is (identity, a preconditioner, ...) and the
+        routing is shared by every inner-product attributor.  A dense test
+        layer makes that layer's score a bare GEMM against the train layer
+        materialized once per block (see :meth:`inner_product`); a factorized
+        one is scored by the ghost contraction with no materialization at
+        all.  Which is cheaper depends on the train batch, the number of
+        queries and the token count
+        (:func:`~dattri_llm.gradient.ops.maybe_use_materialized_gram`): one
+        512-token query against a batch of eight is cheapest in the ghost
+        form, sixteen queries are cheapest dense.  Deciding here keeps the
+        decision out of the per-block loop and, above all, means the test
+        side is never materialized *again for every train block* -- which is
+        what the per-layer kernel has to do when both sides arrive factorized
+        and the rule picks the dense route.  Layers without an outer-product
+        gradient (norm, embedding) are small and simply materialized; layers
+        already dense (a projected capture, a preconditioned query) pass
+        through.
+
+        The dense copies live for the whole scoring loop, so they are
+        admitted against the :class:`~dattri_llm.utils.cache.CacheBudget`
+        layer by layer, the layers with the largest flop saving first.  What
+        is charged is the growth over the factorized form each dense layer
+        replaces -- the block is converted with ``consume=True``, so the
+        factorized payload is released as its dense copy is built and never
+        both are held -- and whatever does not fit stays factorized.  At full
+        dimension the dense form is ~1 GB *per sample*; caching is an
+        optimization and must never be the reason a run runs out of memory.
+        """
+        b_train = self.args.per_device_train_batch_size or 1
+        # (saving, name): the flop saving of scoring the layer dense
+        # rather than ghost, per train block, for ordering the admission.
+        candidates: list[tuple[float, str]] = []
+        for name in test_rep.layer_names:
+            value = test_rep.data[name]
+            if not isinstance(value, Factorized):
+                continue
+            layer_type = test_rep.layer_types[name]
+            if not (
+                ops.is_linear(layer_type)
+                or ops.is_conv(layer_type)
+                or ops.is_conv_transpose(layer_type)
+            ):
+                candidates.append((float("inf"), name))
+                continue
+            b_test, s, k, d = ops.effective_dims(value, layer_type)
+            if ops.maybe_use_materialized_gram(b_train, b_test, s, k, d):
+                cost_f = b_train * b_test * s * s * (d + k)
+                cost_m = (b_train + b_test) * s * d * k + b_train * b_test * d * k
+                candidates.append((cost_f - cost_m, name))
+        if not candidates:
+            return test_rep
+        budget = CacheBudget(test_rep.device)
+        held = 0
+        dense: list[str] = []
+        for _saving, name in sorted(candidates, reverse=True):
+            layer = test_rep.select_layers([name])
+            growth = max(layer.materialized_nbytes - layer.nbytes, 0)
+            if budget.fits(growth, held):
+                dense.append(name)
+                held += growth
+        if not dense:
+            return test_rep
+        return test_rep.map_layers(
+            lambda _n, v, t: ops.materialize(v, t),
+            layers=dense,
+            consume=True,
+        )
 
     def inner_product(  # noqa: PLR6301 - overridable hook
         self,
@@ -617,22 +691,22 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
 
         Runs :meth:`prepare_scoring` first.  *transform_test* overrides
         :meth:`transform_test_rep` -- e.g. the identity when the test source
-        already holds preconditioned representations.
+        already holds preconditioned representations.  Either way the
+        transformed block is then routed by :meth:`_route_test_rep`.
         ``attribution_granularity="token"`` scores with
         :meth:`inner_product_per_token`, one row per training token position.
         """
         self.prepare_scoring(train_source, test_source)
+        transform = (
+            transform_test if transform_test is not None else self.transform_test_rep
+        )
         return score_sources(
             train_source,
             test_source,
             self.args.device,
             inner_product=self.inner_product,
             transform_train=self.transform_train_rep,
-            transform_test=(
-                transform_test
-                if transform_test is not None
-                else self.transform_test_rep
-            ),
+            transform_test=lambda block: self._route_test_rep(transform(block)),
             batch_size=self.args.per_device_train_batch_size or 1,
             loop_over_test=loop_over_test,
             granularity=attribution_granularity,

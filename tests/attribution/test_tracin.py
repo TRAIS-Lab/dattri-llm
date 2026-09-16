@@ -23,14 +23,16 @@ import pytest
 import torch
 from torch import nn
 
+from dattri_llm.attribution import base
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.datasets import make_gradient_multistep_dataloader
-from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 from dattri_llm.gradient.storage_manager import GradientStorageManager
+from dattri_llm.utils.cache import CacheBudget
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
@@ -167,6 +169,82 @@ def collected(tmp_path):
         "train_hashes": train_hashes,
         "test_hashes": test_hashes,
     }
+
+
+def _query_block(n_test: int, seed: int = 0, *, s: int = 4, k: int = 8, d: int = 8):
+    gen = torch.Generator().manual_seed(seed)
+    data = {
+        f"l{i}": Factorized(
+            activation=torch.randn(n_test, s, k, generator=gen),
+            pre_activation_grad=torch.randn(n_test, s, d, generator=gen),
+        )
+        for i in range(2)
+    }
+    return Gradient(
+        representation=dict.fromkeys(data, "factorized"),
+        data=data,
+        layer_types=dict.fromkeys(data, "nn.Linear"),
+        indexing=dict.fromkeys(data, "batch_token"),
+    )
+
+
+class TestTestRepRouting:
+    """The transformed test block is converted, per layer, to whichever
+    form the cross-gram cost rule picks for it against the train batch
+    (shared by every inner-product attributor; TracIn is the concrete
+    class whose transform is the identity).
+    """
+
+    def _attr(self, tmp_path, train_bs: int = 8):
+        args = AttributionArguments(
+            output_dir=str(tmp_path), per_device_train_batch_size=train_bs
+        )
+        return TracInAttributor(args)
+
+    def test_one_query_stays_factorized(self, tmp_path):
+        rep = self._attr(tmp_path)._route_test_rep(_query_block(1))
+        assert all(isinstance(v, Factorized) for v in rep.data.values())
+
+    def test_many_queries_go_dense(self, tmp_path):
+        rep = self._attr(tmp_path)._route_test_rep(_query_block(16))
+        assert all(isinstance(v, torch.Tensor) for v in rep.data.values())
+        assert all(r == "materialized" for r in rep.representation.values())
+
+    def test_over_budget_stays_factorized(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            base, "CacheBudget", lambda device: CacheBudget(limit_bytes=0)
+        )
+        # k = d = 16: the dense form is larger than the factors, so it costs.
+        rep = self._attr(tmp_path)._route_test_rep(_query_block(16, k=16, d=16))
+        assert all(isinstance(v, Factorized) for v in rep.data.values())
+
+    def test_budget_admits_largest_saving_first(self, tmp_path, monkeypatch):
+        # Both layers grow when densified; the narrower l1 saves more flops
+        # (the ghost route's S^2 term is what the dense route removes).
+        block = _query_block(16, k=16, d=16)
+        block.data["l1"] = Factorized(
+            activation=torch.randn(16, 4, 12),
+            pre_activation_grad=torch.randn(16, 4, 12),
+        )
+        layer = block.select_layers(["l1"])
+        growth = layer.materialized_nbytes - layer.nbytes
+        monkeypatch.setattr(
+            base, "CacheBudget", lambda device: CacheBudget(limit_bytes=growth)
+        )
+        rep = self._attr(tmp_path)._route_test_rep(block)
+        assert isinstance(rep.data["l1"], torch.Tensor)
+        assert isinstance(rep.data["l0"], Factorized)
+
+    def test_routes_agree_on_scores(self, tmp_path, monkeypatch):
+        attr = self._attr(tmp_path)
+        train = _query_block(8, seed=1)
+        query = _query_block(16, seed=2)
+        dense = attr.inner_product(train, attr._route_test_rep(query.clone()))
+        monkeypatch.setattr(
+            base, "CacheBudget", lambda device: CacheBudget(limit_bytes=0)
+        )
+        ghost = attr.inner_product(train, attr._route_test_rep(query.clone()))
+        assert torch.allclose(dense, ghost, atol=1e-5, rtol=1e-5)
 
 
 class TestTracInOnDisk:

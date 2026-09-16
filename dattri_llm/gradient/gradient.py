@@ -310,6 +310,7 @@ class Gradient:
         fn: Callable[[str, GradientData, str], GradientData | None],
         *,
         layers: Iterable[str] | None = None,
+        consume: bool = False,
     ) -> Gradient:
         """Apply ``fn(name, value, layer_type)`` to every (selected) layer and
         rebuild the block from the results.
@@ -321,13 +322,22 @@ class Gradient:
         drop the layer.  Layers outside *layers* pass through unchanged.
         Layer types are preserved; validation is skipped because *fn* may
         legitimately change a layer's width.
+
+        With ``consume=True`` this block gives up each selected layer as soon
+        as *fn* has produced its replacement, so a whole-block conversion
+        never holds both forms at once (the old payload is freed as the new
+        one is built, one layer in flight).  The consumed block is unusable
+        afterwards: it keeps only the layers outside *layers*.
         """
         selected = set(self.data) if layers is None else set(layers)
         new_data: dict[str, GradientData] = {}
         new_repr: dict[str, GradientRepresentation] = {}
         new_indexing: dict[str, Indexing] = {}
-        for name, old in self.data.items():
+        for name in list(self.data):
+            release = consume and name in selected
+            old = self.data.pop(name) if release else self.data[name]
             value = fn(name, old, self.layer_types[name]) if name in selected else old
+            del old
             if value is None:
                 continue
             new_data[name] = value

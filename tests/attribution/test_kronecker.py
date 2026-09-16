@@ -391,6 +391,32 @@ def _kfac_oracle_mt(tr_f, te_f, train_hashes, test_hashes, layer, damping):
     return torch.einsum("nop,mop->nm", T, dW_te)
 
 
+class TestKFACFactorizedPreconditioning:
+    """K-FAC preconditions a factorized query on its factors, and the score
+    against raw train factors equals the dense two-sided preconditioning.
+    """
+
+    def test_factorized_query_matches_dense(self, tmp_path):
+        torch.manual_seed(0)
+        b_tr, b_te, t, k, d = 4, 2, 3, 5, 6
+        train = Factorized(torch.randn(b_tr, t, k), torch.randn(b_tr, t, d))
+        query = Factorized(torch.randn(b_te, t, k), torch.randn(b_te, t, d))
+        A, G = ops.kfac_factors(
+            train.activation, train.pre_activation_grad, "nn.Linear"
+        )
+        A_inv, G_inv = ops.sym_inverse(A, 0.1), ops.sym_inverse(G, 0.1)
+        attr = KFACAttributor(AttributionArguments(output_dir=str(tmp_path)))
+        rep = attr.precondition_test_layer(query, "nn.Linear", (A_inv, G_inv))
+        assert isinstance(rep, Factorized)
+        dense = ops.kfac_precondition_materialized(
+            ops.materialize(query, "nn.Linear"), A_inv, G_inv
+        )
+        expected = ops.materialize(train, "nn.Linear") @ dense.T
+        for mode in ("factorized", "materialized"):
+            got = ops.cross_dot(train, rep, "nn.Linear", mode=mode)
+            assert torch.allclose(got, expected, atol=1e-5, rtol=1e-5)
+
+
 class TestKFACMultiToken:
     def test_matches_oracle_with_token_dim(self, tmp_path):
         """KFAC's token-summed factorised path must match the explicit sum_t oracle."""
