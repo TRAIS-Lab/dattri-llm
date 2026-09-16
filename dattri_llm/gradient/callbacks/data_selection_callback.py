@@ -789,6 +789,27 @@ class DataSelectionCallback(HookManagerCallback):
         other = gradient if target is None else target
         mode = "materialized" if score_mode == "materialized" else "auto"
 
+        # Only layers captured per sample can be scored per sample.  A layer
+        # the manager could only hook at batch level (``param_grad`` -- e.g. a
+        # normalization class the per-sample hooks do not recognise) carries
+        # one summed gradient for the whole batch: it says nothing about any
+        # single sample, and ``remove_contributions`` skips it for the same
+        # reason, so it stays out of the score rather than contributing a
+        # mis-shaped term.
+        scorable = [
+            name
+            for name in gradient.layer_names
+            if gradient.layer_types.get(name) != ops.PARAM_GRAD_TYPES
+        ]
+        if len(scorable) < len(gradient.layer_names):
+            gradient = gradient.select_layers(scorable)
+            if target is not None:
+                other = other.select_layers(
+                    [n for n in scorable if n in other.layer_names]
+                )
+            else:
+                other = gradient
+
         # {layer: (B_layer, B_target)} cross-gram per selected scoring mode.
         per_layer = gradient.similarity(other, mode=mode)
 
