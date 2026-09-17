@@ -1043,3 +1043,33 @@ class TestOuterProductKernel:
         got = materialize_factors(a, g, "nn.ConvTranspose2d")
         assert got.shape == (3, 5 * 4)
         assert torch.allclose(got, want, atol=1e-6)
+
+
+class TestProjectionMatrix:
+    """``DattriProjector.resolve`` applies exactly what ``apply`` applies."""
+
+    def _proj(self):
+        from dattri_llm.gradient.ops.projection import DattriProjector
+
+        return DattriProjector()
+
+    @pytest.mark.parametrize("include_bias", [False, True])
+    def test_matches_apply(self, include_bias):
+        proj = self._proj()
+        x = torch.randn(2, 5, 12)
+        kw = {"proj_dim": 8, "proj_seed": 3, "proj_max_batch_size": 32}
+        want = proj.apply(x, include_bias=include_bias, **kw)
+        resolved = proj.resolve(
+            12, include_bias=include_bias, device=x.device, dtype=x.dtype, **kw
+        )
+        assert resolved.matches(x)
+        assert torch.equal(resolved(x), want)
+        assert resolved(x).shape == (2, 5, 8)
+
+    def test_detects_a_different_feature(self):
+        proj = self._proj()
+        resolved = proj.resolve(
+            12, proj_dim=8, proj_max_batch_size=32, device="cpu", dtype=torch.float32
+        )
+        assert not resolved.matches(torch.randn(2, 5, 13))
+        assert not resolved.matches(torch.randn(2, 5, 12, dtype=torch.float64))

@@ -51,8 +51,10 @@ from torch import nn
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.ops import (
     canonical_class_name,
+    dtypes,
     extract_module_kwargs,
     is_embedding,
+    to_3d,
 )
 
 if TYPE_CHECKING:
@@ -146,6 +148,9 @@ def _make_layer_buffer() -> LayerBuffer:
         # replica threads and drop calls for layers invoked more than once.
         "_proj_parts": [],
         "_proj_kw": None,
+        # The layer's LoGRA projections resolved once per side ("a" / "g"):
+        # matrix, bias row, dtype and device (see _projection_matrix).
+        "_proj_matrix": {},
         "_capture_style": "factorized",
         "_device_id": {},
         # Grad-enabled forward invocations observed this step.  Each forward
@@ -340,15 +345,8 @@ def register_linear_io_hooks(
                     if _preprojects_activation(
                         buf["_class_name"], _projection_style(buf)
                     ):
-                        proj_kw = {
-                            k: v for k, v in buf["_proj_kw"].items() if k != "style"
-                        }
-                        a = ops.project_activation(
-                            a,
-                            buf["_class_name"],
-                            projector,
-                            buf["_module_kwargs"],
-                            **proj_kw,
+                        a = _projection_matrix(buf, "a", a, projector)(
+                            to_3d(dtypes.align(a)[0])
                         )
                         emit_type, emit_kwargs = "nn.Linear", None
                     with buf["_lock"]:
@@ -566,6 +564,40 @@ def _warn_orphan_backward(layer_name: str) -> None:
     )
 
 
+def _projection_matrix(
+    buf: LayerBuffer,
+    side: str,
+    x: torch.Tensor,
+    projector: ops.DattriProjector | None,
+) -> ops.ProjectionMatrix:
+    """The layer's LoGRA projection of *side* (``"a"``: the activation, with
+    the bias ones-column and dattri's ``proj_seed + 1``; ``"g"``: the output
+    gradient, ``proj_seed``), resolved on first use and reused while the
+    feature keeps its width, dtype and device -- the same map
+    :func:`~dattri_llm.gradient.ops.project_activation` /
+    :func:`~dattri_llm.gradient.ops.project_gradient` apply, without their
+    per-call dispatch (a hooked layer is projected twice per step).
+    """
+    matrix = buf["_proj_matrix"].get(side)
+    (x,) = dtypes.align(x)
+    if matrix is not None and matrix.matches(x):
+        return matrix
+    kw = {k: v for k, v in buf["_proj_kw"].items() if k != "style"}
+    seed = kw.pop("proj_seed", 0)
+    module_kwargs = buf["_module_kwargs"]
+    with_bias = side == "a" and module_kwargs is not None and module_kwargs["has_bias"]
+    matrix = ops.DattriProjector.coerce(projector).resolve(
+        x.shape[-1],
+        proj_seed=seed + 1 if side == "a" else seed,
+        include_bias=with_bias,
+        device=x.device,
+        dtype=x.dtype,
+        **kw,
+    )
+    buf["_proj_matrix"][side] = matrix
+    return matrix
+
+
 def _preprojects_activation(layer_type: str, style: str | None) -> bool:
     """Whether a projected layer's activation is projected in the *forward* hook.
 
@@ -699,7 +731,7 @@ def _capture_projected(
         # path (same seeds).
         if _preprojects_activation(layer_type, style):
             a_p = a
-            g_p = ops.project_gradient(g, layer_type, projector, module_kwargs, **kw)
+            g_p = _projection_matrix(buf, "g", g, projector)(to_3d(dtypes.align(g)[0]))
             emit = g_p
         else:
             if a.ndim == 1 and is_embedding(layer_type):

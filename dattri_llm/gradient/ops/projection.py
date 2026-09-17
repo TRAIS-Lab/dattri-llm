@@ -281,6 +281,38 @@ class DattriProjector:
             out = flat @ matrix
         return out.reshape(*lead, proj_dim)
 
+    def resolve(
+        self,
+        d_in: int,
+        *,
+        proj_dim: int,
+        proj_seed: int = 0,
+        include_bias: bool = False,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        **proj_kwargs,
+    ) -> ProjectionMatrix:
+        """The projection :meth:`apply` would perform on a ``(..., d_in)``
+        feature of this *dtype* on this *device*, resolved once.
+
+        :meth:`apply` re-derives the matrix key from its arguments and looks
+        the matrix up on every call -- fine for a one-off, but a capture hook
+        projects the same layer twice per step, thousands of times per
+        attribution, and that dispatch costs more than the kernel.  A
+        :class:`ProjectionMatrix` holds the matrix (and, with
+        *include_bias*, its bias row) and applies it with one ``addmm``.
+        """
+        device = torch.device(proj_kwargs.pop("device", device))
+        matrix = self.matrix(
+            d_in + (1 if include_bias else 0),
+            proj_dim=proj_dim,
+            proj_seed=proj_seed,
+            device=device,
+            dtype=dtype,
+            **proj_kwargs,
+        )
+        return ProjectionMatrix(matrix, include_bias, d_in, dtype, device)
+
     def clear(self) -> None:
         """Drop every cached projection matrix (e.g. to free device memory)."""
         self._cache.clear()
@@ -297,6 +329,48 @@ class DattriProjector:
     def __exit__(self, *_exc: object) -> bool:
         self.close()
         return False
+
+
+class ProjectionMatrix:
+    """One layer's random projection with everything but the kernel done.
+
+    Built by :meth:`DattriProjector.resolve`; :meth:`matches` says whether a
+    feature is the one it was resolved for (width, dtype, device), and
+    :meth:`__call__` projects it exactly as :meth:`DattriProjector.apply`
+    would (same matrix, same ``addmm``), without re-deriving anything.
+    """
+
+    __slots__ = ("bias_row", "d_in", "device", "dtype", "matrix", "proj_dim")
+
+    def __init__(
+        self,
+        matrix: torch.Tensor,
+        include_bias: bool,
+        d_in: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.matrix = matrix[:-1] if include_bias else matrix
+        self.bias_row = matrix[-1] if include_bias else None
+        self.d_in, self.dtype, self.device = d_in, dtype, device
+        self.proj_dim = matrix.shape[1]
+
+    def matches(self, x: torch.Tensor) -> bool:
+        """Whether *x* is a feature this projection was resolved for."""
+        return (
+            x.shape[-1] == self.d_in
+            and x.dtype == self.dtype
+            and x.device == self.device
+        )
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Project the last axis of *x* (``(..., d_in)`` to ``(..., proj_dim)``)."""
+        flat = x.reshape(-1, self.d_in)
+        if self.bias_row is None:
+            out = flat @ self.matrix
+        else:
+            out = torch.addmm(self.bias_row, flat, self.matrix)
+        return out.reshape(*x.shape[:-1], self.proj_dim)
 
 
 def apply_projection(
