@@ -1294,6 +1294,7 @@ class HookManager:
                 projector=self._projector,
                 offload_to_cpu=self._offload_to_cpu,
                 preconditioner=self._preconditioner,
+                include_frozen=self._config.include_frozen,
             )
             self._n_layers = len(self._buffers)
             # The weight.grad post-accumulate barrier (sub-condition b) only

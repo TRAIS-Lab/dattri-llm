@@ -1170,3 +1170,62 @@ class TestHookLifecycle:
         grad = hm.get_gradient()
         assert grad is not None
         assert grad.batch_size == 3
+
+
+class _EmbedMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(20, 8)
+        self.fc1 = nn.Linear(8, 12)
+        self.fc2 = nn.Linear(12, 5)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.fc2(torch.relu(self.fc1(self.embedding(input_ids))))
+
+
+class TestIncludeFrozen:
+    """``include_frozen`` hooks layers whose parameters do not require grad;
+    a frozen probe captures the same factors and computes no weight gradient.
+    """
+
+    LAYERS = (r"^fc1$", r"^fc2$")
+
+    def _capture(self, *, freeze: bool, include_frozen: bool):
+        torch.manual_seed(0)
+        model = _EmbedMLP()
+        if freeze:
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in model.embedding.parameters():  # keeps gradients flowing
+                p.requires_grad = True
+        rec = _Recording()
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(
+                linear_io=list(self.LAYERS), include_frozen=include_frozen
+            ),
+            callbacks=[rec],
+        )
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        with hm.collect():
+            model(ids).pow(2).sum().backward()
+        hm.remove()
+        return model, rec
+
+    def test_frozen_layers_skipped_by_default(self):
+        _, rec = self._capture(freeze=True, include_frozen=False)
+        assert rec.records == []
+
+    def test_frozen_probe_matches_unfrozen_capture(self):
+        _, want = self._capture(freeze=False, include_frozen=False)
+        model, got = self._capture(freeze=True, include_frozen=True)
+        assert len(got.records) == len(want.records) == 1
+        g_want, g_got = want.records[0].gradient, got.records[0].gradient
+        assert set(g_got.layer_names) == set(g_want.layer_names) == {"fc1", "fc2"}
+        for name in g_want.layer_names:
+            a, b = g_want.data[name], g_got.data[name]
+            assert torch.equal(a.activation, b.activation)
+            assert torch.equal(a.pre_activation_grad, b.pre_activation_grad)
+        # Autograd was never asked for the frozen weights' gradients.
+        assert model.fc1.weight.grad is None
+        assert model.fc2.weight.grad is None

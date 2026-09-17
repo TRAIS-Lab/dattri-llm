@@ -189,6 +189,7 @@ def register_linear_io_hooks(
     projector: ops.DattriProjector | None = None,
     offload_to_cpu: bool = False,
     preconditioner: GradientPreconditioner | None = None,
+    include_frozen: bool = False,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
@@ -237,6 +238,8 @@ def register_linear_io_hooks(
             :func:`~dattri_llm.gradient.ops.should_materialize`, per layer and
             micro-batch; a layer's choice is fixed by its first micro-batch of
             a step).
+        include_frozen: Hook a layer even when none of its parameters
+            requires grad (see :class:`HookManagerConfig`).
         offload_to_cpu: When ``True``, move every buffered capture (the raw
             factors, or the projected result for a projected layer) to CPU.
             Default ``False``: buffers stay on the tensors' own device to
@@ -290,7 +293,7 @@ def register_linear_io_hooks(
         if layer_names is not None and name not in layer_names:
             continue
 
-        if not _has_trainable_params(module):
+        if not include_frozen and not _has_trainable_params(module):
             continue
 
         buffers[name] = _make_layer_buffer()

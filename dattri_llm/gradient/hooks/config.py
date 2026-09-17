@@ -194,6 +194,18 @@ class HookManagerConfig:
     whatever the capture style.  A layer's representation is fixed by its
     first micro-batch of a step, so accumulation windows never mix the two.
 
+    **Frozen layers** -- by default a ``linear_io`` layer whose parameters do
+    not require grad is not hooked: its gradient is not part of the training
+    signal (the frozen base of a LoRA model, say).  ``include_frozen=True``
+    hooks such layers too.  A layer's per-sample weight gradient is defined
+    by its input activation and output gradient whether or not autograd is
+    asked for ``weight.grad``, so a *probe* can freeze the whole model (keeping
+    one input-side parameter trainable, e.g. the embedding, so gradients still
+    flow through the activations) and capture exactly the factors it would
+    capture unfrozen -- while autograd computes and stores no weight
+    gradient at all.  Under FSDP that is what keeps the sharded gradients
+    (one more copy of the model across the cards) from being allocated.
+
     **Per-layer projection** -- :attr:`projection_kwargs` enables
     capture-time random projection: instead of buffering a layer's raw
     factors, each backward pass projects them down to ``proj_dim`` on the
@@ -295,6 +307,7 @@ class HookManagerConfig:
         projection_kwargs: dict[str, dict] | None = None,
         projector: Callable | None = None,
         capture_style: str = "factorized",
+        include_frozen: bool = False,
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
@@ -319,6 +332,10 @@ class HookManagerConfig:
         self.projection_kwargs = self._validate_projection(projection_kwargs)
         self.capture_style = self._validate_capture_style(capture_style)
         self.projector = projector
+        # Frozen layers are skipped by default (their gradient is not part of
+        # the training signal -- e.g. a LoRA base model).  ``include_frozen``
+        # hooks them anyway: see the class docstring.
+        self.include_frozen = bool(include_frozen)
 
     @staticmethod
     def _validate_assignment(
