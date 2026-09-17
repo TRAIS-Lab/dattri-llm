@@ -1023,3 +1023,23 @@ def test_cross_gram_per_token_sums_to_full(layer_type, factory):
     per_token = cross_gram_per_token(a1, g1, a2, g2, layer_type)  # (B1, T1, B2)
     assert per_token.shape == (a1.shape[0], a1.shape[1], a2.shape[0])
     assert torch.allclose(per_token.sum(1), full, atol=1e-4, rtol=1e-4)
+
+
+class TestOuterProductKernel:
+    """``materialize_factors`` forms the token-summed outer product with
+    ``bmm``; it must equal the einsum that defines it.
+    """
+
+    def test_linear_matches_einsum(self):
+        a, g = torch.randn(3, 7, 5), torch.randn(3, 7, 4)
+        want = torch.einsum("bto,bti->boi", g, a).flatten(1)
+        got = materialize_factors(a, g, "nn.Linear")
+        assert got.shape == (3, 4 * 5)
+        assert torch.allclose(got, want, atol=1e-6)
+
+    def test_conv_transpose_matches_einsum(self):
+        a, g = torch.randn(3, 7, 5), torch.randn(3, 7, 4)
+        want = torch.einsum("blc,blp->bcp", a, g).flatten(1)
+        got = materialize_factors(a, g, "nn.ConvTranspose2d")
+        assert got.shape == (3, 5 * 4)
+        assert torch.allclose(got, want, atol=1e-6)
