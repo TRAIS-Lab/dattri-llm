@@ -250,7 +250,11 @@ class TestUnbackwardedForwards:
     def test_detached_branch_does_not_stall(self):
         gen = torch.Generator().manual_seed(5)
         batches = [torch.randn(B, IN_DIM, generator=gen) for _ in range(2)]
-        rec = _collect(DetachedBranchModel(), batches)
+        # The layer no gradient reaches is left out of the record, and said
+        # so once (not once per step).
+        with pytest.warns(UserWarning, match="received no gradient") as caught:
+            rec = _collect(DetachedBranchModel(), batches)
+        assert sum("received no gradient" in str(w.message) for w in caught) == 1
         assert [r.step for r in rec.records] == [0, 1]
         for r in rec.records:
             assert r.gradient.layer_names == {"used"}

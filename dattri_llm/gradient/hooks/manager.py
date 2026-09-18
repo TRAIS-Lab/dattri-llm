@@ -57,6 +57,23 @@ def _current_graph_task_id() -> int:
     return _GRAPH_TASK_ID_PROBE() if _GRAPH_TASK_ID_PROBE is not None else -1
 
 
+def _first_grad_tensor(output: object) -> torch.Tensor | None:
+    """The first tensor requiring grad in a model output (a tensor, a
+    tuple/list, or a dict such as an HF ``ModelOutput``), else ``None``.
+    """
+    if isinstance(output, torch.Tensor):
+        return output if output.requires_grad else None
+    values: Iterable = output.values() if isinstance(output, dict) else output
+    try:
+        for value in values:
+            found = _first_grad_tensor(value)
+            if found is not None:
+                return found
+    except TypeError:  # not iterable
+        return None
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Hook manager                                                                 #
 # --------------------------------------------------------------------------- #
@@ -282,6 +299,12 @@ class HookManager:
         # Hook state -- populated by register(), emptied by remove().
         self._registered: bool = False
         self._model_fwd_handle: torch.utils.hooks.RemovableHandle | None = None
+        self._model_out_handle: torch.utils.hooks.RemovableHandle | None = None
+        # Hooked layers whose every forward of the step went without a
+        # backward (set by _reconcile_unmatched_forwards; read at the end of
+        # the backward, where such a layer is a definitive fact).
+        self._orphaned_layers: set[str] = set()
+        self._warned_orphans: set[frozenset[str]] = set()
         self._has_linear_io: bool = False
         self._buffers: dict = {}
         self._handles: list = []
@@ -470,9 +493,77 @@ class HookManager:
                 return
             self._mlp_params_ready = True
             self._reconcile_unmatched_forwards()
-            record = self._check_mlp_done()
+            orphaned = sorted(self._orphaned_layers)
+            # The backward is over: a hooked layer that ran forward but never
+            # saw a gradient is now a fact, and a step in which that holds
+            # for EVERY hooked layer can never complete.
+            stalled = (
+                self._has_linear_io
+                and bool(orphaned)
+                and not self._active_layers
+                and not self._bwd_done
+            )
+            record = None if stalled else self._check_mlp_done()
+        if stalled:
+            raise RuntimeError(
+                "No hooked layer received a gradient this step: "
+                f"{orphaned[:8]}{'...' if len(orphaned) > 8 else ''} ran forward "
+                "but the backward pass did not reach them, so the step cannot "
+                "complete. A layer receives a gradient only when the loss "
+                "depends on its output through some parameter that requires "
+                "grad; with frozen layers (include_frozen=True) a parameter "
+                "upstream of them -- typically the input embedding -- must "
+                "stay trainable.",
+            )
+        if orphaned and record is not None:
+            key = frozenset(orphaned)
+            if key not in self._warned_orphans:
+                self._warned_orphans.add(key)
+                warnings.warn(
+                    f"Hooked layers {orphaned[:8]}{'...' if len(orphaned) > 8 else ''} "
+                    "ran forward but received no gradient this step and are "
+                    "left out of its record (a detached branch, or a frozen "
+                    "layer with no trainable parameter upstream of it). "
+                    "Reported once per layer set.",
+                    stacklevel=2,
+                )
         if record is not None:
             self._dispatch_step_end(record)
+
+    def _capture_model_output(
+        self,
+        _module: nn.Module,
+        _args: tuple,
+        output: object,
+    ) -> None:
+        """Forward hook on the model root: arm :meth:`_on_backward_begin` on
+        the output, so every backward through the model is observed -- even
+        one that reaches no hooked layer (they are all frozen and nothing
+        upstream requires grad), which no layer hook could report.
+        """
+        if not self._collecting or self._n_layers == 0 or not torch.is_grad_enabled():
+            return
+        tensor = _first_grad_tensor(output)
+        if tensor is not None:
+            tensor.register_hook(self._on_backward_begin)
+
+    def _on_backward_begin(self, _grad: torch.Tensor) -> None:
+        """Tensor hook on the model output: the backward has just started.
+
+        Queues the end-of-backward callback here -- from inside the outermost
+        backward task -- whatever the hooked layers' parameters, so
+        :meth:`_on_backward_end` always reconciles the step (the layer-hook
+        queue sites need a trainable hooked parameter to fire at all).
+        """
+        if not self._collecting:
+            return
+        with self._step_lock:
+            if not self._backward_end_scheduled and queue_backward_end_callback(
+                self._on_backward_end,
+            ):
+                self._backward_end_scheduled = True
+                if self._outer_task_id == -1:
+                    self._outer_task_id = _current_graph_task_id()
 
     def _reconcile_unmatched_forwards(self) -> None:
         """Discard forward captures whose backward never fired (backward is
@@ -502,9 +593,13 @@ class HookManager:
                 matched = len(buf["_pair_pos"])
                 if buf["_fwd_fires"] != matched:
                     buf["_fwd_fires"] = matched
-            if matched == 0:
-                # Every forward was orphaned (detached branch): the layer did
-                # not participate in this step after all.
+            if matched == 0 and buf["_fwd_fires"] == 0 and had_orphans:
+                # Every forward was orphaned (detached branch, or a frozen
+                # layer no gradient reached): the layer did not participate
+                # in this step after all.
+                self._active_layers.discard(layer_name)
+                self._orphaned_layers.add(layer_name)
+            elif matched == 0:
                 self._active_layers.discard(layer_name)
             elif self._bwd_replica_counts.get(layer_name, 0) >= matched:
                 self._seen_bwd.add(layer_name)
@@ -741,6 +836,7 @@ class HookManager:
         self._step_count += 1
         self._seen_bwd.clear()
         self._bwd_replica_counts.clear()
+        self._orphaned_layers.clear()
         self._mlp_param_hook_count = 0
         self._param_hook_count = 0
         # Reset completion flags for the next step.
@@ -1222,6 +1318,7 @@ class HookManager:
         self._backward_end_scheduled = False
         self._seen_bwd.clear()
         self._bwd_replica_counts.clear()
+        self._orphaned_layers.clear()
         self._last_inputs = {}
         self._collecting = True
         try:
@@ -1257,6 +1354,7 @@ class HookManager:
             self._capture_model_input,
             with_kwargs=True,
         )
+        self._model_out_handle = root.register_forward_hook(self._capture_model_output)
 
         # Resolve which hook family each layer is assigned to (one family per
         # layer), then register concrete layer-name sets.
@@ -1297,6 +1395,7 @@ class HookManager:
                 include_frozen=self._config.include_frozen,
             )
             self._n_layers = len(self._buffers)
+            self._warn_frozen_layers(root, capture_layers)
             # The weight.grad post-accumulate barrier (sub-condition b) only
             # covers non-invasive layers: invasive layers never populate
             # weight.grad, so their step completion rides solely on the backward
@@ -1366,6 +1465,9 @@ class HookManager:
             return
         self._model_fwd_handle.remove()
         self._model_fwd_handle = None
+        if self._model_out_handle is not None:
+            self._model_out_handle.remove()
+            self._model_out_handle = None
         remove_hooks(self._handles)
         self._handles = []
         # Restore any invasive_linear_io forward overrides to their originals.
@@ -1383,6 +1485,49 @@ class HookManager:
             self._projector.close()
             self._projector = None
         self._registered = False
+
+    def _warn_frozen_layers(self, root: nn.Module, candidates: set[str]) -> None:
+        """Say what frozen layers mean for capture, at registration time.
+
+        Hooked layers without a trainable parameter (``include_frozen=True``)
+        receive a gradient only through a trainable parameter upstream; a
+        step no hooked layer receives a gradient in cannot complete (it
+        raises at the end of that backward, and under DDP/FSDP the other
+        ranks may hang in their collectives).  With ``include_frozen=False``
+        a model whose candidate layers are all frozen hooks nothing at all.
+        """
+        modules = dict(root.named_modules())
+
+        def frozen(name: str) -> bool:
+            module = modules.get(name)
+            return module is not None and not any(
+                p.requires_grad for p in module.parameters(recurse=False)
+            )
+
+        if self._config.include_frozen:
+            names = sorted(n for n in self._buffers if frozen(n))
+            if names:
+                warnings.warn(
+                    f"{len(names)} hooked layer(s) have no trainable parameter "
+                    f"(include_frozen=True), e.g. {names[:3]}. They receive a "
+                    "gradient only through a parameter upstream of them that "
+                    "requires grad (typically the input embedding); a step in "
+                    "which no hooked layer receives one cannot complete and "
+                    "raises at the end of that backward -- under DDP/FSDP the "
+                    "other ranks may then hang in their collectives.",
+                    stacklevel=3,
+                )
+        elif not self._buffers:
+            skipped = sorted(n for n in candidates if frozen(n))
+            if skipped:
+                warnings.warn(
+                    f"No layer hooked: the {len(skipped)} linear-IO candidate(s) "
+                    f"(e.g. {skipped[:3]}) have no trainable parameter and "
+                    "include_frozen is False. Pass "
+                    "HookManagerConfig(include_frozen=True) to capture frozen "
+                    "layers (a parameter upstream of them must require grad).",
+                    stacklevel=3,
+                )
 
     def _validate_preconditioning(
         self, root: nn.Module, param_grad_layers: set[str]

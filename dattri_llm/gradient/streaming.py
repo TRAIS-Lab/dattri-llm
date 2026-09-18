@@ -771,9 +771,12 @@ class GradientStreamer(GradientSource):
 
         record = self._capture.record
         if record is None:
+            # The manager reports the *reason* a step does not complete (a
+            # backward that reached no hooked layer raises at its end); this
+            # is left for a loss_fn that never ran the hooked model at all.
             raise RuntimeError(
-                "No gradient was captured this step. Ensure loss_fn runs the "
-                "model on the batch and backward flows through the hooked layers.",
+                "loss_fn produced no capture step: it must run the streamer's "
+                "model on the batch and its backward must reach the hooked layers.",
             )
         # Consistency check: with both counters zeroed at __iter__, the manager's
         # capture index must advance exactly once per batch.  A mismatch means a
@@ -1281,9 +1284,9 @@ class ReplayGradientSource(GradientSource):
                 record = state.capture.record
                 if record is None:
                     raise RuntimeError(
-                        f"No gradient was captured replaying step {step}. Ensure "
-                        "loss_fn runs the model on the batch and backward flows "
-                        "through the hooked layers.",
+                        f"loss_fn produced no capture step replaying step {step}: "
+                        "it must run the model on the batch and its backward must "
+                        "reach the hooked layers.",
                     )
                 grad = record.gradient
                 if self._layer_name is not None:

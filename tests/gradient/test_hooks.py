@@ -1229,3 +1229,83 @@ class TestIncludeFrozen:
         # Autograd was never asked for the frozen weights' gradients.
         assert model.fc1.weight.grad is None
         assert model.fc2.weight.grad is None
+
+    def test_frozen_layers_warn_at_registration(self):
+        with pytest.warns(
+            UserWarning, match="no trainable parameter .include_frozen=True"
+        ):
+            self._capture(freeze=True, include_frozen=True)
+
+    def test_nothing_hooked_warns_at_registration(self):
+        with pytest.warns(UserWarning, match="No layer hooked"):
+            self._capture(freeze=True, include_frozen=False)
+
+    def test_trainable_layers_do_not_warn(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            warnings.filterwarnings("ignore", message="Full backward hook")
+            self._capture(freeze=False, include_frozen=False)
+
+    def test_frozen_probe_completes_under_nonreentrant_checkpointing(self):
+        """Forward fires twice (original + recomputation), backward once; the
+        end-of-backward reconciliation must run for frozen layers too, or
+        the step never completes and the buffers grow step over step.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        class Ckpt(_EmbedMLP):
+            def forward(self, input_ids):
+                h = self.embedding(input_ids)
+                return checkpoint(
+                    lambda x: self.fc2(torch.relu(self.fc1(x))), h, use_reentrant=False
+                )
+
+        torch.manual_seed(0)
+        model = Ckpt()
+        model.requires_grad_(requires_grad=False)
+        model.embedding.requires_grad_(requires_grad=True)
+        rec = _Recording()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            hm = HookManager(
+                model,
+                config=HookManagerConfig(
+                    linear_io=list(self.LAYERS), include_frozen=True
+                ),
+                callbacks=[rec],
+            )
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        with hm.collect():
+            for _ in range(3):
+                model(ids).pow(2).sum().backward()
+        hm.remove()
+        assert [r.step for r in rec.records] == [0, 1, 2]
+        assert all(set(r.gradient.layer_names) == {"fc1", "fc2"} for r in rec.records)
+
+    def test_no_gradient_reaching_hooked_layers_raises(self):
+        """Everything frozen but a layer *after* the hooked ones: the backward
+        never reaches them.  The step must fail loudly at the end of that
+        backward (silently it would leak, and stall the ranks under DDP/FSDP).
+        """
+        torch.manual_seed(0)
+        model = _EmbedMLP()
+        model.requires_grad_(requires_grad=False)
+        model.fc2.requires_grad_(requires_grad=True)  # only the last layer trains
+        rec = _Recording()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            hm = HookManager(
+                model,
+                config=HookManagerConfig(linear_io=[r"^fc1$"], include_frozen=True),
+                callbacks=[rec],
+            )
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        try:
+            with hm.collect():  # noqa: SIM117
+                with pytest.raises(
+                    RuntimeError, match="No hooked layer received a gradient"
+                ):
+                    model(ids).pow(2).sum().backward()
+        finally:
+            hm.remove()
+        assert rec.records == []
