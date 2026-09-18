@@ -404,6 +404,23 @@ class GradientStreamer(GradientSource):
             (before its update) and its batch here, so the step can be
             replayed later by a :class:`ReplayGradientSource` instead of
             storing its gradients.  Not supported under FSDP.
+        hook_manager: Share another streamer's hooks (its ``.hook_manager``)
+            instead of registering a second set over the same model.
+        forward_model: The DDP/FSDP-wrapped module forward/backward run on,
+            when ``model`` is already wrapped: the caller's own wrapper (a
+            trainer's, or one built once for several passes), or the
+            :attr:`forward_model` of the streamer whose ``hook_manager`` is
+            shared.  Required with a shared ``hook_manager`` under
+            distributed execution, since a model can only be wrapped once
+            (under FSDP its parameters are already sharded).  ``None``
+            (default) wraps ``model`` per ``args``.
+        shard: Under distributed execution, split ``dataset`` across the
+            ranks (a :class:`~torch.utils.data.DistributedSampler`; the
+            default) or stream all of it on every rank (``False``).  A test
+            set every rank scores its own training shard against must not be
+            sharded.  Every rank must still run the same number of steps, so
+            all ranks stream the same (unsharded) dataset.  No effect on a
+            single process.
     """
 
     def __init__(
@@ -423,11 +440,14 @@ class GradientStreamer(GradientSource):
         hook_manager: HookManager | None = None,
         precondition: bool = False,
         snapshots: TrajectorySnapshots | str | None = None,
+        forward_model: nn.Module | None = None,
+        shard: bool = True,
     ) -> None:
         self._model = model
         self._dataset = dataset
         self._args = args
         self._batch_size = batch_size
+        self._shard = shard
         self.enable_update = enable_update
         if snapshots is not None and not isinstance(snapshots, TrajectorySnapshots):
             snapshots = TrajectorySnapshots(snapshots)
@@ -530,8 +550,19 @@ class GradientStreamer(GradientSource):
 
         # ``_model`` is the unwrapped reference (hooks, params, eval/grad state);
         # ``_fwd_model`` is what forward/backward actually run on (DDP/FSDP when
-        # distributed, otherwise the same object).
-        self._fwd_model = self._wrap_model(model, args)
+        # distributed, otherwise the same object).  A model the caller (or
+        # the streamer whose hooks are shared) already wrapped is not wrapped
+        # again: it can only be wrapped once.
+        if forward_model is not None:
+            self._fwd_model = forward_model
+        elif hook_manager is not None and args.world_size > 1:
+            raise ValueError(
+                "A shared hook_manager under distributed execution needs the "
+                "sharing streamer's forward_model= as well (the model is "
+                "already wrapped; pass ``other.forward_model``).",
+            )
+        else:
+            self._fwd_model = self._wrap_model(model, args)
 
         self._loader = self._build_loader()
         # Gradient accumulation (enable_update only): micro-batches per
@@ -573,6 +604,14 @@ class GradientStreamer(GradientSource):
     def model(self) -> nn.Module:
         """The unwrapped model the hooks are registered on."""
         return self._model
+
+    @property
+    def forward_model(self) -> nn.Module:
+        """The module forward/backward run on: the DDP/FSDP wrapper under
+        distributed execution, else :attr:`model` itself.  Pass it, together
+        with :attr:`hook_manager`, to a streamer sharing these hooks.
+        """
+        return self._fwd_model
 
     @property
     def hook_manager(self) -> HookManager:
@@ -928,7 +967,8 @@ class GradientStreamer(GradientSource):
         # (sampler and shuffle are mutually exclusive, so set only one). Content
         # hashes stay globally unique, so per-rank rows concatenate cleanly -- the
         # on-the-fly analogue of GradientStorageManager's per-rank index merge.
-        if self._args.world_size > 1:
+        # ``shard=False`` (a test set) streams the whole dataset on every rank.
+        if self._args.world_size > 1 and self._shard:
             kwargs["sampler"] = DistributedSampler(
                 self._dataset,
                 num_replicas=self._args.world_size,

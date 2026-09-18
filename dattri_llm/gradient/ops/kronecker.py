@@ -17,6 +17,7 @@ from dattri_llm.gradient.ops.types import (
     is_embedding,
     is_norm,
 )
+from dattri_llm.utils.distributed import all_reduce_sum
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -467,6 +468,19 @@ class LayerKroneckerAccumulator:
         self._G += (g_f.T @ g_f).float()
         self._n += N
 
+    def all_reduce(self) -> None:
+        """Sum the accumulated sums and counts over every rank in place, so
+        :meth:`result` is the covariance of the whole (sharded) fit set.
+        A no-op outside a distributed context.  Every rank must call it,
+        and each must have accumulated at least one batch for this layer.
+        """
+        if self._A is None:
+            raise RuntimeError("No gradient-carrying data has been accumulated")
+        all_reduce_sum(self._A)
+        all_reduce_sum(self._G)
+        n = torch.tensor([self._n], dtype=torch.int64)
+        self._n = int(all_reduce_sum(n).item())
+
     def result(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (A, G) normalized covariance matrices."""
         if self._A is None or self._n == 0:
@@ -525,6 +539,16 @@ class LayerFisherAccumulator:
             )
         self._F += grad.T @ grad
         self._n += B
+
+    def all_reduce(self) -> None:
+        """Sum the accumulated Fisher and count over every rank in place (a
+        no-op outside a distributed context; every rank must call it).
+        """
+        if self._F is None:
+            raise RuntimeError("No data has been accumulated")
+        all_reduce_sum(self._F)
+        n = torch.tensor([self._n], dtype=torch.int64)
+        self._n = int(all_reduce_sum(n).item())
 
     def result(self) -> torch.Tensor:
         """Return normalized empirical Fisher matrix."""
@@ -585,6 +609,15 @@ class KroneckerAccumulator:
                 bf.module_kwargs,
             )
 
+    def all_reduce(self) -> None:
+        """Sum every layer's accumulator over the ranks (see
+        :meth:`LayerKroneckerAccumulator.all_reduce`).  The layer set must
+        agree across ranks, which it does when every rank streams blocks of
+        the same capture.
+        """
+        for name in sorted(self._layers):
+            self._layers[name].all_reduce()
+
     def result(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Return ``{layer: (A, G)}`` for every accumulated layer."""
         return {name: acc.result() for name, acc in self._layers.items()}
@@ -631,6 +664,14 @@ class FisherAccumulator:
                 self._layers.pop(name, None)
                 continue
             self._layers.setdefault(name, LayerFisherAccumulator()).update_from_grad(g)
+
+    def all_reduce(self) -> None:
+        """Sum every layer's accumulator over the ranks (see
+        :meth:`LayerFisherAccumulator.all_reduce`); the layer set must agree
+        across ranks.
+        """
+        for name in sorted(self._layers):
+            self._layers[name].all_reduce()
 
     def result(self) -> dict[str, torch.Tensor]:
         """Return ``{layer: F}`` for every accumulated (non-skipped) layer."""

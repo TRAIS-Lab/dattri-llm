@@ -100,6 +100,15 @@ class KroneckerCovarianceCallback(HookManagerCallback):
             include_bias=self._include_bias,
         )
 
+    def all_reduce(self) -> None:
+        """Sum every layer's accumulator over the ranks, so :meth:`result` is
+        the covariance of the whole capture and not this rank's shard (see
+        :meth:`~dattri_llm.gradient.ops.LayerKroneckerAccumulator.all_reduce`).
+        A no-op single-process; every rank must call it.
+        """
+        for layer_name in sorted(self._accumulators):
+            self._accumulators[layer_name].all_reduce()
+
     def result(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Return the fitted ``{layer: (A, G)}`` covariances (normalized).
 

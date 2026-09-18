@@ -7,6 +7,11 @@ Every function is safe to call whether or not a process group is initialised
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
 
 def is_dist_initialized() -> bool:
     """Return ``True`` when a ``torch.distributed`` process group is active."""
@@ -42,3 +47,32 @@ def dist_world_size() -> int:
     except Exception:  # noqa: BLE001, S110 - guarded probe; backend may raise anything
         pass
     return 1
+
+
+def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
+    """Sum *tensor* over every rank in place and return it.
+
+    A no-op outside a distributed context.  The reduction runs on the
+    process group's device (NCCL reduces CUDA tensors only; gloo works on
+    CPU), so a tensor living elsewhere is moved there and back.
+
+    Args:
+        tensor: The per-rank partial sum.
+
+    Returns:
+        *tensor*, now holding the sum across ranks.
+    """
+    if dist_world_size() == 1:
+        return tensor
+    import torch
+    import torch.distributed as dist
+
+    if "nccl" in str(dist.get_backend()).lower():
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+    buf = tensor.to(device)
+    dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+    if buf is not tensor:
+        tensor.copy_(buf)
+    return tensor

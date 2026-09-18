@@ -59,6 +59,7 @@ from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.cache import CACHE_RESIDENCIES
+from dattri_llm.utils.distributed import all_reduce_sum
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -936,6 +937,11 @@ class KFACAttributor(KroneckerAttributor):
             kron.update(train_g, layers)
             # Reuse this single sweep to fit the direct Fisher.
             self.accumulate_fisher(fisher_acc, train_g)
+        # A live source under DDP/FSDP streams one shard per rank: the fit
+        # is over the whole set only once the sums are reduced (no-op
+        # single-process).  Supplied covariances are the caller's to reduce.
+        kron.all_reduce()
+        fisher_acc.all_reduce()
         # {layer: (A, G)} raw covariances (undamped)
         return {**kron.result(), **supplied}
 
@@ -1042,6 +1048,11 @@ class EKFACAttributor(KroneckerAttributor):
                 train_g = train_block.to(device)
                 kron.update(train_g, self.kfac_layers(train_g))
                 self.accumulate_fisher(fisher_acc, train_g)
+            # Sum the per-rank shards of a live DDP/FSDP source (no-op
+            # single-process) before the eigendecomposition, which every
+            # rank then performs on identical input.
+            kron.all_reduce()
+            fisher_acc.all_reduce()
             covariances = kron.result()
         else:
             covariances = supplied
@@ -1079,6 +1090,15 @@ class EKFACAttributor(KroneckerAttributor):
                 lam_sum[layer] = lam_sum.get(layer, 0) + (M * M).sum(0)
                 counts[layer] = counts.get(layer, 0) + M.shape[0]
 
+        # Per-rank shards of a live DDP/FSDP source sum into the whole
+        # set's spectrum (no-op single-process); the direct Fisher fitted in
+        # this sweep (supplied covariances) is reduced here too.
+        for layer in sorted(lam_sum):
+            all_reduce_sum(lam_sum[layer])
+            n = torch.tensor([counts[layer]], dtype=torch.int64)
+            counts[layer] = int(all_reduce_sum(n).item())
+        if supplied is not None:
+            fisher_acc.all_reduce()
         # The *undamped* empirical spectrum; damping is a per-layer shift
         # applied later in damp(), so the raw fit can be re-damped freely.
         return {

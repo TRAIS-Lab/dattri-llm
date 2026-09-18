@@ -274,6 +274,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         enable_update: bool = False,
         hook_config: HookManagerConfig | None = None,
         snapshots: TrajectorySnapshots | None = None,
+        forward_model: nn.Module | None = None,
     ) -> GradientStreamer:
         """Live train gradients: a streamer over *train_dataset*.
 
@@ -287,6 +288,8 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             hook_config: Capture configuration; ``None`` uses the default.
             snapshots: Under ``enable_update``, record every step's
                 parameters and batch here so the trajectory can be replayed.
+            forward_model: The task model's existing DDP/FSDP wrapper, when
+                the caller wrapped it already; ``None`` wraps per ``args``.
         """
         return GradientStreamer(
             self.require_task("attribute").get_model(),
@@ -298,6 +301,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             checkpoint_step=checkpoint_step,
             config=hook_config,
             snapshots=snapshots,
+            forward_model=forward_model,
         )
 
     def generate_test_rep(
@@ -307,6 +311,8 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         checkpoint_step: int = 0,
         hook_config: HookManagerConfig | None = None,
         hook_manager: object | None = None,
+        forward_model: nn.Module | None = None,
+        shard: bool = True,
     ) -> GradientStreamer:
         """Live test gradients: a frozen streamer over *test_dataset*.
 
@@ -317,6 +323,13 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 given.
             hook_manager: Share the train streamer's hook manager (one set of
                 hooks over the model) instead of registering a second one.
+            forward_model: With *hook_manager*, the train streamer's
+                ``forward_model`` (its DDP/FSDP wrapper), so the model is
+                not wrapped twice.
+            shard: Under distributed execution, split the test set across
+                the ranks (a stored test set, merged later) or stream all of
+                it on every rank (``False``: live scoring, where each rank
+                scores its training shard against every query).
         """
         return GradientStreamer(
             self.require_task("attribute").get_model(),
@@ -328,6 +341,8 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             checkpoint_step=checkpoint_step,
             config=hook_config,
             hook_manager=hook_manager,
+            forward_model=forward_model,
+            shard=shard,
         )
 
     def load_train_rep(
@@ -849,10 +864,16 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 enable_update=enable_update,
                 hook_config=hook_config,
             )
+            # The test probe rides the train streamer's hooks and wrapper, and
+            # every rank streams every query: each rank scores its own
+            # training shard against the whole test set, so the per-rank
+            # score rows concatenate into the full matrix.
             test = self.generate_test_rep(
                 test_dataset,
                 checkpoint_step=k,
                 hook_manager=train.hook_manager,
+                forward_model=train.forward_model,
+                shard=False,
             )
             hooked_layers = list(train.hook_manager.layer_name)
             with train, test:
