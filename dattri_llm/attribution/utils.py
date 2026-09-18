@@ -1,6 +1,6 @@
 """Common utilities shared by the attribution algorithms.
 
-* :func:`normalize_layer_names` / :func:`task_loss_fn` -- small adapters.
+* :func:`normalize_layer_names` -- a small adapter.
 * :func:`collect_gradients` -- run a streamer to completion into a store
   (the engine of every attributor's ``cache``).
 * :func:`score_sources` -- the inner-product scoring loop: every train block
@@ -24,8 +24,6 @@ from dattri_llm.utils.cache import CacheBudget, TensorCache
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from torch import nn
-
     from dattri_llm.gradient.storage_manager import GradientStorageManager
     from dattri_llm.gradient.streaming import GradientStreamer
 
@@ -48,21 +46,6 @@ def normalize_layer_names(
     if isinstance(layer_name, str):
         return [layer_name]
     return list(layer_name)
-
-
-def task_loss_fn(func: Callable) -> Callable:
-    """Adapt a dattri ``AttributionTask`` loss/target -- ``(params, data) -> loss``
-    (functorch style) -- to the streamer's ``(model, batch) -> loss``.
-
-    The streamer drives a live model, so we call *func* with that model's current
-    parameters; *func* runs the same ``functional_call`` forward the task defines,
-    and ``batch`` is the loader's batch in the task's ``data`` format.
-    """
-
-    def loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
-        return func(dict(model.named_parameters()), batch)
-
-    return loss_fn
 
 
 def collect_gradients(

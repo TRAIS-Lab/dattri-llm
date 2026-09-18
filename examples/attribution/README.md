@@ -21,8 +21,9 @@ python examples/attribution/attribution_from_disk.py
 
 ## `attribution_on_the_fly.py` — one-call live attribution (workflow 1)
 
-The attribution target is described with a `dattri` `AttributionTask`
-(functorch-style loss + checkpoint list); `TracInAttributor.attribute(train_ds,
+The attribution target is described with an `AttributionTask` (a
+`(model, batch) -> loss` function on the live model, plus the checkpoints to
+score at; the model's current weights by default); `TracInAttributor.attribute(train_ds,
 test_ds)` then streams the gradients live and scores them in one call — nothing is
 persisted. The full `(num_train, num_test)` matrix is read back with
 `score.agnostic_matrix()`.

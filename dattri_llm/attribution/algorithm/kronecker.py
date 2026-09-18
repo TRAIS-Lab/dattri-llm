@@ -64,13 +64,13 @@ from dattri_llm.utils.distributed import all_reduce_sum
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
-    from dattri.task import AttributionTask
     from torch.utils.data import Dataset
 
     from dattri_llm.attribution.arguments import AttributionArguments
     from dattri_llm.attribution.score import AttributionScore
     from dattri_llm.gradient.hooks import HookManagerConfig
     from dattri_llm.gradient.streaming import DiskGradientSource, GradientSource
+    from dattri_llm.task import AttributionTask
 
 NonKfacStrategy = Literal["ignore", "direct"]
 

@@ -11,12 +11,12 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
-from dattri.task import AttributionTask
 from torch import nn
 from torch.utils.data import Dataset
 
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.task import AttributionTask
 
 IN, HID, OUT = 8, 16, 4
 
@@ -69,15 +69,13 @@ if __name__ == "__main__":
     )
     train_ds, test_ds = DictDataset(x_tr, y_tr), DictDataset(x_te, y_te)
 
-    # describe the attribution target with a dattri AttributionTask: the loss is
-    # functorch-style (params, data) -> loss; checkpoints is the list of model
-    # states to score at (here just the current weights)
-    def loss_func(params, data):
-        yhat = torch.func.functional_call(model, params, (data["x"],))
-        return ((yhat - data["y"]) ** 2).sum()
+    # describe the attribution target with an AttributionTask: the loss runs
+    # the live model on a batch, (model, batch) -> loss; the model's current
+    # weights are the (single) checkpoint to score at
+    def loss_func(model, data):
+        return ((model(data["x"]) - data["y"]) ** 2).sum()
 
-    checkpoint = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    task = AttributionTask(loss_func=loss_func, model=model, checkpoints=[checkpoint])
+    task = AttributionTask(loss_func=loss_func, model=model)
 
     with tempfile.TemporaryDirectory() as tmp:
         # attribute -- one call streams the gradients live and scores them;

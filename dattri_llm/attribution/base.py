@@ -3,8 +3,9 @@
 Two levels, mirroring dattri:
 
 * :class:`BaseAttributor` -- the contract every attributor satisfies: build it
-  from :class:`AttributionArguments` (plus an optional dattri
-  ``AttributionTask`` for the live workflow), ``cache`` gradients, and
+  from :class:`AttributionArguments` (plus an optional
+  :class:`~dattri_llm.task.AttributionTask` for the live workflow), ``cache``
+  gradients, and
   ``attribute`` either live or ``attribute_from_cache``.
 * :class:`BaseInnerProductAttributor` -- the concrete workflow of every method
   whose score is an inner product between a (transformed) train representation
@@ -29,18 +30,17 @@ from dattri_llm.attribution.utils import (
     collect_gradients,
     normalize_layer_names,
     score_sources,
-    task_loss_fn,
 )
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
+from dattri_llm.task import AttributionTask, as_task
 from dattri_llm.utils.cache import CACHE_RESIDENCIES, CacheBudget
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
-    from dattri.task import AttributionTask
     from torch import nn
     from torch.utils.data import Dataset
 
@@ -96,9 +96,10 @@ class BaseAttributor(ABC):
             args: Configuration controlling device placement, batch sizes,
                 precision, DataLoader behaviour, distributed settings and the
                 output directory.  See :class:`AttributionArguments`.
-            task: The dattri ``AttributionTask`` supplying the model, loss,
-                optional target function and checkpoints.  Required by the
-                live methods (:meth:`cache`, :meth:`attribute`); unused by
+            task: The :class:`~dattri_llm.task.AttributionTask` supplying
+                the model, loss, optional target function and checkpoints (a
+                dattri task is adapted).  Required by the live methods
+                (:meth:`cache`, :meth:`attribute`); unused by
                 :meth:`attribute_from_cache`.
             **kwargs: Method-specific construction options.
         """
@@ -222,7 +223,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         task: AttributionTask | None = None,
     ) -> None:
         self.args = args
-        self.task = task
+        self.task: AttributionTask | None = None if task is None else as_task(task)
 
     # ------------------------------------------------------------------ #
     # Task plumbing                                                        #
@@ -239,13 +240,11 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
 
     def num_checkpoints(self) -> int:
         """Number of checkpoints the task provides."""
-        return len(self.require_task("attribute").get_checkpoints())
+        return self.require_task("attribute").num_checkpoints()
 
     def load_checkpoint(self, index: int) -> nn.Module:
         """Load the task's *index*-th checkpoint into its model and return it."""
-        task = self.require_task("attribute")
-        task._load_checkpoints(index)  # noqa: SLF001 - dattri's loading entry point
-        return task.get_model()
+        return self.require_task("attribute").load_checkpoint(index)
 
     def checkpoints(self) -> list[int]:
         """Checkpoint indices :meth:`attribute` ensembles over (all, by default).
@@ -255,12 +254,12 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         return list(range(self.num_checkpoints()))
 
     def train_loss_fn(self) -> Callable:
-        """The task's training loss in the streamer's ``(model, batch)`` form."""
-        return task_loss_fn(self.require_task("attribute").original_loss_func)
+        """The task's training loss, ``(model, batch) -> loss``."""
+        return self.require_task("attribute").loss_func
 
     def test_loss_fn(self) -> Callable:
         """The task's target function (defaults to its loss) for the test side."""
-        return task_loss_fn(self.require_task("attribute").original_target_func)
+        return self.require_task("attribute").target_func
 
     # ------------------------------------------------------------------ #
     # Representations: live sources and on-disk sources                    #
@@ -288,11 +287,12 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             hook_config: Capture configuration; ``None`` uses the default.
             snapshots: Under ``enable_update``, record every step's
                 parameters and batch here so the trajectory can be replayed.
-            forward_model: The task model's existing DDP/FSDP wrapper, when
-                the caller wrapped it already; ``None`` wraps per ``args``.
+            forward_model: The DDP/FSDP wrapper to run on; ``None`` uses the
+                one the task's model came in, if any, else wraps per ``args``.
         """
+        task = self.require_task("attribute")
         return GradientStreamer(
-            self.require_task("attribute").get_model(),
+            task.model,
             train_dataset,
             self.args,
             batch_size=self.args.per_device_train_batch_size,
@@ -301,7 +301,9 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             checkpoint_step=checkpoint_step,
             config=hook_config,
             snapshots=snapshots,
-            forward_model=forward_model,
+            forward_model=task.forward_model
+            if forward_model is None
+            else forward_model,
         )
 
     def generate_test_rep(
@@ -325,14 +327,16 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 hooks over the model) instead of registering a second one.
             forward_model: With *hook_manager*, the train streamer's
                 ``forward_model`` (its DDP/FSDP wrapper), so the model is
-                not wrapped twice.
+                not wrapped twice; ``None`` uses the wrapper the task's
+                model came in, if any.
             shard: Under distributed execution, split the test set across
                 the ranks (a stored test set, merged later) or stream all of
                 it on every rank (``False``: live scoring, where each rank
                 scores its training shard against every query).
         """
+        task = self.require_task("attribute")
         return GradientStreamer(
-            self.require_task("attribute").get_model(),
+            task.model,
             test_dataset,
             self.args,
             batch_size=self.args.per_device_eval_batch_size,
@@ -341,7 +345,9 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             checkpoint_step=checkpoint_step,
             config=hook_config,
             hook_manager=hook_manager,
-            forward_model=forward_model,
+            forward_model=task.forward_model
+            if forward_model is None
+            else forward_model,
             shard=shard,
         )
 

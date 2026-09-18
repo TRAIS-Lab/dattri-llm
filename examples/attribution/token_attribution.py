@@ -12,7 +12,6 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
-from dattri.task import AttributionTask
 from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -20,6 +19,7 @@ from dattri_llm.attribution.algorithm.kronecker import KFACAttributor
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.hooks import HookManagerConfig
+from dattri_llm.task import AttributionTask
 
 MODEL_ID = "sshleifer/tiny-gpt2"  # 2-layer GPT-2, runs on CPU
 MAX_LENGTH = 16
@@ -89,12 +89,9 @@ if __name__ == "__main__":
     train_ds = TextDataset(tokenizer, TRAIN_TEXTS)
     query_ds = TextDataset(tokenizer, [QUERY_TEXT])
 
-    # the attribution target: the language-modeling loss of a batch
-    def loss_func(params, batch):
-        return torch.func.functional_call(model, params, args=(), kwargs=batch).loss
-
-    checkpoint = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    task = AttributionTask(loss_func=loss_func, model=model, checkpoints=[checkpoint])
+    # the attribution target: the language-modeling loss of a batch,
+    # ``model(**batch).loss`` -- the task's default loss
+    task = AttributionTask(loss_func=None, model=model)
 
     with tempfile.TemporaryDirectory() as tmp:
         attr_args = AttributionArguments(

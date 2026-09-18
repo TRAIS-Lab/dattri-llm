@@ -18,7 +18,6 @@ from dattri_llm.attribution.utils import (
     collect_gradients,
     normalize_layer_names,
     score_sources,
-    task_loss_fn,
 )
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.streaming import rebatch_blocks
@@ -146,17 +145,29 @@ class TestNormalizeLayerNames:
         assert out is not names
 
 
-class TestTaskLossFn:
+class TestFromDattri:
     def test_adapts_functorch_loss_to_streamer_convention(self):
+        from dattri.task import AttributionTask as DattriTask
+
+        from dattri_llm.task import AttributionTask, as_task
+
         model = nn.Linear(3, 1, bias=False)
         batch = torch.ones(2, 3)
 
         def dattri_loss(params, data):
             return torch.func.functional_call(model, params, (data,)).sum()
 
-        loss_fn = task_loss_fn(dattri_loss)
+        task = as_task(
+            DattriTask(
+                loss_func=dattri_loss, model=model, checkpoints=[model.state_dict()]
+            )
+        )
+        assert isinstance(task, AttributionTask)
+        assert task.model is model
         expected = model(batch).sum()
-        assert torch.allclose(loss_fn(model, batch), expected)
+        assert torch.allclose(task.loss_func(model, batch), expected)
+        assert torch.allclose(task.target_func(model, batch), expected)
+        assert task.load_checkpoint(0) is model
 
 
 # --------------------------------------------------------------------------- #

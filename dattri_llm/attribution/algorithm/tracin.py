@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
 
-    from dattri.task import AttributionTask
     from torch.utils.data import Dataset
 
     from dattri_llm.attribution.arguments import AttributionArguments
@@ -47,6 +46,7 @@ if TYPE_CHECKING:
     from dattri_llm.gradient.hooks import HookManagerConfig
     from dattri_llm.gradient.storage_manager import GradientStorageManager
     from dattri_llm.gradient.streaming import DiskGradientSource
+    from dattri_llm.task import AttributionTask
     from dattri_llm.utils.cache import TensorCache
 
 

@@ -239,16 +239,15 @@ class TestCollectToDiskOnBlock:
     """
 
     def _streamer(self, attr, train_ds):
-        from dattri_llm.attribution.utils import task_loss_fn
         from dattri_llm.gradient.streaming import GradientStreamer
 
-        attr.task._load_checkpoints(0)
+        attr.task.load_checkpoint(0)
         return GradientStreamer(
-            attr.task.get_model(),
+            attr.task.model,
             train_ds,
             attr.args,
             batch_size=attr.args.per_device_train_batch_size,
-            loss_fn=task_loss_fn(attr.task.original_loss_func),
+            loss_fn=attr.task.loss_func,
         )
 
     def test_on_block_covariance_matches_fit(self, tmp_path):
@@ -321,17 +320,17 @@ class TestCompactKFAC:
         )
 
     def _collect(self, attr, ds, out, style, capture_style="factorized", cov=None):
-        from dattri_llm.attribution.utils import collect_gradients, task_loss_fn
+        from dattri_llm.attribution.utils import collect_gradients
         from dattri_llm.gradient.storage_manager import GradientStorageManager
         from dattri_llm.gradient.streaming import GradientStreamer
 
-        attr.task._load_checkpoints(0)
+        attr.task.load_checkpoint(0)
         streamer = GradientStreamer(
-            attr.task.get_model(),
+            attr.task.model,
             ds,
             attr.args,
             batch_size=attr.args.per_device_train_batch_size,
-            loss_fn=task_loss_fn(attr.task.original_loss_func),
+            loss_fn=attr.task.loss_func,
             config=self._proj(style, capture_style),
         )
         if cov is not None:

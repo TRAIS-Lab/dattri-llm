@@ -41,7 +41,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
 
-    from dattri.task import AttributionTask
     from torch.utils.data import Dataset
 
     from dattri_llm.attribution.arguments import AttributionArguments
@@ -50,6 +49,7 @@ if TYPE_CHECKING:
     from dattri_llm.gradient.hooks import HookManagerConfig
     from dattri_llm.gradient.storage_manager import GradientStorageManager
     from dattri_llm.gradient.streaming import DiskGradientSource, GradientSource
+    from dattri_llm.task import AttributionTask
 
 
 def _unit_rows(block: Gradient, scale: float) -> Gradient:
@@ -159,8 +159,9 @@ class LESSAttributor(BaseInnerProductAttributor):
         """A **preconditioned** train streamer: the trajectory's own optimizer
         when updating, else the checkpoint's optimizer.
         """
+        task = self.require_task("attribute")
         return GradientStreamer(
-            self.require_task("attribute").get_model(),
+            task.model,
             train_dataset,
             self.args,
             batch_size=self.args.per_device_train_batch_size,
@@ -170,6 +171,7 @@ class LESSAttributor(BaseInnerProductAttributor):
             config=hook_config,
             optimizer=None if enable_update else self._optimizers[checkpoint_step],
             precondition=True,
+            forward_model=task.forward_model,
         )
 
     def collect_gradients(

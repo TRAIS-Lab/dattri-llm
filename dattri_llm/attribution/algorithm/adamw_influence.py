@@ -60,7 +60,6 @@ from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import DiskGradientSource, ReplayGradientSource
 
 if TYPE_CHECKING:
-    from dattri.task import AttributionTask
     from torch import nn
     from torch.utils.data import Dataset
 
@@ -71,6 +70,7 @@ if TYPE_CHECKING:
     from dattri_llm.gradient.gradient import Gradient
     from dattri_llm.gradient.hooks import HookManagerConfig
     from dattri_llm.gradient.streaming import GradientStreamer
+    from dattri_llm.task import AttributionTask
 
 _DYNAMICS_FILE = "adamw_dynamics.pt"
 
