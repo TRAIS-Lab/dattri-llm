@@ -28,6 +28,7 @@ import torch
 from dattri_llm.attribution.score import AttributionScore
 from dattri_llm.attribution.utils import (
     collect_gradients,
+    finalize_factors,
     normalize_layer_names,
     score_sources,
 )
@@ -610,6 +611,13 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         both are held -- and whatever does not fit stays factorized.  At full
         dimension the dense form is ~1 GB *per sample*; caching is an
         optimization and must never be the reason a run runs out of memory.
+
+        A layer that stays factorized is not left raw either: its factors are
+        preprocessed once here and replaced by the result
+        (:func:`~dattri_llm.attribution.utils.finalize_factors`), under the
+        same budget, so that whichever route a layer takes, the block the
+        scoring loop holds is in its ready-to-score form and no train block
+        repeats the query's preprocessing.
         """
         b_train = self.args.per_device_train_batch_size or 1
         # (saving, name): the flop saving of scoring the layer dense
@@ -632,8 +640,6 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 cost_f = b_train * b_test * s * s * (d + k)
                 cost_m = (b_train + b_test) * s * d * k + b_train * b_test * d * k
                 candidates.append((cost_f - cost_m, name))
-        if not candidates:
-            return test_rep
         budget = CacheBudget(test_rep.device)
         held = 0
         dense: list[str] = []
@@ -643,13 +649,13 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             if budget.fits(growth, held):
                 dense.append(name)
                 held += growth
-        if not dense:
-            return test_rep
-        return test_rep.map_layers(
-            lambda _n, v, t: ops.materialize(v, t),
-            layers=dense,
-            consume=True,
-        )
+        if dense:
+            test_rep = test_rep.map_layers(
+                lambda _n, v, t: ops.materialize(v, t),
+                layers=dense,
+                consume=True,
+            )
+        return finalize_factors(test_rep, budget=budget, held=held)
 
     def inner_product(  # noqa: PLR6301 - overridable hook
         self,
@@ -713,7 +719,10 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         Runs :meth:`prepare_scoring` first.  *transform_test* overrides
         :meth:`transform_test_rep` -- e.g. the identity when the test source
         already holds preconditioned representations.  Either way the
-        transformed block is then routed by :meth:`_route_test_rep`.
+        transformed block is then routed by :meth:`_route_test_rep`, and each
+        transformed train block has its factors preprocessed once
+        (:func:`~dattri_llm.attribution.utils.finalize_factors`) before it is
+        scored, however many test blocks it meets.
         ``attribution_granularity="token"`` scores with
         :meth:`inner_product_per_token`, one row per training token position.
         """
@@ -726,7 +735,9 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             test_source,
             self.args.device,
             inner_product=self.inner_product,
-            transform_train=self.transform_train_rep,
+            transform_train=lambda block: finalize_factors(
+                self.transform_train_rep(block)
+            ),
             transform_test=lambda block: self._route_test_rep(transform(block)),
             batch_size=self.args.per_device_train_batch_size or 1,
             loop_over_test=loop_over_test,

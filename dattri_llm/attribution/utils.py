@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient import ops
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.streaming import rebatch_blocks
 from dattri_llm.utils.cache import CacheBudget, TensorCache
 
@@ -173,6 +174,65 @@ def _merge_dense_test(
         rebatch_blocks(stream, batch_size=sum(len(c) for _, c in cached_test))
     )
     return [(rep, cols) for _steps, rep, cols in merged]
+
+
+def finalize_factors(
+    rep: Gradient,
+    *,
+    budget: CacheBudget | None = None,
+    held: int = 0,
+) -> Gradient:
+    """Preprocess every raw factorized layer of *rep* once and keep the result.
+
+    Hooks store a layer's factors raw, and every product kernel turns them
+    into the form it contracts (the bias column of a linear layer, the
+    normalized activation of a norm layer, the unfolded patches of a
+    convolution) through :func:`~dattri_llm.gradient.ops.preprocess_factors`.
+    A block that is scored more than once would repeat that work on every
+    call, so the scoring loop replaces each raw layer by its *final* factors
+    (a :class:`~dattri_llm.gradient.gradient.Factorized` with
+    ``module_kwargs=None``, which every kernel uses as it is) before the
+    block is scored.  The raw payload is released as its replacement is built.
+
+    Embedding layers stay raw: materializing them needs their
+    ``module_kwargs``, and their preprocessing is a mask.  Layers that are
+    already final or dense pass through.
+
+    Args:
+        rep: The block to convert; it is consumed (see
+            :meth:`~dattri_llm.gradient.gradient.Gradient.map_layers`).
+        budget: When given, the growth of a layer's final factors over its raw
+            ones (an unfolded convolution is larger than its input) is admitted
+            against it, and a layer that does not fit stays raw.  ``None``
+            converts every layer -- right for a train block, whose final
+            factors the kernels would allocate anyway.
+        held: Bytes already charged to *budget* by the caller.
+
+    Returns:
+        The block with its raw factorized layers replaced by final factors.
+    """
+    names = [
+        name
+        for name, value in rep.data.items()
+        if isinstance(value, Factorized)
+        and value.module_kwargs is not None
+        and not ops.is_embedding(rep.layer_types[name])
+    ]
+    if not names:
+        return rep
+    charged = held
+
+    def finalize(_name: str, value: Factorized, layer_type: str) -> Factorized:
+        nonlocal charged
+        a, g = ops.preprocess_factorized(value, layer_type)
+        final = Factorized(activation=a, pre_activation_grad=g, module_kwargs=None)
+        growth = max(final.nbytes - value.nbytes, 0)
+        if budget is not None and not budget.fits(growth, charged):
+            return value
+        charged += growth
+        return final
+
+    return rep.map_layers(finalize, layers=names, consume=True)
 
 
 def score_sources(

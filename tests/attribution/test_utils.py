@@ -8,6 +8,7 @@ model-backed end-to-end paths are covered by the attributor test modules.
 
 from __future__ import annotations
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -16,12 +17,14 @@ from torch import nn
 
 from dattri_llm.attribution.utils import (
     collect_gradients,
+    finalize_factors,
     normalize_layer_names,
     score_sources,
 )
+from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.streaming import rebatch_blocks
-from dattri_llm.utils.cache import TensorCache
+from dattri_llm.utils.cache import CacheBudget, TensorCache
 
 B, T, D_IN, D_OUT = 2, 4, 3, 5
 
@@ -473,3 +476,117 @@ class TestScoreSources:
         train, test = self._sources(n_train=2, n_test=1)
         score_sources(train, test, "cpu", inner_product=inner_product)
         assert caches == [None, None]
+
+
+def _raw_block(n: int, seed: int = 0) -> Gradient:
+    """Raw hook captures of a biased Linear, a bias-free Linear, a LayerNorm,
+    a Conv2d and an Embedding, as the HookManager stores them.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    modules = {
+        "linear": (nn.Linear(6, 5), "nn.Linear", (n, 3, 6), (n, 3, 5)),
+        "nobias": (nn.Linear(6, 5, bias=False), "nn.Linear", (n, 3, 6), (n, 3, 5)),
+        "norm": (nn.LayerNorm(6), "nn.LayerNorm", (n, 3, 6), (n, 3, 6)),
+        "conv": (
+            nn.Conv2d(2, 4, 3, padding=1),
+            "nn.Conv2d",
+            (n, 2, 5, 5),
+            (n, 4, 5, 5),
+        ),
+    }
+    data, types = {}, {}
+    for name, (module, layer_type, a_shape, g_shape) in modules.items():
+        data[name] = Factorized(
+            activation=torch.randn(*a_shape, generator=gen),
+            pre_activation_grad=torch.randn(*g_shape, generator=gen),
+            module_kwargs=ops.extract_module_kwargs(module, layer_type),
+        )
+        types[name] = layer_type
+    emb = nn.Embedding(11, 5)
+    data["emb"] = Factorized(
+        activation=torch.randint(0, 11, (n, 3), generator=gen),
+        pre_activation_grad=torch.randn(n, 3, 5, generator=gen),
+        module_kwargs=ops.extract_module_kwargs(emb, "nn.Embedding"),
+    )
+    types["emb"] = "nn.Embedding"
+    return Gradient(
+        representation=dict.fromkeys(data, "factorized"),
+        data=data,
+        layer_types=types,
+        indexing=dict.fromkeys(data, "batch_token"),
+        validate_on_init=False,
+    )
+
+
+class TestFinalizeFactors:
+    """Raw factorized layers are preprocessed once and replaced by their final
+    factors, which every kernel scores exactly as it scores the raw ones.
+    """
+
+    def test_layers_become_final_and_embedding_stays_raw(self):
+        final = finalize_factors(_raw_block(4))
+        for name in ("linear", "nobias", "norm", "conv"):
+            assert final.data[name].module_kwargs is None, name
+        assert final.data["emb"].module_kwargs is not None
+        # The bias column is folded in once; a bias-free layer is untouched.
+        assert final.data["linear"].activation.shape[-1] == 7
+        assert final.data["nobias"].activation.shape[-1] == 6
+
+    def test_scores_match_the_raw_block(self):
+        train, query = _raw_block(4, seed=1), _raw_block(2, seed=2)
+        raw = ops.layerwise_cross_dot(train, query, reduce="none")
+        mixed = ops.layerwise_cross_dot(
+            _raw_block(4, seed=1),
+            finalize_factors(_raw_block(2, seed=2)),
+            reduce="none",
+        )
+        both = ops.layerwise_cross_dot(
+            finalize_factors(_raw_block(4, seed=1)),
+            finalize_factors(_raw_block(2, seed=2)),
+            reduce="none",
+        )
+        for name, expected in raw.items():
+            assert torch.allclose(mixed[name], expected, atol=1e-5), name
+            assert torch.allclose(both[name], expected, atol=1e-5), name
+
+    def test_final_block_is_not_preprocessed_again(self, monkeypatch):
+        # ``ops.dot`` is a function; the kernels' module is reached by name.
+        dot = importlib.import_module("dattri_llm.gradient.ops.dot")
+
+        raw_calls = []
+        real = dot.preprocess_factors
+
+        def counting(a, g, layer_type, module_kwargs=None, include_bias=True):
+            if module_kwargs is not None:
+                raw_calls.append(layer_type)
+            return real(a, g, layer_type, module_kwargs, include_bias)
+
+        train, query = (
+            finalize_factors(_raw_block(4, 1)),
+            finalize_factors(_raw_block(2, 2)),
+        )
+        monkeypatch.setattr(dot, "preprocess_factors", counting)
+        for _ in range(3):
+            ops.layerwise_cross_dot(train, query)
+        # Only the embedding layer (kept raw on purpose) is still preprocessed.
+        assert set(raw_calls) == {"nn.Embedding"}
+
+    def test_budget_keeps_a_growing_layer_raw(self):
+        final = finalize_factors(_raw_block(4), budget=CacheBudget(limit_bytes=0))
+        assert final.data["linear"].module_kwargs is not None  # +1 column: grows
+        assert final.data["nobias"].module_kwargs is None  # no growth: admitted
+
+    def test_already_final_and_dense_layers_pass_through(self):
+        block = make_factorized_block()
+        assert finalize_factors(block) is block
+        dense = make_materialized_block()
+        assert finalize_factors(dense) is dense
+
+    def test_effective_dims_of_final_factors(self):
+        raw = _raw_block(4)
+        final = finalize_factors(_raw_block(4))
+        for name in ("linear", "nobias", "conv"):
+            b, s_, k, d = ops.effective_dims(raw.data[name], raw.layer_types[name])
+            fb, fs, fk, fd = ops.effective_dims(final.data[name], raw.layer_types[name])
+            bias = int(raw.data[name].module_kwargs["has_bias"])
+            assert (fb, fs, fk - bias, fd) == (b, s_, k, d), name

@@ -649,11 +649,15 @@ def effective_dims(f: Factorized, layer_type: str) -> tuple[int, int, int, int]:
     """Cheap ``(B, S, K, D)`` for the cost heuristic: batch, token/patch count,
     input width, output width -- the *post-preprocess* dims, read straight from the
     raw factor shapes (no im2col / materialization).  Bias's ``+1`` on ``K`` is
-    ignored (it is a heuristic).
+    ignored (it is a heuristic).  *Final* factors (``module_kwargs=None``) are
+    already in the preprocessed ``(B, S, K)`` / ``(B, S, D)`` layout whatever
+    the layer type, so their dims are read directly.
     """
     bf = f.as_batch_first()
     a, g = bf.activation, bf.pre_activation_grad
-    mk = bf.module_kwargs or {}
+    if bf.module_kwargs is None:
+        return a.shape[0], math.prod(a.shape[1:-1]), a.shape[-1], g.shape[-1]
+    mk = bf.module_kwargs
     if is_conv(layer_type):
         # a=(B,C_in,*sp_in), g=(B,C_out,*sp_out): S = output positions,
         # K = C_in*prodkernel, D = C_out

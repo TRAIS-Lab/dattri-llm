@@ -235,6 +235,37 @@ class TestTestRepRouting:
         assert isinstance(rep.data["l1"], torch.Tensor)
         assert isinstance(rep.data["l0"], Factorized)
 
+    def test_factorized_query_layers_are_preprocessed_once(self, tmp_path):
+        """A query layer that stays factorized is cached as final factors, so
+        no train block repeats its preprocessing.
+        """
+        gen = torch.Generator().manual_seed(0)
+
+        def raw_block(n):
+            data = {
+                "l0": Factorized(
+                    activation=torch.randn(n, 4, 8, generator=gen),
+                    pre_activation_grad=torch.randn(n, 4, 8, generator=gen),
+                    module_kwargs={"has_bias": True},
+                )
+            }
+            return Gradient(
+                representation={"l0": "factorized"},
+                data=data,
+                layer_types={"l0": "nn.Linear"},
+                indexing={"l0": "batch_token"},
+            )
+
+        attr = self._attr(tmp_path)
+        train, query = raw_block(8), raw_block(1)
+        expected = attr.inner_product(train.clone(), query.clone())
+        routed = attr._route_test_rep(query)
+        layer = routed.data["l0"]
+        assert isinstance(layer, Factorized)
+        assert layer.module_kwargs is None
+        assert layer.activation.shape[-1] == 9  # the bias column, folded once
+        assert torch.allclose(attr.inner_product(train, routed), expected, atol=1e-5)
+
     def test_routes_agree_on_scores(self, tmp_path, monkeypatch):
         attr = self._attr(tmp_path)
         train = _query_block(8, seed=1)
