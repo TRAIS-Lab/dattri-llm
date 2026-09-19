@@ -93,14 +93,18 @@ def cross_gram(
             if maybe_use_materialized_gram(B1, B2, S, K, D)
             else "factorized"
         )
+    # Both routes are written as plain matrix products rather than einsums:
+    # the contractions are tiny for short sequences, where an einsum's
+    # equation parsing and view building cost more than its kernel.
     if mode == "materialized":
         # Contract tokens into per-sample weight grads, then GEMM -- no S^2 tensor.
-        M1 = torch.einsum("btk,btd->bkd", a1_f, g1_f).reshape(B1, -1)  # (B1, K*D)
-        M2 = torch.einsum("csk,csd->ckd", a2_f, g2_f).reshape(B2, -1)  # (B2, K*D)
+        M1 = torch.bmm(a1_f.transpose(1, 2), g1_f).reshape(B1, -1)  # (B1, K*D)
+        M2 = torch.bmm(a2_f.transpose(1, 2), g2_f).reshape(B2, -1)  # (B2, K*D)
         return M1 @ M2.T  # (B1, B2)
-    K_a = torch.einsum("btk,csk->btcs", a1_f, a2_f)
-    K_g = torch.einsum("btd,csd->btcs", g1_f, g2_f)
-    return torch.einsum("btcs,btcs->bc", K_a, K_g)  # (B1, B2)
+    S2 = a2_f.shape[1]  # the two sides may differ in token count
+    K_a = a1_f.reshape(B1 * S, K) @ a2_f.reshape(B2 * S2, K).T  # (B1*S, B2*S2)
+    K_g = g1_f.reshape(B1 * S, D) @ g2_f.reshape(B2 * S2, D).T
+    return (K_a * K_g).view(B1, S, B2, S2).sum((1, 3))  # (B1, B2)
 
 
 def cross_dot_factors(
