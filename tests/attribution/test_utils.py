@@ -272,6 +272,48 @@ class TestRebatchBlocks:
 # --------------------------------------------------------------------------- #
 
 
+class TestRebatchBlocksMemory:
+    """A block is not copied or kept alive by the re-batcher: for a live source
+    the next request is the next forward/backward pass, where the peak sits.
+    """
+
+    def test_single_block_batch_reuses_the_block_tensors(self):
+        block = make_materialized_block(b=B)
+        ((_, out, _),) = list(
+            rebatch_blocks([(0, block, [str(i) for i in range(B)])], B)
+        )
+        for name, tensor in block.data.items():
+            assert out.data[name].data_ptr() == tensor.data_ptr(), name
+
+    @pytest.mark.parametrize(
+        "factory", [make_materialized_block, make_factorized_block]
+    )
+    def test_block_is_released_before_the_next_request(self, factory):
+        import gc
+        import weakref
+
+        alive: list[weakref.ref] = []
+
+        def source():
+            for step in range(3):
+                # The consumer has dropped the previous batch: nothing else
+                # may still hold the previous block when this request runs.
+                gc.collect()
+                assert all(ref() is None for ref in alive), (
+                    f"step {step - 1} still alive"
+                )
+                block = factory(seed=step, b=B)
+                first = next(iter(block.data.values()))
+                anchor = first if isinstance(first, torch.Tensor) else first.activation
+                alive.append(weakref.ref(anchor))
+                yield step, block, [f"{step}-{i}" for i in range(B)]
+                del block, first, anchor
+
+        for _steps, batch, _ids in rebatch_blocks(source(), B):
+            assert batch.batch_size == B
+            batch = None  # noqa: PLW2901 - the consumer lets go before asking again
+
+
 class TestScoreSources:
     def _sources(self, n_train=3, n_test=2, reusable=True):
         train = FakeSource(make_stream(n_train))

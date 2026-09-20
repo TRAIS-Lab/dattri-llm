@@ -402,6 +402,9 @@ def score_sources(
                 chunk = score_block(train_rep, cached_test, None)
             row_chunks.append(chunk)
             stamp_rows(ids, steps, chunk)
+            # The next request to a live source is the next forward and
+            # backward pass: do not carry this block through it.
+            train_g = train_rep = None  # noqa: PLW2901
     else:
         for train_step, train_g, train_hashes in train_source:
             train_rep = transform_train(train_g.to(device))
@@ -415,6 +418,7 @@ def score_sources(
                 chunk = score_block(train_rep, test_blocks(), dense_cache)
             row_chunks.append(chunk)
             stamp_rows(list(train_hashes), [train_step] * train_rep.batch_size, chunk)
+            train_g = train_rep = None  # noqa: PLW2901 - see above
 
     scores = (
         torch.cat(row_chunks, dim=0)

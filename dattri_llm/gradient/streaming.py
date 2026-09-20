@@ -206,6 +206,12 @@ def rebatch_blocks(
     flushed first, so a mixed source stays in order).  Nothing is moved
     between devices.
 
+    A block is never held longer than its consumer holds it: a batch made of a
+    single block reuses that block's tensors (no copy), only the block's
+    metadata is remembered, and the reference to a block is dropped before the
+    source is asked for the next one -- for a live source that request *is*
+    the next forward and backward pass, which is where the memory peak sits.
+
     Yields:
         ``(per_row_steps, Gradient, per_row_ids)`` batches in the source's
         sample order -- every row is stamped with the step it came from.
@@ -216,16 +222,22 @@ def rebatch_blocks(
     pending_ids: list[str] = []
     pending_steps: list[int] = []
     pending_n = 0
-    meta: Gradient | None = None
+    # (representation, layer_types, indexing) of the pending blocks -- the
+    # metadata only, so the block itself is not kept alive.
+    meta: tuple[dict, dict, dict] | None = None
 
     def build() -> tuple[list[int], Gradient, list[str]]:
         nonlocal pending, pending_ids, pending_steps, pending_n
-        data = {name: torch.cat(tensors, dim=0) for name, tensors in pending.items()}
+        data = {
+            name: tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+            for name, tensors in pending.items()
+        }
+        representation, layer_types, indexing = meta
         big = Gradient(
-            representation=meta.representation,
+            representation=representation,
             data=data,
-            layer_types=meta.layer_types,
-            indexing=meta.indexing,
+            layer_types=layer_types,
+            indexing=indexing,
             validate_on_init=False,
         )
         batch = (pending_steps, big, pending_ids)
@@ -236,14 +248,19 @@ def rebatch_blocks(
         if not all(isinstance(v, torch.Tensor) for v in block.data.values()):
             if pending_n:
                 yield build()
-            yield [step] * block.batch_size, block, list(hashes)
+            batch = ([step] * block.batch_size, block, list(hashes))
+            block = None  # noqa: PLW2901 - released before the next request
+            yield batch
+            del batch
             continue
-        meta = block
+        meta = (block.representation, block.layer_types, block.indexing)
         for name, tensor in block.data.items():
             pending.setdefault(name, []).append(tensor)
+        del tensor  # the loop variable would keep the last layer alive
         pending_ids.extend(hashes)
         pending_steps.extend([step] * block.batch_size)
         pending_n += block.batch_size
+        block = None  # noqa: PLW2901 - released before the next request
         if pending_n >= batch_size:
             yield build()
     if pending_n:
