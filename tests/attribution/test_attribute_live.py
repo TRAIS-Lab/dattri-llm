@@ -447,6 +447,27 @@ class TestCompactEKFAC(TestCompactKFAC):
             attr.fit(train, str(tmp_path / "fisher"), covariances=partial)
 
 
+class TestFactorCacheResidency:
+    """``factor_cache_residency``: the fitted factors held off the device, in a
+    cache of any residency, score the same as factors kept on the device.
+    """
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "tiered", "disk"])
+    def test_scores_match_on_device_factors(self, cls, residency, tmp_path):
+        def scores(out, factor_cache_residency):
+            task, tr, te = _make_task_and_data()
+            attr = cls(
+                _args(out), task=task, factor_cache_residency=factor_cache_residency
+            )
+            return attr.attribute(tr, te, damping=1e-3).agnostic_matrix()
+
+        ids_ref, ref = scores(tmp_path / "ref", None)
+        ids, got = scores(tmp_path / residency, residency)
+        assert ids == ids_ref
+        assert torch.allclose(ref, got, atol=1e-5, rtol=1e-4)
+
+
 class TestBatchedScoring:
     """score_sources always re-batches the train side into
     ``per_device_train_batch_size`` groups; the batch size only affects

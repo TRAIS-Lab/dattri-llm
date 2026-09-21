@@ -26,7 +26,7 @@ from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttr
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.gradient import Factorized
+from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_sample
@@ -1414,4 +1414,79 @@ class TestPersistedFisher:
                 collected,
                 damping=DAMPING,
                 fisher_dir=fdir,
+            )
+
+
+class TestFactorPlacement:
+    """The fit hands buffers over instead of copying them, and the factors may
+    rest on the host without changing a score.
+    """
+
+    def test_accumulator_result_consume_hands_buffers_over(self):
+        from dattri_llm.gradient.ops.kronecker import LayerKroneckerAccumulator
+
+        gen = torch.Generator().manual_seed(0)
+        a, g = torch.randn(4, 3, 5, generator=gen), torch.randn(4, 3, 2, generator=gen)
+        copied, consumed = LayerKroneckerAccumulator(), LayerKroneckerAccumulator()
+        for acc in (copied, consumed):
+            acc.update(a, g, "nn.Linear", {"has_bias": False})
+        buffer = consumed._A
+        A, G = consumed.result(consume=True)
+        A_ref, G_ref = copied.result()
+        assert A.data_ptr() == buffer.data_ptr()  # no second copy
+        assert consumed._A is None  # and the accumulator let go of it
+        assert torch.allclose(A, A_ref)
+        assert torch.allclose(G, G_ref)
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "tiered", "disk"])
+    def test_cached_factors_give_the_same_preconditioner(
+        self, cls, residency, tmp_path
+    ):
+        gen = torch.Generator().manual_seed(0)
+        raw = {
+            "l0": (torch.randn(6, 6, generator=gen), torch.randn(4, 4, generator=gen))
+        }
+        raw["l0"] = tuple(m @ m.T + torch.eye(m.shape[0]) for m in raw["l0"])
+        if cls is EKFACAttributor:
+            U_A = torch.linalg.eigh(raw["l0"][0])[1]
+            U_G = torch.linalg.eigh(raw["l0"][1])[1]
+            raw["l0"] = (U_A, U_G, torch.rand(4 * 6, generator=gen) + 0.1)
+        args = AttributionArguments(output_dir=str(tmp_path))
+        block = Gradient(
+            representation={"l0": "factorized"},
+            data={
+                "l0": Factorized(
+                    activation=torch.randn(3, 2, 6, generator=gen),
+                    pre_activation_grad=torch.randn(3, 2, 4, generator=gen),
+                    module_kwargs={"has_bias": False},
+                )
+            },
+            layer_types={"l0": "nn.Linear"},
+            indexing={"l0": "batch_token"},
+        )
+        outs = []
+        for cached in (None, residency):
+            attr = cls(args, factor_cache_residency=cached)
+            attr._preconditioner = attr.damp_fit((raw, {}), 1e-3)
+            factors = attr._preconditioner[0]["l0"]
+            if cached:
+                assert all(t.device.type == "cpu" for t in factors)
+            if cached == "memory" and cls is EKFACAttributor:
+                # The eigenbases pass through damping: the off-device
+                # original is handed back instead of a copy.
+                assert factors[0] is raw["l0"][0]
+            out = attr.transform_test_rep(block.clone()).data["l0"]
+            outs.append(ops.materialize(out, "nn.Linear"))
+            if cached:
+                spill = attr._preconditioner[0]._cache.spill_dir
+                attr._release_factor_caches()
+                assert spill is None or not spill.exists()  # nothing left on disk
+        assert torch.allclose(outs[0], outs[1], atol=1e-6)
+
+    def test_factor_cache_residency_is_validated(self, tmp_path):
+        with pytest.raises(ValueError, match="factor_cache_residency"):
+            KFACAttributor(
+                AttributionArguments(output_dir=str(tmp_path)),
+                factor_cache_residency="cpu",
             )

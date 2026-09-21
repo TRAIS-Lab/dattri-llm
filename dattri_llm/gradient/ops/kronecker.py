@@ -481,11 +481,21 @@ class LayerKroneckerAccumulator:
         n = torch.tensor([self._n], dtype=torch.int64)
         self._n = int(all_reduce_sum(n).item())
 
-    def result(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (A, G) normalized covariance matrices."""
+    def result(self, *, consume: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (A, G) normalized covariance matrices.
+
+        With ``consume=True`` the running sums are normalized in place and
+        handed over, and the accumulator is reset: no second copy of the
+        covariances is made, which for a large model is as big as the
+        factors themselves.
+        """
         if self._A is None or self._n == 0:
             raise RuntimeError("No gradient-carrying data has been accumulated")
-        return self._A / self._n, self._G / self._n
+        if not consume:
+            return self._A / self._n, self._G / self._n
+        A, G = self._A.div_(self._n), self._G.div_(self._n)
+        self.reset()
+        return A, G
 
     def reset(self) -> None:
         """Reset accumulator state."""
@@ -618,9 +628,19 @@ class KroneckerAccumulator:
         for name in sorted(self._layers):
             self._layers[name].all_reduce()
 
-    def result(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """Return ``{layer: (A, G)}`` for every accumulated layer."""
-        return {name: acc.result() for name, acc in self._layers.items()}
+    def result(
+        self, *, consume: bool = False
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Return ``{layer: (A, G)}`` for every accumulated layer.
+
+        ``consume=True`` hands the accumulated buffers over instead of copying
+        them (see :meth:`LayerKroneckerAccumulator.result`) and leaves this
+        accumulator empty.
+        """
+        out = {name: acc.result(consume=consume) for name, acc in self._layers.items()}
+        if consume:
+            self._layers = {}
+        return out
 
 
 class FisherAccumulator:

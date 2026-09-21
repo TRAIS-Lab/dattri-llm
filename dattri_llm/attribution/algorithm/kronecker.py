@@ -49,6 +49,7 @@ import contextlib
 import tempfile
 import warnings
 from abc import abstractmethod
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal
 
@@ -58,7 +59,7 @@ from dattri_llm.attribution.base import BaseInnerProductAttributor
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.storage_manager import GradientStorageManager
-from dattri_llm.utils.cache import CACHE_RESIDENCIES
+from dattri_llm.utils.cache import CACHE_RESIDENCIES, CacheBudget, TensorCache
 from dattri_llm.utils.distributed import all_reduce_sum
 
 if TYPE_CHECKING:
@@ -81,10 +82,58 @@ RawFit = tuple[dict, dict[str, torch.Tensor]]
 Preconditioner = tuple[dict, dict[str, torch.Tensor]]
 
 
+class _FactorCache(Mapping):
+    """``{layer: factors}`` held in a :class:`~dattri_llm.utils.cache.TensorCache`.
+
+    The factors of a layer (a tensor or a tuple of tensors) are moved to the
+    host and cached under the cache's residency: host memory (``"memory"``),
+    files (``"disk"``), or host memory that spills to files once its budget --
+    a share of the free host memory -- is used (``"tiered"``).  An entry the
+    ``"memory"`` budget refuses stays where it was.  A lookup returns the
+    layer's factors off the device; the caller moves them to it.
+    """
+
+    def __init__(self, residency: str) -> None:
+        self._cache = TensorCache(residency, budget=CacheBudget())
+        self._kept: dict[str, object] = {}  # entries the cache refused
+        self._order: list[str] = []
+
+    def __setitem__(self, layer: str, factors: object) -> None:
+        host = _map_tensors(factors, lambda t: t.to("cpu"))
+        self._kept.pop(layer, None)
+        if not self._cache.put(layer, host):
+            self._kept[layer] = factors
+        if layer not in self._order:
+            self._order.append(layer)
+
+    def __getitem__(self, layer: str) -> object:
+        if layer in self._kept:
+            return self._kept[layer]
+        if layer not in self._cache:
+            raise KeyError(layer)
+        return self._cache.get(layer)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._order)
+
+    def __len__(self) -> int:
+        return len(self._order)
+
+    def close(self) -> None:
+        """Release the cached factors (spilled files are deleted)."""
+        self._cache.close()
+        self._kept.clear()
+        self._order.clear()
+
+
 def _map_tensors(obj: object, fn: Callable[[torch.Tensor], torch.Tensor]) -> object:
-    """*obj* with *fn* applied to every tensor inside its dicts, lists and tuples."""
+    """*obj* with *fn* applied to every tensor inside its dicts, lists and tuples.
+    A :class:`_FactorCache` is returned as it is: it places its own tensors.
+    """
     if isinstance(obj, torch.Tensor):
         return fn(obj)
+    if isinstance(obj, _FactorCache):
+        return obj
     if isinstance(obj, dict):
         return {k: _map_tensors(v, fn) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -118,8 +167,22 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         args: AttributionArguments,
         *,
         task: AttributionTask | None = None,
+        factor_cache_residency: str | None = None,
     ) -> None:
         super().__init__(args, task=task)
+        if (
+            factor_cache_residency is not None
+            and factor_cache_residency not in CACHE_RESIDENCIES
+        ):
+            raise ValueError(
+                "factor_cache_residency must be one of "
+                f"{list(CACHE_RESIDENCIES)} or None, got {factor_cache_residency!r}.",
+            )
+        # Where the fitted factors are held: on the device (``None``), or in a
+        # cache of this residency, from which one layer's factors come to the
+        # device at a time (see :class:`_FactorCache`).
+        self._factor_cache_residency = factor_cache_residency
+        self._factor_caches: list[_FactorCache] = []
         # Per-call options (set by the entry points, read by prepare_scoring).
         self._damping: float = 1e-3
         self._non_kfac_strategy: NonKfacStrategy = "ignore"
@@ -268,13 +331,51 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         rather than the eigendecomposition :meth:`damp` uses for the small
         K-FAC factors.
         """
-        raw_factors, raw_fisher = _map_tensors(
-            raw_fit, lambda t: t.to(self.args.device)
-        )
+        raw_factors, raw_fisher = raw_fit
+        device = self.args.device
+        # One layer at a time: the raw factors may be cached off the device,
+        # and the damped ones go where factors are held (:meth:`_factor_map`).
+        # A tensor the damping passes through unchanged (EK-FAC's eigenbases)
+        # is handed back as its off-device original instead of being copied.
+        factors = self._factor_map()
+        for layer, raw in raw_factors.items():
+            original: dict[int, torch.Tensor] = {}
+
+            def to_device(
+                t: torch.Tensor, original: dict[int, torch.Tensor] = original
+            ) -> torch.Tensor:
+                moved = t.to(device)
+                original[id(moved)] = t
+                return moved
+
+            damped = self.damp({layer: _map_tensors(raw, to_device)}, damping)[layer]
+            if isinstance(factors, _FactorCache):
+                damped = _map_tensors(
+                    damped, lambda t, original=original: original.get(id(t), t)
+                )
+            factors[layer] = damped
+        raw_fisher = _map_tensors(raw_fisher, lambda t: t.to(device))
         return (
-            self.damp(raw_factors, damping),
+            factors,
             {layer: ops.dense_inverse(F, damping) for layer, F in raw_fisher.items()},
         )
+
+    def _factor_map(self) -> dict | _FactorCache:
+        """An empty ``{layer: factors}`` map where fitted factors are held: a
+        plain dict (the factors stay where they are) or, under
+        ``factor_cache_residency``, a :class:`_FactorCache` this attributor owns.
+        """
+        if self._factor_cache_residency is None:
+            return {}
+        cache = _FactorCache(self._factor_cache_residency)
+        self._factor_caches.append(cache)
+        return cache
+
+    def _release_factor_caches(self, keep: tuple = ()) -> None:
+        """Close every factor cache of this attributor except those in *keep*."""
+        for cache in [c for c in self._factor_caches if not any(c is k for k in keep)]:
+            cache.close()
+            self._factor_caches.remove(cache)
 
     def prepare_scoring(
         self,
@@ -291,6 +392,8 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         # kept for re-damping (see :meth:`damp_fit`), but on the host, so it
         # does not sit on the device beside its inverses for the whole pass.
         self._raw_fit = _map_tensors(self._raw_fit, lambda t: t.to("cpu"))
+        # Factor caches of an earlier fit are released once nothing uses them.
+        self._release_factor_caches(keep=(self._raw_fit[0], self._preconditioner[0]))
 
     def _set_options(
         self,
@@ -335,6 +438,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 "prepare_scoring() must run before transform_test_rep()."
             )
         factors, fisher_inverse = self._preconditioner
+        device = test_rep.device
 
         def precondition(
             name: str,
@@ -342,7 +446,12 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             layer_type: str,
         ) -> Factorized | torch.Tensor | None:
             if name in factors:
-                return self.precondition_test_layer(value, layer_type, factors[name])
+                # Cached factors come to the device one layer at
+                # a time (a no-op when they already live there).
+                layer_factors = _map_tensors(
+                    factors[name], lambda t: t.to(device, non_blocking=True)
+                )
+                return self.precondition_test_layer(value, layer_type, layer_factors)
             if name in fisher_inverse:
                 # F_l^-1 is symmetric, so it is applied wholly on this side.
                 dense = ops.materialize(value, layer_type).float()
@@ -523,7 +632,9 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         return fisher_dir
 
     def load_fisher(self, fisher_dir: str) -> RawFit:
-        """Load and validate a persisted fit, placed on ``args.device``."""
+        """Load and validate a persisted fit, placed on ``args.device`` (the
+        K-FAC factors in the factor cache under ``factor_cache_residency``).
+        """
         path = Path(fisher_dir) / self._FISHER_FILE
         if not path.exists():
             raise ValueError(
@@ -545,10 +656,13 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 f"{meta.get('mode')!r}, but this attributor uses mode={mode!r}.",
             )
         device = self.args.device
-        return self._move_raw(blob["raw_ctx"], device), self._move_raw(
-            blob["raw_fim"],
-            device,
-        )
+        raw_fisher = self._move_raw(blob["raw_fim"], device)
+        if self._factor_cache_residency is None:
+            return self._move_raw(blob["raw_ctx"], device), raw_fisher
+        factors = self._factor_map()
+        for layer, raw in blob["raw_ctx"].items():
+            factors[layer] = raw
+        return factors, raw_fisher
 
     def fit(
         self,
@@ -614,7 +728,11 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             raw_factors, raw_fisher = self.fit_raw(train)
         finally:
             self._capture_covariances = None
-        return self.save_fisher(raw_factors, fisher_dir, fisher=raw_fisher)
+        fisher_dir = self.save_fisher(raw_factors, fisher_dir, fisher=raw_fisher)
+        if isinstance(raw_factors, _FactorCache):  # the fit is on disk now
+            raw_factors.close()
+            self._factor_caches.remove(raw_factors)
+        return fisher_dir
 
     # ------------------------------------------------------------------ #
     # Entry points                                                         #
@@ -915,6 +1033,13 @@ class KFACAttributor(KroneckerAttributor):
     Args:
         args: :class:`AttributionArguments`.
         task: The attribution task; required by the live methods only.
+        factor_cache_residency: Where the fitted factors are held.  ``None``
+            (default) keeps them on the device.  ``"memory"`` holds them in
+            host memory, ``"disk"`` in files, and ``"tiered"`` in host memory
+            that spills to files once its budget is used; one layer's factors
+            come to the device at a time, at the cost of one transfer of a
+            layer's factors per block.  At full dimension the factors are as
+            large as the squared layer widths.
     """
 
     algorithm: ClassVar[str] = "KFAC"
@@ -942,8 +1067,12 @@ class KFACAttributor(KroneckerAttributor):
         # single-process).  Supplied covariances are the caller's to reduce.
         kron.all_reduce()
         fisher_acc.all_reduce()
-        # {layer: (A, G)} raw covariances (undamped)
-        return {**kron.result(), **supplied}
+        # {layer: (A, G)} raw covariances (undamped); the accumulator's
+        # buffers are handed over rather than copied.
+        factors = self._factor_map()
+        for layer, covariances in {**kron.result(consume=True), **supplied}.items():
+            factors[layer] = covariances
+        return factors
 
     def damp(  # noqa: PLR6301 - subclass hook
         self,
@@ -1004,6 +1133,13 @@ class EKFACAttributor(KroneckerAttributor):
         args: :class:`AttributionArguments`.
         task: The attribution task; required by the live methods only.
         mode: ``"exact"`` (default) or ``"approx"``; currently equivalent.
+        factor_cache_residency: Where the fitted factors are held.  ``None``
+            (default) keeps them on the device.  ``"memory"`` holds them in
+            host memory, ``"disk"`` in files, and ``"tiered"`` in host memory
+            that spills to files once its budget is used; one layer's factors
+            come to the device at a time, at the cost of one transfer of a
+            layer's factors per block.  At full dimension the factors are as
+            large as the squared layer widths.
     """
 
     algorithm: ClassVar[str] = "EKFAC"
@@ -1015,12 +1151,17 @@ class EKFACAttributor(KroneckerAttributor):
         *,
         task: AttributionTask | None = None,
         mode: str = "exact",
+        factor_cache_residency: str | None = None,
     ) -> None:
         if mode not in self.EKFAC_MODES:
             raise ValueError(
                 f"mode must be one of {self.EKFAC_MODES}, got {mode!r}.",
             )
-        super().__init__(args, task=task)
+        super().__init__(
+            args,
+            task=task,
+            factor_cache_residency=factor_cache_residency,
+        )
         self.mode = mode
 
     def fit_factors(
@@ -1039,7 +1180,7 @@ class EKFACAttributor(KroneckerAttributor):
         """
         device = self.args.device
         supplied = self._capture_covariances
-        eig: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        eig = self._factor_map()  # {layer: (U_A, U_G)}
         if supplied is None:
             # Pass 1 -- Kronecker covariance factors and their eigenbases (and
             # the direct Fisher from the same sweep).
@@ -1053,15 +1194,19 @@ class EKFACAttributor(KroneckerAttributor):
             # rank then performs on identical input.
             kron.all_reduce()
             fisher_acc.all_reduce()
-            covariances = kron.result()
+            # The accumulator's buffers are handed over, not copied.
+            covariances = kron.result(consume=True)
+            del kron
         else:
-            covariances = supplied
-        for layer, (A, G) in covariances.items():
-            _, U_A, _, U_G = ops.kfac_eigh(A, G)
+            covariances = dict(supplied)  # popped below; the caller's dict is kept
+        # Only the eigenbases are needed from here on, and the covariances are
+        # as large again: each layer's pair is released as soon as it has been
+        # decomposed, so covariances and eigenbases never sit side by side.
+        for layer in list(covariances):
+            A, G = covariances.pop(layer)
+            _, U_A, _, U_G = ops.kfac_eigh(A.to(device), G.to(device))
+            del A, G
             eig[layer] = (U_A, U_G)
-        # Only the eigenbases are needed from here on; the covariances are as
-        # large again (~4 GB for Pythia-410M) and must not sit through pass 2.
-        del covariances
 
         # Pass 2 -- empirical second moments of the projected gradients (Lambda).
         # Skipped entirely when no K-FAC layer is present (and no supplied
@@ -1084,8 +1229,8 @@ class EKFACAttributor(KroneckerAttributor):
                 M = ops.ekfac_materialize(
                     train_g.data[layer],
                     train_g.layer_types[layer],
-                    U_A,
-                    U_G,
+                    U_A.to(device, non_blocking=True),
+                    U_G.to(device, non_blocking=True),
                 )  # (B, D)
                 lam_sum[layer] = lam_sum.get(layer, 0) + (M * M).sum(0)
                 counts[layer] = counts.get(layer, 0) + M.shape[0]
@@ -1101,10 +1246,14 @@ class EKFACAttributor(KroneckerAttributor):
             fisher_acc.all_reduce()
         # The *undamped* empirical spectrum; damping is a per-layer shift
         # applied later in damp(), so the raw fit can be re-damped freely.
-        return {
-            layer: (U_A, U_G, lam_sum[layer] / counts[layer])
-            for layer, (U_A, U_G) in eig.items()
-        }
+        factors = self._factor_map()
+        for layer in list(eig):
+            U_A, U_G = eig[layer]
+            factors[layer] = (U_A, U_G, lam_sum.pop(layer).div_(counts[layer]))
+        if isinstance(eig, _FactorCache):  # the eigenbases now live in *factors*
+            eig.close()
+            self._factor_caches.remove(eig)
+        return factors
 
     def damp(  # noqa: PLR6301 - subclass hook
         self,
