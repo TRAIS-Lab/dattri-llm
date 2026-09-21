@@ -462,13 +462,14 @@ class TestCovariancesAtCapture:
 
     def _attribute(self, cls, out, capture_style, residency, *, at_capture):
         task, tr, te = _make_task_and_data()
-        attr = cls(_args(out), task=task, covariances_at_capture=at_capture)
+        attr = cls(_args(out), task=task)
         return attr.attribute(
             tr,
             te,
             hook_config=self._config(capture_style),
             gradient_cache_residency=residency,
             damping=self.DAMP,
+            covariances_at_capture=at_capture,
         ).agnostic_matrix()
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
@@ -518,12 +519,25 @@ class TestCovariancesAtCapture:
         assert torch.allclose(ref, got, atol=1e-4, rtol=1e-3)
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
-    def test_off_fits_from_the_store(self, cls, tmp_path):
+    @pytest.mark.parametrize("residency", ["memory", "disk"])
+    def test_off_fits_from_the_store(self, cls, residency, tmp_path):
         """With the option off nothing is collected: a compact store falls back
-        to the direct Fisher, with its warning.
+        to the direct Fisher, with its warning.  The disk path collects
+        through ``cache``, which keeps the call's setting.
         """
         with pytest.warns(UserWarning, match="stored materialized"):
-            self._attribute(cls, tmp_path, "materialized", "memory", at_capture=False)
+            self._attribute(cls, tmp_path, "materialized", residency, at_capture=False)
+
+    def test_cache_without_covariances(self, tmp_path):
+        task, tr, te = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path), task=task)
+        ((train_dir, _test_dir),) = attr.cache(
+            tr,
+            te,
+            hook_config=self._config("factorized"),
+            covariances_at_capture=False,
+        )
+        assert attr._covariances_for(attr.load_train_rep(train_dir)) is None  # noqa: SLF001
 
     def test_step_filter_refits(self, tmp_path):
         """A step filter changes the fit, so collected covariances are not used."""
@@ -550,15 +564,67 @@ class TestFactorCacheResidency:
     def test_scores_match_on_device_factors(self, cls, residency, tmp_path):
         def scores(out, factor_cache_residency):
             task, tr, te = _make_task_and_data()
-            attr = cls(
-                _args(out), task=task, factor_cache_residency=factor_cache_residency
-            )
-            return attr.attribute(tr, te, damping=1e-3).agnostic_matrix()
+            attr = cls(_args(out), task=task)
+            return attr.attribute(
+                tr, te, damping=1e-3, factor_cache_residency=factor_cache_residency
+            ).agnostic_matrix()
 
         ids_ref, ref = scores(tmp_path / "ref", None)
         ids, got = scores(tmp_path / residency, residency)
         assert ids == ids_ref
         assert torch.allclose(ref, got, atol=1e-5, rtol=1e-4)
+
+
+class TestLiveFisherDir:
+    """``attribute(fisher_dir=...)``: the first live call persists its fit and
+    later calls over the same training set load it.
+    """
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", [None, "memory"])
+    def test_later_calls_reuse_the_fit(self, cls, residency, tmp_path):
+        task, tr, te = _make_task_and_data()
+        fisher = str(tmp_path / "fisher")
+        kwargs = {"damping": 1e-3, "gradient_cache_residency": residency}
+
+        ids_ref, ref = (
+            cls(_args(tmp_path / "ref"), task=task)
+            .attribute(tr, te, **kwargs)
+            .agnostic_matrix()
+        )
+        attr = cls(_args(tmp_path / "run"), task=task)
+        ids_a, first = attr.attribute(
+            tr, te, fisher_dir=fisher, **kwargs
+        ).agnostic_matrix()
+        attr.fit_raw = None  # a refit would fail
+        attr.load_fisher = None  # and so would reading the file again
+        ids_b, second = attr.attribute(
+            tr, te, fisher_dir=fisher, **kwargs
+        ).agnostic_matrix()
+        fresh = cls(_args(tmp_path / "fresh"), task=task)  # reads the file
+        fresh.fit_raw = None
+        ids_c, third = fresh.attribute(
+            tr, te, fisher_dir=fisher, **kwargs
+        ).agnostic_matrix()
+
+        assert ids_a == ids_b == ids_c == ids_ref
+        assert torch.equal(ref, first)
+        assert torch.equal(first, second)
+        assert torch.allclose(first, third, atol=1e-6, rtol=1e-5)
+
+    @pytest.mark.parametrize("factor_cache_residency", [None, "memory", "disk"])
+    def test_reuse_with_cached_factors(self, factor_cache_residency, tmp_path):
+        task, tr, te = _make_task_and_data()
+        attr = EKFACAttributor(_args(tmp_path / "run"), task=task)
+        kwargs = {
+            "fisher_dir": str(tmp_path / "fisher"),
+            "factor_cache_residency": factor_cache_residency,
+        }
+        _, first = attr.attribute(tr, te, damping=1e-3, **kwargs).agnostic_matrix()
+        _, other = attr.attribute(tr, te, damping=1e-1, **kwargs).agnostic_matrix()
+        _, again = attr.attribute(tr, te, damping=1e-3, **kwargs).agnostic_matrix()
+        assert not torch.allclose(first, other)
+        assert torch.equal(first, again)
 
 
 class TestBatchedScoring:

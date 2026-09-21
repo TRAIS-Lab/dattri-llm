@@ -17,6 +17,8 @@ weight gradient is exactly the rank-1 outer product ``g a^T``.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
@@ -1341,9 +1343,7 @@ class TestPersistedFisher:
             )
 
     def test_persisted_direct_fim_matches_fresh(self, norm_collected, tmp_path):
-        """The direct dense-Fisher factors persist and reload too; the fit's
-        ``non_kfac_strategy`` (``"direct"``) wins over the (default) call value.
-        """
+        """The direct dense-Fisher factors persist and reload too."""
 
         def score(attr, **kw):
             return attr.attribute_from_cache(
@@ -1366,7 +1366,11 @@ class TestPersistedFisher:
             str(tmp_path / "fisher"),
             non_kfac_strategy="direct",
         )
-        loaded = score(_attr(KFACAttributor, tmp_path / "load"), fisher_dir=fdir)
+        loaded = score(
+            _attr(KFACAttributor, tmp_path / "load"),
+            fisher_dir=fdir,
+            non_kfac_strategy="direct",
+        )
         assert torch.allclose(fresh, loaded, atol=1e-4, rtol=1e-3), (
             f"max diff {(fresh - loaded).abs().max():.2e}"
         )
@@ -1384,13 +1388,53 @@ class TestPersistedFisher:
                 fisher_dir=fdir,
             )
 
-    def test_missing_fisher_dir_raises(self, collected, tmp_path):
+    def test_load_missing_fisher_dir_raises(self, tmp_path):
         with pytest.raises(ValueError, match="No fitted Fisher"):
-            self._score(
-                _make(KFACAttributor, tmp_path / "x"),
-                collected,
+            _make(KFACAttributor, tmp_path / "x").load_fisher(
+                str(tmp_path / "does_not_exist")
+            )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_empty_fisher_dir_is_filled_and_reused(self, cls, collected, tmp_path):
+        """A call given a directory without a fit writes its fit there; the
+        next call loads it instead of fitting.
+        """
+        fdir = str(tmp_path / "fisher")
+        first = self._score(
+            _make(cls, tmp_path / "first"), collected, damping=DAMPING, fisher_dir=fdir
+        )
+        blob = torch.load(
+            Path(fdir) / cls._FISHER_FILE, map_location="cpu", weights_only=True
+        )
+        assert blob["meta"]["damping"] == DAMPING
+        assert blob["meta"]["relative_damping"] is False
+
+        attr = _make(cls, tmp_path / "second")
+        attr.fit_raw = None  # a refit would fail
+        second = self._score(attr, collected, damping=DAMPING, fisher_dir=fdir)
+        assert torch.equal(first, second)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"non_kfac_strategy": "direct"},
+            {"direct_fim_max_params": 16},
+            {"selected_training_steps": [0]},
+            {"layer_name": [LAYERS[0]]},
+        ],
+    )
+    def test_fit_under_other_options_raises(self, options, collected, tmp_path):
+        fdir = _make(KFACAttributor, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        with pytest.raises(ValueError, match="other options"):
+            _make(KFACAttributor, tmp_path / "x").attribute_from_cache(
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 damping=DAMPING,
-                fisher_dir=str(tmp_path / "does_not_exist"),
+                fisher_dir=fdir,
+                **options,
             )
 
     def test_ekfac_mode_mismatch_raises(self, collected, tmp_path):
@@ -1467,7 +1511,15 @@ class TestFactorPlacement:
         )
         outs = []
         for cached in (None, residency):
-            attr = cls(args, factor_cache_residency=cached)
+            attr = cls(args)
+            attr._set_options(
+                1e-3,
+                "ignore",
+                4096,
+                relative_damping=False,
+                factor_cache_residency=cached,
+                covariances_at_capture=True,
+            )
             attr._preconditioner = attr.damp_fit((raw, {}), 1e-3)
             factors = attr._preconditioner[0]["l0"]
             if cached:
@@ -1484,9 +1536,43 @@ class TestFactorPlacement:
                 assert spill is None or not spill.exists()  # nothing left on disk
         assert torch.allclose(outs[0], outs[1], atol=1e-6)
 
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_relative_damping_scales_with_the_mean_eigenvalue(self, cls, tmp_path):
+        """``relative_damping``: the damping added to a spectrum is a multiple
+        of its mean eigenvalue, so it equals absolute damping of that size.
+        """
+        gen = torch.Generator().manual_seed(0)
+        A, G = (torch.randn(n, n, generator=gen) for n in (6, 4))
+        A, G = A @ A.T + torch.eye(6), G @ G.T + torch.eye(4)
+        args = AttributionArguments(output_dir=str(tmp_path))
+        rel, absolute = cls(args), cls(args)
+        rel._set_options(
+            0.1,
+            "ignore",
+            4096,
+            relative_damping=True,
+            factor_cache_residency=None,
+            covariances_at_capture=True,
+        )
+        if cls is KFACAttributor:
+            raw = {"l0": (A, G)}
+            got = rel.damp(raw, 0.1)["l0"]
+            for m, inv in zip((A, G), got, strict=True):
+                want = ops.sym_inverse(m, 0.1 * float(torch.linalg.eigvalsh(m).mean()))
+                assert torch.allclose(inv, want, atol=1e-5)
+        else:
+            lam = torch.rand(24, generator=gen) + 0.1
+            raw = {"l0": (torch.eye(6), torch.eye(4), lam)}
+            got = rel.damp(raw, 0.1)["l0"][2]
+            assert torch.allclose(got, lam + 0.1 * lam.mean())
+            assert torch.allclose(absolute.damp(raw, 0.1)["l0"][2], lam + 0.1)
+
     def test_factor_cache_residency_is_validated(self, tmp_path):
         with pytest.raises(ValueError, match="factor_cache_residency"):
             KFACAttributor(
-                AttributionArguments(output_dir=str(tmp_path)),
+                AttributionArguments(output_dir=str(tmp_path))
+            ).attribute_from_cache(
+                str(tmp_path / "train"),
+                str(tmp_path / "test"),
                 factor_cache_residency="cpu",
             )

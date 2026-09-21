@@ -132,6 +132,11 @@ class _FactorCache(Mapping):
         self._order.clear()
 
 
+def _mean_eigenvalue(matrix: torch.Tensor) -> torch.Tensor:
+    """Mean eigenvalue of a square matrix: its trace over its size."""
+    return matrix.diagonal().float().mean()
+
+
 def _map_tensors(obj: object, fn: Callable[[torch.Tensor], torch.Tensor]) -> object:
     """*obj* with *fn* applied to every tensor inside its dicts, lists and tuples.
     A :class:`_FactorCache` is returned as it is: it places its own tensors.
@@ -147,7 +152,7 @@ def _map_tensors(obj: object, fn: Callable[[torch.Tensor], torch.Tensor]) -> obj
     return obj
 
 
-class KroneckerAttributor(BaseInnerProductAttributor):
+class KroneckerAttributor(BaseInnerProductAttributor):  # noqa: PLR0904 - the workflow's hook surface
     """Shared workflow of the K-FAC family; subclass to add a Kronecker variant.
 
     A subclass implements three things:
@@ -173,27 +178,21 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         args: AttributionArguments,
         *,
         task: AttributionTask | None = None,
-        factor_cache_residency: str | None = None,
-        covariances_at_capture: bool = True,
     ) -> None:
         super().__init__(args, task=task)
-        if (
-            factor_cache_residency is not None
-            and factor_cache_residency not in CACHE_RESIDENCIES
-        ):
-            raise ValueError(
-                "factor_cache_residency must be one of "
-                f"{list(CACHE_RESIDENCIES)} or None, got {factor_cache_residency!r}.",
-            )
-        # Collect the Kronecker covariances while the train gradients are
-        # captured into a store (see :meth:`collect_gradients`).
-        self._covariances_at_capture = covariances_at_capture
+        # Per-call options (set by the entry points through _set_options).
+        # ``relative_damping``: ``damping`` is a multiple of each matrix's mean
+        # eigenvalue (see :meth:`_damping_for`).  ``covariances_at_capture``:
+        # the covariances are collected while the train gradients are captured
+        # into a store (see :meth:`collect_gradients`).
+        self._relative_damping: bool = False
+        self._covariances_at_capture: bool = True
         self._capture_streamer: GradientStreamer | None = None
         self._collected_covariances: dict[str, dict] = {}
-        # Where the fitted factors are held: on the device (``None``), or in a
-        # cache of this residency, from which one layer's factors come to the
-        # device at a time (see :class:`_FactorCache`).
-        self._factor_cache_residency = factor_cache_residency
+        # ``factor_cache_residency``: where the fitted factors are held -- on the
+        # device (``None``), or in a cache of this residency, from which one
+        # layer's factors come to the device at a time (:class:`_FactorCache`).
+        self._factor_cache_residency: str | None = None
         self._factor_caches: list[_FactorCache] = []
         # Per-call options (set by the entry points, read by prepare_scoring).
         self._damping: float = 1e-3
@@ -202,6 +201,12 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         # A loaded/fit raw fit, and its damped form for the current pass.
         self._raw_fit: RawFit | None = None
         self._preconditioner: Preconditioner | None = None
+        # What the fit was restricted to, and where a new fit is persisted.
+        self._fit_scope: dict = {"layer_name": None, "selected_training_steps": None}
+        self._save_fit_to: str | None = None
+        # The fit last saved to or loaded from a fisher_dir, with what
+        # identifies it, so the next call naming that directory skips the read.
+        self._fisher_dir_fit: tuple[tuple, RawFit] | None = None
         # Per-fit bookkeeping: embedding layers the direct Fisher left
         # uncovered, K-FAC-typed layers diverted to the dense Fisher because
         # they were stored materialized, and whether norm layers enter the
@@ -306,8 +311,14 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         fisher_acc = ops.FisherAccumulator(max_params)
         raw_factors = self.fit_factors(train_source, fisher_acc)
         if self._skipped_materialized:
+            n_skipped = len(self._skipped_materialized)
             warnings.warn(
-                "Layers stored materialized (e.g. a TRAK-projected capture) "
+                f"{n_skipped} of the {n_skipped + len(raw_factors)} "
+                f"K-FAC-eligible layers are not preconditioned by "
+                f"{self.algorithm}"
+                + (" (none is)" if not raw_factors else "")
+                + ".  Layers stored materialized (e.g. a TRAK-projected "
+                "capture, or a capture_style of 'materialized' or 'auto') "
                 "cannot enter K-FAC -- there are no factorized (a, g) factors "
                 "to build the Kronecker covariances from.  Preconditioning "
                 "them with the direct dense empirical Fisher (FIM) instead, "
@@ -332,6 +343,17 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 + ". Check the hook config and the collected layers.",
             )
         return raw_factors, raw_fisher
+
+    def _damping_for(
+        self, damping: float, spectrum_mean: torch.Tensor | float
+    ) -> float:
+        """The value added to a spectrum whose mean eigenvalue is
+        *spectrum_mean*: ``damping`` itself, or ``damping * spectrum_mean``
+        under ``relative_damping``.
+        """
+        if not self._relative_damping:
+            return damping
+        return damping * float(spectrum_mean)
 
     def damp_fit(self, raw_fit: RawFit, damping: float) -> Preconditioner:
         """Fold *damping* into a raw fit -> the scoring preconditioner.
@@ -369,7 +391,12 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         raw_fisher = _map_tensors(raw_fisher, lambda t: t.to(device))
         return (
             factors,
-            {layer: ops.dense_inverse(F, damping) for layer, F in raw_fisher.items()},
+            {
+                layer: ops.dense_inverse(
+                    F, self._damping_for(damping, _mean_eigenvalue(F))
+                )
+                for layer, F in raw_fisher.items()
+            },
         )
 
     def _factor_map(self) -> dict | _FactorCache:
@@ -435,6 +462,33 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             torch.save(covariances, root / self._COVARIANCE_FILE)
         return result
 
+    def cache(
+        self,
+        train_dataset: Dataset,
+        test_dataset: Dataset,
+        *,
+        covariances_at_capture: bool | None = None,
+        **kwargs: object,
+    ) -> list[tuple[str, str]]:
+        """Collect both sides to disk (see the base class).
+
+        Args:
+            train_dataset: Training dataset to stream.
+            test_dataset: Test dataset to stream.
+            covariances_at_capture: Accumulate the Kronecker covariances during
+                the train pass and save them next to the train gradients, as
+                in :meth:`attribute`.  ``None`` (default) keeps the setting of
+                the enclosing :meth:`attribute` call, ``True`` otherwise.
+            **kwargs: The base class's options (``cache_dir``, ``hook_config``,
+                ``enable_update``, ``on_train_block``).
+
+        Returns:
+            The ``(train_gradients_dir, test_gradients_dir)`` pairs.
+        """
+        if covariances_at_capture is not None:
+            self._covariances_at_capture = covariances_at_capture
+        return super().cache(train_dataset, test_dataset, **kwargs)
+
     def _covariances_for(self, train_source: GradientSource) -> dict | None:
         """The covariances collected with *train_source*'s store, when the
         source reads every stored step (a step filter changes the fit).
@@ -475,16 +529,31 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         # kept for re-damping (see :meth:`damp_fit`), but on the host, so it
         # does not sit on the device beside its inverses for the whole pass.
         self._raw_fit = _map_tensors(self._raw_fit, lambda t: t.to("cpu"))
+        if self._save_fit_to is not None:
+            self.save_fisher(
+                self._raw_fit[0], self._save_fit_to, fisher=self._raw_fit[1]
+            )
+            self._fisher_dir_fit = (
+                self._fisher_dir_key(self._save_fit_to),
+                self._raw_fit,
+            )
+            self._save_fit_to = None
         # Factor caches of an earlier fit are released once nothing uses them.
-        self._release_factor_caches(keep=(self._raw_fit[0], self._preconditioner[0]))
+        kept = () if self._fisher_dir_fit is None else (self._fisher_dir_fit[1][0],)
+        self._release_factor_caches(
+            keep=(self._raw_fit[0], self._preconditioner[0], *kept)
+        )
 
     def _set_options(
         self,
         damping: float,
         non_kfac_strategy: NonKfacStrategy,
         direct_fim_max_params: int,
+        relative_damping: bool,
+        factor_cache_residency: str | None,
+        covariances_at_capture: bool,
     ) -> None:
-        """Validate and store the per-call fit/damping options; reset the pass."""
+        """Validate and store the per-call options; reset the pass."""
         if damping < 0:
             raise ValueError(f"damping must be non-negative, got {damping}.")
         if non_kfac_strategy not in ("ignore", "direct"):
@@ -496,11 +565,24 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             raise ValueError(
                 f"direct_fim_max_params must be positive, got {direct_fim_max_params}.",
             )
+        if (
+            factor_cache_residency is not None
+            and factor_cache_residency not in CACHE_RESIDENCIES
+        ):
+            raise ValueError(
+                "factor_cache_residency must be one of "
+                f"{list(CACHE_RESIDENCIES)} or None, got {factor_cache_residency!r}.",
+            )
         self._damping = damping
         self._non_kfac_strategy = non_kfac_strategy
         self._direct_fim_max_params = direct_fim_max_params
+        self._relative_damping = relative_damping
+        self._factor_cache_residency = factor_cache_residency
+        self._covariances_at_capture = covariances_at_capture
         self._raw_fit = None
         self._preconditioner = None
+        self._fit_scope = {"layer_name": None, "selected_training_steps": None}
+        self._save_fit_to = None
 
     # ------------------------------------------------------------------ #
     # Test-side preconditioning (the transform hook)                      #
@@ -642,17 +724,79 @@ class KroneckerAttributor(BaseInnerProductAttributor):
 
     _FISHER_FILE = "fisher_factors.pt"
 
+    # Options recorded with a persisted fit that do not define it.
+    _FISHER_PROVENANCE = ("damping", "relative_damping")
+
     def _fisher_meta(self) -> dict:
-        """Identity of a persisted fit -- checked on load for compatibility."""
+        """Metadata of a persisted fit.
+
+        Every entry except :attr:`_FISHER_PROVENANCE` defines the fit and is
+        compared on load; the damping is applied after loading, so it is
+        recorded only as the setting of the call that wrote the file.
+        """
         meta = {
             "algorithm": self.algorithm,
             "non_kfac_strategy": self._non_kfac_strategy,
             "direct_fim_max_params": self._direct_fim_max_params,
+            **self._fit_scope,
+            "damping": self._damping,
+            "relative_damping": self._relative_damping,
         }
         mode = getattr(self, "mode", None)
         if mode is not None:
             meta["mode"] = mode
         return meta
+
+    def _set_fit_scope(
+        self,
+        layer_name: str | list[str] | None,
+        selected_training_steps: Iterable[int] | None,
+    ) -> None:
+        """Record the layers and train steps the fit is restricted to."""
+        if isinstance(layer_name, str):
+            layer_name = [layer_name]
+        self._fit_scope = {
+            "layer_name": None if layer_name is None else sorted(layer_name),
+            "selected_training_steps": (
+                None
+                if selected_training_steps is None
+                else sorted(int(step) for step in selected_training_steps)
+            ),
+        }
+
+    def _fisher_dir_key(self, fisher_dir: str) -> tuple:
+        """What identifies the fit of *fisher_dir* held by this attributor."""
+        path = Path(fisher_dir) / self._FISHER_FILE
+        defining = {
+            key: value
+            for key, value in self._fisher_meta().items()
+            if key not in self._FISHER_PROVENANCE
+        }
+        return (
+            str(path.resolve()),
+            path.stat().st_mtime_ns,
+            repr(sorted(defining.items())),
+            self._factor_cache_residency,
+        )
+
+    def _use_fisher_dir(self, fisher_dir: str | None) -> None:
+        """Load the fit in *fisher_dir*, or have the coming fit saved there.
+
+        The fit this attributor last saved to or loaded from the directory is
+        reused without reading the file again when the file and the options
+        that define the fit are unchanged.
+        """
+        if fisher_dir is None:
+            return
+        if not (Path(fisher_dir) / self._FISHER_FILE).exists():
+            self._save_fit_to = fisher_dir
+            return
+        key = self._fisher_dir_key(fisher_dir)
+        if self._fisher_dir_fit is not None and self._fisher_dir_fit[0] == key:
+            self._raw_fit = self._fisher_dir_fit[1]
+            return
+        self._raw_fit = self.load_fisher(fisher_dir)
+        self._fisher_dir_fit = (key, self._raw_fit)
 
     @staticmethod
     def _move_raw(raw: dict, device: torch.device) -> dict:
@@ -703,15 +847,19 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         path = Path(fisher_dir)
         path.mkdir(parents=True, exist_ok=True)
         cpu = torch.device("cpu")
-        # Persist on CPU so the factor file is portable across devices.
+        # Persist on CPU so the factor file is portable across devices.  Every
+        # rank holds the same all-reduced fit and may share the directory, so
+        # each writes its own file and renames it into place.
+        partial = path / f"{self._FISHER_FILE}.rank{dist_rank() or 0}.partial"
         torch.save(
             {
                 "meta": self._fisher_meta(),
                 "raw_ctx": self._move_raw(covariances, cpu),
                 "raw_fim": self._move_raw(fisher or {}, cpu),
             },
-            path / self._FISHER_FILE,
+            partial,
         )
+        partial.replace(path / self._FISHER_FILE)
         return fisher_dir
 
     def load_fisher(self, fisher_dir: str) -> RawFit:
@@ -732,11 +880,18 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 f"fisher_dir {fisher_dir!r} holds {meta.get('algorithm')!r} "
                 f"factors, but this is a {self.algorithm} attributor.",
             )
-        mode = getattr(self, "mode", None)
-        if mode is not None and meta.get("mode") != mode:
+        expected = self._fisher_meta()
+        differing = {
+            key: (meta.get(key), value)
+            for key, value in expected.items()
+            if key not in self._FISHER_PROVENANCE and meta.get(key) != value
+        }
+        if differing:
             raise ValueError(
-                f"fisher_dir {fisher_dir!r} was fit with mode="
-                f"{meta.get('mode')!r}, but this attributor uses mode={mode!r}.",
+                f"fisher_dir {fisher_dir!r} holds a fit made under other "
+                "options (recorded, requested): "
+                f"{differing}.  Request the recorded options, or pass another "
+                "fisher_dir to fit under the requested ones.",
             )
         device = self.args.device
         raw_fisher = self._move_raw(blob["raw_fim"], device)
@@ -758,6 +913,8 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         layer_name: str | list[str] | None = None,
         verbose: bool = False,
         covariances: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        factor_cache_residency: str | None = None,
+        covariances_at_capture: bool = True,
     ) -> str:
         """Fit and persist the **damping-free** Fisher factors, once.
 
@@ -790,11 +947,24 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 projected covariances precondition), so a compact store is
                 enough for either method.  Every K-FAC-eligible layer of the
                 store must be covered.
+            factor_cache_residency: Where the fitted factors are held during
+                the fit; as in :meth:`attribute`.
+            covariances_at_capture: When *covariances* is not given, use the
+                covariances that were accumulated while the train gradients
+                were collected (see :meth:`attribute`), if the store has them.
 
         Returns:
             ``fisher_dir``.
         """
-        self._set_options(self._damping, non_kfac_strategy, direct_fim_max_params)
+        self._set_options(
+            self._damping,
+            non_kfac_strategy,
+            direct_fim_max_params,
+            self._relative_damping,
+            factor_cache_residency,
+            covariances_at_capture,
+        )
+        self._set_fit_scope(layer_name, selected_training_steps)
         train = self.load_train_rep(
             train_gradients_dir,
             steps=selected_training_steps,
@@ -836,6 +1006,10 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         damping: float = 1e-3,
         non_kfac_strategy: NonKfacStrategy = "ignore",
         direct_fim_max_params: int = 4096,
+        relative_damping: bool = False,
+        factor_cache_residency: str | None = None,
+        covariances_at_capture: bool = True,
+        fisher_dir: str | None = None,
     ) -> AttributionScore:
         """Score by collecting gradients **live** at the task's first checkpoint.
 
@@ -863,8 +1037,40 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             non_kfac_strategy: ``"ignore"`` (default) skips norm layers;
                 ``"direct"`` preconditions them with a dense empirical Fisher.
             direct_fim_max_params: Parameter-count cap for that dense Fisher.
+            relative_damping: Interpret ``damping`` as a multiple of the mean
+                eigenvalue of whatever it is added to -- each covariance factor
+                (K-FAC), each layer's corrected spectrum (EK-FAC), each dense
+                Fisher block -- instead of an absolute value.
+            factor_cache_residency: Where the fitted factors are held.  ``None``
+                (default) keeps them on the device.  ``"memory"`` holds them in
+                host memory, ``"disk"`` in files, and ``"tiered"`` in host
+                memory that spills to files once its budget is used; one
+                layer's factors come to the device at a time.  At full
+                dimension the factors are as large as the squared layer widths.
+            covariances_at_capture: Use Kronecker covariances accumulated during
+                the pass that collected the train gradients into a store
+                (:meth:`cache`, or :meth:`attribute` with a
+                ``gradient_cache_residency``), so the fit does not sweep the
+                store for them and a materialized ``"logra"`` store can be
+                preconditioned.  They stay on the device during that pass
+                (``d_in x d_in`` and ``d_out x d_out`` per layer); ``False``
+                fits them from the stored factors.
+            fisher_dir: Directory of a persisted fit, as in
+                :meth:`attribute_from_cache`: loaded when it holds one, and
+                otherwise written by this call, so that later calls over the
+                same training set (other queries, another ``damping``) skip
+                the fit.
         """
-        self._set_options(damping, non_kfac_strategy, direct_fim_max_params)
+        self._set_options(
+            damping,
+            non_kfac_strategy,
+            direct_fim_max_params,
+            relative_damping,
+            factor_cache_residency,
+            covariances_at_capture,
+        )
+        if gradient_cache_residency is None:  # else attribute_from_cache does it
+            self._use_fisher_dir(fisher_dir)
         extra: dict = {}
         if gradient_cache_residency is not None and loop_over_test:
             extra["preconditioned_test_cache_residency"] = gradient_cache_residency
@@ -880,6 +1086,10 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             damping=damping,
             non_kfac_strategy=non_kfac_strategy,
             direct_fim_max_params=direct_fim_max_params,
+            relative_damping=relative_damping,
+            factor_cache_residency=factor_cache_residency,
+            covariances_at_capture=covariances_at_capture,
+            fisher_dir=fisher_dir,
             **extra,
         )
 
@@ -900,12 +1110,15 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         fisher_dir: str | None = None,
         non_kfac_strategy: NonKfacStrategy = "ignore",
         direct_fim_max_params: int = 4096,
+        relative_damping: bool = False,
+        factor_cache_residency: str | None = None,
+        covariances_at_capture: bool = True,
     ) -> AttributionScore:
         """Score collected gradients (the *store-then-attribute* path).
 
         The Fisher is estimated from the (selected) train gradients unless
-        *fisher_dir* supplies a persisted fit (see :meth:`fit`), which is
-        loaded and re-damped instead -- the train pre-pass is skipped.
+        *fisher_dir* holds a persisted fit (see :meth:`fit`), which is loaded
+        and damped instead -- the train pre-pass is skipped.
 
         Args:
             train_source: Train gradients -- directory, open store, or source.
@@ -930,13 +1143,29 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 test representations in an **ephemeral** store of this
                 residency (``"memory"``/``"tiered"``/``"disk"`` temp),
                 released on return.  ``None`` (default) recomputes per block.
-            fisher_dir: Directory of factors persisted by :meth:`fit` /
-                :meth:`save_fisher`.  When given, ``non_kfac_strategy`` and
-                ``direct_fim_max_params`` come from the recorded fit.
+            fisher_dir: Directory of a persisted fit (:meth:`fit`,
+                :meth:`save_fisher`, or an earlier call given this directory).
+                A fit found there is loaded; it must have been made under this
+                call's ``non_kfac_strategy``, ``direct_fim_max_params``,
+                ``layer_name`` and ``selected_training_steps``, or a
+                ``ValueError`` is raised.  ``damping`` and
+                ``relative_damping`` are applied after loading and may differ.
+                When the directory holds no fit, this call's fit is written
+                there.
             non_kfac_strategy: As in :meth:`attribute`.
             direct_fim_max_params: As in :meth:`attribute`.
+            relative_damping: As in :meth:`attribute`.
+            factor_cache_residency: As in :meth:`attribute`.
+            covariances_at_capture: As in :meth:`attribute`.
         """
-        self._set_options(damping, non_kfac_strategy, direct_fim_max_params)
+        self._set_options(
+            damping,
+            non_kfac_strategy,
+            direct_fim_max_params,
+            relative_damping,
+            factor_cache_residency,
+            covariances_at_capture,
+        )
         cache_precond = (
             preconditioned_test_dir is not None
             or preconditioned_test_cache_residency is not None
@@ -956,12 +1185,14 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 f"{list(CACHE_RESIDENCIES)} or None, got "
                 f"{preconditioned_test_cache_residency!r}.",
             )
-        if fisher_dir is not None:
-            self._raw_fit = self.load_fisher(fisher_dir)
+        self._set_fit_scope(layer_name, selected_training_steps)
+        self._use_fisher_dir(fisher_dir)
         train_store = self.resolve_store(train_source)
         test_store = self.resolve_store(test_source)
         meta = {
             "damping": damping,
+            "relative_damping": relative_damping,
+            "factor_cache_residency": factor_cache_residency,
             "non_kfac_strategy": non_kfac_strategy,
             "fisher_dir": fisher_dir,
             **(algorithm_meta or {}),
@@ -1050,6 +1281,9 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         direct_fim_max_params: int = 4096,
         layer_name: str | list[str] | None = None,
         verbose: bool = False,
+        relative_damping: bool = False,
+        factor_cache_residency: str | None = None,
+        covariances_at_capture: bool = True,
     ) -> str:
         """Fit the preconditioner and persist **preconditioned** test reps.
 
@@ -1074,6 +1308,9 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             selected_training_steps: Restricts the fit, not what is stored.
             non_kfac_strategy: As in :meth:`attribute`.
             direct_fim_max_params: As in :meth:`attribute`.
+            relative_damping: As in :meth:`attribute`.
+            factor_cache_residency: As in :meth:`attribute`.
+            covariances_at_capture: As in :meth:`attribute`.
             layer_name: As in :meth:`attribute_from_cache`.
             verbose: Show progress bars on the logging process.
 
@@ -1083,7 +1320,14 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         if preconditioned_test_dir is None:
             subdir = f"{self.algorithm.lower()}_preconditioned_test"
             preconditioned_test_dir = str(Path(self.args.output_dir) / subdir)
-        self._set_options(damping, non_kfac_strategy, direct_fim_max_params)
+        self._set_options(
+            damping,
+            non_kfac_strategy,
+            direct_fim_max_params,
+            relative_damping,
+            factor_cache_residency,
+            covariances_at_capture,
+        )
         train = self.load_train_rep(
             train_gradients_dir,
             steps=selected_training_steps,
@@ -1118,21 +1362,6 @@ class KFACAttributor(KroneckerAttributor):
     Args:
         args: :class:`AttributionArguments`.
         task: The attribution task; required by the live methods only.
-        factor_cache_residency: Where the fitted factors are held.  ``None``
-            (default) keeps them on the device.  ``"memory"`` holds them in
-            host memory, ``"disk"`` in files, and ``"tiered"`` in host memory
-            that spills to files once its budget is used; one layer's factors
-            come to the device at a time, at the cost of one transfer of a
-            layer's factors per block.  At full dimension the factors are as
-            large as the squared layer widths.
-        covariances_at_capture: Accumulate the Kronecker covariances during
-            the pass that collects the train gradients into a store
-            (:meth:`cache`, or :meth:`attribute` with a
-            ``gradient_cache_residency``), so the fit does not sweep the store
-            for them and a materialized ``"logra"`` store can be
-            preconditioned.  The covariances stay on the device during that
-            pass (``d_in x d_in`` and ``d_out x d_out`` per layer); pass
-            ``False`` to fit them from the stored factors afterwards.
     """
 
     algorithm: ClassVar[str] = "KFAC"
@@ -1167,7 +1396,7 @@ class KFACAttributor(KroneckerAttributor):
             factors[layer] = covariances
         return factors
 
-    def damp(  # noqa: PLR6301 - subclass hook
+    def damp(
         self,
         raw_factors: dict[str, tuple[torch.Tensor, torch.Tensor]],
         damping: float,
@@ -1176,7 +1405,10 @@ class KFACAttributor(KroneckerAttributor):
         # The inverses are the only place damping enters K-FAC scoring, so
         # re-damping is two small eighs per layer -- no training sweep.
         return {
-            layer: (ops.sym_inverse(A, damping), ops.sym_inverse(G, damping))
+            layer: (
+                ops.sym_inverse(A, self._damping_for(damping, _mean_eigenvalue(A))),
+                ops.sym_inverse(G, self._damping_for(damping, _mean_eigenvalue(G))),
+            )
             for layer, (A, G) in raw_factors.items()
         }
 
@@ -1226,21 +1458,6 @@ class EKFACAttributor(KroneckerAttributor):
         args: :class:`AttributionArguments`.
         task: The attribution task; required by the live methods only.
         mode: ``"exact"`` (default) or ``"approx"``; currently equivalent.
-        factor_cache_residency: Where the fitted factors are held.  ``None``
-            (default) keeps them on the device.  ``"memory"`` holds them in
-            host memory, ``"disk"`` in files, and ``"tiered"`` in host memory
-            that spills to files once its budget is used; one layer's factors
-            come to the device at a time, at the cost of one transfer of a
-            layer's factors per block.  At full dimension the factors are as
-            large as the squared layer widths.
-        covariances_at_capture: Accumulate the Kronecker covariances during
-            the pass that collects the train gradients into a store
-            (:meth:`cache`, or :meth:`attribute` with a
-            ``gradient_cache_residency``), so the fit does not sweep the store
-            for them and a materialized ``"logra"`` store can be
-            preconditioned.  The covariances stay on the device during that
-            pass (``d_in x d_in`` and ``d_out x d_out`` per layer); pass
-            ``False`` to fit them from the stored factors afterwards.
     """
 
     algorithm: ClassVar[str] = "EKFAC"
@@ -1252,19 +1469,12 @@ class EKFACAttributor(KroneckerAttributor):
         *,
         task: AttributionTask | None = None,
         mode: str = "exact",
-        factor_cache_residency: str | None = None,
-        covariances_at_capture: bool = True,
     ) -> None:
         if mode not in self.EKFAC_MODES:
             raise ValueError(
                 f"mode must be one of {self.EKFAC_MODES}, got {mode!r}.",
             )
-        super().__init__(
-            args,
-            task=task,
-            factor_cache_residency=factor_cache_residency,
-            covariances_at_capture=covariances_at_capture,
-        )
+        super().__init__(args, task=task)
         self.mode = mode
 
     def fit_factors(
@@ -1358,7 +1568,7 @@ class EKFACAttributor(KroneckerAttributor):
             self._factor_caches.remove(eig)
         return factors
 
-    def damp(  # noqa: PLR6301 - subclass hook
+    def damp(
         self,
         raw_factors: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         damping: float,
@@ -1366,7 +1576,7 @@ class EKFACAttributor(KroneckerAttributor):
         """``{layer: (U_A, U_G, lambda_raw + damping)}`` -- a spectrum shift."""
         # F_l^-1 ~ (U_A x U_G)(lambda_raw + damping)^-1(U_A x U_G)^T
         return {
-            layer: (U_A, U_G, lam_raw + damping)
+            layer: (U_A, U_G, lam_raw + self._damping_for(damping, lam_raw.mean()))
             for layer, (U_A, U_G, lam_raw) in raw_factors.items()
         }
 
