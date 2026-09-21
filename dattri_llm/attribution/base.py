@@ -520,11 +520,14 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             self.load_checkpoint(k)
             train_dir, test_dir = pair(k)
             # Test first: with enable_update the train pass advances the model.
+            # Every rank captures every query: each rank scores its training
+            # shard against the whole test set, as in :meth:`attribute`.
             self.collect_gradients(
                 self.generate_test_rep(
                     test_dataset,
                     checkpoint_step=k,
                     hook_config=hook_config,
+                    shard=False,
                 ),
                 GradientStorageManager(test_dir),
             )
@@ -975,6 +978,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                         test_dataset,
                         checkpoint_step=k,
                         hook_config=hook_config,
+                        shard=False,  # every query on every rank (see cache())
                     ),
                     test_store,
                 )

@@ -324,12 +324,63 @@ def _missing_wrapper_worker(rank, world_size, result_queue, rendezvous_path, out
     _report(rank, result_queue, body)
 
 
+def _stored_queries_worker(
+    rank, world_size, result_queue, rendezvous_path, residency, out_dir
+):
+    _init_group(rank, world_size, rendezvous_path)
+
+    def body():
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel
+
+        from dattri_llm.attribution.algorithm.tracin import TracInAttributor
+        from dattri_llm.task import AttributionTask
+
+        torch.manual_seed(SEED)
+        task = AttributionTask(_loss_fn, DistributedDataParallel(MLP()))
+        train_ds, test_ds = _make_data(N_TRAIN, seed=1), _make_data(N_TEST, seed=2)
+
+        def scores(sub, **kwargs):
+            attributor = TracInAttributor(
+                _args(f"{out_dir}/{sub}/rank{rank}"), task=task
+            )
+            return attributor.attribute(train_ds, test_ds, **kwargs)
+
+        live = scores("live")  # every rank streams every query
+        stored = scores("stored", gradient_cache_residency=residency)
+        # The store path captures every query on every rank: each rank holds
+        # the whole query set, in the same column order.
+        columns: list = [None] * world_size
+        dist.all_gather_object(columns, list(stored.test_ids))
+        ok = set(stored.test_ids) == {hash_sample(test_ds[i]) for i in range(N_TEST)}
+        ok = ok and all(c == columns[0] for c in columns)
+        # ... and the scores equal the live path's, query by query.
+        ids_live, m_live = live.agnostic_matrix()
+        ids_stored, m_stored = stored.agnostic_matrix()
+        ok = ok and ids_live == ids_stored
+        reorder = [live.test_index[h] for h in stored.test_ids]
+        ok = ok and torch.allclose(m_live[:, reorder], m_stored, atol=ATOL)
+        return ok, f"queries {len(stored.test_ids)}/{N_TEST}, columns agree {columns}"
+
+    _report(rank, result_queue, body)
+
+
 class TestSharedForwardModel:
     @pytest.mark.parametrize("mode", ["fsdp", "ddp"])
     def test_test_probe_shares_wrapper_and_sees_every_query(self, mode, tmp_path):
         if not _can_bind_localhost():
             pytest.skip("local socket binds are not permitted in this environment")
         ok, report = _spawn(_shared_worker, mode, str(tmp_path))
+        assert ok, report
+
+    @pytest.mark.parametrize("residency", ["memory", "disk"])
+    def test_stored_queries_reach_every_rank(self, residency, tmp_path):
+        """``attribute(gradient_cache_residency=...)`` scores every query on
+        every rank, as the live path does.
+        """
+        if not _can_bind_localhost():
+            pytest.skip("local socket binds are not permitted in this environment")
+        ok, report = _spawn(_stored_queries_worker, residency, str(tmp_path))
         assert ok, report
 
     def test_shared_hooks_without_wrapper_are_refused(self, tmp_path):
