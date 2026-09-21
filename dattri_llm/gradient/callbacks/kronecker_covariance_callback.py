@@ -14,14 +14,16 @@ Two use sites share it:
   :class:`~dattri_llm.gradient.callbacks.OffloadCallback` when wrapping a
   training loop, so one pass both stores gradients and fits the covariances (no
   re-iterable source needed -- the training data streams by once).
-* **On-the-fly** -- an attributor's ``cache``/``collect_gradients`` attaches it to
-  the streamer's manager so the Fisher is fit in the collection pass.
+* **On-the-fly** -- a K-FAC-family attributor attaches it to the train
+  streamer's manager when it collects the train gradients into a store
+  (``covariances_at_capture``, the default), so the covariances are fit in the
+  collection pass.
 
 The factors are accumulated with the same
 :class:`~dattri_llm.gradient.ops.LayerKroneckerAccumulator` the fit pass uses,
 so :meth:`result` reproduces :meth:`KFACAttributor.fit`'s covariances.  They are
-built from the **raw** (un-projected) factors, i.e. in full weight space -- the
-covariances a factorized/full store is scored with.
+built from the factors the capture emits -- projected ones under a
+capture-time projection -- i.e. the covariances the store is scored with.
 """
 
 from __future__ import annotations

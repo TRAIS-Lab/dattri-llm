@@ -447,6 +447,99 @@ class TestCompactEKFAC(TestCompactKFAC):
             attr.fit(train, str(tmp_path / "fisher"), covariances=partial)
 
 
+class TestCovariancesAtCapture:
+    """``covariances_at_capture`` (the default): the pass that collects the
+    train gradients into a store also accumulates the Kronecker covariances,
+    so the one-call workflows score a compact (materialized "logra") store and
+    match a fit swept from the stored factors.
+    """
+
+    DAMP = 1e-3
+
+    @staticmethod
+    def _config(capture_style):
+        return TestCompactKFAC()._proj("logra", capture_style)  # noqa: SLF001
+
+    def _attribute(self, cls, out, capture_style, residency, *, at_capture):
+        task, tr, te = _make_task_and_data()
+        attr = cls(_args(out), task=task, covariances_at_capture=at_capture)
+        return attr.attribute(
+            tr,
+            te,
+            hook_config=self._config(capture_style),
+            gradient_cache_residency=residency,
+            damping=self.DAMP,
+        ).agnostic_matrix()
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "disk"])
+    def test_attribute_matches_swept_fit(self, cls, residency, tmp_path):
+        ids_ref, ref = self._attribute(
+            cls, tmp_path / "ref", "factorized", residency, at_capture=False
+        )
+        for capture_style in ("factorized", "materialized"):
+            with warnings.catch_warnings():
+                # the compact store must be K-FAC-preconditioned, not diverted
+                warnings.filterwarnings("error", message=".*stored materialized.*")
+                ids, got = self._attribute(
+                    cls,
+                    tmp_path / capture_style,
+                    capture_style,
+                    residency,
+                    at_capture=True,
+                )
+            assert ids == ids_ref
+            assert torch.allclose(ref, got, atol=1e-4, rtol=1e-3), (
+                f"{capture_style}: max diff {(ref - got).abs().max():.2e}"
+            )
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_cache_persists_covariances(self, cls, tmp_path):
+        """``cache`` saves them next to the train store; a fresh attributor's
+        ``attribute_from_cache`` finds them there.
+        """
+        ids_ref, ref = self._attribute(
+            cls, tmp_path / "ref", "factorized", "disk", at_capture=False
+        )
+        task, tr, te = _make_task_and_data()
+        pairs = cls(_args(tmp_path / "c"), task=task).cache(
+            tr, te, hook_config=self._config("materialized")
+        )
+        ((train_dir, test_dir),) = pairs
+        task, _, _ = _make_task_and_data()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*stored materialized.*")
+            ids, got = (
+                cls(_args(tmp_path / "s"), task=task)
+                .attribute_from_cache(train_dir, test_dir, damping=self.DAMP)
+                .agnostic_matrix()
+            )
+        assert ids == ids_ref
+        assert torch.allclose(ref, got, atol=1e-4, rtol=1e-3)
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_off_fits_from_the_store(self, cls, tmp_path):
+        """With the option off nothing is collected: a compact store falls back
+        to the direct Fisher, with its warning.
+        """
+        with pytest.warns(UserWarning, match="stored materialized"):
+            self._attribute(cls, tmp_path, "materialized", "memory", at_capture=False)
+
+    def test_step_filter_refits(self, tmp_path):
+        """A step filter changes the fit, so collected covariances are not used."""
+        task, tr, te = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path), task=task)
+        ((train_dir, _test_dir),) = attr.cache(
+            tr, te, hook_config=self._config("factorized")
+        )
+        from types import SimpleNamespace
+
+        train = attr.load_train_rep(train_dir)
+        assert attr._covariances_for(train) is not None  # noqa: SLF001
+        subset = SimpleNamespace(file_manager=train.file_manager, steps=[])
+        assert attr._covariances_for(subset) is None  # noqa: SLF001
+
+
 class TestFactorCacheResidency:
     """``factor_cache_residency``: the fitted factors held off the device, in a
     cache of any residency, score the same as factors kept on the device.

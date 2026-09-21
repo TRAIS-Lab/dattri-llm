@@ -57,10 +57,12 @@ import torch
 
 from dattri_llm.attribution.base import BaseInnerProductAttributor
 from dattri_llm.gradient import ops
+from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+from dattri_llm.gradient.datasets import resolve_steps
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.cache import CACHE_RESIDENCIES, CacheBudget, TensorCache
-from dattri_llm.utils.distributed import all_reduce_sum
+from dattri_llm.utils.distributed import all_reduce_sum, dist_rank
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -70,7 +72,11 @@ if TYPE_CHECKING:
     from dattri_llm.attribution.arguments import AttributionArguments
     from dattri_llm.attribution.score import AttributionScore
     from dattri_llm.gradient.hooks import HookManagerConfig
-    from dattri_llm.gradient.streaming import DiskGradientSource, GradientSource
+    from dattri_llm.gradient.streaming import (
+        DiskGradientSource,
+        GradientSource,
+        GradientStreamer,
+    )
     from dattri_llm.task import AttributionTask
 
 NonKfacStrategy = Literal["ignore", "direct"]
@@ -168,6 +174,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         *,
         task: AttributionTask | None = None,
         factor_cache_residency: str | None = None,
+        covariances_at_capture: bool = True,
     ) -> None:
         super().__init__(args, task=task)
         if (
@@ -178,6 +185,11 @@ class KroneckerAttributor(BaseInnerProductAttributor):
                 "factor_cache_residency must be one of "
                 f"{list(CACHE_RESIDENCIES)} or None, got {factor_cache_residency!r}.",
             )
+        # Collect the Kronecker covariances while the train gradients are
+        # captured into a store (see :meth:`collect_gradients`).
+        self._covariances_at_capture = covariances_at_capture
+        self._capture_streamer: GradientStreamer | None = None
+        self._collected_covariances: dict[str, dict] = {}
         # Where the fitted factors are held: on the device (``None``), or in a
         # cache of this residency, from which one layer's factors come to the
         # device at a time (see :class:`_FactorCache`).
@@ -377,6 +389,69 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             cache.close()
             self._factor_caches.remove(cache)
 
+    # ------------------------------------------------------------------ #
+    # Covariances collected at capture                                     #
+    # ------------------------------------------------------------------ #
+
+    _COVARIANCE_FILE: ClassVar[str] = "kronecker_covariances.pt"
+
+    def generate_train_rep(
+        self, train_dataset: Dataset, **kwargs: object
+    ) -> GradientStreamer:
+        """The train streamer; a frozen one is remembered so that
+        :meth:`collect_gradients` can attach the covariance callback to it.
+        """
+        streamer = super().generate_train_rep(train_dataset, **kwargs)
+        frozen = not kwargs.get("enable_update")
+        self._capture_streamer = (
+            streamer if self._covariances_at_capture and frozen else None
+        )
+        return streamer
+
+    def collect_gradients(
+        self,
+        streamer: GradientStreamer,
+        store: GradientStorageManager,
+        **kwargs: object,
+    ) -> GradientStorageManager:
+        """Collect *streamer* into *store*.  With ``covariances_at_capture``,
+        the train streamer's pass also accumulates the Kronecker covariances
+        ``{layer: (A, G)}`` (a :class:`KroneckerCovarianceCallback`), which the
+        fit over that store then uses instead of sweeping the store for them.
+        They are kept for this attributor and, for a ``"disk"`` store, saved
+        in the store's directory.
+        """
+        if streamer is not self._capture_streamer:
+            return super().collect_gradients(streamer, store, **kwargs)
+        self._capture_streamer = None
+        callback = KroneckerCovarianceCallback()
+        streamer.hook_manager.add_callback(callback)
+        result = super().collect_gradients(streamer, store, **kwargs)
+        callback.all_reduce()  # the whole capture, not this rank's shard
+        covariances = self._move_raw(callback.result(), torch.device("cpu"))
+        root = Path(store.save_dir)
+        self._collected_covariances[str(root.resolve())] = covariances
+        if store.residency == "disk" and dist_rank() in (None, 0):
+            torch.save(covariances, root / self._COVARIANCE_FILE)
+        return result
+
+    def _covariances_for(self, train_source: GradientSource) -> dict | None:
+        """The covariances collected with *train_source*'s store, when the
+        source reads every stored step (a step filter changes the fit).
+        """
+        store = getattr(train_source, "file_manager", None)
+        if not self._covariances_at_capture or store is None:
+            return None
+        if sorted(train_source.steps) != sorted(resolve_steps(store, None)):
+            return None
+        root = Path(store.save_dir)
+        covariances = self._collected_covariances.get(str(root.resolve()))
+        if covariances is None and (root / self._COVARIANCE_FILE).exists():
+            covariances = torch.load(
+                root / self._COVARIANCE_FILE, map_location="cpu", weights_only=True
+            )
+        return covariances
+
     def prepare_scoring(
         self,
         train_source: GradientSource,
@@ -386,7 +461,15 @@ class KroneckerAttributor(BaseInnerProductAttributor):
         if self._preconditioner is not None:
             return
         if self._raw_fit is None:
-            self._raw_fit = self.fit_raw(train_source)
+            collected = self._covariances_for(train_source)
+            if collected is not None and self._capture_covariances is None:
+                self._capture_covariances = self._move_raw(collected, self.args.device)
+                try:
+                    self._raw_fit = self.fit_raw(train_source)
+                finally:
+                    self._capture_covariances = None
+            else:
+                self._raw_fit = self.fit_raw(train_source)
         self._preconditioner = self.damp_fit(self._raw_fit, self._damping)
         # Only the damped preconditioner takes part in scoring; the raw fit is
         # kept for re-damping (see :meth:`damp_fit`), but on the host, so it
@@ -719,6 +802,8 @@ class KroneckerAttributor(BaseInnerProductAttributor):
             verbose=verbose,
             desc=f"{self.algorithm}: fitting Fisher",
         )
+        if covariances is None:
+            covariances = self._covariances_for(train)
         self._capture_covariances = (
             None
             if covariances is None
@@ -1040,6 +1125,14 @@ class KFACAttributor(KroneckerAttributor):
             come to the device at a time, at the cost of one transfer of a
             layer's factors per block.  At full dimension the factors are as
             large as the squared layer widths.
+        covariances_at_capture: Accumulate the Kronecker covariances during
+            the pass that collects the train gradients into a store
+            (:meth:`cache`, or :meth:`attribute` with a
+            ``gradient_cache_residency``), so the fit does not sweep the store
+            for them and a materialized ``"logra"`` store can be
+            preconditioned.  The covariances stay on the device during that
+            pass (``d_in x d_in`` and ``d_out x d_out`` per layer); pass
+            ``False`` to fit them from the stored factors afterwards.
     """
 
     algorithm: ClassVar[str] = "KFAC"
@@ -1140,6 +1233,14 @@ class EKFACAttributor(KroneckerAttributor):
             come to the device at a time, at the cost of one transfer of a
             layer's factors per block.  At full dimension the factors are as
             large as the squared layer widths.
+        covariances_at_capture: Accumulate the Kronecker covariances during
+            the pass that collects the train gradients into a store
+            (:meth:`cache`, or :meth:`attribute` with a
+            ``gradient_cache_residency``), so the fit does not sweep the store
+            for them and a materialized ``"logra"`` store can be
+            preconditioned.  The covariances stay on the device during that
+            pass (``d_in x d_in`` and ``d_out x d_out`` per layer); pass
+            ``False`` to fit them from the stored factors afterwards.
     """
 
     algorithm: ClassVar[str] = "EKFAC"
@@ -1152,6 +1253,7 @@ class EKFACAttributor(KroneckerAttributor):
         task: AttributionTask | None = None,
         mode: str = "exact",
         factor_cache_residency: str | None = None,
+        covariances_at_capture: bool = True,
     ) -> None:
         if mode not in self.EKFAC_MODES:
             raise ValueError(
@@ -1161,6 +1263,7 @@ class EKFACAttributor(KroneckerAttributor):
             args,
             task=task,
             factor_cache_residency=factor_cache_residency,
+            covariances_at_capture=covariances_at_capture,
         )
         self.mode = mode
 
