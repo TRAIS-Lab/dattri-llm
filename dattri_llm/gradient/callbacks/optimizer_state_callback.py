@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     from dattri_llm.gradient.gradient import GradientRecord
 
 
+def _cpu_copy(t: torch.Tensor) -> torch.Tensor:
+    return t.detach().to("cpu", torch.float32, copy=True)
+
+
 class OptimizerStateCallback(HookManagerCallback):
     """Snapshot an Adam-family optimizer's moments on each layer's coordinates.
 
@@ -101,15 +105,31 @@ class OptimizerStateCallback(HookManagerCallback):
             v = snap.state(name, "exp_avg_sq", idx)
             width = snap.width(name) if idx is None else idx.numel()
             zeros = torch.zeros(width)
+            # A copy: a dense read of a bias-free layer is a view of the
+            # optimizer's own tensor, which the next update changes in place.
             out["layers"][name] = (
-                zeros if m is None else m.detach().to("cpu", torch.float32),
-                zeros.clone() if v is None else v.detach().to("cpu", torch.float32),
+                zeros if m is None else _cpu_copy(m),
+                zeros.clone() if v is None else _cpu_copy(v),
             )
             if "step" not in out:
                 out["step"] = snap.step_count(name)
                 hp = snap.hyperparameters(name)
                 out.update({k: hp[k] for k in ("lr", "betas", "eps", "weight_decay")})
         return out
+
+    def on_layer_backward(
+        self,
+        layer_name: str,
+        grad_output: torch.Tensor,  # noqa: ARG002
+        layer_type: str,  # noqa: ARG002
+        module_kwargs: dict | None = None,  # noqa: ARG002
+    ) -> None:
+        """Bind a sharded layer while its unit is unsharded; the moments are
+        read once the step ends, when it no longer is (see
+        :meth:`OptimizerSnapshot.bind`).
+        """
+        if self._layers is None or layer_name in self._layers:
+            self.snapshot.bind(layer_name)
 
     def on_step_end(self, record: GradientRecord) -> None:
         """Pre-step moments of every hooked layer, keyed by the record's step."""

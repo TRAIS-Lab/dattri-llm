@@ -178,7 +178,11 @@ class HookManager:
             incompatible.  :attr:`precondition` switches the map off and on
             between passes (a raw test probe sharing the hooks).  Every
             coordinate-wise ``torch.optim`` optimizer is supported under
-            single-process or DDP training; FSDP's sharded state is not.
+            single-process, DDP, ``FullyShardedDataParallel``
+            (``use_orig_params=True``) and ``fully_shard`` training.  Under
+            either sharding a layer's state is gathered across ranks inside
+            its backward hook, so every rank must run the same hooked layers
+            in the same order.
     """
 
     def __init__(
@@ -1373,7 +1377,7 @@ class HookManager:
         self._n_mlp_params = 0
         self._n_layers = 0
         if self._preconditioner is not None:
-            self._validate_preconditioning(root, param_grad_layers)
+            self._validate_preconditioning(param_grad_layers)
         if self._has_linear_io:
             self._bwd_done = False
             if self._config.projection_kwargs is not None and self._projector is None:
@@ -1529,9 +1533,7 @@ class HookManager:
                     stacklevel=3,
                 )
 
-    def _validate_preconditioning(
-        self, root: nn.Module, param_grad_layers: set[str]
-    ) -> None:
+    def _validate_preconditioning(self, param_grad_layers: set[str]) -> None:
         """Reject configurations the optimizer map cannot serve."""
         if param_grad_layers:
             raise ValueError(
@@ -1546,13 +1548,6 @@ class HookManager:
                     f"projection_kwargs[{name!r}] uses style 'logra', which "
                     "cannot be preconditioned: the optimizer map needs exact "
                     "gradient entries. Use no projection, 'mask', or 'dense'.",
-                )
-        for module in root.modules():
-            names = {c.__name__ for c in type(module).__mro__}
-            if "FullyShardedDataParallel" in names or "FSDPModule" in names:
-                raise NotImplementedError(
-                    "HookManager(optimizer=...) does not support FSDP: the "
-                    "optimizer state is sharded across ranks.",
                 )
 
     @property

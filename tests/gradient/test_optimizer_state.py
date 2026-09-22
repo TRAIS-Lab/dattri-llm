@@ -361,6 +361,30 @@ class TestOptimizerStateCallback:
                 6,
             )  # the capture kept the same S
 
+    def test_recorded_moments_are_copies_of_the_optimizer_state(self):
+        # A dense read of a bias-free layer is a view of the optimizer's own
+        # tensor on CPU; the recorded pre-step moments must not follow the
+        # update the next ``step()`` applies in place.
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(IN, 3, bias=False))
+        opt = torch.optim.AdamW(model.parameters(), lr=0.05)
+        model(torch.randn(BATCH, IN)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+        cb = OptimizerStateCallback(model, opt)
+        hm = HookManager(
+            model, config=HookManagerConfig(linear_io=REGISTER_ALL), callbacks=[cb]
+        )
+        with hm.collect():
+            model(torch.randn(BATCH, IN)).sum().backward()
+        held = opt.state[model[0].weight]["exp_avg"].reshape(-1).clone()
+        opt.step()
+        recorded, _ = cb.pre[0]["layers"]["0"]
+        assert torch.equal(recorded, held)
+        assert not torch.equal(
+            recorded, opt.state[model[0].weight]["exp_avg"].reshape(-1)
+        )
+
     def test_post_before_pre_raises(self):
         model = MLP()
         cb = OptimizerStateCallback(model, torch.optim.AdamW(model.parameters()))
