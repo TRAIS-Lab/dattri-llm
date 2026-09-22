@@ -151,12 +151,16 @@ def _worker(rank, world_size, scenario, result_queue, rendezvous_path):
 
         def forward():
             if api == "fully_shard":
+                from torch.distributed.device_mesh import init_device_mesh
                 from torch.distributed.fsdp import fully_shard
 
+                # An explicit CPU mesh: without one the mesh is built on the
+                # default accelerator, which is not the gloo group's device.
+                mesh = init_device_mesh("cpu", (world_size,))
                 if nested:
-                    fully_shard(model.b1)
-                    fully_shard(model.b2)
-                holder["fsdp"] = fully_shard(model)
+                    fully_shard(model.b1, mesh=mesh)
+                    fully_shard(model.b2, mesh=mesh)
+                holder["fsdp"] = fully_shard(model, mesh=mesh)
             else:
                 holder["fsdp"] = FSDP(
                     model,
