@@ -142,11 +142,13 @@ if __name__ == "__main__":
     print("Scoring the training batch ...")
     ghost_cb = DataSelectionCallback(
         model=model,
-        threshold=args_cli.drop_fraction,
-        threshold_mode="bottom_fraction",
         target="fixed",
         target_gradient=val_gradient,
-        score_mode="ghost",
+        scoring_kwargs={"score_mode": "ghost"},
+        selection_kwargs={
+            "threshold": args_cli.drop_fraction,
+            "threshold_mode": "bottom_fraction",
+        },
     )
     hm = HookManager(model, config=hook_cfg, callbacks=[ghost_cb])
     with hm.collect():
