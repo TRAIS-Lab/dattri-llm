@@ -100,10 +100,7 @@ class DattriProjector:
 
     A seeded random projection is a *fixed* linear map, so its ``(D, proj_dim)``
     matrix is built once -- by projecting the identity through the factory --
-    and every later call is a single matmul.  Without the cache each call would
-    rebuild it (allocate, seed a generator, draw the entries, scale): ~12
-    dispatched ops per call, two calls per hooked layer per step, a third of
-    the per-layer capture cost at batch 1.  A rank-64 matrix is ``D x 64``, a
+    and every later call is a single matmul.  A rank-64 matrix is ``D x 64``, a
     few MB even for the widest LLM layers, so the cache stays small.
 
     The cache is a :class:`~dattri_llm.utils.cache.TensorCache` owned by this
@@ -296,11 +293,10 @@ class DattriProjector:
         feature of this *dtype* on this *device*, resolved once.
 
         :meth:`apply` re-derives the matrix key from its arguments and looks
-        the matrix up on every call -- fine for a one-off, but a capture hook
-        projects the same layer twice per step, thousands of times per
-        attribution, and that dispatch costs more than the kernel.  A
-        :class:`ProjectionMatrix` holds the matrix (and, with
-        *include_bias*, its bias row) and applies it with one ``addmm``.
+        the matrix up on every call.  A :class:`ProjectionMatrix` holds the
+        matrix (and, with *include_bias*, its bias row) and applies it with
+        one ``addmm``, with no per-call lookup; a capture hook, which projects
+        the same layer on every step, holds one per layer.
         """
         device = torch.device(proj_kwargs.pop("device", device))
         matrix = self.matrix(
@@ -447,10 +443,9 @@ def project_factors(
     an embedding is a linear layer over one-hot inputs
     (``dW = sum_t onehot(id_t) x g_t``), so its integer ids are expanded to
     one-hot vectors of width ``num_embeddings`` before the input-side
-    projection.  (The transient one-hot is ``(B, T, num_embeddings)`` floats;
-    a cached identity-projection lookup table would avoid it -- acceptable
-    until vocab sizes make it hurt.)  Norm layers (diagonal gradient, not an
-    outer product) must use materialized projection instead.
+    projection (a transient ``(B, T, num_embeddings)`` float tensor).  Norm
+    layers (diagonal gradient, not an outer product) must use materialized
+    projection instead.
     """
     if is_norm(layer_type):
         raise ValueError(
@@ -517,8 +512,8 @@ def project_activation(
             f"project_activation is for linear layers only, got {layer_type!r}.",
         )
     # The bias ones-column is folded into the projection (a broadcast add of
-    # the matrix's last row) rather than appended to the activation, which
-    # would copy the whole ``(B, T, d_in)`` tensor once per layer and step.
+    # the matrix's last row); the augmented ``(B, T, d_in + 1)`` activation is
+    # never formed.
     with_bias = module_kwargs is not None and module_kwargs["has_bias"] and include_bias
     a_f = to_3d(dtypes.align(a)[0])
     return apply_projection(
@@ -834,12 +829,12 @@ def maybe_materialize_projected(
 ) -> bool:
     """``True`` when the projected factors should be materialized at capture.
 
-    The scoring path already routes between the factorized and materialized
-    cross-gram by :func:`~dattri_llm.gradient.ops.dot.maybe_use_materialized_gram`;
-    capture had no equivalent, so a projected capture kept the token axis however
-    unfavourable that was.  The same rule applies here, on the *projected* dims:
-    per sample and layer the factors cost ``S*(k_a+k_g)`` while their outer
-    product costs ``k_a*k_g``, so materializing wins once
+    This is the capture-time counterpart of the scoring path's routing between
+    the factorized and materialized cross-gram
+    (:func:`~dattri_llm.gradient.ops.dot.maybe_use_materialized_gram`), applied
+    to the *projected* dims: per sample and layer the factors cost
+    ``S*(k_a+k_g)`` while their outer product costs ``k_a*k_g``, so
+    materializing wins once
 
         S >= H = k_a*k_g / (k_a + k_g).
 

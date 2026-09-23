@@ -4,7 +4,7 @@ These collect real per-sample gradients to disk with the repo's
 ``HookManager`` + ``OffloadCallback`` pipeline, then check the attributor's
 score against an independent autograd oracle.
 
-The simplified attributor computes the full ``(num_train, num_test)`` gradient
+The attributor computes the full ``(num_train, num_test)`` gradient
 cross-gram -- every train record against every test record, with no train/test
 step alignment -- structurally identical to the K-FAC family.  Rows are stamped
 with the step each train gradient was recorded at, so a sample collected at

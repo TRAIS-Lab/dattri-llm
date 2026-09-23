@@ -4,9 +4,9 @@ A store's *residency* (chosen once, at construction) decides where its records
 physically live -- transparent to every reader above the
 :class:`GradientStorageManager`:
 
-* ``"disk"`` (default) -- serialize each group to a file (``torch.save`` /
-  ``torch.load``), the classic store-then-attribute layout.  Crash-safe and
-  re-openable across processes / ranks.
+* ``"disk"`` (default) -- serialize each group to a file, the
+  store-then-attribute layout.  Crash-safe and re-openable across processes /
+  ranks.
 * ``"memory"`` -- hold the (CPU) records in RAM, never serialized.  Zero I/O;
   a re-iterable source reads them back instantly.  Ephemeral (not crash-safe,
   single-process) -- for replay caches, not a system of record.
@@ -217,16 +217,15 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             rank_2/ ...
             rank_3/ ...
 
-    The three bugs that this layout prevents:
+    This layout guarantees:
 
-    * **File-name collision** -- each rank's ``_next_batch_id`` counter is
+    * **Unique file names** -- each rank's ``_next_batch_id`` counter is
       local to its own subdirectory, so ``batch_000000.pt`` on rank 0 and
       ``batch_000000.pt`` on rank 1 live in different directories.
-    * **Index race** -- every rank appends only to its own
+    * **No index race** -- every rank appends only to its own
       ``rank_N/index.jsonl``; there are no concurrent writes to a shared file.
-    * **Silent data loss** -- in DDP each rank processes a different micro-batch,
-      so all ranks must save; restricting saves to rank 0 would discard 3/4 of
-      the gradient data.
+    * **Complete data** -- in DDP each rank processes a different micro-batch,
+      and every rank saves its own.
 
     The index is stored as an **append-only log**: each save appends one line
     to ``index.jsonl`` describing only what that save wrote, and the
@@ -348,13 +347,11 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         self._meta_written: dict | None = None
 
         # Where this process writes (root, or its rank_N/ subdirectory) is
-        # resolved lazily at the first save, NOT here: managers are commonly
-        # constructed before ``init_process_group`` has run (e.g. before the
-        # HF Trainer, which initializes distributed internally), and a
-        # construction-time rank probe would see no process group and route
-        # every rank to the root directory -- exactly the file-name and index
-        # collisions the rank layout exists to prevent.  By the first save,
-        # training is running and the true rank is known.
+        # resolved at the first save, not here: a manager may be constructed
+        # before ``init_process_group`` has run (e.g. before the HF Trainer,
+        # which initializes distributed internally), and a construction-time
+        # rank probe would see no process group and route every rank to the
+        # root directory.
         self._save_dir: Path | None = None
         self._local_prefix: str = ""
         self._next_batch_id: int = 0
@@ -821,8 +818,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
             self.close()
 
     def _index_entry(self, record: GradientRecord, filename: str, idx: int) -> None:
-        # ``getattr``: records pickled before sample_id_key existed read as
-        # content-hashed (None), which is what they were.
+        # A record without a ``sample_id_key`` attribute is content-hashed
+        # (None).
         self._adopt_sample_id_key(getattr(record, "sample_id_key", None))
         hashes = (
             record.input_hash
@@ -864,7 +861,7 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
     # dict and derives the identifier from it (content hash, or the store's
     # ``sample_id_key`` field); ``F_by_hash(identifier, ...)`` takes the
     # precomputed identifier.  Under the ``identifier -> (step, sample_idx) ->
-    # file`` index a step alone no longer identifies a gradient -- only a
+    # file`` index a step alone does not identify a gradient -- only a
     # ``(step, sample_idx)`` pair does -- so there is no step-only loader.
 
     def _identifier_for(self, inputs: dict[str, object]) -> str:
@@ -978,11 +975,11 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
     ) -> Gradient:
         """Load one sample's gradient at one training step, by direct slicing.
 
-        Uses the indexed ``sample`` position to slice the stored record's batch
-        gradient -- an O(1) retrieval, with no scan over the batch.
+        Uses the indexed ``sample_idx`` position to slice the stored record's
+        batch gradient -- an O(1) retrieval, with no scan over the batch.
 
         Args:
-            input_hash: Full 64-character SHA-256 hash of the sample.
+            input_hash: The sample's identifier (see :meth:`lookup_by_hash`).
             step: Training step, as returned by :meth:`lookup_by_hash`.
             sample_idx: The sample's position within the stored batch, as
                 returned by :meth:`lookup_by_hash`.
@@ -1026,7 +1023,7 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         batch); use :meth:`load_sample_by_hash` for the sample's own gradient.
 
         Args:
-            input_hash: Full 64-character SHA-256 hash.
+            input_hash: The sample's identifier (see :meth:`lookup_by_hash`).
 
         Returns:
             List of :class:`GradientRecord` sorted by step.
@@ -1132,7 +1129,8 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
 
     @property
     def index(self) -> dict[str, list[dict]]:
-        """Merged mapping from ``input_hash`` to ``{file, idx, step}`` entries.
+        """Merged mapping from identifier to ``{file, idx, step, sample_idx}``
+        entries.
 
         Spans all ranks.  Updated after every :meth:`save` /
         :meth:`save_bulk` call on this instance.
@@ -1211,11 +1209,10 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         """Write the settings sidecar iff its content changed since last write.
 
         The payload (format, identifier scheme, accumulation convention) is
-        adopted once and then never varies, so writing it on every save cost a
-        temp file plus a rename per save for a file that never changed --
-        which measured as the bulk of the index write.  The first save of a
-        process still writes it before appending any log line, so a log never
-        exists without the settings to read it by.
+        adopted once and then never varies, so it is rewritten (temp file plus
+        rename) only when it differs from the last write.  The first save of a
+        process writes it before appending any log line, so a log never exists
+        without the settings to read it by.
         """
         meta = {
             "format": self._INDEX_FORMAT,

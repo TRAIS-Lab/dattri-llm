@@ -20,9 +20,9 @@ Pinned here:
    streamer implements Trainer's *classic* convention (``loss / N``), which
    Trainer applies whenever the model does not accept loss kwargs -- pinned
    by wrapping the model with an explicit-signature module.  (For models
-   that do accept them, newer Trainer versions instead normalise by the
-   window's token count -- ``num_items_in_batch`` -- which the streamer does
-   not replicate; a custom ``loss_fn`` can bake in any normalisation.)
+   that do accept them, Trainer instead normalises by the window's token
+   count -- ``num_items_in_batch`` -- which the streamer does not replicate;
+   a custom ``loss_fn`` can bake in any normalisation.)
 4. **Frozen probes ignore the setting** entirely.
 """
 

@@ -984,7 +984,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):  # noqa: PLR0904 - the wo
         finally:
             self._capture_covariances = None
         fisher_dir = self.save_fisher(raw_factors, fisher_dir, fisher=raw_fisher)
-        if isinstance(raw_factors, _FactorCache):  # the fit is on disk now
+        if isinstance(raw_factors, _FactorCache):  # the fit is persisted
             raw_factors.close()
             self._factor_caches.remove(raw_factors)
         return fisher_dir
@@ -1425,9 +1425,9 @@ class KFACAttributor(KroneckerAttributor):
         (A_inv a_t)^T``, so the whole inverse is paid once on the two
         (preprocessed) factors (:func:`~dattri_llm.gradient.ops.kfac_precondition`)
         and the result is a final-factor layer the cost rule can still route
-        -- one query against a batch of eight scores by the ghost contraction
-        with no train-side materialization.  A compact materialized block
-        (e.g. a ``"logra"`` capture) takes the two-sided dense product.
+        (the ghost contraction scores it with no train-side materialization).
+        A compact materialized block (e.g. a ``"logra"`` capture) takes the
+        two-sided dense product.
         """
         A_inv, G_inv = factors
         if isinstance(value, torch.Tensor):
@@ -1449,15 +1449,15 @@ class EKFACAttributor(KroneckerAttributor):
     **reduces to K-FAC** when ``Lambda`` equals the Kronecker eigenvalues, and it
     is invariant to the (arbitrary) sign of each eigenvector.
 
-    ``mode`` selects the implementation and is kept for backward compatibility /
-    cross-checking: ``"exact"`` (default) is the faithful projection above;
-    ``"approx"`` mirrors the ``dattri`` library's code path, which after its
-    projection fix produces identical scores.
+    ``mode`` names the projection convention and is recorded with a persisted
+    fit: ``"exact"`` (default) is the projection above; ``"approx"`` is the
+    name of the ``dattri`` library's EK-FAC code path.  Both compute the same
+    scores.
 
     Args:
         args: :class:`AttributionArguments`.
         task: The attribution task; required by the live methods only.
-        mode: ``"exact"`` (default) or ``"approx"``; currently equivalent.
+        mode: ``"exact"`` (default) or ``"approx"``; equivalent.
     """
 
     algorithm: ClassVar[str] = "EKFAC"
@@ -1563,7 +1563,7 @@ class EKFACAttributor(KroneckerAttributor):
         for layer in list(eig):
             U_A, U_G = eig[layer]
             factors[layer] = (U_A, U_G, lam_sum.pop(layer).div_(counts[layer]))
-        if isinstance(eig, _FactorCache):  # the eigenbases now live in *factors*
+        if isinstance(eig, _FactorCache):  # the eigenbases are held in *factors*
             eig.close()
             self._factor_caches.remove(eig)
         return factors

@@ -55,8 +55,7 @@ class TestLinearIoCapable:
 class _TopLevelLinear(nn.Module):
     """Model whose only layer is a top-level ``nn.Linear`` named ``linear``.
 
-    Regression guard: the old name-based heuristic skipped a top-level layer
-    named ``linear`` and silently registered zero layers.
+    Hook assignment is type-based, so a layer is hooked whatever its name.
     """
 
     def __init__(self) -> None:
@@ -69,7 +68,7 @@ class _TopLevelLinear(nn.Module):
 
 class TestResolveHookAssignments:
     def test_default_hooks_top_level_linear(self):
-        # The reported bug: a top-level layer named "linear" must be hooked.
+        # A top-level layer named "linear" is hooked like any other Linear.
         model = _TopLevelLinear()
         assignment = resolve_hook_assignments(model, HookManagerConfig())
         assert assignment == {"linear": "linear_io"}
@@ -656,8 +655,8 @@ class TestTrainabilityFilter:
         x = torch.randn(4, 8)
 
         cb = _Recording()
-        # REGISTER_ALL now works out of the box: the frozen base_layer is skipped,
-        # only the trainable lora_A / lora_B adapters are captured.
+        # With REGISTER_ALL the frozen base_layer is skipped; only the trainable
+        # lora_A / lora_B adapters are captured.
         hm = HookManager(
             model,
             config=HookManagerConfig(linear_io=REGISTER_ALL),
@@ -702,22 +701,6 @@ class TestProjectionConfig:
         with pytest.raises(ValueError, match="not a valid projection style"):
             HookManagerConfig(
                 projection_kwargs={"__default__": {"style": "bogus", "proj_dim": 8}},
-            )
-
-    @pytest.mark.parametrize(
-        "old",
-        [
-            "logra_factorized",
-            "logra_materialized",
-            "materialized",
-            "subset_materialized",
-            "auto",
-        ],
-    )
-    def test_validation_rejects_old_style_names(self, old):
-        with pytest.raises(ValueError, match="no longer a style"):
-            HookManagerConfig(
-                projection_kwargs={"__default__": {"style": old, "proj_dim": 8}},
             )
 
     def test_validation_rejects_seq_len(self):
@@ -787,7 +770,7 @@ class TestProjectionConfig:
             assert g.data[n].activation.shape[-1] == 16
 
     def test_materialized_logra_is_materialized_factors(self):
-        # P1: a materialized "logra" capture stores exactly the token-summed
+        # A materialized "logra" capture stores exactly the token-summed
         # outer product of the factorized "logra" projected factors -- one
         # compact (B, proj_dim*proj_dim) block, and scoring by dot equals the
         # factorized cross-gram.
@@ -969,7 +952,7 @@ class _SeqFirstModel(nn.Module):
 
 class TestNonBatchFirstLayers:
     def test_seq_first_layer_collects_without_error(self):
-        # Regression: a (T, B, d) layer must not raise "same batch size".
+        # A flagged (T, B, d) layer collects without a "same batch size" error.
         model = _SeqFirstModel()
         cb = _Recording()
         hm = HookManager(model, callbacks=[cb], non_batch_first_layers={"proj"})
@@ -1021,8 +1004,7 @@ class _NanoGPT(nn.Module):
 
 class TestUnbatchedPositionalEmbedding:
     def test_collects_without_validation_error(self):
-        # Regression: a (T,) positional-embedding input previously failed with
-        # "invalid embedding factor dimensions".
+        # A (T,) positional-embedding input passes factor validation.
         model = _NanoGPT()
         cb = _Recording()
         hm = HookManager(model, callbacks=[cb])

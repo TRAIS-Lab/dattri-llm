@@ -4,19 +4,14 @@ Captured factors arrive in whatever dtype the training loop produced: pure
 ``bfloat16`` when the model itself is bf16, and a **mix** under the usual
 mixed-precision recipe (fp32 master weights + ``torch.autocast``), where the
 output gradient is bf16 while activations coming off an fp32 normalization stay
-fp32.  The capture layer is deliberately transparent about this -- the hooks
-store ``inp[0]`` and ``grad_output[0]`` unchanged.
-
-The ops then have to choose what to compute in, and the choice is worth real
-time: upcasting bf16 factors to fp32 gives up the tensor cores, which measured
-2.4x on a cross-gram and 7.4x on a materialization at Llama-3.2-1B's layer
-shapes.  This module makes that choice explicit and global instead of hardcoded
-per kernel.
+fp32.  The hooks store ``inp[0]`` and ``grad_output[0]`` unchanged, so the
+compute dtype of every operation is decided here, by one process-wide policy.
 
 ``"auto"`` (the default) computes in the **promoted dtype of the operands**: it
-never widens beyond what it was given, so bf16 in stays bf16, while a genuinely
-mixed fp32/bf16 pair still resolves to fp32 rather than producing an ill-typed
-matmul.  Passing an explicit dtype forces it everywhere instead::
+never widens beyond what it was given, so bf16 in stays bf16 (keeping the
+low-precision tensor-core path), while a genuinely mixed fp32/bf16 pair
+resolves to fp32 rather than producing an ill-typed matmul.  Passing an
+explicit dtype forces it everywhere instead::
 
     from dattri_llm.gradient import ops
 
@@ -26,8 +21,7 @@ matmul.  Passing an explicit dtype forces it everywhere instead::
 
 Reductions whose accuracy does not survive low precision -- covariance
 accumulation, eigendecomposition, matrix inverse -- pin fp32 regardless via
-``minimum=torch.float32``; they run once per fit rather than once per step, so
-the precision costs nothing that matters.
+``minimum=torch.float32``; they run once per fit rather than once per step.
 """
 
 from __future__ import annotations
@@ -66,7 +60,7 @@ def _as_policy(policy: str | torch.dtype) -> str | torch.dtype:
 
 
 def set_compute_dtype(policy: str | torch.dtype) -> str | torch.dtype:
-    """Set the process-wide compute dtype; returns the previous policy."""
+    """Set the process-wide compute dtype; returns the policy it replaces."""
     global _POLICY  # noqa: PLW0603
     previous, _POLICY = _POLICY, _as_policy(policy)
     return previous
@@ -138,12 +132,12 @@ def as_float(
 ) -> tuple[torch.Tensor | None, ...]:
     """Like :func:`align`, but integer operands are converted too.
 
-    :func:`align` deliberately leaves non-floating tensors alone so an
-    embedding's token-id factor survives the ghost path intact.  A few kernels
-    genuinely require a float -- the random projection, which multiplies its
-    input by a Gaussian/Rademacher matrix, and the one-hot expansion feeding it
-    -- and this is the explicit way to say so.  With only integer operands the
-    resolved dtype falls back to fp32.
+    :func:`align` leaves non-floating tensors alone so an embedding's token-id
+    factor survives the ghost path intact.  Kernels that require a float
+    operand -- the random projection, which multiplies its input by a
+    Gaussian/Rademacher matrix, and the one-hot expansion feeding it -- use
+    this variant.  With only integer operands the resolved dtype falls back to
+    fp32.
     """
     dtype = resolve(*tensors, minimum=minimum)
     return tuple(t if (t is None or t.dtype == dtype) else t.to(dtype) for t in tensors)

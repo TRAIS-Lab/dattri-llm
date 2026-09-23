@@ -373,22 +373,8 @@ class HookManagerConfig:
                 "'__default__') to a proj_kwargs dict, e.g. "
                 "{'__default__': {'style': 'logra', 'proj_dim': 512}}.",
             )
-        removed = {
-            "logra_factorized": "style='logra' with capture_style='factorized'",
-            "logra_materialized": "style='logra' with capture_style='materialized'",
-            "materialized": "style='dense'",
-            "subset_materialized": "style='mask'",
-            "auto": "style='logra' with capture_style='auto'",
-        }
         for name, kw in projection.items():
             style = kw.get("style", "logra")
-            if style in removed:
-                raise ValueError(
-                    f"projection_kwargs[{name!r}]['style'] = {style!r} is no "
-                    f"longer a style; use {removed[style]} (the style names how "
-                    "the layer is projected, capture_style how it is "
-                    f"represented). Valid styles: {list(PROJECTION_STYLES)}.",
-                )
             if style not in PROJECTION_STYLES:
                 raise ValueError(
                     f"projection_kwargs[{name!r}]['style'] = {style!r} is not a "
@@ -534,8 +520,8 @@ def resolve_hook_assignments(
                 assignment[name] = LINEAR_IO
             elif _has_trainable_params(module):
                 assignment[name] = PARAM_GRAD
-        # The default never produces conflicts, so skip the zero-layer warning
-        # path below only if something was registered.
+        # The default assignment never conflicts; only the zero-layer case
+        # warns.
         if not assignment:
             _warn_zero_layers()
         return assignment

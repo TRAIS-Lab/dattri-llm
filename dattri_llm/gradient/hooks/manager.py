@@ -41,8 +41,8 @@ if TYPE_CHECKING:
     from dattri_llm.gradient.callbacks import HookManagerCallback
 
 
-# Resolved once at import: the probe runs on every hooked layer's forward
-# fire, so the per-call attribute lookup is hoisted out of the hot path.
+# The private autograd probe, resolved once at import; ``None`` on builds
+# that do not expose it.
 _GRAPH_TASK_ID_PROBE = getattr(torch._C, "_current_graph_task_id", None)
 
 
@@ -51,8 +51,8 @@ def _current_graph_task_id() -> int:
 
     A non-negative id inside a *forward* hook means the forward is a
     gradient-checkpointing recomputation (it runs during the backward).
-    Wraps the private ``torch._C`` probe so older builds degrade to ``-1``
-    (recompute detection off -- checkpointing was unsupported there anyway).
+    Wraps the private ``torch._C`` probe; builds without it return ``-1``
+    (recompute detection is unavailable there).
     """
     return _GRAPH_TASK_ID_PROBE() if _GRAPH_TASK_ID_PROBE is not None else -1
 
@@ -94,10 +94,9 @@ class HookManager:
 
     .. warning::
         Gradient checkpointing (either ``use_reentrant`` variant) and
-        ``nn.DataParallel`` are each supported, but their **combination** is
-        untested territory: checkpoint recomputation would interleave with
-        DataParallel's concurrent per-replica hook threads, and no test pins
-        that interaction.  Prefer DDP when training with checkpointing.
+        ``nn.DataParallel`` are each supported, but not their **combination**:
+        checkpoint recomputation interleaves with DataParallel's concurrent
+        per-replica hook threads.  Use DDP when training with checkpointing.
 
     .. warning::
         Sample identifiers cover the **last** model forward of a step.  When
@@ -116,15 +115,14 @@ class HookManager:
         A weight used in more than one place -- HF-style **tied parameters**
         (e.g. ``embed_tokens`` and ``lm_head`` sharing one weight) or
         repeated invocations of one module (the virtual ``name@k`` layers)
-        -- is scored as if each use site held an independent weight,
-        following the convention of existing attribution implementations.
+        -- is scored as if each use site held an independent weight.
         For per-sample contributions ``g_i`` (site 1) and ``h_i`` (site 2) of
         a shared weight, the true similarity ``<g_i + h_i, g_j + h_j>``
         includes the cross-site terms ``<g_i, h_j> + <h_i, g_j>``; per-layer
         scoring sums the sites independently and drops them -- the same
         block-diagonal treatment K-FAC applies across layers.  Both sites'
         factors are captured in full, so the cross terms remain computable
-        downstream if exactness is ever required.
+        downstream.
 
     Args:
         model: The model to hook (plain ``nn.Module``, ``DataParallel``, or
@@ -262,56 +260,46 @@ class HookManager:
         self._seen_bwd: set[str] = set()
         self._bwd_replica_counts: dict[str, int] = {}
         # This step's participation roster: layers with a grad-enabled
-        # forward fire (``_fwd_fires > 0``), maintained incrementally so
-        # completion checks are O(1).  Kept in sync wherever ``_fwd_fires``
-        # changes: _dispatch_layer_forward (add), _reset_layer_buffers
-        # (clear), _reconcile_unmatched_forwards (drop fully-orphaned).
+        # forward fire (``_fwd_fires > 0``).  Kept in sync wherever
+        # ``_fwd_fires`` changes: _dispatch_layer_forward (add),
+        # _reset_layer_buffers (clear), _reconcile_unmatched_forwards (drop
+        # fully-orphaned).
         self._active_layers: set[str] = set()
         self._step_lock = threading.Lock()
 
-        # Step-completion uses two composite barriers:
+        # Step completion uses two composite barriers.
         #
         # ``_bwd_done`` -- True once *both* sub-conditions hold:
-        #   (a) All MLP-layer full backward hooks have fired.
-        #       Ensures ``_grad_parts`` buffers are populated for every
-        #       hooked layer.
-        #   (b) All MLP-layer trainable-parameter hooks have fired.
-        #       Ensures ``weight.grad`` (and ``bias.grad``) are populated.
+        #   (a) every participating linear-IO layer's full backward hook has
+        #       fired (``_grad_parts`` populated for every hooked layer);
+        #   (b) every linear-IO layer's trainable-parameter hook has fired
+        #       (``weight.grad`` and ``bias.grad`` populated), tracked by
+        #       ``_mlp_param_hook_count``.
+        #   Both hook kinds are needed because PyTorch orders them by whether
+        #   the module input requires grad: when it does, the parameter hook
+        #   fires before the module backward hook and (a) completes the step;
+        #   when it does not, the module backward hook fires first and (b)
+        #   completes the step.
         #
-        #   Sub-condition (b) is tracked via ``_mlp_param_hook_count``.
-        #   Registering both types covers the two possible PyTorch orderings:
-        #
-        #   Case A -- module input *requires grad* (normal LLM training):
-        #     param.register_hook fires first  -> weight.grad set
-        #     register_full_backward_hook fires second -> _grad_parts set
-        #     -> (b) done before (a); step triggered by (a)
-        #
-        #   Case B -- module input does *not* require grad (e.g. raw float
-        #     tensor, no embedding):
-        #     register_full_backward_hook fires first (PyTorch early-fire quirk)
-        #     param.register_hook fires second -> weight.grad set
-        #     -> (a) done before (b); step triggered by (b)
-        #
-        # ``_grad_done`` -- True once all user-specified ``param_grad`` hooks
-        #   have fired (only relevant when ``param_grad`` layers are
-        #   registered; starts True otherwise).
+        # ``_grad_done`` -- True once every ``param_grad`` hook has fired
+        #   (starts True when no ``param_grad`` layer is registered).
         self._bwd_done: bool = True
         self._mlp_param_hook_count: int = 0  # fires toward sub-cond (b)
         self._n_mlp_params: int = 0  # target for sub-cond (b)
         self._grad_done: bool = True
 
-        # End-of-backward barrier for sub-cond (b).  Under FSDP the
-        # per-parameter post-accumulate-grad hooks never fire (grads flow
-        # through the flattened FlatParameter) and FSDP writes the (sharded)
-        # ``param.grad`` back to each original parameter only *after* the whole
-        # backward pass completes.  To cover this, every step queues a callback
-        # on the autograd engine that fires once backward is fully done -- the
-        # point at which all ``param.grad`` are guaranteed ready.  For non-FSDP
-        # models the per-parameter hooks complete the step earlier (during
-        # backward), so this callback is a harmless no-op.  ``_mlp_params_ready``
-        # is the callback's signal; ``_backward_end_scheduled`` is the live
-        # token for the in-flight step (guards against double-queuing and
-        # against a stale callback leaking into the next step).
+        # End-of-backward barrier for sub-condition (b).  Under FSDP the
+        # per-parameter post-accumulate-grad hooks do not fire (gradients flow
+        # through the flattened FlatParameter) and the sharded ``param.grad``
+        # is written back to each original parameter only after the whole
+        # backward pass completes.  Every step therefore queues a callback on
+        # the autograd engine that fires once the backward is fully done, when
+        # every ``param.grad`` is ready.  For non-FSDP models the
+        # per-parameter hooks complete the step earlier, and the callback is
+        # a no-op.  ``_mlp_params_ready`` is the callback's signal;
+        # ``_backward_end_scheduled`` is the live token for the in-flight step
+        # (guards against double-queuing and against a stale callback acting
+        # on the next step).
         self._mlp_params_ready: bool = False
         self._backward_end_scheduled: bool = False
         # True once a forward hook fired during an active backward this step
@@ -414,23 +402,20 @@ class HookManager:
         layer_type: str,
         module_kwargs: dict | None,
     ) -> None:
-        # Maintain the step's participation roster incrementally: O(1) here
-        # instead of an O(n_layers) rescan on every backward fire in
-        # _bwd_hooks_done.  The unlocked membership pre-check makes repeat
-        # fires free; set.add is idempotent, so the worst concurrent-replica
-        # race is a harmless double add.
+        # Add the layer to the step's participation roster.  The unlocked
+        # membership pre-check is safe: set.add is idempotent, so a concurrent
+        # replica fire can at worst add the layer twice.
         if layer_name not in self._active_layers:
             with self._step_lock:
                 self._active_layers.add(layer_name)
         # A forward hook firing while an autograd graph task is active is a
         # checkpoint *recomputation* (both use_reentrant variants), and it
-        # executes inside the OUTERMOST backward's task -- the reentrant
-        # variant's nested sub-backwards have not started yet.  Record that
-        # task id (the true end-of-backward identity) and queue the
-        # end-of-backward callback *here*, so it attaches to the outer task:
-        # a callback queued from a backward hook inside a reentrant
-        # sub-backward would fire at that segment's end, mid-step (see
-        # _on_backward_end's nested-end guard).
+        # executes inside the outermost backward's task, before the reentrant
+        # variant's nested sub-backwards start.  That task id identifies the
+        # true end of the backward, so it is recorded here and the
+        # end-of-backward callback is queued from here, attached to the outer
+        # task (a callback queued from inside a reentrant sub-backward fires at
+        # that segment's end, mid-step; see _on_backward_end).
         if self._collecting:
             task_id = _current_graph_task_id()
             if task_id != -1:
@@ -467,12 +452,11 @@ class HookManager:
 
         record = None
         with self._step_lock:
-            # We are inside the backward pass here -- a valid place to queue
-            # an end-of-backward callback.  Queue it once per step as the
-            # FSDP-safe satisfier of sub-cond (b) (see ``__init__``), and
-            # remember the queuing task's id: without checkpointing this hook
-            # runs in the outermost (only) backward task, which is the end
-            # the callback must act at.
+            # This hook runs inside the backward pass, where an end-of-backward
+            # callback can be queued.  Queue it once per step as the FSDP-safe
+            # satisfier of sub-condition (b) (see ``__init__``), and record the
+            # queuing task's id: without checkpointing this hook runs in the
+            # outermost (only) backward task, whose end the callback acts at.
             if (
                 self._n_mlp_params > 0
                 and not self._backward_end_scheduled
@@ -487,12 +471,10 @@ class HookManager:
             # A layer's backward is complete when it has fired once per
             # *observed* grad-enabled forward this step (the forward pass is
             # fully done before any backward hook runs, so the target is
-            # final here).  Deriving the target from observation -- instead
-            # of predicting it from ``len(device_ids)`` at construction --
-            # keeps the count right when DataParallel's scatter uses fewer
-            # replicas than devices (trailing short batch), when the model is
-            # wrapped after this manager is built, and when a layer is
-            # invoked several times per step (weight tying).
+            # final here).  The observed count is correct when DataParallel's
+            # scatter uses fewer replicas than devices (trailing short batch),
+            # when the model is wrapped after this manager is built, and when
+            # a layer is invoked several times per step (weight tying).
             if (
                 self._bwd_replica_counts[layer_name]
                 >= self._buffers[layer_name]["_fwd_fires"]
@@ -606,8 +588,8 @@ class HookManager:
                     self._outer_task_id = _current_graph_task_id()
 
     def _reconcile_unmatched_forwards(self) -> None:
-        """Discard forward captures whose backward never fired (backward is
-        over -- an unmatched forward is now a definitive fact, not a guess).
+        """Discard forward captures whose backward never fired (the backward
+        is over, so an unmatched forward is definitive).
 
         Two legitimate sources: non-reentrant **gradient checkpointing**
         (both the original forward and the recomputation fire grad-enabled,
@@ -865,10 +847,10 @@ class HookManager:
         checkpointing, even a secondary backward; see
         :meth:`HookManagerCallback.on_step_end`).
         """
-        # Normally already None (released when this step's forward began, see
-        # _capture_model_input); kept as a guard for forwards that bypass the
-        # root pre-hook (e.g. a submodule invoked directly) so we never
-        # transiently hold two full step gradients while assembling.
+        # Already None when this step's forward went through the root
+        # pre-hook (see _capture_model_input); cleared here as well for
+        # forwards that bypass it (e.g. a submodule invoked directly), so two
+        # full step gradients are never held at once while assembling.
         self._last_gradient = None
         gradient = self._assemble_gradient()
         step = self._step_count
@@ -920,11 +902,11 @@ class HookManager:
     def _dispatch_step_end(self, record: GradientRecord) -> None:
         """Deliver a finalized record to every callback, outside the lock.
 
-        Running user code while holding the non-reentrant ``_step_lock`` would
-        turn any callback-triggered backward into a silent same-thread
-        deadlock (the inner pass's hooks re-acquire the lock).  All per-step
-        state was already reset by :meth:`_finalize_step`, so a reentrant
-        backward here simply completes a capture step of its own.
+        Callbacks run with the non-reentrant ``_step_lock`` released, so a
+        callback-triggered backward (whose hooks acquire the lock) does not
+        deadlock.  All per-step state was already reset by
+        :meth:`_finalize_step`, so a reentrant backward here completes a
+        capture step of its own.
         """
         for cb in self._callbacks:
             cb.on_step_end(record)
@@ -941,8 +923,7 @@ class HookManager:
         """
         ordered = [t for _, t in sorted(parts, key=operator.itemgetter(0))]
         if len(ordered) == 1:
-            # The common (non-DataParallel) case: torch.cat would copy the
-            # whole tensor for nothing.
+            # A single part is returned as is (no copy).
             return ordered[0]
         first_device = ordered[0].device
         if any(t.device != first_device for t in ordered[1:]):
@@ -955,8 +936,8 @@ class HookManager:
 
         Returns one ``(act_parts, grad_parts, proj_parts)`` triple per
         per-device invocation position, in forward-invocation order.  The
-        single-invocation case (the overwhelmingly common one) returns the
-        buffers as-is.  For multi-fire layers the grouping undoes the fire
+        single-invocation case returns the buffers as-is.  For multi-fire
+        layers the grouping undoes the fire
         *order*: raw activations buffer in forward order while gradients
         buffer in backward (reverse) order -- ``_pair_pos``, recorded when
         each backward LIFO-matched its forward, carries the pairing.
@@ -1026,11 +1007,11 @@ class HookManager:
 
             # A layer invoked more than once in a step (custom module reuse,
             # RNN unrolls, Siamese towers) is recorded as independent virtual
-            # layers "name", "name@2", ... -- one per matched invocation.
-            # This mirrors how parameter-tied modules are already treated:
+            # layers "name", "name@2", ... -- one per matched invocation --
+            # consistent with the treatment of parameter-tied modules:
             # per-layer scoring sums the invocations' contributions
             # (cross-invocation terms of the shared weight are not
-            # represented, consistent with the layer-block-diagonal treatment
+            # represented, as in the layer-block-diagonal treatment
             # throughout).  Single-invocation layers keep their plain name.
             for inv_k, (act_parts, grad_parts, proj_parts) in enumerate(
                 self._split_invocations(buf),
@@ -1218,9 +1199,8 @@ class HookManager:
                 hm.load_state(state)  # put the training step back exactly
 
         The secondary step's *external* effects (its ``on_step_end`` dispatch)
-        are deliberately not undone -- the callback that triggered it consumes
-        the record; sibling callbacks observe one extra record per secondary
-        pass.
+        are not undone: the callback that triggered it consumes the record;
+        sibling callbacks observe one extra record per secondary pass.
 
         Snapshots everything a completed (or in-flight) step touches: the
         per-layer capture buffers (raw and projected fields), the ``param_grad``
@@ -1656,9 +1636,9 @@ class HookManager:
     def layer_name(self) -> list[str]:
         """The layer set an attributor scores: the hooked per-sample (linear-IO)
         layers.  Layer selection is decided here, at capture, via
-        :class:`HookManagerConfig` -- attributors read it back through this
-        property (e.g. for :class:`AttributionScore` metadata) instead of taking
-        their own ``layer_name`` argument.
+        :class:`HookManagerConfig`; attributors read it back through this
+        property (e.g. for
+        :class:`~dattri_llm.attribution.score.AttributionScore` metadata).
         """
         return list(self._buffers.keys())
 

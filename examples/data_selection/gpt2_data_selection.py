@@ -5,8 +5,6 @@ forward+backward over a mixed-domain training batch then scores every sample by
 gradient alignment with that target (the factorized "ghost" inner product) and
 drops the bottom fraction, exactly as DataSelectionCallback would inside a real
 training loop.
-
-Note: one forward+backward on CPU takes ~5 s for gpt2 (124M). Allow ~60 s total.
 """
 
 from __future__ import annotations

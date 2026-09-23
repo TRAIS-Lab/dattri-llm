@@ -51,11 +51,9 @@ def _concat_batches(batches: list[object]) -> object:
     ``DataLoader`` actually yields -- a tensor, a mapping of tensors, or a
     sequence of either -- and requires every non-batch dimension to match.
 
-    Padding is deliberately *not* attempted: the right fill value depends on
-    what a field means (``0`` for ``input_ids``, ``0`` for an attention mask,
-    ``-100`` for labels), and guessing that from a key name would silently
-    corrupt the target for anyone whose loader names things differently.  A
-    loader whose batches differ in length should pad in its own ``collate_fn``.
+    No padding is applied: the fill value depends on what a field means
+    (``0`` for ``input_ids`` or an attention mask, ``-100`` for labels), so a
+    loader whose batches differ in length must pad in its own ``collate_fn``.
     """
     first = batches[0]
     if torch.is_tensor(first):
@@ -173,7 +171,7 @@ class DataSelectionCallback(HookManagerCallback):
         must be attached to the ``HookManager`` (via
         ``HookManager(callbacks=[...])`` or ``add_callback``).
 
-        Two properties of this design to be aware of:
+        Two consequences:
 
         * The val backward completes a capture step of its own, whose record
           is dispatched to **every** attached callback's ``on_step_end``
@@ -240,13 +238,15 @@ class DataSelectionCallback(HookManagerCallback):
 
     **Val-target prefetch** (``val_targets_per_pass`` argument):
 
-    With ``target="val_loader"`` the attribution target is recomputed every
-    step from one val batch.  At the batch sizes this is used with (typically
-    one example) that forward/backward is *launch-bound*: on an H200 a
-    Llama-3.2-1B pass costs 29.9 ms for a single row against 76.8 ms for eight
-    -- 3.1x the per-row cost -- because the per-layer kernel launches are paid
-    whether or not there are rows to fill them.
-
+    With ``target="val_loader"`` the target is recomputed every step from one
+    val batch.  ``val_targets_per_pass=k`` draws ``k`` val batches, concatenates
+    them along the batch axis, runs one forward/backward, and slices the
+    captured per-sample gradients into ``k`` targets consumed over the next
+    ``k`` steps, so the fixed cost of a val pass is paid once per ``k`` steps.
+    The batches must agree in their non-batch dimensions (pad in the loader's
+    ``collate_fn``).  Under ``threshold_mode="hard"`` the scores are rescaled
+    by a per-step constant when the val loss averages over its batch; the
+    rank-based threshold modes are unaffected.
 
     **Distributed (DDP / FSDP):**
 
@@ -275,19 +275,7 @@ class DataSelectionCallback(HookManagerCallback):
     Args:
         model: The model being trained.  ``DataParallel`` / ``DDP`` wrappers
             are unwrapped automatically via ``.module``; for FSDP, pass the
-            FSDP-wrapped module (see "Distributed (FSDP)" above).
-        threshold: Interpretation depends on ``threshold_mode``:
-
-            * ``"hard"`` -- score cutoff (any float, default ``0.0``).
-            * ``"bottom_fraction"`` / ``"negative_bottom_fraction"`` -- fraction
-              of the batch to drop (float in ``[0, 1)``).
-
-        threshold_mode: One of ``"hard"`` (default), ``"bottom_fraction"``,
-            or ``"negative_bottom_fraction"``.  See class docstring for details.
-        score_mode: Scoring algorithm. ``"ghost"`` (default) uses the ghost
-            inner product (no weight-gradient materialisation); ``"materialized"``
-            builds the full per-sample weight gradient and dots it against the
-            target gradient.  Both produce identical scores.
+            FSDP-wrapped module (see "Distributed (DDP / FSDP)" above).
         target: Target gradient source. ``"batch"`` (default), ``"fixed"``,
             or ``"val_loader"``.  See class docstring for details.
         target_gradient: Required when ``target="fixed"``.  A pre-computed
@@ -307,6 +295,23 @@ class DataSelectionCallback(HookManagerCallback):
             mean-reduced loss behaves exactly as if the batch never contained
             the dropped samples.  Default ``False`` (kept samples stay at
             weight ``1/B``).  See **Renormalization** in the class docstring.
+        val_targets_per_pass: Number of val batches drawn and run in one pass
+            when ``target="val_loader"`` (default ``1``).  See **Val-target
+            prefetch** in the class docstring.
+        scoring_kwargs: ``{'score_mode': 'ghost' | 'materialized'}``,
+            parameterizing :meth:`compute_scores`.  ``"ghost"`` (default) uses
+            the ghost inner product (no weight-gradient materialization);
+            ``"materialized"`` builds the full per-sample weight gradient and
+            dots it against the target gradient.  Both produce identical
+            scores.
+        selection_kwargs: ``{'threshold': float, 'threshold_mode': str,
+            'layer_wise': bool}``, parameterizing :meth:`select_samples`.
+            ``threshold`` is a score cutoff under ``threshold_mode="hard"``
+            (any float, default ``0.0``) and the fraction of the batch to drop
+            (float in ``[0, 1)``) under ``"bottom_fraction"`` /
+            ``"negative_bottom_fraction"``; ``threshold_mode`` defaults to
+            ``"hard"``; ``layer_wise`` (default ``False``) ranks and drops
+            samples independently per layer.
     """
 
     _SCORING_KEYS = frozenset({"score_mode"})
@@ -407,7 +412,7 @@ class DataSelectionCallback(HookManagerCallback):
         # convention.
         self._fsdp_shard_map: dict[int, _ShardSpec] | None = None
         self._fsdp_world_size: int = 1
-        # Back-compat scalar mirrors of the grouped kwargs (read-only inspection).
+        # Scalar mirrors of the grouped kwargs, for inspection.
         self._threshold = selection_kwargs["threshold"]
         self._threshold_mode = selection_kwargs["threshold_mode"]
         self._score_mode = scoring_kwargs["score_mode"]
@@ -574,8 +579,8 @@ class DataSelectionCallback(HookManagerCallback):
         """The single shared drop list for the collective (FSDP/DDP) paths.
 
         Those paths remove contributions collectively with one drop set for the
-        whole batch; per-layer (``layer_wise``) removal is not yet expressible
-        there, so we reject it explicitly rather than silently mis-correcting.
+        whole batch; per-layer (``layer_wise``) removal is not supported there
+        and is rejected.
         """
         if self._selection_kwargs.get("layer_wise", False):
             raise NotImplementedError(
@@ -660,8 +665,8 @@ class DataSelectionCallback(HookManagerCallback):
             return
 
         # Advance the val iterator, cycling when exhausted.  With
-        # val_targets_per_pass > 1 several batches are drawn and run together, so
-        # the launch-bound cost of a batch-1 pass is paid once per k steps.
+        # val_targets_per_pass > 1 several batches are drawn and run together,
+        # so the fixed cost of a val pass is paid once per k steps.
         batches = [self._next_val_batch() for _ in range(self._val_targets_per_pass)]
         batch = batches[0] if len(batches) == 1 else _concat_batches(batches)
 
@@ -870,8 +875,8 @@ class DataSelectionCallback(HookManagerCallback):
             if not drop_l:
                 continue
             renorm = renormalize and 0 < len(drop_l) < b
-            # Normalise sequence-first captures so the batch axis is dim 0 before
-            # we index samples / read the batch size below.
+            # Normalise sequence-first captures so the batch axis is dim 0
+            # before indexing samples / reading the batch size below.
             bf = val.as_batch_first()
             # Skip layers whose gradient was summed over the batch dim during
             # the forward broadcast (e.g. wpe in GPT-2, where position_ids has
@@ -887,10 +892,10 @@ class DataSelectionCallback(HookManagerCallback):
                 continue
 
             # The record carries the layer type the HookManager captured
-            # under -- including a layer_types declaration for classes whose
+            # under, including a layer_types declaration for classes whose
             # name is not recognisable (e.g. a hand-rolled RMSNorm declared
-            # as "nn.RMSNorm").  Re-deriving from the module class here would
-            # bypass exactly that declaration and mis-materialize the layer.
+            # as "nn.RMSNorm"); it is used as is, never re-derived from the
+            # module class.
             layer_type = record.gradient.layer_types[layer_name]
             if renorm:
                 a_d, g_d = DataSelectionCallback._renorm_weighted_factors(bf, drop_l)
@@ -1032,7 +1037,7 @@ class DataSelectionCallback(HookManagerCallback):
         The model may be FSDP-wrapped *after* this callback is constructed, so
         discovery is deferred to the first ``on_step_end``.  Leaves an empty
         map (and ``_fsdp_world_size == 1``) for non-FSDP models, which routes
-        ``on_step_end`` through the rank-local :meth:`_remove_contributions`.
+        ``on_step_end`` through the rank-local :meth:`remove_contributions`.
         """
         if self._fsdp_shard_map is not None:
             return
@@ -1073,7 +1078,7 @@ class DataSelectionCallback(HookManagerCallback):
         record: GradientRecord,
         dropped: list[int],
     ) -> None:
-        """Shard-aware, collective version of :meth:`_remove_contributions`.
+        """Shard-aware, collective version of :meth:`remove_contributions`.
 
         Runs on every rank in lock-step.  See the section comment above for the
         correctness argument.
@@ -1126,7 +1131,7 @@ class DataSelectionCallback(HookManagerCallback):
         dropped: list[int],
     ) -> None:
         """Replicated-gradient (DDP) collective version of
-        :meth:`_remove_contributions`.
+        :meth:`remove_contributions`.
 
         After DDP's allreduce every rank holds the same full
         ``param.grad = (1/world) * sum_r G_r``, so the removal must subtract
@@ -1233,7 +1238,7 @@ class DataSelectionCallback(HookManagerCallback):
             except AttributeError:
                 continue
             # Captured (possibly declared-via-layer_types) type; never
-            # re-derive from the module class (see _remove_contributions).
+            # re-derived from the module class (see remove_contributions).
             layer_type = record.gradient.layer_types[layer_name]
             if renorm:
                 a_d, g_d = self._renorm_weighted_factors(bf, dropped)
@@ -1292,9 +1297,9 @@ class DataSelectionCallback(HookManagerCallback):
 
         Mirrors the per-layer-type reshaping in :meth:`_subtract_weight` but
         uses the *unsharded* ``full_shape`` (FSDP shards expose only a 1-D
-        slice, so ``weight.shape`` is unusable).  The offset is always 0 now
-        that embedding materialization covers the full ``num_embeddings``
-        width; it is kept for the partial-coverage case should one return.
+        slice, so ``weight.shape`` is unusable).  The offset is ``0`` for every
+        supported layer type; embedding materialization covers the full
+        ``num_embeddings`` width.
         """
         contrib = ops.materialize(
             Factorized(a_d, g_d, module_kwargs),

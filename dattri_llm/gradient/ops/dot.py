@@ -93,9 +93,6 @@ def cross_gram(
             if maybe_use_materialized_gram(B1, B2, S, K, D)
             else "factorized"
         )
-    # Both routes are written as plain matrix products rather than einsums:
-    # the contractions are tiny for short sequences, where an einsum's
-    # equation parsing and view building cost more than its kernel.
     if mode == "materialized":
         # Contract tokens into per-sample weight grads, then GEMM -- no S^2 tensor.
         M1 = torch.bmm(a1_f.transpose(1, 2), g1_f).reshape(B1, -1)  # (B1, K*D)
@@ -127,10 +124,8 @@ def cross_dot_factors(
     ``mode`` (``"auto"``/``"factorized"``/``"materialized"``) selects the cross-gram
     path; see :func:`cross_gram`.
 
-    For norm layers the per-position (diagonal) convention is used, so the two
-    sides must share the same flattened ``T * d`` dimension (equal token/spatial
-    count); this holds whenever both gradients come from the same model run at
-    the same sequence length.
+    For norm layers each side's positions are contracted into the per-sample
+    weight gradient first, so the two sides may differ in token/spatial count.
     """
     a1, g1 = preprocess_factors(a1, g1, layer_type, module_kwargs1, include_bias)
     a2, g2 = preprocess_factors(a2, g2, layer_type, module_kwargs2, include_bias)
@@ -515,8 +510,7 @@ def layerwise_cross_dot(
     side may hold the layer raw-factorized, as final factors, or dense -- and
     the representation may differ between the two sides and between layers.
     Only one layer is in flight at a time, so no whole-block materialization
-    ever happens: this is the kernel an attributor's ``inner_product`` should
-    call, and the reason it needs no cache logic of its own.
+    ever happens; this is the kernel an attributor's ``inner_product`` calls.
 
     Args:
         train: The row-side block.
@@ -640,12 +634,12 @@ def layerwise_cross_dot_per_token(
 #                                                                             #
 # The per-sample weight gradient G = g^Ta (Dx K, summed over S token/patch     #
 # positions) can be dotted/normed either factorized ("ghost") or materialized.#
-# Which is cheaper is governed by S relative to H = DK/(D+K); see             #
-# docs/gradient_representation_complexity.md.  These predicates are consumed   #
-# *here at the bottom* -- cross_gram / grad_norm_sq_factors route on them -- so   #
-# every caller (Gradient.similarity, K-FAC's kfac_cross_factors, ...) shares     #
-# one routed implementation; ``mode="auto"`` triggers the heuristic, and the     #
-# explicit "factorized"/"materialized" modes override it.                        #
+# Which is cheaper is governed by S relative to H = DK/(D+K) (flop counts in  #
+# the predicates below).  cross_gram / grad_norm_sq_factors route on these     #
+# predicates, so every caller (Gradient.similarity, K-FAC's                    #
+# kfac_cross_factors, ...) shares one routed implementation; ``mode="auto"``   #
+# triggers the heuristic, and the explicit "factorized"/"materialized" modes   #
+# override it.                                                                 #
 # --------------------------------------------------------------------------- #
 
 
@@ -685,7 +679,7 @@ def maybe_use_materialized_gram(
     kappa: float = 1.0,
 ) -> bool:
     """``True`` when materialize-then-GEMM is the cheaper way to form the
-    ``(B1, B2)`` cross-gram (Sec. 3.2):
+    ``(B1, B2)`` cross-gram, by flop count:
 
         cost_F = B1*B2*S^2*(D+K)            cost_M = (B1+B2)*S*D*K + B1*B2*D*K
 
@@ -697,8 +691,8 @@ def maybe_use_materialized_gram(
 
 
 def maybe_use_materialized_norm(S: int, K: int, D: int) -> bool:
-    """``True`` when materializing is cheaper for per-sample norms (Sec. 3.1).  Here
-    ``cost_F = S^2(D+K)`` and ``cost_M = S*D*K`` (per sample, batch cancels), so
+    """``True`` when materializing is cheaper for per-sample norms by flop count.
+    Here ``cost_F = S^2(D+K)`` and ``cost_M = S*D*K`` (per sample, batch cancels), so
     materialize iff ``S*(D+K) >= DK``, i.e. ``S >= H = DK/(D+K)``.
     """
     return S * (D + K) >= D * K

@@ -286,10 +286,9 @@ class TestEKFAC:
         )
 
     def test_transposed_projection_is_sign_sensitive(self):
-        """Design rationale for the faithful projection ``U_G^T dW U_A``: its
-        score is invariant to an (arbitrary) eigenvector sign flip, whereas the
-        transposed ``U_G dW U_A^T`` (dattri's original) is not -- which is why the
-        'approx' mode was fixed to use the faithful projection too.
+        """The projection ``U_G^T dW U_A`` gives a score that is invariant to an
+        (arbitrary) eigenvector sign flip, whereas the transposed
+        ``U_G dW U_A^T`` does not; both EK-FAC modes use the former.
         """
         torch.manual_seed(0)
         B, out, inn = 30, 4, 5
@@ -313,7 +312,7 @@ class TestEKFAC:
 
         U_G_flip = U_G.clone()
         U_G_flip[:, 0] *= -1  # a different but equally valid eigenbasis
-        # Faithful projection: invariant.  Transposed (dattri): not.
+        # Faithful projection: invariant.  Transposed: not.
         assert torch.allclose(
             score(U_A, U_G, transposed=False),
             score(U_A, U_G_flip, transposed=False),
@@ -326,7 +325,7 @@ class TestEKFAC:
         )
 
     def test_modes_agree(self, collected, tmp_path):
-        """The fixed 'approx' mode now produces the same scores as 'exact'."""
+        """The 'approx' mode produces the same scores as 'exact'."""
 
         def run(mode):
             return (
@@ -508,7 +507,7 @@ def collected_step1(tmp_path):
 
 
 class TestRowStepsTracked:
-    """Regression: rows are stamped with the gradient's recorded step, not 0."""
+    """Rows are stamped with the gradient's recorded step, not 0."""
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_row_steps_reflect_recorded_step(self, collected_step1, tmp_path, cls):
@@ -528,7 +527,9 @@ class TestRowStepsTracked:
 
 
 class TestStepSelection:
-    """``steps=`` restricts which training checkpoints the Fisher + rows use."""
+    """``selected_training_steps`` restricts which training checkpoints the
+    Fisher and the rows use.
+    """
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_selected_steps_equal_curated_single_step_dir(self, tmp_path, cls):
@@ -709,7 +710,7 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
 
 def _collect_norm_model(tmp_path, patterns):
     """Collect the _NormModel's factorised gradients to disk (one step), hooking
-    only the layers matching *patterns* -- layer selection now happens at capture
+    only the layers matching *patterns* -- layer selection happens at capture
     (via the hook config), not at scoring.
     """
     torch.manual_seed(0)
@@ -991,13 +992,11 @@ def _fim_score(g_tr: torch.Tensor, g_te: torch.Tensor) -> torch.Tensor:
 class TestMaterializedLayers:
     """K-FAC/EK-FAC over caches holding materialized (TRAK-projected) layers.
 
-    Regression: ``kfac_layers`` selected by layer *type* only, so a
+    ``kfac_layers`` selects by representation as well as layer type: a
     TRAK-projected layer (materialized tensor, original ``nn.Linear`` type)
-    reached ``KroneckerAccumulator.update`` and crashed with
-    ``AttributeError: 'Tensor' object has no attribute 'as_batch_first'``.
-    A materialized layer can never enter K-FAC, so it is now **always**
-    preconditioned by the direct dense Fisher (with a warning), under either
-    ``non_kfac_strategy``.
+    never enters the Kronecker accumulator.  Without capture-time covariances a
+    materialized layer is preconditioned by the direct dense Fisher (with a
+    warning), under either ``non_kfac_strategy``.
     """
 
     def _run(self, cls, dirs, out_dir, **kw):
@@ -1052,7 +1051,7 @@ class TestMaterializedLayers:
 
     def test_all_materialized_scores_pure_fim(self, tmp_path):
         """Every layer TRAK-projected: the score is the summed per-layer dense
-        Fisher (previously this crashed outright).
+        Fisher.
         """
         torch.manual_seed(0)
         model = _TrakMLP().eval()
@@ -1094,8 +1093,8 @@ class TestMaterializedLayers:
         )
 
     def test_kronecker_accumulator_rejects_tensor_loudly(self, tmp_path):
-        """The ops-layer accumulator itself now fails with a clear TypeError
-        instead of an AttributeError deep inside ``as_batch_first``.
+        """The ops-layer accumulator rejects a materialized layer with a
+        TypeError naming the factorized requirement.
         """
         dirs = _collect_trak_mixed(tmp_path)
         fm = GradientStorageManager(str(dirs[0]))
@@ -1106,15 +1105,15 @@ class TestMaterializedLayers:
 
 
 # --------------------------------------------------------------------------- #
-# P0: test-side preconditioning equivalences                                    #
+# Test-side preconditioning equivalences                                        #
 # --------------------------------------------------------------------------- #
 
 
 class TestPreconditionedTestSide:
-    """The P0 rewrite (whole preconditioner applied once on the test side)
-    must be a pure refactor: every path -- in-memory loop, disk-persisted
-    loop, and the public ``cache_preconditioned_test`` + TracIn scoring --
-    must reproduce the default score bit-for-bit (up to float tolerance).
+    """The whole preconditioner is applied once on the test side: every path
+    -- in-memory loop, disk-persisted loop, and the public
+    ``cache_preconditioned_test`` + TracIn scoring -- must reproduce the
+    default score up to float tolerance.
     """
 
     CLASSES = (KFACAttributor, EKFACAttributor)

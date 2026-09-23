@@ -501,8 +501,8 @@ class Gradient:
         """Return a copy with every CPU payload in pinned (page-locked) memory.
 
         Idempotent; see :meth:`Factorized.pin_memory`.  Lets ``pin_memory=True``
-        DataLoaders pin whole blocks for async host->device transfers
-        (:mod:`dattri_llm.gradient.prefetch`).
+        DataLoaders (as built over :mod:`dattri_llm.gradient.datasets`) pin
+        whole blocks for asynchronous host-to-device transfers.
         """
         new_data: dict[str, GradientData] = {}
         for name, value in self.data.items():
@@ -833,7 +833,7 @@ class Gradient:
         ``dL/dW = sum_t g_t a_t^T`` for **any** loss -- a token-mean (or masked)
         loss already carries its normalization inside the captured per-token
         gradients, so averaging here would divide by the token count a second
-        time and yields the gradient of nothing.
+        time and the result would not be the gradient of any loss.
 
         Args:
             dim: Must be ``"token"`` (only token aggregation is supported).
@@ -866,7 +866,7 @@ class Gradient:
             representation=new_repr,
             data=new_data,
             layer_types=self.layer_types,
-            indexing={},  # all layers now "batch" (default)
+            indexing={},  # every layer at the default "batch" indexing
         )
 
     def slice(

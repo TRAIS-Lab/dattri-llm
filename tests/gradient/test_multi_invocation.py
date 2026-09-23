@@ -12,9 +12,8 @@ Regimes pinned here:
   one backward comes.  The backward LIFO-matches the recomputed capture (the
   tensors the graph actually used) and the stale original is discarded at
   backward end -- records come out identical to an uncheckpointed run.
-* **Gradient checkpointing, ``use_reentrant=True``** (legacy): the first pass
-  runs under ``no_grad`` and is never captured; only the recomputation is.
-  Already worked; pinned so it stays working.
+* **Gradient checkpointing, ``use_reentrant=True``**: the first pass runs
+  under ``no_grad`` and is never captured; only the recomputation is.
 * **Custom module reuse** (one layer invoked twice per step): each invocation
   is recorded as an independent virtual layer ``name`` / ``name@2`` with its
   own exactly-paired (a, g).

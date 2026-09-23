@@ -319,8 +319,8 @@ class TestValLoaderException:
         for r_b, r_a in zip(before_val, after_val, strict=True):
             assert _records_equal(r_b, r_a)
 
-        # Layer events fire twice per step (train + val pass) -- the hooks are
-        # live during the val pass by design.
+        # Layer events fire twice per step (train + val pass): the hooks stay
+        # live during the val pass.
         for name, n in ctrl_spy.layer_forward_counts.items():
             assert spy_before.layer_forward_counts[name] == 2 * n
 

@@ -12,8 +12,8 @@ that has in common:
 * the trajectory pass -- into a gradient store (``train_grads``) or, with
   ``args.recompute_gradients``, into parameter snapshots
   (``train_snapshots``) from which each step's gradients are recomputed at
-  attribution time by a :class:`~dattri_llm.gradient.streaming.\
-ReplayGradientSource`;
+  attribution time by a
+  :class:`~dattri_llm.gradient.streaming.ReplayGradientSource`;
 * opening either kind of train source behind one interface, with the
   per-step random access (``for_steps``) the sweeps use;
 * the ``propagation`` / ``loop_over_test`` options and their validation, the

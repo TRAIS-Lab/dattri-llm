@@ -44,8 +44,8 @@ class TestHashSample:
         assert hash_sample(with_text) == hash_sample(row)
 
     def test_nothing_digestible_raises(self):
-        """Regression: an all-skipped dict hashed to the empty digest, giving
-        every sample the same identity.
+        """A dict with no digestible field raises instead of hashing to the
+        empty digest, which would give every sample the same identity.
         """
         with pytest.raises(ValueError, match="no digestible field"):
             hash_sample({"text": "hello", "meta": None})
@@ -67,9 +67,8 @@ class TestHashBatch:
             assert hashes[i] == hash_sample({k: v[i] for k, v in batch.items()})
 
     def test_broadcast_fields_are_skipped(self):
-        """Regression: a broadcast kwarg (e.g. position_ids of shape (1, T))
-        raised NotImplementedError from inside the capture hooks, crashing
-        training.  It carries no per-sample identity and is now skipped.
+        """A broadcast kwarg (e.g. position_ids of shape (1, T)) carries no
+        per-sample identity and is skipped rather than raising.
         """
         batch = _batch()
         with_pos = dict(batch, position_ids=torch.arange(T).unsqueeze(0))
@@ -77,7 +76,7 @@ class TestHashBatch:
 
     def test_unambiguous_inference_matches_explicit(self):
         """Fields agreeing on one leading dim infer silently and identically
-        to the explicit call (backward-compatible no-arg form).
+        to the explicit call.
         """
         batch = _batch()
         with warnings.catch_warnings():
@@ -94,10 +93,10 @@ class TestHashBatch:
             assert len(hash_batch(batch)) == B
 
     def test_ambiguous_leading_dims_warn_and_prefer_most_common(self):
-        """Regression: max-leading-dim inference let an auxiliary field like
-        cu_seqlens of shape (B+1,) win, excluding input_ids from the hash
-        entirely and keying every sample by an offset.  Disagreeing fields
-        now warn, and the most common dim (the real batch) is used.
+        """An auxiliary field like cu_seqlens of shape (B+1,) must not win the
+        batch-size inference (that would exclude input_ids from the hash and
+        key every sample by an offset).  Disagreeing fields warn, and the most
+        common dim (the real batch) is used.
         """
         batch = _batch()
         with_cu = dict(batch, cu_seqlens=torch.arange(B + 1))

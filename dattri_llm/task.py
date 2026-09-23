@@ -1,9 +1,9 @@
 """The attribution task: a model, the loss to attribute, and the checkpoints.
 
-:class:`AttributionTask` is what the live attribution methods take (the
-``task=`` of every attributor).  It follows the shape of dattri's task --
-``AttributionTask(loss_func, model, checkpoints, target_func)`` -- with one
-difference that matters at LLM scale: the loss runs the **live model**,
+:class:`AttributionTask` is the ``task=`` argument of every attributor.  It
+has the shape of dattri's task -- ``AttributionTask(loss_func, model,
+checkpoints, target_func)`` -- and its loss is evaluated by calling the
+**live model** on a batch:
 
 .. code-block:: python
 
@@ -13,19 +13,18 @@ difference that matters at LLM scale: the loss runs the **live model**,
     task = AttributionTask(loss_func, model)                 # this checkpoint
     task = AttributionTask(loss_func, model, checkpoints=[ckpt_a, ckpt_b])
 
-rather than a ``torch.func`` functional forward over a parameter dict.  A
-plain ``model(...)`` call is what the capture hooks need (they read each
-layer's inputs and output gradients, never the parameter gradient), it costs
-nothing per step, and it is the only forward that works through a DDP or
-FSDP wrapper: ``functional_call`` swaps the parameters underneath the
-wrapper, so it cannot run a sharded model.  ``model`` may therefore be the
-wrapper itself -- the task keeps it as :attr:`forward_model` and exposes the
-wrapped module as :attr:`model` for the hooks.
+A plain ``model(...)`` call is what the capture hooks read (each layer's
+inputs and output gradients, never the parameter gradient) and it runs
+through a DDP or FSDP wrapper, whereas ``torch.func.functional_call`` swaps
+the parameters underneath the wrapper and cannot run a sharded model.
+``model`` may therefore be the wrapper itself: the task keeps it as
+:attr:`forward_model` and exposes the wrapped module as :attr:`model` for
+the hooks.
 
-A dattri task still works everywhere a task is accepted:
+A dattri task is accepted everywhere a task is:
 :meth:`AttributionTask.from_dattri` adapts it (its ``(params, data)`` loss
 runs through ``functional_call`` on the live parameters, its checkpoint
-loader is kept), and the attributors call it for you.
+loader is kept), and the attributors call it themselves.
 """
 
 from __future__ import annotations

@@ -236,7 +236,7 @@ def adam_preconditioner(
     *,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The diagonals ``D_t`` and ``S_t`` of AdamW-influence (Eq. 11a).
+    """The diagonals ``D_t`` and ``S_t`` of AdamW-influence's transition.
 
     ``D_t = 1 / (sqrt(v_hat) + eps)`` is the Adam preconditioner and
     ``S_t = m_hat / (2 sqrt(v_hat) (sqrt(v_hat) + eps) ** 2)`` its sensitivity
@@ -309,7 +309,7 @@ def adamw_influence_transition(
     beta2: float = 0.999,
     weight_decay: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``W M_t`` for the block-diagonal transition ``M_t`` (Eq. 11a).
+    """``W M_t`` for AdamW-influence's block-diagonal transition ``M_t``.
 
     ``W = [W_theta | W_m | W_v]`` is the ``(p, 3k)`` summary matrix; each
     block is ``(p, k)``.  ``M_t`` couples the parameter block to the moments
@@ -342,7 +342,7 @@ def adamw_influence_coupling(
     beta1: float = 0.9,
     beta2: float = 0.999,
 ) -> torch.Tensor:
-    """``W R_t g_z`` for every sample of a batch (Eq. 11b), ``(B, p)``.
+    """``W R_t g_z`` for every sample of a batch, ``(B, p)``.
 
     ``R_t g_z`` is the response of the next state to a change of the batch
     gradient along ``g_z``::

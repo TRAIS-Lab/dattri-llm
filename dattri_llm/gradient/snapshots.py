@@ -175,9 +175,9 @@ class TrajectorySnapshots:
 class LazyDynamics(Mapping):
     """``{step: dynamics}`` read from a :class:`TrajectorySnapshots` on access.
 
-    Each entry has the layout :meth:`~dattri_llm.gradient.callbacks.\
-OptimizerStateCallback.dynamics` produces, assembled from the stored ``pre``
-    and ``post`` sides by *assemble*.
+    Each entry has the layout ``OptimizerStateCallback.dynamics`` (see
+    :mod:`dattri_llm.gradient.callbacks`) produces, assembled from the stored
+    ``pre`` and ``post`` sides by *assemble*.
     """
 
     def __init__(

@@ -1,7 +1,7 @@
 """Core PyTorch hook utilities, HookManager, and related classes.
 
-This package re-exports the full surface of its submodules so existing
-``dattri_llm.gradient.hooks`` imports keep working unchanged:
+This package re-exports the public surface of its submodules under
+``dattri_llm.gradient.hooks``:
 
 * :mod:`~dattri_llm.gradient.hooks.hooks` -- low-level hook registration
   (the ``linear_io`` and ``param_grad`` hook families).

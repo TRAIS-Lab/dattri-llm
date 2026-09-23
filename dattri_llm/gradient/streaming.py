@@ -353,8 +353,7 @@ class GradientStreamer(GradientSource):
     forward -> backward -> clip -> ``optimizer.step`` -> ``scheduler.step`` ->
     ``zero_grad``.
     DeepSpeed is **not** supported (the hook capture is incompatible with its
-    engine); a ``deepspeed`` config is ignored with a warning.  Verified bit-exact
-    against ``Trainer`` in ``scripts/verify_streamer_vs_trainer.py``.
+    engine); a ``deepspeed`` config raises.
 
     Use as a context manager (it registers/removes the :class:`HookManager`
     hooks), then iterate:
@@ -387,12 +386,11 @@ class GradientStreamer(GradientSource):
             once per window of ``N`` micro-batches (the trailing ragged
             window also updates, as at a Trainer epoch end), and each
             micro-batch loss is scaled by ``1/N`` before backward --
-            Trainer's *classic* convention, the one it applies whenever the
-            model does not accept loss kwargs.  The token-count-corrected
-            accumulation newer Trainer versions use for loss-kwargs-aware
-            models (``num_items_in_batch``) is not replicated; bake any
-            custom normalisation into ``loss_fn``.  Every micro-batch still
-            yields its own gradient block.  If
+            Trainer's convention for a model that does not accept loss
+            kwargs.  Trainer's token-count-corrected accumulation for
+            loss-kwargs-aware models (``num_items_in_batch``) is not
+            replicated; bake any custom normalisation into ``loss_fn``.
+            Every micro-batch still yields its own gradient block.  If
             ``False`` (default) the model is frozen, the source is
             re-iterable, and accumulation settings are ignored.
         loss_fn: ``(model, batch) -> scalar``.  Defaults to ``model(**batch).loss``.
@@ -537,9 +535,8 @@ class GradientStreamer(GradientSource):
         # training streamer) the same optimizer trajectory. ------------------
         if args.deepspeed:
             raise NotImplementedError(
-                "GradientStreamer does not support DeepSpeed (the hook-based "
-                "capture is incompatible with its engine); the ``deepspeed`` config "
-                "is ignored. Run single-process, DDP, or FSDP instead.",
+                "GradientStreamer does not yet support DeepSpeed. Run "
+                "single-process, DDP, or FSDP instead.",
             )
         # Gradient checkpointing must be enabled on the *unwrapped* model, before
         # DDP/FSDP wrapping -- exactly as Trainer does (Trainer._inner_training_loop).
@@ -633,8 +630,7 @@ class GradientStreamer(GradientSource):
     @property
     def hook_manager(self) -> HookManager:
         """The underlying :class:`HookManager`.  Pass it to another streamer's
-        ``hook_manager=`` (over the same model) so both share one set of hooks --
-        the cleaner alternative to two managers cross-capturing each backward.
+        ``hook_manager=`` (over the same model) so both share one set of hooks.
         """
         return self._hm
 

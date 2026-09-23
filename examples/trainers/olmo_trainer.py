@@ -133,9 +133,9 @@ if __name__ == "__main__":
         # Retrieval: the content hash of ONE sample's model inputs -- here
         # simply sequences[0], since OLMo's train step feeds the model
         # input_ids -- identifies the sample independently of where shuffling
-        # put it; lookup() then reveals every (step, sample_idx) position it was
-        # recorded at, and load_sample() retrieves each pair's gradient by
-        # direct slicing.
+        # put it; lookup_by_hash() then gives every (step, sample_idx) position
+        # it was recorded at, and load_sample_by_hash() retrieves each pair's
+        # gradient by direct slicing.
         h0 = hash_sample(sequences[0])
         pairs = fm.lookup_by_hash(h0)  # [(step, sample_idx), ...]
         g_first = fm.load_sample_by_hash(h0, *pairs[0])

@@ -469,7 +469,7 @@ def _fsdp_worker(
                             and torch.isfinite(val.pre_activation_grad).all().item()
                         )
 
-                # Numeric agreement with single-GPU reference
+                # Numeric agreement with the single-process reference
                 ref_cfg = ModelConfig(
                     d_model=D_MODEL,
                     n_layers=N_LAYERS,
@@ -538,7 +538,7 @@ class TestOLMoCollectorFSDP:
     """
 
     def test_fsdp_collector_populates_and_agrees(self):
-        """Collector fires correctly under FSDP and agrees with single-GPU reference."""
+        """Collector fires under FSDP and agrees with the single-process reference."""
         import torch.multiprocessing as mp
 
         if not _can_bind_localhost():

@@ -1,11 +1,10 @@
 """Read-path tests for on-disk gradient datasets (gradient/datasets.py).
 
-Regression under test: per-sample records stored at one step with differing
-sequence lengths (no padding-to-max collation) used to fail at *read* time --
-``_records_to_block`` batch-concatenates the records' ``(B, T, d)`` factors,
-and ``torch.cat`` requires equal ``T``.  ``Gradient.concatenate`` now pads the
-shorter side's token axis with exactly-zero gradient rows, which every
-downstream operation treats as inert.
+Per-sample records stored at one step may have differing sequence lengths
+(no padding-to-max collation).  ``_records_to_block`` batch-concatenates the
+records' ``(B, T, d)`` factors, and ``Gradient.concatenate`` pads the shorter
+side's token axis with exactly-zero gradient rows, which every downstream
+operation treats as inert.
 """
 
 from __future__ import annotations

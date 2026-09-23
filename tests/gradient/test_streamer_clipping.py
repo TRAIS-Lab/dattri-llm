@@ -11,11 +11,10 @@ pinned, matching the wrapping regimes:
 2. **Trainer parity**: a streamer trajectory with clipping active lands on
    the same parameters as a real ``transformers.Trainer`` run with the same
    arguments.
-3. **Distributed**: under FSDP the clip must use the *global* norm across
-   shards (regression: the rank-local ``nn.utils`` clip scaled each rank
-   differently); under DDP the vanilla clip on replicated gradients must
-   remain exact and identical across ranks.  Both are checked end-to-end
-   against a single-process reference trajectory.
+3. **Distributed**: under FSDP the clip uses the *global* norm across
+   shards rather than each rank's local norm; under DDP the vanilla clip on
+   replicated gradients is exact and identical across ranks.  Both are
+   checked end-to-end against a single-process reference trajectory.
 """
 
 from __future__ import annotations

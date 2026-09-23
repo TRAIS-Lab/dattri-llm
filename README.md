@@ -163,6 +163,8 @@ collection and online data selection.
 | K-FAC influence | `KFACAttributor` | Kronecker-factored inverse-Fisher preconditioning, fit from the training gradients | [Martens & Grosse, 2015](https://arxiv.org/abs/1503.05671) |
 | EK-FAC influence | `EKFACAttributor` | Kronecker eigenbasis with empirical eigenvalues | [George et al., 2018](https://arxiv.org/abs/1806.03884); [Grosse et al., 2023](https://arxiv.org/abs/2308.03296) |
 | DVEmb | `DVEmbAttributor` | trajectory-aware data value embeddings with GGN/Fisher propagation | [Wang et al., 2024](https://arxiv.org/abs/2412.09538) |
+| LESS | `LESSAttributor` | cosine between a query's gradient and a sample's Adam update direction, summed over checkpoints with the learning rate as weight | [Xia et al., 2024](https://arxiv.org/abs/2402.04333) |
+| AdamW-influence | `AdamWInfluenceAttributor` | first-order influence unrolled through the AdamW trajectory from the recorded optimizer moments; every coordinate or a random mask per layer | [Deng et al., 2026](https://arxiv.org/abs/2605.18814) |
 | Online data selection | `DataSelectionCallback` | gradient-alignment scoring + sample dropping inside the training step | — |
 
 All attributors consume the same `GradientSource` contract (per-step

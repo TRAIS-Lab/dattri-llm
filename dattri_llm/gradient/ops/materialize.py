@@ -97,10 +97,7 @@ def materialize_factors(
         prod = a_f * g_f  # (B, T, d) per-position gradient
         return prod.flatten(1) if per_token else prod.sum(1)  # (B, T*d) or (B, d)
 
-    # The token-summed outer product is one batched GEMM.  ``torch.bmm`` is
-    # called directly: ``einsum`` lowers to the same kernel but pays for
-    # parsing and permuting on every call, which a capture hook makes once
-    # per layer and step (~5% of a batch-1 projected capture).
+    # The token-summed outer product is one batched GEMM.
     if is_conv_transpose(layer_type):
         # a=(B,L,C_in), g=(B,L,P): dW_i = sum_l a_il g_il^T
         result = torch.bmm(a_f.transpose(1, 2), g_f)  # (B, C_in, P)

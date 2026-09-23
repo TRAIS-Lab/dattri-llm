@@ -4,24 +4,16 @@ The key invariant: if *all* samples in a batch are dropped (threshold set high
 enough that every sample's score falls below it), then the weight and bias grads
 of every hooked MLP layer must be exactly zero after the callback fires.
 
-Implementation note on hook timing
-------------------------------------
+Hook timing
+-----------
 PyTorch's ``register_full_backward_hook`` fires *before* ``param.grad`` is
-accumulated when **none** of the module's inputs require a gradient (see the
-PyTorch warning "Full backward hook is firing when gradients are computed with
-respect to module outputs since no inputs require gradients").  This matters for
-``DataSelectionCallback._subtract_weight``: it reads ``weight.grad`` inside the
-callback, which fires from within the backward hook of the last hooked layer.
-
-In real LLM training this edge case never arises because token embeddings
-(trainable parameters) produce intermediate activations that *do* require grad,
-so every MLP layer's input requires grad and the hook fires at the normal time
-(after ``param.grad`` is accumulated).
-
-To replicate the real-world computational graph, the ``MinimalEmbeddingMLP``
-fixture below routes the batch through a trainable ``nn.Embedding`` layer before
-the MLP, ensuring that MLP inputs always require grad and that ``param.grad`` is
-populated by the time ``on_step_end`` fires.
+accumulated when none of the module's inputs require a gradient (the PyTorch
+warning "Full backward hook is firing when gradients are computed with respect
+to module outputs since no inputs require gradients").  The callback reads
+``weight.grad`` from within the backward hook of the last hooked layer, so the
+``MinimalEmbeddingMLP`` fixture routes the batch through a trainable
+``nn.Embedding`` before the MLP, as an LLM does: every MLP input requires grad
+and ``param.grad`` is populated by the time ``on_step_end`` fires.
 """
 
 from __future__ import annotations
@@ -42,11 +34,9 @@ from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
 class MinimalEmbeddingMLP(nn.Module):
     """Embedding -> two-layer MLP.
 
-    The ``nn.Embedding`` lookup ensures that MLP inputs always require grad,
-    which matches real LLM training (token IDs -> embedding parameters -> MLP).
-    Without this, PyTorch's ``register_full_backward_hook`` fires before
-    ``param.grad`` is accumulated for the first MLP layer, causing
-    ``DataSelectionCallback`` to silently skip gradient subtraction on it.
+    The ``nn.Embedding`` lookup makes every MLP input require grad, as in LLM
+    training (token IDs -> embedding parameters -> MLP), so ``param.grad`` of
+    every MLP layer is accumulated before the backward hook fires.
     """
 
     def __init__(
@@ -581,7 +571,7 @@ class TestScoreModeEquivalence:
 
 
 # --------------------------------------------------------------------------- #
-# Normalization-layer consistency (regression: ghost vs materialized for norms) #
+# Normalization-layer consistency: ghost vs materialized for norms              #
 # --------------------------------------------------------------------------- #
 
 
@@ -615,9 +605,8 @@ class _OpaqueNormMLP(nn.Module):
 class TestBatchLevelLayersAreNotScored:
     """Under the zero-argument ``HookManagerConfig`` a layer the per-sample
     hooks cannot capture is hooked with ``param_grad``: one summed gradient for
-    the batch.  It carries no per-sample information, so scoring must leave it
-    out (it used to contribute a ``(d,)`` term that broke the layer sum) and
-    the step must still drop and correct on the per-sample layers.
+    the batch.  It carries no per-sample information, so scoring leaves it out
+    and the step still drops and corrects on the per-sample layers.
     """
 
     def test_default_config_with_opaque_norm(self):
@@ -652,10 +641,8 @@ class _NormMLP(nn.Module):
     """Embedding -> LayerNorm -> two-layer MLP.
 
     The LayerNorm (always hooked) has a token dimension, so its parameter
-    gradient is the *elementwise* x_hat * g, not an outer product.  Earlier the
-    ghost path scored norm layers with the Linear-style gram (g*g)(a*a), which
-    disagrees with the materialized (elementwise) path -- this model exercises
-    that case.
+    gradient is the *elementwise* x_hat * g, not an outer product; the ghost
+    path scores it in that form, not with the Linear-style gram (g*g)(a*a).
     """
 
     def __init__(self, vocab_size=32, embed_dim=8, hidden=16, out_features=4):
@@ -860,9 +847,9 @@ class TestTargetModes:
     def test_fixed_with_same_batch_matches_batch_mode(self, score_mode):
         """Fixed target == the training batch gradient -> identical scores.
 
-        Justification: score[i] = <dW_i, dW_target>.  When dW_target is the
-        sum of all training gradients, this equals sum_j <dW_i, dW_j>,
-        which is exactly what 'batch' mode computes.
+        score[i] = <dW_i, dW_target>.  When dW_target is the sum of all
+        training gradients, this equals sum_j <dW_i, dW_j>, which is exactly
+        what 'batch' mode computes.
         """
         torch.manual_seed(40)
         B, T = 4, 6
@@ -1049,7 +1036,7 @@ class TestTargetModes:
         B, T = 3, 5
         model = MinimalEmbeddingMLP()
         train_ids = _make_token_ids(B, T)
-        val_ids = _make_token_ids(2, T)  # different size to surface bugs
+        val_ids = _make_token_ids(2, T)  # a different batch size from training
 
         def val_loss_fn(m, batch):
             return m(batch).mean()
@@ -1260,14 +1247,11 @@ def _declared_norm_grads(model: _DeclaredNormMLP) -> dict[str, torch.Tensor]:
 
 
 class TestDeclaredLayerTypeRemoval:
-    """Gradient removal must use the layer type the record was captured under.
+    """Gradient removal uses the layer type the record was captured under.
 
-    Regression: ``_remove_contributions`` re-derived each layer's type from
-    the live module class (``canonical_class_name``), bypassing the
-    ``layer_types`` declaration the capture honoured.  A hand-rolled RMSNorm
-    declared as ``"nn.RMSNorm"`` was then materialized as a Linear-style
-    outer product and removal crashed with a reshape error (or, for other
-    declared families, could subtract silently wrong values).
+    A hand-rolled RMSNorm declared as ``"nn.RMSNorm"`` through ``layer_types``
+    is materialized as a norm gradient during removal, not re-derived from the
+    live module class as a Linear-style outer product.
     """
 
     B, T = 4, 6
@@ -1318,11 +1302,10 @@ class TestDeclaredLayerTypeRemoval:
 class TestValPrefetch:
     """``val_targets_per_pass`` batches the val-target passes.
 
-    The option exists for speed, so what these tests pin down is that nothing
-    else moves: the same steps drop the same samples, and the ranking that
-    selection reads is unchanged.  Absolute scores are *expected* to differ by
-    a per-step constant when the val loss averages over its batch, so the
-    assertions are on drop sets and ranks rather than values.
+    Batching the passes leaves selection unchanged: the same steps drop the
+    same samples, and the ranking that selection reads is the same.  Absolute
+    scores differ by a per-step constant when the val loss averages over its
+    batch, so the assertions are on drop sets and ranks rather than values.
     """
 
     B, T, STEPS = 8, 6, 6

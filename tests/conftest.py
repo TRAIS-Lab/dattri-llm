@@ -23,9 +23,9 @@ class TinyMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        # Simulated attention projection (NOT in mlp -> should NOT be hooked)
+        # Simulated attention projection, outside the ``mlp`` block
         self.attn_proj = nn.Linear(d_model, d_model, bias=False)
-        # MLP block: named so that _is_mlp_linear matches it
+        # MLP block, selectable by an ``mlp`` regex
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 2, bias=False),  # mlp.0
             nn.ReLU(),

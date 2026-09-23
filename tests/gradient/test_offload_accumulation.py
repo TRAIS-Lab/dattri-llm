@@ -1,4 +1,4 @@
-"""OffloadCallback gradient-accumulation windows (store-then-attribute #19).
+"""OffloadCallback gradient-accumulation windows.
 
 With ``gradient_accumulation_steps=N``, every window of N capture records is
 merged into one stored record whose ``step`` is the optimizer-step counter --

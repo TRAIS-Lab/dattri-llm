@@ -10,19 +10,17 @@ activations and output gradients needed for the outer-product identity:
 
     dL/dW ~ g^T x a    (per sample)
 
-DataParallel support: each replica fires its hooks in a separate thread.
-The hooks accumulate all replica calls in ``_act_parts`` / ``_grad_parts``
-(thread-safe, tagged by source device index) rather than overwriting a single
-slot.  Single-GPU and DDP usage is unaffected -- the lists always hold one
-element in those cases.
+Under DataParallel each replica fires its hooks in a separate thread.  The
+hooks append every replica's call to ``_act_parts`` / ``_grad_parts``
+(thread-safe, tagged by source device index).  Single-device and DDP usage
+appends one element per call.
 
 Parameter gradient hooks -- ``register_param_grad_hooks``
 ---------------------------------------------------------
 Registers ``Tensor.register_hook`` on the *parameters* of general modules.
 The hook fires during the backward pass immediately after each parameter's
-gradient is freshly computed -- not a post-backward ``.grad`` read, which can
-be ``None`` on the first call or hold a stale accumulated value from the
-previous step.
+gradient is computed, so the captured value is that step's gradient: never
+``None`` and never a stale accumulated value from an earlier step.
 
 Under DataParallel the hook is placed on the *original* module's parameters,
 which receive the gradient sum from all replicas before the hook fires.
@@ -143,9 +141,9 @@ def _make_layer_buffer() -> LayerBuffer:
         # _act_parts/_grad_parts (already projected).  ``_proj_kw`` is the layer's
         # resolved proj_kwargs (or None to capture raw factors).
         # ``_device_id`` maps each replica's device id to a stack of on-device
-        # forward activations, so the backward hook can pair (a, g) *per device*
-        # (LIFO) before projecting -- a single shared slot would race across DDP
-        # replica threads and drop calls for layers invoked more than once.
+        # forward activations, so the backward hook pairs (a, g) *per device*
+        # (LIFO) before projecting; the per-device stacks stay correct across
+        # DataParallel replica threads and for layers invoked more than once.
         "_proj_parts": [],
         "_proj_kw": None,
         # The layer's LoGRA projections resolved once per side ("a" / "g"):
@@ -267,8 +265,8 @@ def register_linear_io_hooks(
             through the optimizer
             state, and only that dense result is buffered.  Like projection,
             it runs inside the backward hook, so the state read is the one
-            the coming ``optimizer.step()`` updates from.  The ``logra_*``
-            styles cannot be preconditioned (the map does not commute with a
+            the coming ``optimizer.step()`` updates from.  The ``"logra"``
+            style cannot be preconditioned (the map does not commute with a
             factor-side projection).  The flag must not change between a
             layer's forward and its backward.
 
@@ -315,10 +313,9 @@ def register_linear_io_hooks(
 
         def _make_forward_hook(layer_name: str) -> Callable:
             def _fwd(_module: nn.Module, inp: tuple, _out: object) -> None:
-                # A forward under no_grad / inference_mode can never produce a
-                # backward, so capturing its activation would only contaminate
-                # the step buffers (e.g. an RL log-prob or eval pass between
-                # training steps).
+                # A forward under no_grad / inference_mode produces no
+                # backward (e.g. an RL log-prob or eval pass between training
+                # steps); its activation is not part of the step.
                 if not torch.is_grad_enabled():
                     return
                 a = inp[0].detach()
@@ -576,10 +573,9 @@ def _projection_matrix(
     """The layer's LoGRA projection of *side* (``"a"``: the activation, with
     the bias ones-column and dattri's ``proj_seed + 1``; ``"g"``: the output
     gradient, ``proj_seed``), resolved on first use and reused while the
-    feature keeps its width, dtype and device -- the same map
+    feature keeps its width, dtype and device.  It is the same map
     :func:`~dattri_llm.gradient.ops.project_activation` /
-    :func:`~dattri_llm.gradient.ops.project_gradient` apply, without their
-    per-call dispatch (a hooked layer is projected twice per step).
+    :func:`~dattri_llm.gradient.ops.project_gradient` apply.
     """
     matrix = buf["_proj_matrix"].get(side)
     (x,) = dtypes.align(x)
@@ -823,15 +819,11 @@ def register_param_grad_hooks(
 
     For each qualifying module, a ``Tensor.register_hook`` is placed on every
     trainable parameter (``requires_grad=True``).  The hook fires during the
-    backward pass at the moment the gradient for that parameter is freshly
-    computed, writing it to the buffer.  This avoids two common pitfalls:
-
-    * Reading ``.grad`` **after** ``backward()`` returns can yield ``None``
-      on the first call if no gradient flowed to that parameter, or a stale
-      accumulated value when gradient accumulation spans multiple steps.
-    * Reading ``.grad`` **inside** a module backward hook may see a partially
-      accumulated tensor when other parameters in the same module still have
-      pending gradient contributions.
+    backward pass at the moment the gradient for that parameter is computed,
+    writing it to the buffer.  The captured value is therefore that step's
+    gradient for the parameter: never ``None``, never a value accumulated
+    from an earlier step, and complete even while other parameters of the
+    same module still have pending contributions.
 
     Under ``DataParallel`` the hook is attached to the *original* module's
     parameters; replica gradients are summed back before the hook fires.
@@ -886,9 +878,8 @@ def register_param_grad_hooks(
 
             def _make_hook(ln: str, pn: str) -> Callable:
                 def _hook(grad: torch.Tensor) -> None:
-                    # grad is the freshly-computed gradient for this parameter.
-                    # It arrives here before being written to param.grad, so
-                    # there is no risk of reading a stale or None value.
+                    # grad is this parameter's gradient for the step; it
+                    # arrives here before being written to param.grad.
                     g = grad.detach()
                     if offload_to_cpu:
                         g = g.cpu()
@@ -961,9 +952,8 @@ def register_linear_param_hooks(
             def _make_hook(ln: str, pn: str) -> Callable:
                 def _hook(p: torch.nn.Parameter) -> None:
                     if on_linear_param_grad is not None:
-                        # No .cpu() here: the only in-tree consumer is the
-                        # HookManager's step-completion counter, which ignores
-                        # the value -- a device transfer would be pure waste.
+                        # The gradient is handed over on its own device; no
+                        # copy is made.
                         on_linear_param_grad(ln, pn, p.grad.detach())
 
                 return _hook

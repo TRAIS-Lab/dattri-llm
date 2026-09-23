@@ -1,13 +1,19 @@
 """Gradient collection callbacks.
 
-Three built-in callbacks are provided:
+This package holds one module per callback; every callback is re-exported
+here under ``dattri_llm.gradient.callbacks``:
 
 ``HookManagerCallback``
     Base class.  All methods are no-ops; subclass and override only what you
     need.
 
+``CaptureCallback``
+    Holds the most recent step's
+    :class:`~dattri_llm.gradient.gradient.GradientRecord` in memory.
+
 ``OffloadCallback``
-    Periodically flushes :class:`GradientRecord` objects to disk via
+    Periodically flushes :class:`~dattri_llm.gradient.gradient.GradientRecord`
+    objects to disk via
     :class:`~dattri_llm.gradient.storage_manager.GradientStorageManager`.
     Supports both per-batch and per-sample recording granularity.
 
@@ -16,18 +22,23 @@ Three built-in callbacks are provided:
     each step, then removes low-influence samples' contributions from
     ``param.grad`` before ``optimizer.step()``.
 
-    Two scoring modes are available via ``score_mode``:
+    Two scoring modes are available via ``scoring_kwargs["score_mode"]``:
 
     * ``"ghost"`` (default) -- gram-matrix form, no weight-gradient
-      materialisation. Cost O((B*T)^2 * (out + in)) per layer.
+      materialization.  Cost O((B*T)^2 * (out + in)) per layer.
     * ``"materialized"`` -- builds the explicit per-sample weight gradient
-      and dots it against the batch gradient. Easier to verify but uses
-      more memory.
+      and dots it against the batch gradient.  Uses more memory.
 
     Both modes produce identical scores.
 
-This package holds one module per callback; everything is re-exported here so
-existing ``dattri_llm.gradient.callbacks`` imports keep working unchanged.
+``KroneckerCovarianceCallback``
+    Accumulates the per-layer K-FAC covariances ``(A, G)`` during collection.
+
+``OptimizerStateCallback``
+    Records an Adam-family optimizer's moments on both sides of every step.
+
+``ParameterSnapshotCallback``
+    Stores the parameters every capture step runs from.
 """
 
 from dattri_llm.gradient.callbacks.base import HookManagerCallback

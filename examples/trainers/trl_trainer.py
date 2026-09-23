@@ -69,27 +69,23 @@ if __name__ == "__main__":
     # wpe (positional embedding) receives an unbatched position tensor, so its
     # gradient is broadcast over the batch and is NOT per-sample; lm_head is
     # never invoked as a module by TRL's SFT loss (it computes the LM loss
-    # through a fused/functional linear on the tied weight), so its hooks
-    # would never fire and step completion would stall waiting for them.
+    # through a fused/functional linear on the tied weight), so it has no
+    # gradient to capture.
     hook_cfg = HookManagerConfig(linear_io=[r"transformer\.h\.", r"wte"])
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # A sample's content hash covers the model inputs TRL feeds the
-        # forward pass, and two of those inputs depend on which samples share
-        # the batch: the pad-to-longest sequence length and the
-        # num_items_in_batch loss-normalization count.  Train the full set as
-        # ONE fixed-length batch so both are constant and each sample's hash
-        # is identical across epochs.
+        # A sample's content hash is taken over its unpadded tokens, so it is
+        # the same whichever batch the sample is padded with; the tiny corpus
+        # is trained as one batch only to keep the run short.
         sft_config = SFTConfig(
             output_dir=tmpdir,
             num_train_epochs=args_cli.epochs,
             per_device_train_batch_size=len(SENTENCES),
             max_length=32,
             pad_to_multiple_of=32,
-            # TRL (unlike plain TrainingArguments) turns gradient checkpointing
-            # ON by default; its non-reentrant mode runs every checkpointed
-            # block forward twice with grad enabled (build + recompute), which
-            # would double-capture activations.  Disable it for collection.
+            # TRL turns gradient checkpointing on by default; capture handles
+            # it (the recomputed forward is matched to its backward), it is
+            # off here only to keep the tiny run fast.
             gradient_checkpointing=False,
             use_cpu=True,
             logging_steps=100,

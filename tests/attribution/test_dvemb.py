@@ -126,7 +126,7 @@ def collected(tmp_path):
 
 def _make_attr(out_dir, lr):
     """Attributor whose ``attribute_from_cache`` defaults to this test's
-    per-attribution ``learning_rate`` (now a method argument, not a ctor one).
+    per-attribution ``learning_rate`` (a method argument).
     """
     attr = DVEmbAttributor(_args(out_dir))
     orig = attr.attribute_from_cache

@@ -14,7 +14,9 @@ whose step fits the A40.
 
 ``routing-steps-b<B>`` is the per-step protocol: one fixed batch size B for
 every T, 128 timed steps after 8 warm-up steps, runtime reported per step.
-``routing-steps-b1`` continues to T = 16384.  ``routing`` is the fixed-token
+``routing-steps-b1`` continues to T = 16384, and ``routing-steps-b8-long``
+runs dattri-llm's three routes at batch 8 on to T = 8192 (one H200).
+``routing`` is the fixed-token
 protocol (524,288 training tokens at every T, batch 8 up to T = 512 and 4096
 tokens per batch beyond it), and ``routing-batch1`` runs that protocol at one
 sequence per step on an eighth of the tokens.
@@ -71,17 +73,20 @@ STEPS, WARMUP_STEPS = 128, 8
 BATCHES = (1, 2, 4, 8, 16)
 
 
-def step_cells(batch: int) -> list[dict]:
+def step_cells(batch: int, seq_lens: tuple[int, ...] | None = None, ours_only: bool = False) -> list[dict]:
     """The sweep at one fixed batch size for every T, timed over a fixed
     number of steps (after a short warm-up) and reported per step."""
     out = []
-    for seq_len in LONG_SEQ_LENS if batch == 1 else SEQ_LENS:
+    if seq_lens is None:
+        seq_lens = LONG_SEQ_LENS if batch == 1 else SEQ_LENS
+    for seq_len in seq_lens:
         workload = dict(BASE, block_size=seq_len, batch=batch, steps=STEPS,
                         warmup_train=WARMUP_STEPS * batch, measure_train=STEPS * batch,
                         n_train=(WARMUP_STEPS + STEPS) * batch)
         for route in ROUTES:
             out += runner.grid(["dattri_llm"], ["graddot"], ["0.5b"], route=route, **workload)
-        out += runner.grid(["bergson", "kronfluence"], ["graddot"], ["0.5b"], **workload)
+        if not ours_only:
+            out += runner.grid(["bergson", "kronfluence"], ["graddot"], ["0.5b"], **workload)
     return out
 
 
@@ -92,6 +97,8 @@ EXPERIMENTS = {
     "routing-batch1": cells(batch=1, train_tokens=TRAIN_TOKENS // 8),
     # Fixed steps and a fixed batch for every T; one experiment per batch size.
     **{f"routing-steps-b{b}": step_cells(b) for b in BATCHES},
+    # Batch 8 on to 8192 tokens, dattri-llm's three routes only (fits one H200).
+    "routing-steps-b8-long": step_cells(8, (*SEQ_LENS, 4096, 8192), ours_only=True),
 }
 
 

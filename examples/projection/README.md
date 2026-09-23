@@ -28,7 +28,7 @@ in six sections:
 5. **Per-layer configuration** — the `projection_kwargs` mapping is keyed by layer
    name, so each layer gets its own budget (`fc1` at 128, `fc2` at 32), and
    **without** a `"__default__"` entry, layers with no entry of their own are
-   captured raw. Mixed configs are first-class.
+   captured raw.
 6. **Custom layer classes** — hooking a hand-rolled layer the library cannot
    recognise, declared with `layer_types` + `module_kwargs` and verified
    against autograd.
@@ -121,11 +121,9 @@ HookManagerConfig(
 `embedding_bag_module_kwargs`, `conv{1,2,3}d_module_kwargs` and their
 transposes, `layer_norm_module_kwargs`, `rms_norm_module_kwargs`,
 `group_norm_module_kwargs`, `instance_norm{1,2,3}d_module_kwargs`). Every
-argument is keyword-only and **required** by design: these helpers describe
-non-standard layers, exactly the situation where a silently assumed default
-(a bias that is not there, a different epsilon) would corrupt the captured
-gradients without any error — a forgotten field fails at config-build time
-instead.
+argument is keyword-only and **required**: a missing field (a bias that is
+not there, a different epsilon) fails at config-build time rather than
+silently changing the captured gradients.
 
 The tutorial closes the loop by *verifying* the declaration: the sum of the
 captured per-sample gradients reproduces autograd's `param.grad` for the

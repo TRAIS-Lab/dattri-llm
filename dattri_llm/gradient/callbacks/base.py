@@ -89,8 +89,8 @@ class HookManagerCallback:
           :meth:`HookManager.save_state` / :meth:`HookManager.clear_state` /
           :meth:`HookManager.load_state`.
         * Under FSDP, step completion relies on an end-of-backward engine
-          callback whose ordering for *nested* backwards is not guaranteed --
-          reentrancy there is untested territory.
+          callback whose ordering for *nested* backwards is not guaranteed;
+          a secondary backward is not supported there.
 
         Args:
             record: The assembled :class:`GradientRecord` for this step.

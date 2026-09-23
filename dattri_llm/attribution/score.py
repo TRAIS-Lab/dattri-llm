@@ -1,11 +1,11 @@
 """Structured attribution scores for the on-disk gradient workflow.
 
 * **Trajectory-aware rows.**  TracIn-style scores are a sum of per-step
-  ensemble terms ``sum_k weight_k * <g_train^k, g_test^k>``.  We keep those
-  terms *un-summed*: every row of :attr:`scores` is a single
+  ensemble terms ``sum_k weight_k * <g_train^k, g_test^k>``.  Those terms
+  are kept *un-summed*: every row of :attr:`scores` is a single
   ``(train_hash, step)`` pair.  Summing a training sample's rows over steps
-  recovers the trajectory-*agnostic* score, so the
-  finer representation loses no information.  The test side stays
+  recovers the trajectory-*agnostic* score, so the finer representation
+  loses no information.  The test side stays
   trajectory-agnostic: one column per test sample.
 
 * **Token-level rows.**  A score attributed at ``"token"`` granularity keeps
@@ -305,8 +305,7 @@ class AttributionScore:
         """Every step's score matrix, keyed by step.
 
         Convenience wrapper over :meth:`step_matrix` that returns the per-step
-        view for *all* steps at once -- the natural way to present per-step
-        attribution scores to a user.
+        view for *all* steps at once.
 
         Returns:
             Ordered mapping ``step -> (train_ids, matrix)`` for each step in
@@ -454,7 +453,7 @@ class AttributionScore:
         with Path(out / cls._META_FILE).open(encoding="utf-8") as f:
             meta = json.load(f)
         algorithm_meta = meta.get("algorithm_meta", {})
-        # Older saves carried normalized_grad as a top-level field; fold it in.
+        # A top-level ``normalized_grad`` entry is folded into algorithm_meta.
         if "normalized_grad" in meta:
             algorithm_meta.setdefault("normalized_grad", meta["normalized_grad"])
         return cls(

@@ -91,9 +91,9 @@ class TestLiveLoopOverTest:
     def test_looped_matches_cached(self, tmp_path, normalized_grad):
         """loop_over_test=True must score identically to the cached path.
 
-        Regression: with the shared HookManager, each test-source re-stream
-        reset and advanced the shared step counter mid-train-pass, tripping
-        the streamer's step-desync guard on the second train block.
+        Each test-source re-stream runs on the shared HookManager in the middle
+        of a train pass; the train streamer's step bookkeeping must survive the
+        interleaving so its step-desync guard does not fire on later blocks.
         """
         task, train_ds, test_ds = _make_task_and_data()
 

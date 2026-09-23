@@ -138,17 +138,15 @@ def dense_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
     """Damped symmetric inverse ``(matrix + damping*I)^{-1}`` via Cholesky.
 
     Mathematically identical to :func:`sym_inverse` (both return the damped
-    inverse ``(M + damping*I)^{-1}``) but far cheaper on the **large dense
+    inverse ``(M + damping*I)^{-1}``) but cheaper on the **large dense
     empirical-Fisher** blocks: a Cholesky factorization + triangular solve
-    instead of a full eigendecomposition (~10x faster at 4096x4096).  ``M`` is
-    PSD and ``M + damping*I`` is therefore positive-definite for any
-    ``damping > 0``; should Cholesky still fail numerically (too small a damping
-    on a near-singular block) it falls back to :func:`sym_inverse`, so
-    robustness matches the eigendecomposition path.
+    instead of a full eigendecomposition.  ``M`` is PSD and ``M + damping*I``
+    is therefore positive-definite for any ``damping > 0``; should Cholesky
+    still fail numerically (too small a damping on a near-singular block) it
+    falls back to :func:`sym_inverse`.
 
-    Prefer this for the dense Fisher; keep :func:`sym_inverse` for the small,
-    possibly rank-deficient K-FAC covariance factors, where the eigenbasis is
-    reused and the size makes the eigendecomposition cheap.
+    Used for the dense Fisher; :func:`sym_inverse` serves the small, possibly
+    rank-deficient K-FAC covariance factors, whose eigenbasis is reused.
     """
     m = matrix.float()
     damped = m + damping * torch.eye(m.shape[-1], device=m.device, dtype=m.dtype)
@@ -367,9 +365,9 @@ def kfac_precondition_materialized(
     the projected space, laid out ``(k_g, k_a)`` row-major (see
     :func:`materialize_factors`).  With the projected inverse covariances ``A_inv``
     (``k_a x k_a``) and ``G_inv`` (``k_g x k_g``) this applies
-    ``(A_inv (x) G_inv) vec(dW) = vec(G_inv dW A_inv)`` -- the same two small
-    matmuls logix uses -- returning the preconditioned block flattened back to
-    ``(B, k_g * k_a)``, ready to dot against a raw materialized train block.
+    ``(A_inv (x) G_inv) vec(dW) = vec(G_inv dW A_inv)`` as two small matmuls,
+    returning the preconditioned block flattened back to ``(B, k_g * k_a)``,
+    ready to dot against a raw materialized train block.
     """
     batch = block.shape[0]
     k_g, k_a = G_inv.shape[0], A_inv.shape[0]

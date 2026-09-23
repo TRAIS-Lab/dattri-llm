@@ -719,8 +719,8 @@ class TestAggregate:
             g.aggregate(dim="batch")  # type: ignore[arg-type]
 
     def test_aggregate_mean_mode_removed(self):
-        # mode was removed: a mean over tokens double-applies the loss's own
-        # normalization and never computes a gradient.
+        # aggregate takes no mode: a mean over tokens would double-apply the
+        # loss's own normalization and never computes a gradient.
         g = make_gradient(indexing="batch_token")
         with pytest.raises(TypeError):
             g.aggregate(dim="token", mode="mean")  # type: ignore[call-arg]
@@ -1121,7 +1121,7 @@ class TestBatchFirst:
         assert bf.pre_activation_grad.shape == (B, T, D_OUT)
 
     def test_seq_first_batch_size(self):
-        # Regression: a (T, B, d) layer must report B, not T.
+        # A (T, B, d) layer must report B, not T.
         _bf, sf = _seq_first_pair()
         assert sf.batch_size == B
 

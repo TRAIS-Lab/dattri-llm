@@ -214,10 +214,9 @@ class TestDotIdentity:
         assert torch.allclose(self_dot, norms, atol=1e-4, rtol=1e-4)
 
     def test_embedding_padding_idx_matches_autograd(self):
-        """With padding_idx, materialize_factors and dot_factors must match
-        autograd, whose
-        embedding backward zeroes the pad row of weight.grad (regression: pad
-        positions' contributions were included).
+        """With padding_idx, materialize_factors and dot_factors match autograd,
+        whose embedding backward zeroes the pad row of weight.grad: pad
+        positions contribute nothing.
         """
         from torch import nn
 
@@ -257,9 +256,8 @@ class TestDotIdentity:
 
     @pytest.mark.parametrize("mode", ["sum", "mean"])
     def test_embedding_bag_padding_idx_matches_autograd(self, mode):
-        """With padding_idx, the bag expansion must exclude pad tokens and,
-        for mode='mean', divide by each bag's non-pad count (regression: pad
-        positions received gradient and the divisor was the full T).
+        """With padding_idx, the bag expansion excludes pad tokens and, for
+        mode='mean', divides by each bag's non-pad count.
         """
         from torch import nn
 
@@ -292,8 +290,7 @@ class TestDotIdentity:
     def test_embedding_width_is_batch_independent(self):
         """Materialized embedding gradients are always (B, num_embeddings * E),
         whatever token range a batch touches, so cross-batch dots are
-        well-defined (regression: width was max(token) + 1 per batch and
-        mixed-width embedding dots crashed on a shape mismatch).
+        well-defined.
         """
         ids_lo = torch.randint(0, 5, (B, T))  # small token ids only
         ids_hi = torch.randint(VOCAB - 5, VOCAB, (B, T))  # large ids only
@@ -317,8 +314,8 @@ class TestDotIdentity:
             )
 
     def test_embedding_different_token_counts(self):
-        """Embedding dot_factors with T1 != T2 (regression: side 2's scatter used
-        side 1's token count and crashed on mismatched sequence lengths).
+        """Embedding dot_factors accepts factor pairs with different token
+        counts (T1 != T2) and matches the materialized dot.
         """
         t1, t2 = T, T + 3
         ids1 = torch.randint(0, VOCAB, (B, t1))

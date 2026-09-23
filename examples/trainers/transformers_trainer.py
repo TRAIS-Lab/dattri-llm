@@ -153,9 +153,9 @@ if __name__ == "__main__":
             # Retrieval is a two-step scheme.  The content hash of ONE sample's
             # model inputs -- here simply dataset[0], since the Trainer passes
             # {input_ids, attention_mask, labels} through unchanged -- identifies
-            # WHAT the sample is, independent of shuffling.  lookup() then
-            # reveals WHERE it was recorded: every (step, sample_idx)
-            # pair, and load_sample() retrieves each pair's gradient by a
+            # WHAT the sample is, independent of shuffling.  lookup_by_hash()
+            # then gives WHERE it was recorded: every (step, sample_idx) pair,
+            # and load_sample_by_hash() retrieves each pair's gradient by a
             # direct slice of the stored record (no scan over the batch).
             h0 = hash_sample(dataset[0])
             pairs = fm.lookup_by_hash(h0)  # [(step, sample_idx), ...]

@@ -131,8 +131,7 @@ class TestHashSample:
     def test_hash_batch_skips_non_batch_first(self):
         # A field whose leading dim disagrees with the batch (e.g. a
         # sequence-first or broadcast tensor) carries no per-sample identity
-        # and is skipped rather than raising (it used to crash the capture
-        # hooks mid-training).
+        # and is skipped rather than raising.
         batch = {"x": torch.randn(3, 5), "pos": torch.randn(7, 3)}
         assert hash_batch(batch, batch_size=3) == hash_batch(
             {"x": batch["x"]},
@@ -143,11 +142,9 @@ class TestHashSample:
 class TestRecordBatchSizeFromGradient:
     """The record's identity hashes use the *gradient's* batch size.
 
-    Regression: the manager guessed the batch size from the first captured
-    input tensor's leading dim.  A broadcast kwarg (position_ids of shape
-    (1, T)) arriving before input_ids made it infer batch size 1, so a
-    B-sample step was labelled with a single hash of the shared broadcast
-    row -- caught only later, as a batch-size mismatch at save time.
+    A broadcast kwarg (position_ids of shape (1, T)) arriving before
+    input_ids does not set the batch size: a B-sample step is labelled with
+    one hash per sample, never with a single hash of the shared broadcast row.
     """
 
     class _PosFirstNet(nn.Module):
@@ -1774,10 +1771,8 @@ class TestResidency:
     """disk / memory / tiered residency backends of GradientStorageManager."""
 
     def test_tiered_spill_uses_the_store_disk_format(self):
-        """A spilled group is serialized like a directly-written one.
-
-        Spill wrote ``torch.save`` unconditionally, so a memmap store silently
-        fell back to pickle for every evicted group.
+        """A spilled group is serialized like a directly-written one: a memmap
+        store's evicted groups are memmapped, not pickled.
         """
         with (
             tempfile.TemporaryDirectory() as tmpdir,
@@ -2164,7 +2159,7 @@ class TestDiskFormat:
             handle = next(iter(fm.iter_steps([0])))[0]
             meta_path = Path(d) / f"{handle}.meta"
             payload = torch.load(meta_path, weights_only=False)
-            payload["format"] = 1  # pretend it was written by the old writer
+            payload["format"] = 1  # a layout version this reader does not accept
             torch.save(payload, meta_path)
 
             with pytest.raises(ValueError, match="memmap format"):
@@ -2173,10 +2168,9 @@ class TestDiskFormat:
     def test_memmap_reopen_does_not_overwrite_existing_groups(self):
         """Reopening a memmap store resumes the counter instead of restarting.
 
-        The auto-name counter has to see ``batch_<id>.mmap.bin``, not just
-        ``batch_<id>.pt``; otherwise a second collection into the same dir
-        rewrites ``batch_000000.mmap`` while the index still points at it, and
-        the first run's samples silently read back as the second run's data.
+        The auto-name counter accounts for ``batch_<id>.mmap.bin`` groups as
+        well as ``batch_<id>.pt``, so a second collection into the same dir
+        never rewrites a group the index still points at.
         """
         with tempfile.TemporaryDirectory() as d:
             first = GradientStorageManager(d, disk_format="memmap")
@@ -2321,9 +2315,9 @@ class TestProjectedCovarianceCallback:
     def test_covariances_are_compact_and_match_blocks(self):
         from dattri_llm.gradient.ops import KroneckerAccumulator
 
-        # a factorized logra capture keeps the projected factors in the block,
-        # so the block
-        # KroneckerAccumulator is the reference for the compact covariance.
+        # A factorized logra capture keeps the projected factors in the block,
+        # so the block KroneckerAccumulator is the reference for the compact
+        # covariance.
         rec, cov = self._collect("logra")
         got = cov.result()
         assert got, "no covariances collected"
@@ -2346,10 +2340,9 @@ class TestProjectedCovarianceCallback:
             assert torch.allclose(g_got, g_ref, atol=1e-5), f"G {layer}"
 
     def test_compact_store_still_gets_projected_covariance(self):
-        # a materialized logra capture stores a compact (B, k*k) block (no
-        # factors), yet the
-        # callback still fits the compact (k, k) covariances from the projected
-        # factors emitted at capture -- the whole point of the logix-style path.
+        # A materialized logra capture stores a compact (B, k*k) block with no
+        # factors; the callback still fits the compact (k, k) covariances from
+        # the projected factors emitted at capture.
         _rec, cov = self._collect("logra", "materialized")
         got = cov.result()
         assert got

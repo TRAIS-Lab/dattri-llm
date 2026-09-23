@@ -1,14 +1,13 @@
-"""Capture-time projection routing (``style="auto"``).
+"""Capture-time projection routing (``capture_style="auto"``).
 
-Scoring already routes between the factorized and materialized cross-gram by a
-cost model; capture did not, so a projected capture always kept the token axis.
-After projection that is the wrong default: at ``k_a=k_g=64`` the factors cost
-``S*(k_a+k_g)`` against the outer product's ``k_a*k_g``, so a 512-token sequence
-stores 16x more as factors.
+A projected layer is stored either as its factors, costing ``S*(k_a+k_g)`` per
+sample, or as their outer product, costing ``k_a*k_g``; ``"auto"`` picks the
+cheaper of the two from the actual shapes (at ``k_a=k_g=64`` a 512-token
+sequence stores 16x more as factors).
 
-Two properties matter and are tested separately:
+Two properties are tested separately:
   * the rule fires where the arithmetic says it should, and
-  * routing is an OPTIMIZATION -- scores must not depend on which side it picks.
+  * routing is an optimization -- scores do not depend on which side it picks.
 """
 
 from __future__ import annotations

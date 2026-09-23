@@ -2,10 +2,9 @@
 
 Shared building blocks for consumers of pre-collected on-disk gradients (the
 :class:`~dattri_llm.gradient.streaming.DiskGradientSource`, and through it the
-attributors).  Reading on-disk gradients one *sample* at a time would re-read
-each batch file once per sample; these helpers instead expose one *file* per
-item so a standard DataLoader with ``num_workers > 0`` can prefetch whole
-batch blocks in parallel.
+attributors).  Each dataset item is one *file*, read with a single
+``torch.load``, so a standard DataLoader with ``num_workers > 0`` prefetches
+whole batch blocks in parallel and no batch file is read more than once.
 """
 
 from __future__ import annotations
@@ -135,9 +134,10 @@ class GradientFileMultiStepDataset(Dataset):
             for step, idxs in by_step.items()
         }
         if get_worker_info() is not None:
-            # Memmap-backed tensors can't cross the worker->parent IPC (torch's
-            # fd-sharing sends a closed mapping fd -> EBADF); clone to heap
-            # storage.  With ``num_workers=0`` the zero-copy view is the point.
+            # Tensors handed from a worker to the parent process must own heap
+            # storage: a memmap-backed view cannot be shared across the
+            # worker IPC.  In-process loading (``num_workers=0``) keeps the
+            # zero-copy view.
             blocks = {
                 step: (block.clone(), hashes)
                 for step, (block, hashes) in blocks.items()
@@ -153,10 +153,10 @@ def make_gradient_multistep_dataloader(
 ) -> DataLoader:
     """Build a DataLoader yielding per-file blocks for multiple steps."""
     dataset = GradientFileMultiStepDataset(file_manager, steps, layer_name=layer_name)
-    # Worker-process prefetch only helps a ``disk`` store (overlap file reads
-    # with compute).  For an in-RAM (``memory``/``tiered``) store the records
-    # already live in this process; a worker would have to pickle them across
-    # the process boundary, defeating the point -- so read in-process.
+    # Worker processes serve a ``disk`` store, overlapping file reads with
+    # compute.  An in-RAM (``memory``/``tiered``) store already holds its
+    # records in this process and is read in-process, so no record is
+    # pickled across a process boundary.
     num_workers = args.dataloader_num_workers if file_manager.residency == "disk" else 0
     kwargs: dict = {
         "dataset": dataset,
@@ -182,8 +182,8 @@ def resolve_steps(
     ``requested=None`` selects every step present on disk.  Otherwise the
     requested steps are intersected with what is available, so an over-specified
     range (e.g. ``range(0, 1000)`` against checkpoints saved every 50 steps) is
-    accepted and simply keeps the steps that exist.  An empty intersection is an
-    error -- it almost always means a typo'd or wrong step set.
+    accepted and keeps the steps that exist.  An empty intersection is an
+    error.
 
     Args:
         file_manager: Manager opened on the gradient directory.

@@ -76,7 +76,7 @@ from at sweep time (see :mod:`dattri_llm.attribution.algorithm.trajectory`).
 
 This is the **basic** DVEmb estimator -- it materialises the per-layer gradients
 and propagates the exact (Fisher-approximated) product.  Influence-checkpointing
-and the low-rank embedding compression of the paper are deliberately omitted.
+and the low-rank embedding compression of the paper are not implemented.
 
 The result is an :class:`~dattri_llm.attribution.score.AttributionScore` whose
 rows are ``(train_hash, step)`` pairs (one row per recorded checkpoint of a

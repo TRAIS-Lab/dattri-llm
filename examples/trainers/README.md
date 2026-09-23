@@ -34,19 +34,23 @@ own tokenization, collation, and label masking, and the wrapped
 `trainer.train()` captures per-sample gradients below all of it. Retrieval
 works by the content hash of the model inputs TRL actually produced: the same
 sample lands at different `(step, sample_idx)` positions across shuffled
-epochs, and the hash ties its occurrences together.
+epochs, and the hash ties its occurrences together. The hash is taken over a
+sample's unpadded tokens, so it does not depend on the batch the sample was
+padded with, and batch-level inputs such as TRL's `num_items_in_batch` count
+do not enter it.
 
-Three TRL-specific settings in the script are deliberate:
+Two things about the hook selection are worth knowing:
 
-- **gradient checkpointing is disabled** — TRL enables it by default, and its
-  non-reentrant recomputation runs each block forward twice with grad enabled,
-  which would double-capture activations;
 - **`lm_head` is not hooked** — TRL's SFT loss applies the tied output weight
-  functionally (fused linear + cross-entropy), so the module's hooks would
-  never fire and step completion would stall;
-- **one fixed-length batch per epoch** — TRL feeds the batch-dependent
-  `num_items_in_batch` count into the model forward, so a sample's content
-  hash only stays epoch-stable when its batch context is stable.
+  functionally (fused linear + cross-entropy), so the module is never invoked
+  and has no captured gradient; a selected layer that does not run in a step
+  is simply not part of that step's record;
+- **`wpe` is not hooked** — GPT-2's position embedding takes one position
+  tensor shared by the batch, so its gradient is not per-sample.
+
+TRL's default gradient checkpointing (either `use_reentrant` variant) is
+supported: the recomputed forward is matched to its backward and each step is
+captured once. The script keeps it off only to keep the tiny run fast.
 
 ```bash
 pip install trl

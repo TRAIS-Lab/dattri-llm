@@ -444,8 +444,8 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         :class:`Gradient` records carrying the source blocks' steps and
         hashes, so scoring against the store is a plain inner product
         (e.g. ``TracInAttributor.attribute_from_cache``).  *transform*
-        defaults to :meth:`transform_test_rep`; pass ``None`` explicitly via
-        an identity when *source* already yields the final representation.
+        defaults to :meth:`transform_test_rep`; pass an identity when
+        *source* already yields the final representation.
 
         Args:
             source: Blocks to transform, moved to ``args.device`` first.
@@ -584,24 +584,19 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
 
     def _route_test_rep(self, test_rep: Gradient) -> Gradient:
         """Give each factorized test layer the representation the cross-gram
-        cost rule picks for it (Sec. 3.2), once, before the scoring loop.
+        cost rule picks for it, once, before the scoring loop.
 
-        Runs on the output of :meth:`transform_test_rep`, so a method's own
-        transform stays what it is (identity, a preconditioner, ...) and the
-        routing is shared by every inner-product attributor.  A dense test
-        layer makes that layer's score a bare GEMM against the train layer
-        materialized once per block (see :meth:`inner_product`); a factorized
-        one is scored by the ghost contraction with no materialization at
-        all.  Which is cheaper depends on the train batch, the number of
-        queries and the token count
-        (:func:`~dattri_llm.gradient.ops.maybe_use_materialized_gram`): one
-        512-token query against a batch of eight is cheapest in the ghost
-        form, sixteen queries are cheapest dense.  Deciding here keeps the
-        decision out of the per-block loop and, above all, means the test
-        side is never materialized *again for every train block* -- which is
-        what the per-layer kernel has to do when both sides arrive factorized
-        and the rule picks the dense route.  Layers without an outer-product
-        gradient (norm, embedding) are small and simply materialized; layers
+        Runs on the output of :meth:`transform_test_rep`, so the routing is
+        shared by every inner-product attributor whatever its transform.  A
+        dense test layer makes that layer's score a GEMM against the train
+        layer materialized once per block (see :meth:`inner_product`); a
+        factorized one is scored by the ghost contraction with no
+        materialization.  Which is cheaper depends on the train batch, the
+        number of queries and the token count
+        (:func:`~dattri_llm.gradient.ops.maybe_use_materialized_gram`).
+        Routing once here means the test side is materialized at most once
+        for the whole loop rather than once per train block.  Layers without
+        an outer-product gradient (norm, embedding) are materialized; layers
         already dense (a projected capture, a preconditioned query) pass
         through.
 
@@ -610,13 +605,11 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         layer by layer, the layers with the largest flop saving first.  What
         is charged is the growth over the factorized form each dense layer
         replaces -- the block is converted with ``consume=True``, so the
-        factorized payload is released as its dense copy is built and never
-        both are held -- and whatever does not fit stays factorized.  At full
-        dimension the dense form is ~1 GB *per sample*; caching is an
-        optimization and must never be the reason a run runs out of memory.
+        factorized payload is released as its dense copy is built -- and a
+        layer that does not fit stays factorized.
 
-        A layer that stays factorized is not left raw either: its factors are
-        preprocessed once here and replaced by the result
+        A layer that stays factorized has its factors preprocessed once here
+        and replaced by the result
         (:func:`~dattri_llm.attribution.utils.finalize_factors`), under the
         same budget, so that whichever route a layer takes, the block the
         scoring loop holds is in its ready-to-score form and no train block

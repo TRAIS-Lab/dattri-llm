@@ -10,7 +10,7 @@ gradients — and drop the bottom fraction, exactly what it would do inside a re
 training loop before the optimizer step.
 
 ```bash
-python examples/data_selection/gpt2_data_selection.py                       # ~60 s on CPU
+python examples/data_selection/gpt2_data_selection.py
 python examples/data_selection/gpt2_data_selection.py --drop_fraction 0.5
 ```
 

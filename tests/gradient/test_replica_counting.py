@@ -1,20 +1,15 @@
-"""Step completion counts *observed* forward fires, not predicted replicas.
+"""Step completion counts observed forward fires per layer and per step.
 
-Regression under test: the manager used to fix the per-layer backward-hook
-target to ``len(device_ids)`` at construction (``_n_replicas``).  Two ways
-that prediction went wrong, in opposite directions:
+Each grad-enabled forward of a hooked layer produces exactly one backward, and
+the forward pass finishes before any backward hook runs, so the number of
+forward fires observed for a layer is the number of backward fires the step
+waits for.  Two consequences are pinned here:
 
 * A trailing batch smaller than the device count makes ``DataParallel``'s
-  scatter use fewer replicas -- fewer hook fires than predicted, so the step
-  never completed (and its leftover counts poisoned the next batch).
-* Wrapping in ``DataParallel`` *after* constructing the manager (the
-  documented order for FSDP) left the prediction at 1 -- the step completed
-  prematurely on the first replica's fires.
-
-The fix derives the target per step and per layer from the forward hooks
-actually observed (``_fwd_fires``): each grad-enabled forward produces
-exactly one backward, and the forward pass finishes before any backward hook
-runs, so the target is final by the time it is compared.
+  scatter use fewer replicas; the step completes with the fires that actually
+  occur, and no leftover counts carry into the next batch.
+* Wrapping in ``DataParallel`` *after* constructing the manager does not make
+  the step complete prematurely on the first replica's fires.
 
 CPU emulation: ``ChunkedWrapper`` runs its submodule once per fixed-size
 chunk of the batch -- per-layer hook counts are exactly those of a
@@ -112,9 +107,9 @@ class TestObservedFireCounting:
                 )
 
     def test_trailing_short_batch_completes(self):
-        """A final batch smaller than the chunk count still completes its step
-        (the original hang), and the following state is clean: per-step layer
-        sets reflect how many chunks actually ran.
+        """A final batch smaller than the chunk count still completes its step,
+        and the following state is clean: per-step layer sets reflect how many
+        chunks actually ran.
         """
         gen = torch.Generator().manual_seed(2)
         batches = [
@@ -138,14 +133,13 @@ class TestObservedFireCounting:
 def _dp_devices_unavailable(min_free_gib: float = 2.0, devices=(0, 1)) -> bool:
     """True when the cards this test needs are missing or too full to use.
 
-    The test's own tensors are tiny (~16 MiB), but a CUDA context plus cuBLAS
-    workspaces cost ~0.6 GiB per device before ``DataParallel`` scatters
-    anything, and the scatter allocates on top of that.  On a shared machine
-    the shortfall surfaces as a bare ``CUDA error: out of memory`` from inside
-    ``torch._C._scatter``, which reads like a library regression rather than a
-    busy box.  ``mem_get_info`` is itself allocating -- it establishes a
-    context -- so it is guarded too: a device with no room to hold a context
-    raises here rather than returning a small number.
+    A CUDA context plus cuBLAS workspaces are allocated on each device before
+    ``DataParallel`` scatters anything, and the scatter allocates on top of
+    that; on a busy device the shortfall surfaces as a bare
+    ``CUDA error: out of memory`` from inside ``torch._C._scatter``.
+    ``mem_get_info`` itself establishes a context, so it is guarded too: a
+    device with no room to hold a context raises here rather than returning a
+    small number.
     """
     if torch.cuda.device_count() < len(devices):
         return True
@@ -160,10 +154,9 @@ def _skip_if_oom(exc: BaseException) -> None:
     """Turn an out-of-memory failure into a skip.
 
     The free-memory precheck races other processes on a shared GPU: memory can
-    be ample at collection time and gone by the time the scatter runs.  This
-    test asserts *replica counting*, so an OOM says nothing about the library
-    either way -- report it as an unavailable environment, and let any other
-    error propagate.
+    be ample at collection time and gone by the time the scatter runs.  The
+    test asserts replica counting, which an OOM says nothing about, so it is
+    reported as an unavailable environment; any other error propagates.
     """
     if "out of memory" in str(exc).lower():
         pytest.skip(f"insufficient free GPU memory for nn.DataParallel: {exc}")
@@ -225,13 +218,11 @@ class ConditionalModel(nn.Module):
 
 
 class TestUnusedRegisteredLayers:
-    """Layers registered but never fired must not stall step completion.
+    """Layers registered but never fired do not stall step completion.
 
-    Regression: completion used to require *every* registered layer in
-    ``_seen_bwd``, so a hooked layer off the execution path stalled the step
-    forever (and its leftover state poisoned the following batches).  With
-    observed-fire counting, only layers that participated in the step's
-    forward are required, and they alone appear in the record.
+    Only layers that participated in the step's forward are waited for, and
+    they alone appear in the record; a hooked layer off the execution path
+    leaves no state behind for the following batches.
     """
 
     def test_unused_layer_does_not_stall_steps(self):

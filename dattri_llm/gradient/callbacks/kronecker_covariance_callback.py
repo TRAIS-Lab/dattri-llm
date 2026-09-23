@@ -2,10 +2,11 @@
 
 Standard K-FAC estimates the per-layer Kronecker factors ``(A, G)`` -- the
 input-activation and output-gradient covariances -- from the training gradients.
-The store-then-attribute path fits them in a separate re-pass over the on-disk
-gradients (see :meth:`KFACAttributor.fit`); this callback fits them **inline
-during the capture pass instead**, from the raw factors the
-:class:`~dattri_llm.gradient.hooks.HookManager` already emits to
+The store-then-attribute path fits them in a separate pass over the stored
+gradients
+(:meth:`~dattri_llm.attribution.algorithm.kronecker.KroneckerAttributor.fit`);
+this callback fits them during the capture pass, from the raw factors the
+:class:`~dattri_llm.gradient.hooks.HookManager` emits to
 ``on_layer_forward`` / ``on_layer_backward``.
 
 Two use sites share it:
@@ -21,9 +22,10 @@ Two use sites share it:
 
 The factors are accumulated with the same
 :class:`~dattri_llm.gradient.ops.LayerKroneckerAccumulator` the fit pass uses,
-so :meth:`result` reproduces :meth:`KFACAttributor.fit`'s covariances.  They are
-built from the factors the capture emits -- projected ones under a
-capture-time projection -- i.e. the covariances the store is scored with.
+so :meth:`KroneckerCovarianceCallback.result` reproduces the fit pass's
+covariances.  They are built from the factors the capture emits -- projected
+ones under a capture-time projection -- i.e. the covariances the store is
+scored with.
 """
 
 from __future__ import annotations
@@ -48,8 +50,8 @@ class KroneckerCovarianceCallback(HookManagerCallback):
 
     Args:
         include_bias: Append the bias row/column to the activation covariance
-            (as K-FAC does for a layer with a bias term).  Matches
-            :meth:`KFACAttributor.fit`'s default.
+            (as K-FAC does for a layer with a bias term).  Matches the default
+            of the fit pass.
     """
 
     def __init__(self, *, include_bias: bool = True) -> None:
@@ -88,9 +90,9 @@ class KroneckerCovarianceCallback(HookManagerCallback):
             # the orphan; skip it here rather than pairing the wrong activation.
             return
         activation = pending.pop()
-        # module_kwargs (has_bias, conv stride/padding, ...) is what makes the
-        # covariance match KFACAttributor.fit -- e.g. a biased layer appends the
-        # bias row so A is (d_in + 1) x (d_in + 1).
+        # module_kwargs (has_bias, conv stride/padding, ...) shapes the
+        # covariance: a biased layer appends the bias row, so A is
+        # (d_in + 1) x (d_in + 1).
         self._accumulators.setdefault(
             layer_name,
             ops.LayerKroneckerAccumulator(),
@@ -114,13 +116,13 @@ class KroneckerCovarianceCallback(HookManagerCallback):
     def result(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Return the fitted ``{layer: (A, G)}`` covariances (normalized).
 
-        These are the raw, damping-free factors :meth:`KFACAttributor.fit`
-        persists; a layer that saw no gradient-carrying data is omitted.
+        These are the raw, damping-free factors the fit pass persists; a layer
+        that saw no gradient-carrying data is omitted.
         """
         out: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for layer_name, acc in self._accumulators.items():
-            # suppress (not try/except in-loop): a layer whose every row was
-            # gradient-free accumulated nothing and is simply omitted.
+            # A layer whose every row was gradient-free accumulated nothing
+            # and is omitted.
             with contextlib.suppress(RuntimeError):
                 out[layer_name] = acc.result()
         return out

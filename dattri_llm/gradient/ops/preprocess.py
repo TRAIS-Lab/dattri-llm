@@ -239,13 +239,9 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
         "scale_grad_by_freq",
         False,
     ):
-        # TODO: supportable in principle -- the inverse-frequency scaling is a
-        # whole-forward-call statistic, so it must be applied to ``g`` at
-        # capture/assembly time (per buffered part, while the call's full id
-        # tensor is intact); preprocess-time counting is wrong once records
-        # are sliced or concatenated.  No modern architecture sets the flag
-        # (0 of 665 nn.Embedding sites in transformers 4.55), so refuse until
-        # someone needs it.
+        # The inverse-frequency scaling is a statistic of the whole forward
+        # call's id tensor; it cannot be recovered at preprocess time once
+        # records have been sliced or concatenated.
         raise NotImplementedError(
             f"{layer_type} with scale_grad_by_freq=True is not supported: the "
             "inverse-frequency gradient scaling is a whole-batch statistic "
@@ -434,10 +430,10 @@ def to_3d(x: torch.Tensor) -> torch.Tensor:
 # :class:`~dattri_llm.gradient.gradient.Factorized` container instead: they call
 # :meth:`Factorized.as_batch_first` to normalise a sequence-first capture, unpack
 # ``module_kwargs``, and delegate to the ``_factors`` version.  These are the
-# entry points to prefer -- the call is both shorter and automatically correct
-# for non-batch-first layers, so nothing downstream needs to reason about tensor
-# layout.  Reach for the raw ``_factors`` kernels only when you already hold
-# bare, batch-first factor tensors (e.g. inside another kernel).
+# entry points to prefer: they are correct for non-batch-first layers without
+# the caller reasoning about tensor layout.  Use the raw ``_factors`` kernels
+# only when already holding bare, batch-first factor tensors (e.g. inside
+# another kernel).
 
 
 def preprocess_factorized(
