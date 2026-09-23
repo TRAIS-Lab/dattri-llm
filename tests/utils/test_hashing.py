@@ -147,3 +147,65 @@ class TestHashBatch:
         # Inferred: nothing to infer a batch size from in the first place.
         with pytest.raises(ValueError, match="could not infer a batch size"):
             hash_batch({"text": "hello"})
+
+
+class TestPaddingStripped:
+    """A sample's hash does not depend on the batch it was padded with."""
+
+    def test_same_sample_two_batch_lengths(self):
+        tokens = torch.tensor([5, 6, 7])
+        short = {
+            "input_ids": torch.tensor([5, 6, 7, 0]),
+            "attention_mask": torch.tensor([1, 1, 1, 0]),
+        }
+        long = {
+            "input_ids": torch.tensor([5, 6, 7, 0, 0, 0, 0]),
+            "attention_mask": torch.tensor([1, 1, 1, 0, 0, 0, 0]),
+        }
+        left = {
+            "input_ids": torch.tensor([0, 0, 5, 6, 7]),
+            "attention_mask": torch.tensor([0, 0, 1, 1, 1]),
+        }
+        assert hash_sample(short) == hash_sample(long) == hash_sample(left)
+        assert hash_sample(short) == hash_sample(
+            {"input_ids": tokens}
+        )  # the raw dataset item
+
+    def test_padded_labels_stripped_with_the_tokens(self):
+        a = {
+            "input_ids": torch.tensor([5, 6, 0]),
+            "labels": torch.tensor([5, 6, -100]),
+            "attention_mask": torch.tensor([1, 1, 0]),
+        }
+        b = {
+            "input_ids": torch.tensor([5, 6, 0, 0]),
+            "labels": torch.tensor([5, 6, -100, -100]),
+            "attention_mask": torch.tensor([1, 1, 0, 0]),
+        }
+        assert hash_sample(a) == hash_sample(b)
+        assert hash_sample(a) != hash_sample(
+            {"input_ids": torch.tensor([5, 6])}
+        )  # labels still count
+
+    def test_batch_rows_match_unpadded_items(self):
+        batch = {
+            "input_ids": torch.tensor([[5, 6, 7, 8], [9, 0, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1], [1, 0, 0, 0]]),
+        }
+        hashes = hash_batch(batch, 2)
+        assert hashes[0] == hash_sample({"input_ids": torch.tensor([5, 6, 7, 8])})
+        assert hashes[1] == hash_sample({"input_ids": torch.tensor([9])})
+
+    def test_without_a_mask_nothing_is_stripped(self):
+        a = hash_sample({"input_ids": torch.tensor([5, 6, 0])})
+        b = hash_sample({"input_ids": torch.tensor([5, 6, 0, 0])})
+        assert a != b
+
+    def test_fields_of_another_length_kept_whole(self):
+        shifted = {
+            "input_ids": torch.tensor([5, 6, 7, 0]),
+            "attention_mask": torch.tensor([1, 1, 1, 0]),
+            "labels": torch.tensor([6, 7, 0]),
+        }  # shifted by one: not the mask's length
+        same = {"input_ids": torch.tensor([5, 6, 7]), "labels": torch.tensor([6, 7, 0])}
+        assert hash_sample(shifted) == hash_sample(same)
