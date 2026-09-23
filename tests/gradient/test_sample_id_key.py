@@ -21,7 +21,7 @@ from torch import nn
 from dattri_llm.gradient.callbacks import CaptureCallback, OffloadCallback
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 from dattri_llm.gradient.storage_manager import GradientStorageManager
-from dattri_llm.utils.hashing import hash_batch
+from dattri_llm.utils.hashing import hash_batch, hash_sample
 
 B, IN_DIM, OUT_DIM = 4, 6, 3
 
@@ -161,3 +161,71 @@ class TestFileManagerRoundTrip:
         h = hash_batch({"x": x}, B)[0]
         assert fm.lookup_by_hash(h) == [(0, 0)]
         assert fm.lookup({"x": x[0]}) == [(0, 0)]  # content-hash path intact
+
+
+class MaskedModel(nn.Module):
+    """Called like a trainer's model: positional inputs plus per-sample
+    keyword tensors that are not part of a sample's identity.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = nn.Linear(IN_DIM, OUT_DIM)
+
+    def forward(self, x, labels=None, label_mask=None, index=None):
+        return self.fc(x)
+
+
+def _hash_step(model, fields, *args, **kwargs):
+    cb = CaptureCallback()
+    hm = HookManager(
+        model,
+        config=HookManagerConfig(linear_io=REGISTER_ALL),
+        callbacks=[cb],
+        sample_hash_fields=fields,
+    )
+    try:
+        with hm.collect():
+            model.zero_grad()
+            model(*args, **kwargs).pow(2).sum().backward()
+    finally:
+        hm.remove()
+    return cb.record
+
+
+class TestSampleHashFields:
+    """``sample_hash_fields`` restricts the content hash to the named inputs."""
+
+    def test_only_the_named_kwarg_is_hashed(self):
+        x, labels = torch.randn(B, IN_DIM), torch.randint(0, 9, (B, 5))
+        full = _hash_step(
+            MaskedModel(),
+            ["labels"],
+            x,
+            labels=labels,
+            label_mask=torch.ones(B, 5, dtype=torch.bool),
+            index=torch.arange(B),
+        )
+        bare = _hash_step(MaskedModel(), "labels", x, labels=labels)
+        expected = [hash_sample({"labels": labels[i]}) for i in range(B)]
+        assert full.input_hash == bare.input_hash == expected
+        assert full.sample_id_key is None  # still the content-hash scheme
+
+    def test_positional_field(self):
+        x, labels = torch.randn(B, IN_DIM), torch.randint(0, 9, (B, 5))
+        rec = _hash_step(MaskedModel(), [0], x, labels=labels)
+        assert rec.input_hash == [hash_sample({"_arg0": x[i]}) for i in range(B)]
+
+    def test_missing_field_raises(self):
+        with pytest.raises(KeyError, match="sample_hash_fields"):
+            _hash_step(MaskedModel(), ["labels"], torch.randn(B, IN_DIM))
+
+    def test_exclusive_with_sample_id_key(self):
+        with pytest.raises(ValueError, match="alternative"):
+            HookManager(
+                MaskedModel(), sample_id_key="index", sample_hash_fields=["labels"]
+            )
+
+    def test_empty_is_rejected(self):
+        with pytest.raises(ValueError, match="at least one"):
+            HookManager(MaskedModel(), sample_hash_fields=[])

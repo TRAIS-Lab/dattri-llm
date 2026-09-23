@@ -146,6 +146,17 @@ class HookManager:
             stringified, so an ``idx`` column of ``[32, 42]`` yields
             identifiers ``["32", "42"]``.  The chosen key is stamped on every
             emitted record (:attr:`GradientRecord.sample_id_key`).
+        sample_hash_fields: The input fields the content hash is taken over,
+            instead of every captured tensor input: a ``str`` names a forward
+            kwarg, an ``int`` indexes the positional forward arguments (hashed
+            under the key ``"_arg<i>"``).  Use it when the model is called with
+            per-sample inputs that are not part of a sample's identity (a label
+            mask, a position in the dataset), or to give samples captured
+            through different calls the same identity:
+            ``sample_hash_fields=["labels"]`` makes a sample's identifier
+            ``hash_sample({"labels": labels_row})``.  Every field must be
+            present in every step's inputs (a missing one raises).  Mutually
+            exclusive with ``sample_id_key``.
         non_batch_first_layers: Optional set/list of fully-qualified layer names
             whose captured activations are **sequence-first** (``(T, B, ...)``)
             rather than the default batch-first (``(B, T, ...)``) -- e.g. layers
@@ -191,6 +202,7 @@ class HookManager:
         config: HookManagerConfig | None = None,
         callbacks: list[HookManagerCallback] | None = None,
         sample_id_key: str | int | None = None,
+        sample_hash_fields: Iterable[str | int] | None = None,
         non_batch_first_layers: Iterable[str] | None = None,
         offload_to_cpu: bool = False,
         optimizer: torch.optim.Optimizer
@@ -211,6 +223,19 @@ class HookManager:
                     root, optimizer() if callable(optimizer) else optimizer
                 )
             )
+        if isinstance(sample_hash_fields, (str, int)):
+            sample_hash_fields = [sample_hash_fields]
+        self._sample_hash_fields: tuple[str | int, ...] | None = (
+            None if sample_hash_fields is None else tuple(sample_hash_fields)
+        )
+        if self._sample_hash_fields is not None:
+            if sample_id_key is not None:
+                raise ValueError(
+                    "sample_id_key and sample_hash_fields are alternative "
+                    "identifier schemes; pass one of them.",
+                )
+            if not self._sample_hash_fields:
+                raise ValueError("sample_hash_fields must name at least one field.")
         self._sample_id_key = sample_id_key
         self._offload_to_cpu = offload_to_cpu
         self._non_batch_first_layers: set[str] = (
@@ -348,6 +373,17 @@ class HookManager:
             # A new capture step is beginning, so the cached last-step
             # gradient is about to go stale: release it now.
             self._last_gradient = None
+        if self._sample_hash_fields is not None:
+            # Only the designated fields enter the content hash; one that the
+            # call does not carry is reported when the step is finalized.
+            self._last_inputs = {
+                (f"_arg{f}" if isinstance(f, int) else f): (
+                    args[f] if isinstance(f, int) else kwargs[f]
+                )
+                for f in self._sample_hash_fields
+                if (f < len(args) if isinstance(f, int) else f in kwargs)
+            }
+            return
         captured: dict[str, torch.Tensor] = {
             k: v for k, v in kwargs.items() if isinstance(v, torch.Tensor)
         }
@@ -860,6 +896,19 @@ class HookManager:
         if self._sample_id_key is not None:
             input_hash = self._extract_sample_ids(batch_size)
         else:
+            if self._sample_hash_fields is not None:
+                missing = [
+                    f
+                    for f in self._sample_hash_fields
+                    if (f"_arg{f}" if isinstance(f, int) else f)
+                    not in self._last_inputs
+                ]
+                if missing:
+                    raise KeyError(
+                        f"sample_hash_fields {missing!r} were not found among "
+                        "the model inputs of this step; cannot assign sample "
+                        "identities.",
+                    )
             input_hash = hash_batch(self._last_inputs, batch_size)
         return GradientRecord(
             step=step,
@@ -1590,6 +1639,13 @@ class HookManager:
         field sample ids are read from, or ``None`` for content hashing.
         """
         return self._sample_id_key
+
+    @property
+    def sample_hash_fields(self) -> tuple[str | int, ...] | None:
+        """The input fields the content hash is restricted to, or ``None``
+        when it covers every captured tensor input.
+        """
+        return self._sample_hash_fields
 
     @property
     def layer_names(self) -> list[str]:
