@@ -94,7 +94,8 @@ def describe(runs: list[dict]) -> None:
         t = r["task"]
         print(f"  {i:3d}  {r['lib']:12s} {t['family']}/{t['scale']:5s} {t['method']:8s} "
               f"{t.get('proj_mode', '-'):7s} batch {t.get('batch', '-'):<3} "
-              f"n_test {t.get('n_test', '-'):<3} {t['parallelism']}({t['n_gpus']} gpu)")
+              f"n_test {t.get('n_test', '-'):<3} {t['parallelism']}({t['n_gpus']} gpu)"
+              + (f"  {t['hook_family']} r{t.get('repeat', 0)}" if "hook_family" in t else ""))
 
 
 def execute(runs: list[dict], out: Path, name: str) -> tuple[int, int]:

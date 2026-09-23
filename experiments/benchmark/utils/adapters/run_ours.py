@@ -8,16 +8,24 @@ every phase and recording peak memory (see ``log.BenchRun``):
               capture-time covariances; full dimension: live fit and score
     ekfac     EKFACAttributor -- the same two recipes, with the corrected spectrum
 
+The task's ``hook_family`` (``linear_io`` or ``invasive_linear_io``) sets the
+capture path of every hooked layer; unset, each branch keeps its Table 8 path.
+``shared_fit`` makes the invasive run of a pair score against the curvature fit
+of its ``linear_io`` run.
+
     python run_ours.py --task-file <plan.json> --out <dir>
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -63,7 +71,7 @@ def linear_layer_names(model) -> list[str]:
     names = []
     for n, m in model.named_modules():
         if isinstance(m, torch.nn.Linear) and "lm_head" not in n and "embed" not in n:
-            names.append(f"{n}$")
+            names.append(n)
     return names
 
 
@@ -102,10 +110,14 @@ def run(task: dict, out_root: Path) -> None:
     block_size = task.get("block_size", 512)
     batch = task.get("batch", 8)
     seed = task.get("seed", 0)
+    proj_mode = task.get("proj_mode", "rank64")
 
-    tag = (
+    base = (
         f"{task.get('family', '?')}-{task.get('scale', '?')}-{task['dataset']}-{method}"
+        f"-{proj_mode}-q{n_test}"
     )
+    rep = f"-r{task['repeat']}" if "repeat" in task else ""
+    tag = base + (f"-{task['hook_family']}" if "hook_family" in task else "") + rep
     run_dir = out_root / "runs" / tag
     bench = BenchRun(
         {
@@ -126,7 +138,12 @@ def run(task: dict, out_root: Path) -> None:
     with bench.phase("build_model"):
         model, tok = build_model(model_id, params_b, task.get("dtype"))
         layers = linear_layer_names(model)
-        bench.set(n_linear_layers=len(layers))
+        bench.set(
+            n_linear_layers=len(layers),
+            layers_sha=hashlib.sha1("\n".join(layers).encode()).hexdigest()[:12],
+            requires_grad=all(p.requires_grad for p in model.parameters()),
+            tf32=torch.backends.cuda.matmul.allow_tf32,
+        )
 
     with bench.phase("load_data"):
         train_ds, test_ds = load_task_data(
@@ -160,8 +177,14 @@ def run(task: dict, out_root: Path) -> None:
 
     # proj_mode: "rank64" (LoGra rank-64, the low-rank regime) or "full" (no
     # projection -- full-dimension factors, aligned with Bergson/Kronfluence).
-    proj_mode = task.get("proj_mode", "rank64")
     bench.set(proj_mode=proj_mode)
+    cached_kfac = method in ("kfac", "ekfac") and proj_mode != "full"
+    hook_family = task.get("hook_family") or (
+        "linear_io" if cached_kfac else "invasive_linear_io"
+    )
+    # Explicit names, so both families hook exactly the same layers.
+    hook_types = dict.fromkeys(layers, hook_family)
+    bench.set(hook_family=hook_family)
     # capture_style="auto" lets the library's capture-time cost model choose
     # the representation per layer, the same rule scoring uses: materialize the
     # factors once S >= k_a*k_g/(k_a+k_g) on their (projected) widths.  Pinning
@@ -187,17 +210,27 @@ def run(task: dict, out_root: Path) -> None:
     )
     bench.set(capture_style=capture_style)
     hook_config = HookManagerConfig(
-        invasive_linear_io=layers, projection_kwargs=proj, capture_style=capture_style
+        hook_types=hook_types, projection_kwargs=proj, capture_style=capture_style
     )
 
     cache_dir = out_root / "store" / tag
     shutil.rmtree(cache_dir, ignore_errors=True)
 
+    fit_dir = None
+    if task.get("shared_fit") and method in ("kfac", "ekfac"):
+        fit_dir = out_root / "fits" / (base + rep)
+        if hook_family == "linear_io":
+            shutil.rmtree(fit_dir, ignore_errors=True)
+        elif not fit_dir.is_dir():
+            msg = f"shared fit {fit_dir} missing: run the linear_io cell first"
+            raise FileNotFoundError(msg)
+        bench.set(shared_fit=str(fit_dir.relative_to(out_root)))
+
     if method == "graddot":
         attributor = TracInAttributor(args, task=task_obj)
         score = _warm_then_time(
             bench,
-            lambda tr, te: attributor.attribute(tr, te, hook_config=hook_config),
+            lambda tr, te, _: attributor.attribute(tr, te, hook_config=hook_config),
             train_ds,
             test_ds,
             n_warm,
@@ -217,15 +250,19 @@ def run(task: dict, out_root: Path) -> None:
         attributor = cls(args, task=task_obj)
         score = _warm_then_time(
             bench,
-            lambda tr, te: attributor.attribute(
-                tr, te, hook_config=hook_config, damping=DAMPING
+            lambda tr, te, measured: attributor.attribute(
+                tr,
+                te,
+                hook_config=hook_config,
+                damping=DAMPING,
+                fisher_dir=str(fit_dir) if measured and fit_dir else None,
             ),
             train_ds,
             test_ds,
             n_warm,
             n_meas,
         )
-    elif method in ("kfac", "ekfac"):
+    elif cached_kfac:
         # Native-best (store-based) rank-64 K-FAC/EK-FAC: capture the token-summed
         # projected outer product once (one model pass), fit the Fisher from the
         # store (K-FAC: covariances *at capture* via KroneckerCovarianceCallback;
@@ -240,7 +277,7 @@ def run(task: dict, out_root: Path) -> None:
         # GradDot's warm-up absorbs.  The measured method gap was then mostly an
         # artifact of the harness, the same way pinning the factorized capture once
         # made the gap an artifact of the capture style (see `style` above).
-        from dattri_llm.attribution.utils import collect_gradients, task_loss_fn
+        from dattri_llm.attribution.utils import collect_gradients
         from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
         from dattri_llm.gradient.storage_manager import GradientStorageManager
         from dattri_llm.gradient.streaming import GradientStreamer
@@ -268,7 +305,7 @@ def run(task: dict, out_root: Path) -> None:
             }
         }
         mat_config = HookManagerConfig(
-            linear_io=layers, projection_kwargs=mat_proj, capture_style=cap_style
+            hook_types=hook_types, projection_kwargs=mat_proj, capture_style=cap_style
         )
         # Record the style actually used: `capture_style` was set to "auto"
         # above, before this branch, so rows from this path all claimed "auto"
@@ -281,7 +318,7 @@ def run(task: dict, out_root: Path) -> None:
         # (untimed) so `record_disk` still measures only the measured run.
         kfac_stores: list[Path] = []
 
-        def _kfac_cached(tr_ds, te_ds):
+        def _kfac_cached(tr_ds, te_ds, measured):
             """Capture -> fit -> score-from-cache for one training slice.
 
             Everything stateful is rebuilt per call so the warm-up cannot leak
@@ -295,34 +332,45 @@ def run(task: dict, out_root: Path) -> None:
             train_dir, test_dir = str(run_store / "train"), str(run_store / "test")
             attributor = cls(args, task=task_obj)
             cov = KroneckerCovarianceCallback()
-            task_obj._load_checkpoints(0)
-            tr = GradientStreamer(
-                task_obj.get_model(),
-                tr_ds,
-                args,
-                batch_size=batch,
-                loss_fn=task_loss_fn(task_obj.original_loss_func),
-                config=mat_config,
-            )
-            tr.hook_manager.add_callback(cov)  # projected (A, G) at capture
-            collect_gradients(tr, GradientStorageManager(train_dir))
-            te = GradientStreamer(
-                task_obj.get_model(),
-                te_ds,
-                args,
-                batch_size=batch,
-                loss_fn=task_loss_fn(task_obj.original_target_func),
-                config=mat_config,
-            )
-            collect_gradients(te, GradientStorageManager(test_dir))
-            fisher_dir = (
-                attributor.save_fisher(cov.result())
-                if method == "kfac"
-                else attributor.fit(train_dir, covariances=cov.result())
-            )
-            return attributor.attribute_from_cache(
-                train_dir, test_dir, damping=DAMPING, fisher_dir=fisher_dir
-            )
+            probe = attributor.load_checkpoint(0)
+            splits: dict[str, float] = {}
+            with _split(splits, "capture_train"):
+                tr = GradientStreamer(
+                    probe,
+                    tr_ds,
+                    args,
+                    batch_size=batch,
+                    loss_fn=attributor.train_loss_fn(),
+                    config=mat_config,
+                )
+                tr.hook_manager.add_callback(cov)  # projected (A, G) at capture
+                collect_gradients(tr, GradientStorageManager(train_dir))
+            with _split(splits, "capture_test"):
+                te = GradientStreamer(
+                    probe,
+                    te_ds,
+                    args,
+                    batch_size=batch,
+                    loss_fn=attributor.test_loss_fn(),
+                    config=mat_config,
+                )
+                collect_gradients(te, GradientStorageManager(test_dir))
+            shared = str(fit_dir) if measured and fit_dir else None
+            with _split(splits, "fit"):
+                if shared and hook_family != "linear_io":
+                    fisher_dir = shared
+                elif method == "kfac":
+                    fisher_dir = attributor.save_fisher(cov.result(), shared)
+                else:
+                    fisher_dir = attributor.fit(
+                        train_dir, shared, covariances=cov.result()
+                    )
+            with _split(splits, "score"):
+                result = attributor.attribute_from_cache(
+                    train_dir, test_dir, damping=DAMPING, fisher_dir=fisher_dir
+                )
+            bench.set(attribute_splits=splits)  # the measured call writes last
+            return result
 
         score = _warm_then_time(bench, _kfac_cached, train_ds, test_ds, n_warm, n_meas)
         for spent in kfac_stores[:-1]:  # untimed: keep only the measured store
@@ -332,10 +380,18 @@ def run(task: dict, out_root: Path) -> None:
         raise ValueError(msg)
 
     bench.record_disk("store", cache_dir)
-    _, matrix = score.agnostic_matrix()
+    train_ids, matrix = score.agnostic_matrix()
     matrix = matrix.cpu().float()
-    torch.save({"score": matrix}, run_dir / "score.pt")
-    bench.set(score_shape=list(matrix.shape))
+    # Hashes let a comparison align rows and columns across runs.
+    score_file = run_dir / "score.pt"
+    torch.save(
+        {"score": matrix, "train_ids": train_ids, "test_ids": list(score.test_ids)},
+        score_file,
+    )
+    bench.set(
+        score_shape=list(matrix.shape),
+        score_file=str(score_file.relative_to(out_root)),
+    )
     bench.finish(status="ok")
     print(f"[done] {tag}: score {tuple(matrix.shape)}", flush=True)
 
@@ -352,10 +408,22 @@ def _warm_then_time(bench, call, train_ds, test_ds, n_warm, n_meas):
     from torch.utils.data import Subset
 
     if n_warm:
-        call(Subset(train_ds, range(n_warm)), test_ds)
+        call(Subset(train_ds, range(n_warm)), test_ds, False)
     measured = Subset(train_ds, range(n_warm, n_warm + n_meas))
     with bench.phase("attribute", n_meas):
-        return call(measured, test_ds)
+        return call(measured, test_ds, True)
+
+
+@contextlib.contextmanager
+def _split(splits: dict, name: str):
+    """GPU-synced wall time of one step inside a phase (peak stats untouched)."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.monotonic()
+    yield
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    splits[name] = round(time.monotonic() - t0, 3)
 
 
 def main() -> None:

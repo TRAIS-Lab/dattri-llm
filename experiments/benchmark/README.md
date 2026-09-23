@@ -1,13 +1,14 @@
 # Efficiency benchmark
 
-The two efficiency experiments in the paper, and nothing else:
+The efficiency experiments in the paper, and nothing else:
 
 | launcher | paper | what it measures |
 |---|---|---|
 | `benchmark.py` | Tables 1 and 6 | four libraries on Pythia-0.5B, one A40, both projection regimes, 1 and 16 queries |
 | `scaling.py` | scaling figure | three libraries up the Qwen ladder (0.5B to 110B) on H200s |
+| `capture.py` | Appendix B.3 | our methods with ordinary versus invasive capture, on the Table 8 workload |
 
-Both share `utils/`: one adapter per library, the tokenized-block dataset, the
+All share `utils/`: one adapter per library, the tokenized-block dataset, the
 model registry, the result logger, the pinned baseline versions, and the
 sequential cell runner. A *cell* is one (task, library) run; every cell appends
 one self-describing JSON line (task, per-phase wall-clock and peak memory,
@@ -16,6 +17,7 @@ device fingerprint, baseline versions) to `results.jsonl`.
 ```
 benchmark.py            Tables 1/6: cells, --run, --table
 scaling.py              scaling figure: cells, --run, --figure, Modal entrypoints
+capture.py              ordinary vs invasive capture: cells, --run, --table
 utils/runner.py         expand cells -> plan files -> run them one at a time
 utils/adapters/         run_ours.py, run_ours_fsdp.py, run_bergson.py, run_logix.py, run_kronfluence.py
 utils/data.py           WikiText-103 token blocks; identical inputs and order for every library
@@ -24,6 +26,7 @@ utils/log.py            BenchRun: phase timing, peak memory, disk, device detail
 utils/versions.py       pinned baseline versions, asserted at adapter start
 utils/tables.py         results/query{1,16}.jsonl -> the two tables
 utils/figure.py         results/scaling-*.jsonl  -> results/scaling.{pdf,png}
+utils/capture_report.py results/capture-*/       -> time, memory and score agreement per pair
 results/                the measured rows behind the paper, and the rendered figure
 ```
 
@@ -58,6 +61,27 @@ four chunks). Bergson's K-FAC and EK-FAC keep full-dimension factors and
 exhaust one card from 7B, so those cells run sharded. LogIX has no sharded
 path, so its curves end at 32B. Repeated cells reduce to the median-time run.
 
+**Capture paths.** `invasive_linear_io` replaces each hooked `nn.Linear`
+forward so its backward skips the weight-gradient matmul; it produces no
+`weight.grad`, so it serves attribution only, never training. The adapter's
+`hook_family` task key assigns one family to every hooked layer by name. Unset,
+GradDot and full-dimension K-FAC/EK-FAC use `invasive_linear_io` and the
+rank-64 K-FAC/EK-FAC store uses `linear_io` (the Table 8 paths); every row
+records `hook_family`.
+
+`capture.py` runs each method and projection regime with both families on the
+Table 8 workload (1024 measured sequences after 8 warm-up ones, batch 8, fp32
+with TF32 matmuls, one A40): five repetitions per pair, alternating which
+family runs first, 60 cells per query count. The model runs in eval mode with
+trainable parameters and no optimizer, and the streamer clears parameter
+gradients each step in both families. Scores are compared offline after
+aligning rows and columns by sample hash: maximum absolute and relative
+Frobenius error, per-query Spearman and top-10 overlap. A pair agrees when its
+relative error is within the precision tolerance or ten times the run-to-run
+floor of the ordinary path, whichever is larger. `capture-shared-fit` is the
+secondary K-FAC/EK-FAC check: the invasive run scores against the fit of the
+`linear_io` run, so any remaining difference comes from capture alone.
+
 ## Running
 
 Run from the copy of this directory under `experiments_exe/` (see
@@ -65,7 +89,8 @@ Run from the copy of this directory under `experiments_exe/` (see
 the launcher and stay out of the tree.
 
 `--experiment` accepts `query1` and `query16` (`benchmark.py`: the one- and
-sixteen-query tables) and, for
+sixteen-query tables), `capture-query16`, `capture-query1` and
+`capture-shared-fit` (`capture.py`) and, for
 `scaling.py`, `scaling-<method>` and `scaling-<method>-fsdp4` with `<method>`
 one of `graddot`, `kfac`, `ekfac`: eight experiments, each a list of cells
 (`--dry-run` prints them).
@@ -78,6 +103,16 @@ python benchmark.py --experiment query16 --run
 python benchmark.py --experiment query16 --run --libs dattri_llm   # our cells only
 python benchmark.py --table                      # reads results/query{1,16}.jsonl
 
+# ordinary vs invasive capture (one A40)
+python capture.py --experiment capture-query16 --run
+python capture.py --experiment capture-query1 --run
+python capture.py --experiment capture-shared-fit --run    # only if scores differ
+python capture.py --table                        # results/capture-*/ or out/capture-*/
+# ... or on Modal: one L40S per (experiment, method), since Modal has no A40
+modal run capture.py::bench --experiment capture-query1 --smoke   # first repetition only
+modal run --detach capture.py::bench --all       # results/capture-*/ and report.txt
+modal run capture.py::fetch --all                # fetch after a detached run
+
 # scaling figure, locally with the right GPUs ...
 python scaling.py --experiment scaling-graddot --run          # one H200
 python scaling.py --experiment scaling-graddot-fsdp4 --run    # four H200s
@@ -89,8 +124,9 @@ python scaling.py --figure                       # results/scaling-*.jsonl -> re
 
 Runs write to `out/<experiment>/results.jsonl` (appending, never
 overwriting). To make a run the source of a table or the figure, copy it to
-`results/<experiment>.jsonl`; `results/scaling.pdf` is the paper's
-`figures/scaling_crosslib.pdf`.
+`results/<experiment>.jsonl` (for `capture.py`, copy `results.jsonl` and
+`runs/`, which holds the score matrices, to `results/<experiment>/`);
+`results/scaling.pdf` is the paper's `figures/scaling_crosslib.pdf`.
 
 Environment: `PYTHONPATH` must reach the repository root (`dattri_llm` runs
 from the working tree), `BENCH_CACHE` points at the tokenized-block cache and

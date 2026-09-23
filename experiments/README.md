@@ -2,7 +2,7 @@
 
 | directory | paper |
 |---|---|
-| `benchmark/` | efficiency: the cross-library tables (one and sixteen queries) and the scaling figure |
+| `benchmark/` | efficiency: the cross-library tables (one and sixteen queries), the scaling figure, and ordinary versus invasive capture |
 | `fidelity/` | fidelity of optimizer-aware attribution against leave-one-out retraining |
 
 Each is self-contained, with one launcher and a README. This tree holds the
