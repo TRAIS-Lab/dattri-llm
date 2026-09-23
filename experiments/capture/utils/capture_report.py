@@ -16,7 +16,12 @@ from pathlib import Path
 
 import torch
 
-from tables import SETUP, attribution_time
+SETUP = {"build_model", "load_data"}
+
+
+def attribution_time(rec: dict) -> float | None:
+    secs = [p.get("wall_s") or 0.0 for p in rec.get("phases", []) if p["phase"] not in SETUP]
+    return sum(secs) if secs else None
 
 FAMILIES = ("linear_io", "invasive_linear_io")
 METHODS = (("graddot", "GradDot"), ("kfac", "K-FAC"), ("ekfac", "EK-FAC"))

@@ -1,84 +1,96 @@
-# Fidelity of optimizer-aware attribution
+# Fidelity against cost
 
-The experiment behind the fidelity section and its appendix: how well DVEmb and
-AdamW-influence (the `dattri_llm` implementations on captured gradients)
-track trajectory-specific leave-one-out retraining, against MAGIC and SOURCE
-(Bergson's implementations on the same trajectory), in the two settings of
-Deng et al. (arXiv:2605.18814).
-
-```
-fidelity.py             the runs behind the paper: --experiment, --run, --collect, --table
-utils/protocol.py       one AdamW trajectory under hooks, query capture, TSLOO reruns, scoring
-utils/settings.py       the two settings: mlp (MNIST + MLP), gpt2 (WikiText-2 + GPT-2)
-utils/ours.py           DVEmb and AdamW-influence on one (setting, lr, seed), with the ground truth
-utils/magic.py          MAGIC through Bergson's functional trainer on the same trajectory
-utils/source.py         SOURCE through Bergson's approximate-unrolling pipeline (GPT-2)
-utils/source_mlp.py     SOURCE with exact Gauss-Newton curvature (the MLP, which Bergson cannot take)
-utils/curvature.py      the curvature-term ablation on the MLP
-utils/timing.py         a plain training run, the unit of the timing comparison
-utils/tables.py         run directories -> results/fidelity.jsonl -> the tables
-results/fidelity.jsonl  the collected rows behind the paper (run directories are not tracked)
-```
+The fidelity experiment: how faithfully each attribution method predicts the
+effect of removing a training example, and what it costs, on GPT-2 (124M),
+Qwen2.5 at 0.5B, 1.5B and 3B, and OLMo-2-1B and OLMo-3-7B. GPT-2 and Qwen2.5
+are trained by the protocol's own training loop; the OLMo models by
+OLMo-core's trainer, with dattri-llm's capture wrapped around it.
 
 ## Protocol
 
-One deterministic trajectory per (setting, learning rate, seed): seeded
-initialization and batch order, no dropout, no gradient clipping, so a
-leave-one-out rerun is an exact counterfactual. The reference run is wrapped
-in a `HookManager` with an offload callback and the optimizer-state callback,
-caching the per-sample gradients and the AdamW moments around every update;
-the validation points' gradients are captured at the final model; both
-methods score from those caches. The ground truth (TSLOO) reruns the
-trajectory once per selected training example with that example removed
-from the batch of its last occurrence (`--tsloo-at last`; the MLP has one
-epoch, so the conventions coincide) and records the change of every
-validation loss. Fidelity is the Spearman correlation across the selected
-examples, averaged over validation points, then over seeds.
+**Trajectory.** The pretrained model is trained for one epoch on 512 random
+blocks of 128 WikiText-2 tokens: 16 steps at batch 32, AdamW with betas
+(0.9, 0.999), eps 1e-8, no weight decay, peak learning rate 1e-5 with linear
+warmup over the first 10% of the steps and linear decay. Every parameter is
+trained. The blocks are drawn with the model's own tokenizer, so the text of
+a block differs between model families.
 
-| | `mlp` | `gpt2` |
-|---|---|---|
-| model | 784-16-16-10 MLP, ReLU | GPT-2 124M, dropout off |
-| data | 6,000 random MNIST images, 1 epoch, batch 64 | 512 random 128-token WikiText-2 blocks, 3 epochs, batch 32 |
-| optimizer | AdamW, betas (0.9, 0.95), constant lr | AdamW, betas (0.9, 0.999), linear schedule, 10% warmup |
-| attributed | every parameter | 10 random masks of 512 coordinates per layer (`--n-masks 0`: every coordinate, via snapshots and replay) |
-| ground truth | 200 training images x 500 test images | 50 training blocks x 256 validation blocks; the first 64 are the queries every method is scored on |
-| seeds | 0, 1, 2 | 0, 1, 2 |
+**Ground truth.** Trajectory-specific leave-one-out retraining (TSLOO): each
+of 50 random training blocks is removed from its batch, the run is repeated,
+and the change in loss on the validation blocks is recorded. Fidelity is the
+Spearman correlation between a method's scores and those changes over the 50
+blocks, computed per validation block and averaged over the 64 blocks every
+method scores.
 
-MAGIC replays the trajectory with Bergson's functional trainer (torchopt
-AdamW, `eps_root=1e-16`, GPT-2's tied embedding kept tied) and backpropagates
-each query loss through the whole run. SOURCE runs Bergson's pipeline on
-checkpoints saved every 8 steps from the same loop (3 segments, EK-FAC
-factors, all queries in one pass); `SOURCE_WORK_DIR` puts its intermediates
-on local disk. Both are scored against the ground truth of the matching
-`ours.py` run (`--truth-dir`).
+**Numerics.** Training and the reruns are fp32 with TF32 off, eager
+attention, deterministic kernels, no dropout and no gradient clipping. For
+GPT-2 and Qwen2.5 the pretrained weights are loaded once and the same model
+is reset from a CPU copy for each of the 51 runs. The seed is 0.
+
+**OLMo under OLMo-core.** The OLMo models are trained by OLMo-core's
+`Trainer` (its transformer train module, numpy data loader and checkpoints)
+under the same protocol: the released weights are converted once into an
+OLMo-core checkpoint, the learning-rate schedule is passed as a scheduler
+config, and a block is removed through the data loader's label mask. Each
+run is its own process group, as the trainer holds one train module per
+process. OLMo-3-7B trains on one GPU; OLMo-2-1B with FSDP over four GPUs,
+where the loss of a process is the mean over its unmasked tokens and two
+identical runs differ by about 1e-6 in validation loss (the leave-one-out
+effect is about 3e-4). dattri-llm's methods capture around `trainer.fit()`
+(AdamW-influence, with the optimizer's moments) or on the trained model
+(EK-FAC); Bergson's take the trained model through its Hugging Face export.
+GPT-2's position embedding is trained but not hooked (its gradient is shared
+by the batch); under FSDP the AdamW-influence capture hooks the linear layers
+of the transformer blocks.
+
+**Methods.** dattri-llm: AdamW-influence with ten disjoint random masks of
+512, 2048 or 8192 coordinates per layer (scored independently, averaged) and over
+every coordinate (the trajectory is snapshotted and replayed); EK-FAC with a
+rank-64 factor projection and at full dimension. Bergson 0.26.1: MAGIC,
+SOURCE (four segments of four steps, two checkpoints each), TrackStar
+(per-module projection of 64) and EK-FAC. Both EK-FACs damp with 0.1 of each
+layer's mean eigenvalue. Each method has a run of its own.
+
+**Batch sizes.** Every method captures the training gradients in batches of
+8 blocks (for Bergson a token batch of 1024, i.e. 8 blocks of 128 tokens).
+The test batch is, for each library, the largest power of two that fits the
+budget, as in the throughput benchmark: the full-dimension methods score the
+64 queries in chunks of that size (`EKFAC_CHUNK` and `BERGSON_CHUNK` in
+`fidelity.py`), each chunk of dattri-llm's EK-FAC computed and preconditioned
+once; from 3B on its factors are kept in host memory
+(`--factor-cache-residency memory`).
+
+**Budget and measurement.** One GPU, 16 CPU cores, 256 GB of host memory and
+1 TB of local disk per run: a B200 for GPT-2, Qwen2.5-1.5B and OLMo-3-7B, an
+H200 for Qwen2.5-0.5B and 3B. The OLMo-2-1B runs use four A40s. The reported
+time is the attribution time of all 64 queries: training the trajectory and
+loading the model and data are excluded. Memory is the peak GPU allocation
+over the run. A run that does not complete within the budget is recorded as
+infeasible: MAGIC and full-coordinate AdamW-influence at Qwen2.5-1.5B and
+3B, and SOURCE at 3B. On OLMo-3-7B the methods that are infeasible at
+Qwen2.5-1.5B or 3B (MAGIC, SOURCE, full-coordinate AdamW-influence, Bergson's
+EK-FAC) are not run; SOURCE and MAGIC also train the trajectory themselves
+and so cannot run under OLMo-core's trainer.
 
 ## Running
 
-Run from the copy of this directory under `experiments_exe/` (see
-`experiments/README.md`): results, caches and figures are written next to
-the launcher and stay out of the tree.
+Results are written to `results/` next to the launcher.
 
 ```bash
-export PYTHONPATH=/path/to/dattri-llm        # the library runs from the working tree
-python fidelity.py --experiment mlp --dry-run  # list the runs
-python fidelity.py --experiment mlp --run      # 27 runs, one GPU
-python fidelity.py --experiment gpt2 --run
-python fidelity.py --experiment gpt2-full --run       # every coordinate (disk-heavy: ~125 GB of snapshots per run;
-                                                      # FIDELITY_SNAPSHOT_DIR points them at a local disk)
-python fidelity.py --experiment gpt2-protocols --run  # other ground-truth conventions
-python fidelity.py --experiment gpt2-mask --run       # k = 1024
-python fidelity.py --experiment mlp-ablations --run   # curvature term, coverage
-python fidelity.py --experiment timing --run          # one exclusive A40 in the paper
-python fidelity.py --collect --table
+export PYTHONPATH=/path/to/dattri-llm            # the repository root, so that dattri_llm is importable
+python fidelity.py --experiment truth --dry-run   # list the runs
+python fidelity.py --experiment truth --run       # the ground truth of GPT-2 and Qwen2.5
+python fidelity.py --experiment attr --run        # every method against it
+python fidelity.py --experiment olmo-truth --run  # the ground truth of the OLMo models (OLMo-core)
+python fidelity.py --experiment olmo-attr --run   # the methods on the OLMo models
+python fidelity.py --collect                      # the run directories -> results/fidelity.jsonl
 ```
 
-Runs write to `results/<setting>/lr<lr>_seed<seed>[_variant]/` (`result.json`,
-`rows.pt`, `matrices.pt`, and the gradient caches) and are skipped when their
-`result.json` exists. `--collect` reads every run directory into
-`results/fidelity.jsonl`, the tracked rows behind the tables; `--table`
-prints Table 2, Table 9 and the appendix numbers from them.
-The timing experiment is meant for one exclusive GPU with nothing else
-running; the paper's numbers are from one A40 on a cluster node, with
-`SOURCE_WORK_DIR` and `FIDELITY_SNAPSHOT_DIR` on node-local disk.
-MNIST, WikiText-2 and GPT-2 come from the Hugging Face hub; Bergson
-(`bergson`, `torchopt`) is needed for MAGIC and SOURCE.
+Runs write to `results/<setting>/lr1e-05_seed0[_<run>]/` (`result.json`,
+`matrices.pt`, `log.txt`) and are skipped when their `result.json` exists;
+the OLMo training runs write to `$OLMOCORE_WORK_DIR/<scale>/` (default
+`results/work/<scale>/`) and are skipped when their output exists. The
+Bergson runs need `bergson==0.26.1`; the drivers refuse any other Bergson
+version. The OLMo runs need `ai2-olmo-core` (2.6.0) and, for OLMo-2-1B,
+`torchrun` with four GPUs; the launcher starts them with the right number of
+processes.

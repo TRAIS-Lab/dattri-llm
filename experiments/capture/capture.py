@@ -1,4 +1,4 @@
-"""Ordinary versus invasive capture (Appendix B.3, beside Table 8).
+"""Ordinary versus invasive capture.
 
 ``invasive_linear_io`` replaces each hooked ``nn.Linear`` forward so its
 backward skips the weight-gradient matmul; ``linear_io`` leaves the forward
@@ -6,13 +6,13 @@ alone and hooks the same layers.  Each pair runs one of our methods through the
 same pipeline with only the hook family changed, measuring how much of the
 attribution time the skipped matmul accounts for and whether scores move.
 
-Table 8 workload: Pythia-0.5B, one A40, fp32, WikiText-103, 1024 training
+Workload: Pythia-0.5B, one A40, fp32, WikiText-103, 1024 training
 sequences of 512 tokens, batch 8, every method in both projection regimes.
 Each cell warms up on 8 further sequences untimed; five repetitions per pair,
 alternating which family runs first.
 
-    capture-query16     sixteen queries (Table 9's workload), 60 cells
-    capture-query1      one query (Table 8's workload), 60 cells
+    capture-query16     sixteen queries, 60 cells
+    capture-query1      one query, 60 cells
     capture-shared-fit  K-FAC/EK-FAC at sixteen queries, one repetition: the
                         invasive run scores against the linear_io run's fit,
                         isolating capture from curvature fitting
@@ -40,10 +40,15 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 if not (HERE / "utils").is_dir():
     # Modal imports the entrypoint from a copy in /root.
-    HERE = Path("/root/dattri-llm/experiments/benchmark")
+    HERE = Path("/root/dattri-llm/experiments/capture")
+# This benchmark shares the cell runner, the data, the model registry and the
+# result logger of ``experiments/benchmark``; its adapter and report are its own.
+sys.path.insert(0, str(HERE.parent / "benchmark" / "utils"))
 sys.path.insert(0, str(HERE / "utils"))
 
 import runner  # noqa: E402
+
+runner.ADAPTERS = HERE / "utils" / "adapters"
 
 METHODS = ("graddot", "kfac", "ekfac")
 FAMILIES = ("linear_io", "invasive_linear_io")
@@ -95,7 +100,7 @@ except ImportError:  # the launcher also works without Modal
 
 if modal is not None:
     REMOTE_ROOT = "/root/dattri-llm"
-    RUN_DIR = f"{REMOTE_ROOT}/experiments/benchmark"
+    RUN_DIR = f"{REMOTE_ROOT}/experiments/capture"
     ROOT = HERE.parent.parent if modal.is_local() else Path(REMOTE_ROOT)
     HOUR = 60 * 60
     GPU = "L40S"

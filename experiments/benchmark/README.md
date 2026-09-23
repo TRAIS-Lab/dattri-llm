@@ -1,76 +1,109 @@
 # Efficiency benchmark
 
-The efficiency experiments in the paper, and nothing else:
+Time and memory of four attribution libraries (dattri-llm, Bergson,
+Kronfluence, LogIX). Every launcher produces a `results.jsonl` file of
+measured rows.
 
-| launcher | paper | what it measures |
-|---|---|---|
-| `benchmark.py` | Tables 1 and 6 | four libraries on Pythia-0.5B, one A40, both projection regimes, 1 and 16 queries |
-| `scaling.py` | scaling figure | three libraries up the Qwen ladder (0.5B to 110B) on H200s |
-| `capture.py` | Appendix B.3 | our methods with ordinary versus invasive capture, on the Table 8 workload |
-
-All share `utils/`: one adapter per library, the tokenized-block dataset, the
-model registry, the result logger, the pinned baseline versions, and the
-sequential cell runner. A *cell* is one (task, library) run; every cell appends
-one self-describing JSON line (task, per-phase wall-clock and peak memory,
-device fingerprint, baseline versions) to `results.jsonl`.
-
-```
-benchmark.py            Tables 1/6: cells, --run, --table
-scaling.py              scaling figure: cells, --run, --figure, Modal entrypoints
-capture.py              ordinary vs invasive capture: cells, --run, --table
-utils/runner.py         expand cells -> plan files -> run them one at a time
-utils/adapters/         run_ours.py, run_ours_fsdp.py, run_bergson.py, run_logix.py, run_kronfluence.py
-utils/data.py           WikiText-103 token blocks; identical inputs and order for every library
-utils/models.py         family/scale -> HF id, parameter count
-utils/log.py            BenchRun: phase timing, peak memory, disk, device details
-utils/versions.py       pinned baseline versions, asserted at adapter start
-utils/tables.py         results/query{1,16}.jsonl -> the two tables
-utils/figure.py         results/scaling-*.jsonl  -> results/scaling.{pdf,png}
-utils/capture_report.py results/capture-*/       -> time, memory and score agreement per pair
-results/                the measured rows behind the paper, and the rendered figure
-```
+| launcher | what it measures |
+|---|---|
+| `benchmark.py` | four libraries on Pythia-0.5B, one A40, both projection regimes, 1 and 16 queries |
+| `scaling.py` | four libraries up the Qwen ladder (0.5B to 110B) on H200s, batch 1 |
+| `throughput.py` | four libraries on four H200s, each cell at its largest batch, up the Qwen ladder |
+| `routing.py` | GradDot at full dimension against the sequence length: dattri-llm's cost model and each pinned route, with Bergson and Kronfluence, on Pythia-0.5B and one A40 |
 
 ## Protocol
 
+A scale label is a nominal size that selects a released model of the family
+(`utils/models.py`): `0.5b` is Pythia-410M in the Pythia family and
+Qwen2.5-0.5B in the Qwen family, `1b` is Qwen2.5-1.5B, and `110b` is
+Qwen1.5-110B. Every row records the model id and its parameter count
+(`params_b`).
+
 Every library scores the same token blocks in the same order
-(`utils/data.py`, seeded). Attribution time is every recorded phase except
-`build_model` and `load_data`; peak memory is the maximum over those phases.
-Phase names differ per library (ours `attribute`; Bergson `fit` + `score`;
-LogIX `extract` + `score`; Kronfluence `fit_factors` + `pairwise_scores`), so
-setup is excluded rather than attribution named. Bergson runs through its
-Python entry points in-process; its sharded runs spawn worker processes, so
-their peak memory is read from NVML rather than torch's allocator. A cell that
-dies is recorded with `status: oom` or `error`, so a library that stops
-climbing a ladder leaves a row.
+(`utils/data.py`, seeded). Each adapter records `build_model`, `load_data` and
+its attribution phases separately. *Attribution time* is the sum of every
+recorded phase except `build_model` and `load_data`; peak memory is the maximum
+over the same phases. The attribution phases are `attribute` for dattri-llm,
+`fit` + `score` for Bergson, `extract` + `score` for LogIX, and `fit_factors` +
+`pairwise_scores` for Kronfluence. All adapters enable TF32 matmuls. Host
+memory is read from the kernel's peak-RSS counter when a phase ends. Bergson
+runs through its Python entry points in-process; its sharded runs spawn worker
+processes, and their peak memory is read from NVML. A cell that fails is
+recorded with `status: oom`, `timeout` or `error`.
 
-**Tables 1 and 6.** Pythia-0.5B, fp32, WikiText-103, 1024 training
-sequences of 512 tokens, batch 8, one A40. Table 1 scores one query, Table 6
-sixteen. Rank-64 uses each library's own projection (LoGra for ours and
-LogIX, Bergson's projected index); full dimension uses none. Cells a library
-cannot express are `n/a`: Kronfluence has no projected mode, and Bergson's
-EK-FAC refuses projection. Every cell runs at batch 8; at sixteen queries
-the resident query representation is 1.1 GB per query, which is where our
-full-dimension peaks at 16 queries come from.
+**`benchmark.py`.** Pythia-0.5B (`EleutherAI/pythia-410m`), fp32, WikiText-103, 1024 training
+sequences of 512 tokens, batch 8, one A40. `query1` scores one query, `query16`
+sixteen. Rank-64 uses each library's own projection (LoGra for dattri-llm and
+LogIX, Bergson's projected index); full dimension uses none. Kronfluence runs
+at full dimension only and Bergson's EK-FAC accepts no projection, so those
+rank-64 cells are not listed (`NOT_EXPRESSIBLE` in `benchmark.py`).
 
-**Scaling figure.** Qwen2.5 0.5B to 72B and Qwen1.5-110B, bf16, batch 1,
-512-token sequences, rank 64, one query. Each library warms up on 8 samples
-untimed and is timed on the next 64. Models up to 32B run on one H200; 72B
-and 110B run sharded over four (ours with FSDP; Bergson with its own `--fsdp`,
-scoring four queries there because its query build only shards with at least
-four chunks). Bergson's K-FAC and EK-FAC keep full-dimension factors and
-exhaust one card from 7B, so those cells run sharded. LogIX has no sharded
-path, so its curves end at 32B. Repeated cells reduce to the median-time run.
+**`routing.py`.** The setting of `benchmark.py` with the sequence length T swept
+from 32 to 2048 tokens (and, at one sequence per step, to 16384): GradDot at
+full dimension, one query.
+`--experiment routing-steps-b8` uses batch 8 at every T and times 128 steps
+after 8 warm-up steps, so time is reported per step;
+`routing-steps-b{1,2,4,16}` use the other batch sizes. dattri-llm runs three
+times per T: with its cost model choosing per layer (`route: auto`) and with each
+route pinned for every layer (`factorized`, `materialized`; the capture
+representation follows the pinned route). Bergson materializes the training
+side; Kronfluence holds a dense query and chooses by a contraction-order
+search between materializing the training side and applying the query to the
+factors. `--experiment routing` is the fixed-token protocol: 524,288 training
+tokens at every T, batch 8 up to T = 512 and 4096 tokens per batch beyond it
+(its T = 512 cells are the GradDot full-dimension cells of `benchmark.py`).
+`routing-batch1` runs that protocol at one sequence per step on an eighth of
+the tokens.
+
+**`scaling.py`.** Qwen2.5 0.5B to 72B and Qwen1.5-110B, bf16, batch 1,
+512-token sequences, one query per device, rank-64 projection wherever the library
+supports it (Kronfluence runs at full dimension). Each library runs 8 warm-up
+samples untimed and is timed on the next 64. `scaling-<method>` runs 0.5B to
+32B on one H200; a Kronfluence cell is cut off after 1800 s and recorded as
+`timeout`. `scaling-<method>-fsdp4` runs on four H200s: dattri-llm with FSDP
+at 72B and 110B, and Bergson with its own `--fsdp`. Bergson's K-FAC and EK-FAC
+keep full-dimension factors, and their 7B to 32B cells run sharded.
+Kronfluence runs under FSDP from the first scale that does not fit one H200:
+32B for GradDot, 7B to 32B for K-FAC and EK-FAC. Bergson's
+query build shards a query set across its ranks, from four queries on, so its
+72B and 110B GradDot cells are given four queries: one per device, as for
+dattri-llm, which captures its one query on every rank. LogIX runs one replica per GPU
+and is listed up to 32B.
+
+**`throughput.py`.** Qwen ladder, bf16, 512-token sequences, four H200s.
+Every library runs every method (GradDot, K-FAC, EK-FAC) with rank-64
+projection wherever the library supports it and full dimension elsewhere
+(`PROJECTION` in `throughput.py`). Each library uses its own multi-GPU mode:
+dattri-llm FSDP with frozen capture and live sharded scoring; Bergson
+`--fsdp`; Kronfluence FSDP; LogIX data-parallel replicas. Each (library,
+method, scale) cell runs at the largest power-of-two per-GPU batch at which
+the library completes the workload on the four cards within the time limit
+(`BATCHES`; 0 means out of memory at batch 1 and is recorded as `oom` without
+running). The workload is fixed: every cell attributes the same 512 training
+samples (`WORKLOAD`) in as many steps of its own batch as that takes, after 2
+warm-up steps. The time is the whole attribution call, Kronecker-factor fit
+included, and excludes model loading, data preparation and process start-up
+for every library. Every library of a scale scores the same number of queries
+(`n_test`): one through 32B, four at 72B and 110B. All libraries of a scale
+run on one host, one after another.
+
+Bergson spawns worker processes in every pipeline step, and each worker loads
+the model; the model loads and the start-up before them (interpreter, imports,
+CUDA context, NCCL rendezvous) are timed inside each worker and subtracted. A
+Bergson row holds `time_raw_s` (the summed phases),
+`time_no_worker_load_s` (model loads subtracted) and `time_s` (model loads and
+start-up subtracted); `time_s` is the reported time.
 
 **Capture paths.** `invasive_linear_io` replaces each hooked `nn.Linear`
 forward so its backward skips the weight-gradient matmul; it produces no
 `weight.grad`, so it serves attribution only, never training. The adapter's
 `hook_family` task key assigns one family to every hooked layer by name. Unset,
 GradDot and full-dimension K-FAC/EK-FAC use `invasive_linear_io` and the
-rank-64 K-FAC/EK-FAC store uses `linear_io` (the Table 8 paths); every row
+rank-64 K-FAC/EK-FAC store uses `linear_io` (the paths of `benchmark.py`); every row
 records `hook_family`.
 
 `capture.py` runs each method and projection regime with both families on the
-Table 8 workload (1024 measured sequences after 8 warm-up ones, batch 8, fp32
+workload of `benchmark.py` (1024 measured sequences after 8 warm-up ones, batch 8, fp32
 with TF32 matmuls, one A40): five repetitions per pair, alternating which
 family runs first, 60 cells per query count. The model runs in eval mode with
 trainable parameters and no optimizer, and the streamer clears parameter
@@ -84,87 +117,58 @@ secondary K-FAC/EK-FAC check: the invasive run scores against the fit of the
 
 ## Running
 
-Run from the copy of this directory under `experiments_exe/` (see
-`experiments/README.md`): results, caches and figures are written next to
-the launcher and stay out of the tree.
+Results and caches are written next to the launcher.
 
-`--experiment` accepts `query1` and `query16` (`benchmark.py`: the one- and
-sixteen-query tables), `capture-query16`, `capture-query1` and
-`capture-shared-fit` (`capture.py`) and, for
-`scaling.py`, `scaling-<method>` and `scaling-<method>-fsdp4` with `<method>`
-one of `graddot`, `kfac`, `ekfac`: eight experiments, each a list of cells
-(`--dry-run` prints them).
+`benchmark.py`, `scaling.py` and `routing.py` share one command line:
+`--experiment NAME` with `--dry-run` (list the cells and write the plan files)
+or `--run` (execute them in order), and optionally `--out_dir DIR`,
+`--libs a,b` (keep these libraries) and `--cells 0-4,7` (keep these indices of
+the `--dry-run` listing, to split an experiment over several jobs).
+
+| launcher | experiments |
+|---|---|
+| `benchmark.py` | `query1`, `query16` |
+| `scaling.py` | `scaling-<method>`, `scaling-<method>-fsdp4`, with `<method>` one of `graddot`, `kfac`, `ekfac` |
+| `routing.py` | `routing-steps-b{1,2,4,8,16}`, `routing`, `routing-batch1` |
 
 ```bash
-# Tables 1 and 6 (one A40; cells run one at a time, on purpose)
+# one A40; cells run one at a time
 python benchmark.py --experiment query1 --dry-run
 python benchmark.py --experiment query1 --run
 python benchmark.py --experiment query16 --run
-python benchmark.py --experiment query16 --run --libs dattri_llm   # our cells only
-python benchmark.py --table                      # reads results/query{1,16}.jsonl
+python benchmark.py --experiment query16 --run --libs dattri_llm   # dattri-llm cells only
 
-# ordinary vs invasive capture (one A40)
-python capture.py --experiment capture-query16 --run
-python capture.py --experiment capture-query1 --run
-python capture.py --experiment capture-shared-fit --run    # only if scores differ
-python capture.py --table                        # results/capture-*/ or out/capture-*/
-# ... or on Modal: one L40S per (experiment, method), since Modal has no A40
-modal run capture.py::bench --experiment capture-query1 --smoke   # first repetition only
-modal run --detach capture.py::bench --all       # results/capture-*/ and report.txt
-modal run capture.py::fetch --all                # fetch after a detached run
+# one A40
+python routing.py --experiment routing-steps-b8 --run
 
-# scaling figure, locally with the right GPUs ...
 python scaling.py --experiment scaling-graddot --run          # one H200
 python scaling.py --experiment scaling-graddot-fsdp4 --run    # four H200s
-# ... or on Modal (provisions the GPUs, caches weights, fetches results/)
-modal run scaling.py::bench --experiment scaling-graddot
-modal run scaling.py::bench --all
-python scaling.py --figure                       # results/scaling-*.jsonl -> results/scaling.{pdf,png}
+
+# four H200s; the libraries of a scale run in one process, one after another
+python throughput.py --run 0.5b,1b,3b,7b,14b,32b,72b,110b     # -> out/throughput/<scale>/results.jsonl
+python throughput.py --run 7b --libs bergson --methods graddot
 ```
 
-Runs write to `out/<experiment>/results.jsonl` (appending, never
-overwriting). To make a run the source of a table or the figure, copy it to
-`results/<experiment>.jsonl` (for `capture.py`, copy `results.jsonl` and
-`runs/`, which holds the score matrices, to `results/<experiment>/`);
-`results/scaling.pdf` is the paper's `figures/scaling_crosslib.pdf`.
+Runs append to `out/<experiment>/results.jsonl` (`throughput.py`:
+`out/throughput/<scale>/results.jsonl`); `--out_dir` changes the directory.
 
-Environment: `PYTHONPATH` must reach the repository root (`dattri_llm` runs
-from the working tree), `BENCH_CACHE` points at the tokenized-block cache and
-`HF_HOME` at the model weights. Baselines are pinned in `utils/versions.py`
-and the adapters refuse other versions. LogIX needs Python < 3.11.
+Environment:
 
-The tables report *attribution time*: each adapter records `build_model`,
-`load_data` and its attribution phases separately, and the two setup phases
-are excluded (as in the scaling figure), so cold checkpoint reads and each
-library's own data pipeline do not enter the comparison. All four adapters
-enable TF32 matmuls. Three things about the machine matter for the timed
-region and must be the same for every library:
+* `PYTHONPATH` must reach the repository root (`dattri_llm` runs from the
+  working tree).
+* `BENCH_CACHE` points at the tokenized-block cache and `HF_HOME` at the model
+  weights.
+* `BERGSON_STORE` is the directory of Bergson's gradient stores.
+* `THROUGHPUT_N_GPUS` sets the GPU count of `throughput.py` (default 4).
+* Baselines are pinned in `utils/versions.py` (Bergson 0.26.1, Kronfluence
+  1.0.1, LogIX 0.1.1) and the adapters refuse other versions. LogIX needs
+  Python < 3.11.
+
+Settings for the timed region, the same for every library:
 
 * every gradient store, index or log is written under `--out_dir` (Bergson's
-  under `BERGSON_STORE`), so point both at **node-local** disk, not a shared
-  filesystem, and copy `results.jsonl` back afterwards;
+  under `BERGSON_STORE`); point both at local disk;
 * read the checkpoint once before the first cell (`cat model.safetensors >
-  /dev/null`) so `build_model` reflects a warm page cache;
-* set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (and the newer
-  `PYTORCH_ALLOC_CONF` spelling): two Bergson cells sit within 1 GB of the
-  A40's capacity and fragment without it.
-
-On a SLURM cluster wrap the same command:
-
-```bash
-#!/bin/bash
-#SBATCH --gres=gpu:1
-export BERGSON_STORE=/tmp/bergson_$SLURM_JOB_ID TMPDIR=/tmp
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTORCH_ALLOC_CONF=expandable_segments:True
-cat $HF_HOME/hub/models--EleutherAI--pythia-410m/snapshots/*/model.safetensors > /dev/null
-python benchmark.py --experiment query1 --run --out_dir /tmp/bench_$SLURM_JOB_ID/query1
-cp /tmp/bench_$SLURM_JOB_ID/query1/results.jsonl results/query1.jsonl
-```
-
-## Results in this directory
-
-`results/query1.jsonl` and `results/query16.jsonl` hold the A40 rows behind the
-tables; `results/scaling-<method>.jsonl` and `results/scaling-<method>-fsdp4.jsonl`
-hold the H200 rows behind the figure, including the recorded OOM rows. Every
-cell of the tables traces to a row in these files (the previous run sets are
-kept under `results/archive/`). Every cell runs at batch 8.
+  /dev/null`) so the page cache is warm;
+* set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (and the
+  `PYTORCH_ALLOC_CONF` spelling of newer PyTorch versions).

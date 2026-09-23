@@ -1,14 +1,14 @@
-"""Result logging for the universal attribution benchmark.
+"""Result logging for the attribution benchmark.
 
 Every (task, library) run is wrapped in a :class:`BenchRun`, which records a
 single self-describing JSON line:
 
 * **runtime** -- wall time per phase and total, GPU-synced.
 * **GPU memory** -- peak allocated + reserved per visible device.
-* **CPU memory** -- peak process RSS (background sampler) + host RAM.
+* **CPU memory** -- peak process RSS (the kernel's high-water mark) + host RAM.
 * **disk** -- bytes written to the run's cache/output dirs.
 * **device details** -- GPU name/count/capability/VRAM, CPU count, host RAM,
-  CUDA/cuDNN/torch/transformers versions, hostname, SLURM job id, world size.
+  CUDA/cuDNN/torch/transformers versions, hostname, job id, world size.
 * **task** -- family/scale/model/dataset/method/parallelism/n_train/... verbatim.
 
 Usage::
@@ -28,7 +28,6 @@ import contextlib
 import json
 import os
 import platform
-import threading
 import time
 from pathlib import Path
 
@@ -47,7 +46,7 @@ def _dist_rank_world() -> tuple[int, int]:
 
 
 def device_details() -> dict:
-    """Full device + environment fingerprint for the run record."""
+    """Device and environment details for the run record."""
     rank, world = _dist_rank_world()
     info: dict = {
         "hostname": platform.node(),
@@ -79,50 +78,40 @@ def device_details() -> dict:
     info["gpu_count"] = len(gpus)
     info["gpus"] = gpus
     info["gpu_name"] = gpus[0]["name"] if gpus else "cpu"
-    # every baseline's installed version, so a row says what it ran against
+    # the installed version of every baseline library
     info["baseline_versions"] = {lib: installed(lib) for lib in BASELINE_VERSIONS}
     return info
 
 
-class _RSSSampler:
-    """Background thread tracking peak process-tree RSS (bytes)."""
+class _PeakRSS:
+    """Peak host memory (RSS) of the process and of its finished children.
 
-    def __init__(self, interval: float = 0.05) -> None:
-        self._interval = interval
-        self._proc = psutil.Process()
-        self._peak = 0
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+    Read from the kernel's high-water marks (``ru_maxrss`` of
+    ``RUSAGE_SELF`` plus ``RUSAGE_CHILDREN``).  The marks cover the lifetime of
+    the process, so the value a phase records is the peak reached from process
+    start to the end of that phase.
+    """
 
-    def _rss(self) -> int:
-        total = self._proc.memory_info().rss
-        for c in self._proc.children(recursive=True):
-            with contextlib.suppress(psutil.Error):
-                total += c.memory_info().rss
-        return total
+    @staticmethod
+    def _peak() -> int:
+        import resource
+
+        kb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+              + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+        return kb * 1024  # Linux reports kilobytes
 
     def start(self) -> None:
-        self._peak = self._rss()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval):
-            with contextlib.suppress(psutil.Error):
-                self._peak = max(self._peak, self._rss())
+        """No-op; the kernel tracks the high-water mark."""
 
     def reset(self) -> None:
-        self._peak = self._rss()
+        """No-op; the high-water mark covers the process lifetime."""
 
     @property
     def peak_gb(self) -> float:
-        return round(self._peak / _GB, 3)
+        return round(self._peak() / _GB, 3)
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
+        """No-op."""
 
 
 def _gpu_peaks() -> list[dict]:
@@ -138,6 +127,7 @@ def _gpu_peaks() -> list[dict]:
 
 
 def dir_bytes(path: str | Path) -> int:
+    """Total size in bytes of the files under *path* (0 if it does not exist)."""
     p = Path(path)
     if not p.exists():
         return 0
@@ -145,7 +135,14 @@ def dir_bytes(path: str | Path) -> int:
 
 
 class BenchRun:
-    """One (task, library) benchmark run: timing, memory, and disk."""
+    """One (task, library) benchmark run: timing, memory, and disk.
+
+    Args:
+        task: the task dict, stored verbatim in the record.
+        results_path: the JSON-lines file the record is appended to (rank 0 only).
+        run_dir: optional directory that also receives ``record.json``.
+        lib: library name; defaults to ``task["lib"]``.
+    """
 
     def __init__(self, task: dict, results_path: str | Path,
                  run_dir: str | Path | None = None,
@@ -160,13 +157,19 @@ class BenchRun:
         self.phases: list[dict] = []
         self.disk: dict[str, float] = {}
         self.extra: dict = {}
-        self._sampler = _RSSSampler()
+        self._sampler = _PeakRSS()
         self._sampler.start()
         self._t_start = time.monotonic()
 
     # -- timing -------------------------------------------------------------
     @contextlib.contextmanager
     def phase(self, name: str, work_units: int | None = None, unit: str = "samples"):
+        """Time the enclosed block as phase *name*.
+
+        Synchronizes CUDA and resets the GPU peak-memory counters on entry;
+        on exit records wall time, per-device peak GPU memory and peak RSS.
+        With *work_units*, also records throughput and ``s_per_sample``.
+        """
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             for i in range(torch.cuda.device_count()):
@@ -185,9 +188,7 @@ class BenchRun:
             row["work_units"] = work_units
             row["throughput"] = round(work_units / wall, 3) if wall > 0 else None
             row["unit"] = f"{unit}/s"
-            # Reported metric: seconds per training sample.  Wall-clock alone is
-            # not comparable across libraries unless the workload matches, and
-            # per-sample cost is what scales to a real training set.
+            # Seconds per work unit (per training sample in the adapters).
             row["s_per_sample"] = round(wall / work_units, 6) if work_units else None
         self.phases.append(row)
         peak = row["gpu_peak"][0]["alloc_gb"] if row["gpu_peak"] else 0.0
@@ -196,13 +197,16 @@ class BenchRun:
 
     # -- annotations --------------------------------------------------------
     def record_disk(self, label: str, path: str | Path) -> None:
+        """Record the size in GB of all files under *path* as ``disk_gb[label]``."""
         self.disk[label] = round(dir_bytes(path) / _GB, 4)
 
     def set(self, **kv) -> None:
+        """Add top-level fields to the record."""
         self.extra.update(kv)
 
     # -- output -------------------------------------------------------------
     def finish(self, **summary) -> dict:
+        """Assemble the record, append it to ``results_path`` (rank 0) and return it."""
         self._sampler.stop()
         self.extra.update(summary)
         record = {

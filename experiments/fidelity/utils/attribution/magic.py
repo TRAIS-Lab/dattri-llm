@@ -1,16 +1,23 @@
-"""MAGIC (Bergson) on the harness trajectories.
+"""MAGIC (Bergson) on the fidelity trajectory.
 
-Bergson's functional ``Trainer`` replays our exact trajectory -- same init,
-batch order, loss, and AdamW settings (torchopt, bias-corrected, eps outside
-the root, no weight decay) -- saving checkpoints, then backpropagates each
-validation point's loss through the whole run.  The training loss carries a
-weight per (step, position), so the weight gradient is the per-(sample,
-step) influence (the ``each`` protocol) and its sum over a sample's
-occurrences is the whole-run influence (the ``all`` protocol).
+Bergson's functional ``Trainer`` runs the setting's trajectory -- its model
+initialization, batch order and learning-rate schedule, with Bergson's
+weighted causal-LM cross-entropy and torchopt's AdamW (betas 0.9/0.999,
+eps 1e-8, eps_root 1e-16, no weight decay) -- saving checkpoints, then
+``Trainer.backward`` backpropagates each validation block's loss through
+the whole run.  The training loss carries a weight per (step, position);
+the negated gradient of a validation loss with respect to a weight is the
+score of the training block at that step and position.
 
-    python utils/magic.py --setting mlp  --lr 1e-3 --seed 0 --n-queries 500
-    python utils/magic.py --setting gpt2 --lr 1e-5 --seed 0 --n-queries 64 \
-        --truth-dir results/gpt2/lr1e-05_seed0
+``train_s`` times ``Trainer.train`` (checkpoint saves included) and
+``attribute_s`` the backward passes over all queries; the validation-loss
+comparison with the reference trajectory lies between the two and is not
+timed.  ``result.json`` holds the setting, the timing, the peak device
+memory and, with ``--truth-dir``, the mean Spearman correlation under
+``magic``; the scores are saved as ``magic_scores.pt`` with shape
+``(n_queries, n_steps, batch_size)``.
+
+    python utils/attribution/magic.py --scale 0.5b --lr 1e-5 --seed 0 --n-queries 64 --truth-dir results/qwen0.5b/lr1e-05_seed0
 """
 
 from __future__ import annotations
@@ -19,9 +26,13 @@ import argparse
 import json
 import pathlib
 import shutil
+import sys
 import time
 
-import torch
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path[: 1] = [str(HERE.parent)]  # protocol, settings, common
+
+import torch  # noqa: E402
 import torch.nn.functional as F
 import torchopt
 from torch import nn
@@ -30,12 +41,13 @@ from torchopt.pytree import tree_iter
 from bergson.distributed import grad_tree
 from bergson.magic import BackwardState, Trainer
 from bergson.utils.math import weighted_causal_lm_ce
-from protocol import make_batches, occurrences, peak_gb, run_trajectory, spearman_per_column
+from common import require_bergson
+from protocol import make_batches, peak_gb, run_trajectory, spearman_per_column
 from settings import build, parser
 
 
 class IndexStream:
-    """Bergson ``DataStream`` over our index batches with (step, position) weights."""
+    """Bergson ``DataStream`` over the trajectory's index batches with one weight per (step, position)."""
 
     def __init__(self, s, batches, device):
         self.s = s
@@ -58,83 +70,46 @@ class IndexStream:
 
     def __getitem__(self, i: int) -> dict:
         idx = self.batches[i]
-        w = self.weights[i, : idx.numel()]
-        if self.s.name == "mlp":
-            return {
-                "input_ids": self.s.data["x_tr"][idx],
-                "labels": self.s.data["y_tr"][idx],
-                "example_weight": w,
-            }
         x = self.s.data["x_tr"][idx]
-        return {
-            "input_ids": x,
-            "labels": x,
-            "example_weight": w,
-            "valid_mask": torch.ones_like(x, dtype=torch.bool),
-        }
+        return {"input_ids": x, "labels": x, "example_weight": self.weights[i, : idx.numel()]}
 
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
 
 
-class WeightedMLP(nn.Module):
-    """Raw-loss wrapper: mean cross-entropy with per-example weights."""
-
-    def __init__(self, mlp: nn.Module) -> None:
-        super().__init__()
-        self.mlp = mlp
-
-    def forward(self, input_ids, labels, example_weight=None, valid_mask=None):
-        ce = F.cross_entropy(self.mlp(input_ids), labels, reduction="none")
-        if example_weight is None:
-            return ce.mean()
-        return (ce * example_weight).sum() / ce.numel()
-
-
 class WeightedLM(nn.Module):
-    """Raw-loss wrapper: Bergson's weighted causal-LM cross-entropy.
+    """Causal LM returning Bergson's weighted causal-LM cross-entropy.
 
-    GPT-2 ties ``lm_head.weight`` to ``wte.weight``; the functional trainer
-    copies every named parameter separately, which would untie them.  The
-    head is therefore dropped and the logits formed from ``wte`` directly.
+    With ``tie_word_embeddings`` the output head is replaced by an identity
+    and the logits are formed from the input-embedding weight, so the
+    functional trainer holds one shared parameter; an untied head is used
+    as it is.
     """
 
     def __init__(self, lm: nn.Module) -> None:
         super().__init__()
-        lm.lm_head = nn.Identity()
+        self.tied = bool(getattr(lm.config, "tie_word_embeddings", False))
+        self.head = None if self.tied else lm.get_output_embeddings()
         self.lm = lm
+        if self.tied:
+            lm.set_output_embeddings(nn.Identity())
 
-    def forward(self, input_ids, labels, example_weight=None, valid_mask=None):
-        hidden = self.lm.transformer(input_ids=input_ids).last_hidden_state
-        logits = F.linear(hidden, self.lm.transformer.wte.weight)
-        return weighted_causal_lm_ce(
-            logits, labels, example_weight=example_weight, valid_mask=valid_mask
-        )
+    def forward(self, input_ids, labels, example_weight=None):
+        hidden = self.lm.base_model(input_ids=input_ids).last_hidden_state
+        weight = self.lm.get_input_embeddings().weight if self.tied else self.head.weight
+        logits = F.linear(hidden, weight)
+        # Every position is a valid label: the token mean over the batch.
+        return weighted_causal_lm_ce(logits, labels, example_weight=example_weight)
 
 
 def magic_model(s):
+    # A fresh instance of the setting's model, wrapped for the functional trainer.
     torch.manual_seed(s.seed)
-    if s.name == "mlp":
-        return WeightedMLP(s.build_model()).to(s.device)
-    from transformers import GPT2LMHeadModel
-
-    lm = GPT2LMHeadModel.from_pretrained(
-        "gpt2",
-        resid_pdrop=0.0,
-        embd_pdrop=0.0,
-        attn_pdrop=0.0,
-        attn_implementation="eager",
-    )
-    return WeightedLM(lm).to(s.device)
+    return WeightedLM(s.build_model.fresh()).to(s.device)
 
 
 def query_batch(s, q: int) -> dict:
-    if s.name == "mlp":
-        return {
-            "input_ids": s.data["x_va"][q : q + 1],
-            "labels": s.data["y_va"][q : q + 1],
-        }
     x = s.data["x_va"][q : q + 1]
     return {"input_ids": x, "labels": x}
 
@@ -144,7 +119,8 @@ def main() -> None:
     ap.add_argument("--n-queries", type=int, default=64)
     ap.add_argument("--truth-dir", default=None, help="run directory with matrices.pt")
     a, rest = ap.parse_known_args()
-    s = build(parser().parse_args(rest))  # --setting / --lr / --seed / --tag
+    require_bergson()
+    s = build(parser().parse_args(rest))  # --scale / --lr / --seed / --tag
     out = s.out_dir.parent / f"{s.out_dir.name}_magic"
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "log.txt"
@@ -159,15 +135,12 @@ def main() -> None:
     log(f"== MAGIC {s.name} lr={lr} seed={s.seed} queries={a.n_queries}")
     batches = make_batches(s.n_train, s.batch_size, s.epochs, s.seed)
     n_steps = len(batches)
-    betas = (0.9, 0.95) if s.name == "mlp" else (0.9, 0.999)
     opt = torchopt.adamw(
         lambda count: lr * s.lr_factor(int(count), n_steps),
-        betas=betas,
+        betas=(0.9, 0.999),
         eps=1e-8,
         weight_decay=0.0,
-        # Not 0: the backward differentiates sqrt(nu), which is singular at
-        # coordinates whose gradient is identically zero.  1e-16 shifts the
-        # forward by ~1e-8 at those coordinates only.
+        # sqrt(nu + eps_root) has a finite derivative where nu is zero.
         eps_root=1e-16,
     )
     model = magic_model(s)
@@ -179,11 +152,14 @@ def main() -> None:
     state = trainer.train(
         state, stream, save_dir=str(ckpt_dir), save_mode="sqrt", inplace=True
     )
-    log(f"  forward: {time.time() - t0:.0f}s, {n_steps} steps, {peak_gb()}")
+    torch.cuda.synchronize()
+    timing = {"train_s": round(time.time() - t0, 1), "phases": {}}
+    peaks = [torch.cuda.max_memory_allocated() / 2**30]
+    log(f"  forward: {timing['train_s']:.0f}s, {n_steps} steps, {peak_gb()}")
     torch.cuda.reset_peak_memory_stats()
 
-    # Trajectory check against our reference run: the ground truth is only
-    # valid if Bergson's replay lands on the same parameters.
+    # Log the largest validation-loss difference between Bergson's final state
+    # and the reference trajectory's final model (not timed).
     ref = torch.load(a.truth_dir + "/matrices.pt") if a.truth_dir else None
 
     def loss_of(q: int) -> torch.Tensor:
@@ -196,7 +172,7 @@ def main() -> None:
     ref_losses = s.val_losses(ref_model).cpu()[: losses.numel()]
     del ref_model
     log(
-        f"  val-loss max |magic - ours| = {(losses - ref_losses).abs().max():.2e} (tsloo effects ~1e-3)"
+        f"  val-loss max |magic - ours| = {(losses - ref_losses).abs().max():.2e}"
     )
 
     final = state.to("cpu")
@@ -227,6 +203,12 @@ def main() -> None:
         del bwd, work
         if (q + 1) % 10 == 0 or q + 1 == n_q:
             log(f"  query {q + 1}/{n_q}  {time.time() - t0:.0f}s, {peak_gb()}")
+    torch.cuda.synchronize()
+    timing["attribute_s"] = round(time.time() - t0, 1)
+    timing["total_s"] = round(timing["train_s"] + timing["attribute_s"], 1)
+    peaks.append(torch.cuda.max_memory_allocated() / 2**30)
+    timing["peak_gb"] = round(max(peaks), 2)
+    timing["phases"] = {"train": timing["train_s"], "backward": timing["attribute_s"]}
     # Removing a sample is a weight change of -1: predicted loss change is -dL/dw.
     scores = -w_grads  # (n_q, n_steps, B)
     torch.save({"scores": scores, "batches": batches}, out / "magic_scores.pt")
@@ -237,30 +219,19 @@ def main() -> None:
         "lr": lr,
         "n_queries": n_q,
         "method": "magic",
+        "model": s.extra.get("model"),
+        **timing,
     }
     if ref is not None:
-        pairs = ref.get("pairs") or [(int(i), None) for i in ref["selected"].tolist()]
+        pairs = ref["pairs"]
         truth = ref["tsloo"][:, :n_q]
-        pred = torch.zeros(len(pairs), n_q)
-        for k, (i, t) in enumerate(pairs):
-            steps = [t] if t is not None else occurrences(batches, i)
-            for tt in steps:
-                pos = int((batches[tt] == i).nonzero()[0])
-                pred[k] += scores[:, tt, pos]
-        rho = spearman_per_column(pred, truth)
-        result["magic"] = float(rho.mean())
-        if all(t is not None for _, t in pairs):
-            rank = {(i, t): occurrences(batches, i).index(t) for i, t in pairs}
-            for e in sorted(set(rank.values())):
-                sel = [k for k, pr in enumerate(pairs) if rank[pr] == e]
-                result[f"magic_epoch{e}"] = float(
-                    spearman_per_column(pred[sel], truth[sel]).mean()
-                )
+        pred = torch.stack([scores[:, t, int((batches[t] == i).nonzero()[0])] for i, t in pairs])
+        result["magic"] = float(spearman_per_column(pred, truth).mean())
         torch.save({"pred": pred, "pairs": pairs}, out / "matrices.pt")
     log(f"  result: {json.dumps(result)}")
     with (out / "result.json").open("w") as f:
         json.dump(result, f, indent=2)
-    shutil.rmtree(ckpt_dir, ignore_errors=True)  # ~20 GB of checkpoints
+    shutil.rmtree(ckpt_dir, ignore_errors=True)  # the trainer's checkpoints
 
 
 if __name__ == "__main__":

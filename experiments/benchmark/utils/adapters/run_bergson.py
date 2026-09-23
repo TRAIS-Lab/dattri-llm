@@ -1,32 +1,42 @@
-"""bergson adapter for the universal benchmark.
+"""Bergson adapter for the benchmark (requires Bergson 0.26.1).
 
-bergson drives an on-disk gradient *index* through its ``build`` / ``score`` /
-``ekfac`` pipelines.  They run in this process through bergson's own Python
-entry points (``bergson.build.build``, ``bergson.score.score.score_dataset``,
-``hessians.pipeline.hessian_pipeline``), reached through the same argument
-parser as its CLI so every setting is identical to a ``python -m bergson``
-invocation.  At ``nproc_per_node=1`` bergson runs its worker in the calling
-process (no spawn).  The model is loaded once through bergson's own loader
-(``setup_model_and_peft``), timed and reported as the ``build_model`` phase
-like every other adapter, and reused by every later bergson step; bergson's
-dataset load + tokenization (``setup_data_pipeline``, which every step runs
-before any gradient work) is likewise timed and reported as ``load_data``, the
-phase in which the other adapters read their pre-chunked pools untimed -- it
-was 64-72% of a timed GradDot cell on an H200 before it was excluded.  GPU
-peak memory comes from torch's allocator, except for sharded runs, whose
-workers are child processes: there the peak is NVML's maximum over the cards
-(``mem_source: "nvml"``).  An optional warm-up (``warmup_train`` chunks through
-the same pipeline into a throwaway store) precedes the timed run, matching
-``run_ours.py``.  The record has the phases ``fit`` and ``score``.
+Runs one benchmark cell and appends a JSON row to ``<out>/results.jsonl``
+with per-phase wall time and peak GPU memory.
 
-Native strategy (bergson's own): fixed ``chunk_length`` sequences, rank-64
-projection for the grad-dot index; the K-FAC/EK-FAC pipeline scores with
-full-dimension gradients (``projection_dim=0``), like Kronfluence.
+Bergson drives an on-disk gradient *index* through its ``build`` / ``score`` /
+``ekfac`` subcommands.  They run in this process through
+``bergson.__main__.main``, i.e. through the argument parser of the
+``python -m bergson`` CLI.  At ``nproc_per_node=1`` Bergson runs its worker in
+the calling process; sharded runs (``parallelism: fsdp``, ``n_gpus > 1``)
+spawn worker processes.
 
-    method -> bergson:
-      graddot  build (rank-64 index) + programmatic grad-dot query
-      kfac     ekfac pipeline, ev_correction=false  (full-dim factors)
-      ekfac    ekfac pipeline, ev_correction=true
+Phases of a row:
+
+    build_model  Bergson's model loader (``setup_model_and_peft``); the model
+                 is loaded once and reused by every later Bergson step
+    load_data    Bergson's dataset load + tokenization
+                 (``setup_data_pipeline``)
+    fit, score   attribution; the time this process spends in the two setup
+                 phases is subtracted (the ``ekfac`` pipeline is one command
+                 and is reported as ``fit``)
+
+GPU peak memory comes from torch's allocator.  Bergson's sharded steps run in
+worker processes, so for those runs the peak is NVML's maximum over the cards
+(``mem_source: "nvml"``), and the workers' model-load and start-up times are
+reported in ``bergson_worker_overhead`` (see ``bergson_site/sitecustomize.py``).
+An optional warm-up (``warmup_train`` chunks through the same pipeline into a
+throwaway store) precedes the timed run, as in ``run_ours.py``.
+
+Settings: fixed ``chunk_length`` sequences; ``proj_mode`` selects a rank-64
+projection (``rank64``) or full-dimension gradients (``full``).
+
+    method -> Bergson:
+      graddot  ``build`` (query index) + ``score``
+      kfac     ``ekfac`` pipeline, ev_correction=false
+      ekfac    ``ekfac`` pipeline, ev_correction=true (full dimension)
+
+Environment: ``BERGSON_STORE`` is the directory for Bergson's on-disk index;
+``BENCH_CACHE`` is used when it is unset, then ``~/bergson_bench``.
 """
 
 from __future__ import annotations
@@ -36,8 +46,10 @@ import json
 import contextlib
 import functools
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -48,9 +60,7 @@ sys.path.insert(0, str(BENCH))
 
 import torch
 
-# Same matmul precision as run_ours.py / run_logix.py: TF32 tensor-core
-# matmuls in the float32 tables (Ampere).  Set in this process, which is where
-# the single-card library calls run; the bf16 scaling runs are unaffected.
+# TF32 matmuls for float32 runs, as in run_ours.py / run_logix.py.
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -59,38 +69,24 @@ from versions import require
 
 LIB = "bergson"
 PROJ_DIM = 64
-CHUNK = 512
-# bergson HF dataset spec per benchmark dataset name: (data_str, subset).
-# Namespaced ids, matching data.py: the bare `wikitext` id is the legacy
-# canonical-dataset form and current huggingface_hub rejects it -- parse_hf_uri
-# requires `namespace/name` and raises HfUriError on a single segment.  This
-# table is bergson's own and is passed straight to its CLI, so fixing data.py
-# did not cover it.
+CHUNK = 512  # default chunk length; a task's ``block_size`` overrides it
+# Hugging Face dataset spec passed to Bergson's CLI, per benchmark dataset
+# name: (data_str, subset).  The ids are the namespaced ones used in data.py.
 DATASETS = {
     "wikitext103": ("Salesforce/wikitext", "wikitext-103-raw-v1"),
     "wikitext2": ("Salesforce/wikitext", "wikitext-2-raw-v1"),
 }
-# Bergson materializes its gradient index on disk (>100 GB at full dimension), so
-# this must point at a filesystem with room -- and must not be a hardcoded path
-# from one machine.  ``BENCH_CACHE`` is set per-cluster by the launcher.
 
-# bergson's precision is a per-subcommand flag, not a global one.  ``build``
-# has a single IndexConfig, so it takes a flat ``--precision``; ``score`` and
-# ``ekfac`` carry BOTH ``IndexConfig.precision`` (model parameters) and
+# Task ``dtype`` -> Bergson precision name.  Bergson's precision is a
+# per-subcommand flag: ``build`` takes ``--precision``; ``score`` and ``ekfac``
+# carry both ``IndexConfig.precision`` (model parameters) and
 # ``ScoreConfig.precision`` (dtype the gradients are converted to before
-# scoring), so there a flat ``--precision`` is ambiguous and the parser
-# rejects it -- which is why an earlier version of this adapter concluded the
-# precision could not be set at all and hardwired fp32.  Passing the
-# fully-qualified names works on every subcommand used here.
+# scoring), set through ``--index_cfg.precision`` / ``--score_cfg.precision``.
 _PRECISION = {"float32": "fp32", "bfloat16": "bf16"}
 
 
 def _bergson_precision(task: dict) -> str:
-    """Bergson's name for the experiment's dtype.
-
-    Refuses anything unmapped rather than silently running at the wrong
-    precision -- the failure mode the old hardwired fp32 was guarding against.
-    """
+    """Bergson's name for the task's ``dtype``; raises on an unmapped dtype."""
     wanted = task.get("dtype", "float32")
     if wanted not in _PRECISION:
         raise ValueError(f"run_bergson.py cannot set bergson to dtype={wanted!r}; "
@@ -99,47 +95,37 @@ def _bergson_precision(task: dict) -> str:
 
 
 def _precision_flags(task: dict, subcommand: str) -> list:
-    """The precision flags *this* subcommand accepts (see above)."""
+    """The precision flags *subcommand* accepts (see ``_PRECISION``)."""
     p = _bergson_precision(task)
     if subcommand == "build":
         return ["--precision", p]
     return ["--index_cfg.precision", p, "--score_cfg.precision", p]
 
 
-DAMPING = 0.1  # bergson --damping_factor (relative to mean eigenvalue)
-# bergson takes a *row* split and re-chunks it to ``chunk_length`` itself, so a
-# row count is not a workload: the query/train count it ends up with is
-# ``total_tokens // CHUNK`` (a partial tail is dropped, not padded).
-#
-# The previous implementation converted a target chunk count with a fitted
-# constant (~8.2 rows per chunk) measured from ONE observation.  WikiText token
-# density is far from uniform -- its opening rows are blank lines and section
-# headers -- so the constant mistranslated every request: 16 queries became 18,
-# and 1 query became 0 (an empty dataset), then 6 once a MIN_ROWS floor was
-# bolted on.  Every other library slices a pre-chunked pool and therefore hits
-# n_test exactly; bergson can too.
-#
-# So: tokenize and accumulate until the token budget is reached.  Deterministic,
-# dataset-agnostic, and exact -- no fitted constant, no floor.
+DAMPING = 0.1  # Bergson --damping_factor (relative to mean eigenvalue)
+# Bergson takes a *row* split and re-chunks it to ``chunk_length`` itself; the
+# chunk count it ends up with is ``total_tokens // chunk_length`` (a partial
+# tail is dropped).  ``_rows_for_chunks`` converts a chunk count into the row
+# count that yields exactly that many chunks; results are memoized here.
 _ROWS_CACHE: dict = {}
 
 
 def _rows_for_chunks(model_id: str, data_str: str, subset: str | None,
-                     chunks: int, split: str = "train") -> int:
+                     chunks: int, split: str = "train", chunk: int = CHUNK) -> int:
     """Rows of *split* whose tokenization yields exactly ``chunks`` chunks.
 
     Returns the smallest row count whose cumulative token count reaches
-    ``chunks * CHUNK`` -- i.e. the split bergson will re-chunk into exactly
-    ``chunks`` blocks of ``CHUNK`` tokens.
+    ``chunks * chunk`` -- i.e. the split bergson will re-chunk into exactly
+    ``chunks`` blocks of ``chunk`` tokens.
     """
-    key = (model_id, data_str, subset, chunks, split)
+    key = (model_id, data_str, subset, chunks, split, chunk)
     if key in _ROWS_CACHE:
         return _ROWS_CACHE[key]
 
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    target = chunks * CHUNK
+    target = chunks * chunk
     tok = AutoTokenizer.from_pretrained(model_id)
     # Read in growing windows so a large target does not tokenize the corpus.
     window, cum, rows = max(4096, chunks * 64), 0, 0
@@ -156,36 +142,21 @@ def _rows_for_chunks(model_id: str, data_str: str, subset: str | None,
                 _ROWS_CACHE[key] = rows
                 return rows
     msg = (f"{data_str} {split} has only {cum} tokens, short of the "
-           f"{target} needed for {chunks} chunks of {CHUNK}")
+           f"{target} needed for {chunks} chunks of {chunk}")
     raise ValueError(msg)
 
 
 def _parallel_args(task: dict) -> list:
-    """bergson's own parallelism flags, taken from the task's topology.
+    """Bergson's parallelism flags, taken from the task's topology.
 
-    ``nproc_per_node`` MUST be passed explicitly.  Its default is
-    ``max(1, torch.cuda.device_count())`` -- one process per *visible* GPU -- so
-    left unset bergson silently scales with whatever the container happens to
-    have, while every other adapter here is explicitly single-process.  On a
-    multi-GPU box that hands bergson every card against everyone else's one, and
-    nothing in the record would show it.
-
-    ``--fsdp`` is bergson's own sharding switch, so a task marked
-    ``parallelism: fsdp`` gets sharded capture rather than N replicas.
+    ``--nproc_per_node`` is passed explicitly as the task's ``n_gpus``
+    (Bergson's default is one process per visible GPU).  A task with
+    ``parallelism: fsdp`` and ``n_gpus > 1`` also gets ``--fsdp true``,
+    Bergson's sharding switch.  A step whose dataset is smaller than the world
+    size is run by Bergson in the calling process without a process group;
+    ``_ModelCache`` loads the model unsharded for such a step.
     """
     n = int(task.get("n_gpus", 1) or 1)
-    # --fsdp is deliberately NOT passed.  bergson's hessian pipeline builds its
-    # query index through launch_distributed_run, which for a small query set
-    # calls worker(0, 0, 1, ...) -- world size 1, no launcher, no process group.
-    # --fsdp then makes fully_shard() call init_process_group(), which dies on
-    # "environment variable RANK expected, but not set" -- for the QUERY build
-    # only: with a 1-chunk query set bergson caps that step's world size to 1
-    # and runs it in the calling process.  Under the in-process entry that
-    # step goes through our ``setup_model_and_peft`` wrapper, which skips the
-    # sharding when no process group exists (the model is loaded whole on one
-    # card; fits to 32B), while every train-side step (Fisher fit, apply,
-    # score) has >= 4 chunks, spawns ``nproc_per_node`` workers and shards.
-    # So sharded capture is only offered through this in-process path.
     args = ["--nproc_per_node", str(n)]
     if task.get("parallelism") == "fsdp" and n > 1:
         args += ["--fsdp", "true"]
@@ -193,28 +164,26 @@ def _parallel_args(task: dict) -> list:
 
 
 def _batch_args(task: dict) -> list:
-    """CLI flags pinning bergson's effective batch to the benchmark's.
+    """CLI flags setting Bergson's effective batch to the task's ``batch``.
 
-    bergson has no per-sequence batch setting; the batch it ends up with is the
-    minimum of two independent constraints in ``allocate_batches``:
+    Bergson's batch is the minimum of two constraints in ``allocate_batches``:
 
         max(len in batch) * |batch| <= token_batch_size      (token budget)
         |batch|                     <= max_batch_size        (document cap)
 
-    Both must be set or neither pins the batch.  ``max_batch_size`` alone only
-    *caps*, so raising it above the token budget's implied batch is a no-op --
-    which is why an earlier run passing ``--max_batch_size 8`` still ran at 4,
-    the default 2048-token budget divided by the 512-token sequence length.  So:
-    put the document cap at the target batch and give the token budget headroom
-    (2x) so it never binds, making the effective batch exactly ``batch``.
+    ``--max_batch_size`` is set to ``batch`` and ``--token_batch_size`` to
+    twice ``batch * block_size``, so the document cap is the binding
+    constraint and the effective batch is ``batch`` sequences.
     """
     batch = task.get("batch", 8)
+    chunk = int(task.get("block_size", CHUNK))
     return ["--max_batch_size", str(batch),
-            "--token_batch_size", str(batch * CHUNK * 2)]
+            "--token_batch_size", str(batch * chunk * 2)]
 
 
 def _index_counts(path: str) -> dict:
-    """``num_rows`` / ``num_scores`` bergson recorded for an index, if present."""
+    """Counts (``num_items`` / ``num_rows`` / ``num_scores``) from an index's
+    ``info.json``, if present."""
     info = Path(path) / "info.json"
     if not info.exists():
         return {}
@@ -226,12 +195,12 @@ def _index_counts(path: str) -> dict:
 
 
 def _run_inprocess(cli_args: list) -> None:
-    """The same bergson subcommand, run in this process.
+    """Run a Bergson subcommand in this process.
 
-    ``bergson.__main__.main`` parses ``sys.argv`` with bergson's own
-    simple-parsing dataclasses and calls ``<Command>.execute()``, so the flag
-    lists mean exactly what they mean on the command line.  With
-    ``--nproc_per_node 1`` every pipeline step runs in the calling process.
+    ``bergson.__main__.main`` parses ``sys.argv`` with Bergson's CLI parser
+    and calls ``<Command>.execute()``, so ``cli_args`` are the arguments of a
+    ``python -m bergson`` invocation.  With ``--nproc_per_node 1`` every
+    pipeline step runs in the calling process.
     """
     import bergson.__main__ as bergson_main
 
@@ -248,16 +217,14 @@ def _run_inprocess(cli_args: list) -> None:
 
 
 class _ModelCache:
-    """Memoized, timed stand-in for bergson's ``setup_model_and_peft``.
+    """Memoized, timed wrapper of Bergson's ``setup_model_and_peft``.
 
-    Every bergson worker (build, score, hessian fit) loads its model through
-    that one function.  Wrapping it does two things: the load is *timed* (so it
-    can be reported as ``build_model``, outside attribution time, like the other
-    adapters) and *memoized* (so the warm-up run pays it once and every later
-    step reuses the same model object, as ``run_ours.py`` and
-    ``run_kronfluence.py`` reuse theirs).  bergson's collectors register hooks
-    inside a context manager and remove them on exit, so reuse is safe; GradDot
-    scores from a reused model match a fresh subprocess to bf16 precision.
+    Every Bergson worker (build, score, hessian fit) loads its model through
+    that function.  The wrapper times each load (``load_s``, reported as the
+    ``build_model`` phase) and memoizes the result per configuration, so later
+    steps reuse the loaded model, as ``run_ours.py`` and ``run_kronfluence.py``
+    reuse theirs.  Bergson's collectors register their hooks inside a context
+    manager and remove them on exit.
     """
 
     def __init__(self, real):
@@ -270,14 +237,9 @@ class _ModelCache:
     def __call__(self, cfg, *args, **kwargs):
         self.n_calls += 1
         if getattr(cfg, "fsdp", False) and not torch.distributed.is_initialized():
-            # A step bergson runs in the calling process (world size capped to
-            # 1 by a tiny dataset): no process group, so fully_shard() cannot
-            # run -- load the model whole on this card instead.  Hand the
-            # loader a copy with fsdp=False rather than apply_fsdp=False: with
-            # cfg.fsdp set, bergson's loader picks device_map="cpu" (it expects
-            # fully_shard to move the shards), so the step would run on the CPU
-            # -- which is what happened to the query build of the first sharded
-            # runs (72B "ran" its query build on the CPU in 441 s).
+            # A step Bergson runs in the calling process, without a process
+            # group: the loader gets a copy of the config with fsdp=False, so
+            # it loads the model unsharded on this GPU.
             import copy
             cfg = copy.copy(cfg)
             cfg.fsdp = False
@@ -295,7 +257,7 @@ class _ModelCache:
 
 
 class _CallTimer:
-    """Times every call of one bergson function; no memoization."""
+    """Times every call of one Bergson function; no memoization."""
 
     def __init__(self, real):
         self.real = real
@@ -318,8 +280,9 @@ _DATA_TIMER: _CallTimer | None = None
 
 
 def _install_model_cache() -> _ModelCache:
-    """Patch ``setup_model_and_peft`` / ``setup_data_pipeline`` wherever bergson
-    binds them by name (each worker module imports both into its namespace)."""
+    """Replace ``setup_model_and_peft`` / ``setup_data_pipeline`` with a
+    ``_ModelCache`` / ``_CallTimer`` in every Bergson module that binds them by
+    name.  Idempotent; returns the ``_ModelCache``."""
     global _MODEL_CACHE, _DATA_TIMER
     if _MODEL_CACHE is not None:
         return _MODEL_CACHE
@@ -339,31 +302,97 @@ def _install_model_cache() -> _ModelCache:
     return cache
 
 
-_SHARDED = False   # set by run() for fsdp tasks: bergson's workers are child processes
+_SHARDED = False   # set by run() for fsdp tasks: Bergson's workers are child processes
+_WORLD = 1         # set by run(): workers per launch_distributed_run
+
+# Timing of Bergson's spawned workers (see bergson_site/sitecustomize.py).  Each
+# _timed call gets its own timing directory; _WORKER_OVERHEAD holds one
+# _worker_overhead() summary per _timed call, in call order.
+_SITE_DIR = str(Path(__file__).resolve().parent / "bergson_site")
+_WORKER_OVERHEAD: list = []
+
+
+def _worker_overhead(timing_dir: str, world: int) -> dict:
+    """Model-load and start-up seconds of the worker groups one call spawned.
+
+    Reads the ``<pid>.jsonl`` files written by ``bergson_site/sitecustomize.py``
+    in ``timing_dir``.  A group is the ``world`` processes of one
+    ``launch_distributed_run``; groups run one after another and the ranks of
+    a group run concurrently, so ``load_s`` / ``startup_s`` are the sum over
+    groups of the maximum over a group's ranks.  ``startup`` is interpreter
+    start to entry into the model loader (imports, unpickling the dataset
+    argument, CUDA context, NCCL rendezvous); ``load`` is
+    ``setup_model_and_peft`` (weights + FSDP wrap).  ``groups`` lists the
+    per-group values.
+    """
+    procs = []
+    for f in sorted(Path(timing_dir).glob("*.jsonl")):
+        recs = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+        start = next((r["t"] for r in recs if r["ev"] == "proc_start"), None)
+        loads = [r for r in recs if r["ev"] == "setup_model_and_peft"]
+        if start is None or not loads:
+            continue  # not a bergson worker (e.g. a datasets.map helper)
+        procs.append({"start": start, "startup": loads[0]["t_start"] - start,
+                      "load": sum(r["wall_s"] for r in loads)})
+    procs.sort(key=lambda d: d["start"])
+    if world > 0 and len(procs) % world == 0:
+        groups = [procs[i:i + world] for i in range(0, len(procs), world)]
+    else:  # unexpected process count: split where start times jump
+        groups = []
+        for d in procs:
+            if groups and d["start"] - groups[-1][-1]["start"] < 2.0:
+                groups[-1].append(d)
+            else:
+                groups.append([d])
+    return {"n_groups": len(groups), "n_procs": len(procs),
+            "load_s": round(sum(max(d["load"] for d in g) for g in groups), 3),
+            "startup_s": round(sum(max(d["startup"] for d in g) for g in groups), 3),
+            "groups": [{"load_s": round(max(d["load"] for d in g), 3),
+                        "startup_s": round(max(d["startup"] for d in g), 3)} for g in groups]}
+
 
 
 def _timed(fn) -> tuple[float, float]:
-    """(wall_s, peak_gb) of ``fn()``: wall excluding time spent inside
-    bergson's model loader and data pipeline (reported as ``build_model`` and
-    ``load_data``; with a warm-up the loader never runs inside a timed call
-    anyway), peak from torch -- or from NVML for a sharded run, whose workers
-    are child processes.
+    """(wall_s, peak_gb) of ``fn()``.
+
+    ``wall_s`` excludes the time this process spends inside Bergson's model
+    loader and data pipeline (reported as ``build_model`` and ``load_data``).
+    ``peak_gb`` comes from torch's allocator, or from NVML for a sharded run,
+    whose workers are child processes.  For a sharded run the call also sets
+    ``BERGSON_BENCH_TIMING_DIR`` and puts ``bergson_site`` on ``PYTHONPATH``,
+    and appends the workers' load / start-up summary to ``_WORKER_OVERHEAD``.
     """
     cache = _install_model_cache()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     loads_before, data_before = cache.load_s, _DATA_TIMER.wall_s
     smi = SmiPeak() if _SHARDED else contextlib.nullcontext()
+    timing_dir = None
+    if _SHARDED:
+        # Spawned workers inherit the environment; sitecustomize times their
+        # model loads and start-up into timing_dir.
+        timing_dir = tempfile.mkdtemp(prefix="bergson_workers_")
+        os.environ["BERGSON_BENCH_TIMING_DIR"] = timing_dir
+        path = os.environ.get("PYTHONPATH", "")
+        if _SITE_DIR not in path.split(os.pathsep):
+            os.environ["PYTHONPATH"] = _SITE_DIR + (os.pathsep + path if path else "")
     t0 = time.perf_counter()
-    with smi:
-        fn()
+    try:
+        with smi:
+            fn()
+    finally:
+        os.environ.pop("BERGSON_BENCH_TIMING_DIR", None)
     torch.cuda.synchronize()
+    _WORKER_OVERHEAD.append(
+        _worker_overhead(timing_dir, _WORLD) if timing_dir
+        else {"n_groups": 0, "n_procs": 0, "load_s": 0.0, "startup_s": 0.0, "groups": []})
+    if timing_dir:
+        shutil.rmtree(timing_dir, ignore_errors=True)
     wall = (time.perf_counter() - t0 - (cache.load_s - loads_before)
             - (_DATA_TIMER.wall_s - data_before))
     if _SHARDED:
-        # Workers are child processes: torch's allocator here sees only the
-        # parent's (unsharded query-build) model, so take NVML's max over cards.
-        # Free the parent's model between steps so the workers get the card.
+        # Workers are child processes, so the peak is NVML's max over cards.
+        # Models held by this process are released before the next step.
         cache.models.clear()
         torch.cuda.empty_cache()
         return round(wall, 3), smi.peak_gb
@@ -379,13 +408,13 @@ def _phases(fit: dict, score: dict, n_meas: int) -> list:
         rows.append({"phase": name, "wall_s": round(d["wall"], 3), "work_units": n_meas,
                      "gpu_peak": [{"index": 0, "alloc_gb": d["mem"]}], "cpu_rss_peak_gb": 0})
     return rows
-# BERGSON_STORE first, BENCH_CACHE only as a fallback.  These are different
-# kinds of storage and conflating them is a measurement bug: BENCH_CACHE holds
-# tokenized block pools, which are small, reused across every run and belong on
-# shared//network storage; the bergson index is the artifact whose *local* write
-# cost this benchmark reports, and it exceeds 100 GB at full dimension.  Writing
-# it to a network volume measures the storage fabric and reports those bytes as
-# the run's disk cost.
+
+
+
+# Root of Bergson's on-disk index: ``$BERGSON_STORE``, else ``$BENCH_CACHE``
+# (the directory of the tokenized block pools), else ``~/bergson_bench``.  The
+# index is large at full dimension; point BERGSON_STORE at local storage with
+# enough room.
 STORE_ROOT = (
     os.environ.get("BERGSON_STORE")
     or os.environ.get("BENCH_CACHE", str(Path.home() / "bergson_bench"))
@@ -393,10 +422,13 @@ STORE_ROOT = (
 
 
 class SmiPeak:
-    """Poll nvidia-smi for device memory.used (MB) while sharded workers run."""
+    """Poll ``nvidia-smi`` for device ``memory.used`` while sharded workers run.
+
+    ``peak_gb`` is the maximum seen, over all visible GPUs when ``gpu`` is
+    None or on the GPU with index ``gpu`` otherwise.
+    """
 
     def __init__(self, gpu: str | None = None) -> None:
-        # None: every visible card (max over cards), for bergson's spawned workers
         self.gpu, self.peak_mb = gpu, 0
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._poll, daemon=True)
@@ -433,27 +465,22 @@ def _dir_bytes(p: str) -> int:
 
 
 def run_graddot(task, data_str, subset, train_rows, query_rows, run_path):
-    """bergson GradDot through its ``build`` + ``score`` pipeline.
+    """Bergson GradDot through its ``build`` + ``score`` subcommands.
 
-    ``score`` drives :class:`bergson.score.scorer.Scorer`, which streams the index
-    one module at a time out of the memmap and accumulates ``[batch, n_query]``.
-    The previous implementation used :class:`bergson.query.attributor.Attributor`
-    instead, whose constructor does
+    ``fit`` builds the query index (``build``).  ``score`` runs
+    :class:`bergson.score.scorer.Scorer` over the train split: train gradients
+    are computed on the fly and scored against the query index, which is
+    streamed one module at a time from its memmap.
 
-        self.grads = {name: numpy_to_tensor(mmap[:, lo:hi]).to(device=device) ...}
-
-    i.e. it pulls the *entire* index onto the device.  That is fine at rank-64 and
-    exhausts the card at full dimension, which is what the adapter was reporting
-    as bergson OOM-ing -- it was our choice of entry point, not a library limit.
-
-    Phases: ``fit`` builds the query index; ``score`` walks the train split, whose
-    gradients are computed on the fly and never indexed.
+    Returns ``(fit, score, counts)``: ``{"wall", "mem"}`` per phase and the
+    ``_index_counts`` of the query index and the score store.
     """
     proj = 0 if task.get("proj_mode", "rank64") == "full" else PROJ_DIM
+    chunk = int(task.get("block_size", CHUNK))
     query_path = f"{run_path}/query"
     score_path = f"{run_path}/scores"
     common = ["--model", task["model"], "--dataset", data_str,
-              "--chunk_length", str(CHUNK), "--projection_dim", str(proj)]
+              "--chunk_length", str(chunk), "--projection_dim", str(proj)]
     if subset:
         common += ["--subset", subset]
     common += _batch_args(task) + _parallel_args(task)
@@ -476,49 +503,41 @@ def run_graddot(task, data_str, subset, train_rows, query_rows, run_path):
 
 
 def run_hessian(task, method, data_str, subset, train_rows, query_rows, run_path):
-    """bergson's K-FAC / EK-FAC influence pipeline (CLI >=0.26).
+    """Bergson's K-FAC / EK-FAC influence pipeline.
 
-    Use bergson's own ``ekfac`` subcommand, which is the entry point to
-    ``hessians/pipeline.py`` and runs all four steps in one process:
+    Runs Bergson's ``ekfac`` subcommand, the entry point to
+    ``hessians/pipeline.py``, which performs four steps:
 
-        1. build the QUERY gradients at FULL dimension (the pipeline forces
+        1. build the query gradients at full dimension (the pipeline sets
            ``query_cfg.projection_dim = 0``)
         2. fit the Kronecker factors on the training data
-        3. apply the inverse Hessian to the query gradient, and *only then*
-           project to ``projection_dim``
-        4. score the training examples against the transformed query
+        3. apply the inverse Hessian to the query gradients, then project to
+           ``projection_dim``
+        4. score the training examples against the transformed queries
 
-    Step 3 is why the hand-rolled ``hessian``/``build``/``score`` sequence could
-    not work with projection on: ``Preconditioner.apply`` reshapes each block to
-    ``[n, O, I]``, so it needs gradients in full parameter space, but a
-    ``build --projection_dim 64`` hands it 64-dim vectors and the reshape fails.
-    bergson preconditions first and projects second; the order is not optional.
-
-    The pipeline is a single command, so the whole run is reported as the fit
-    phase (the cross-library table compares ``total_wall_s`` regardless).
+    ``method`` selects ``--hessian_cfg.ev_correction`` (true for ``ekfac``).
+    The pipeline is a single command: its wall time and peak memory are
+    reported as the ``fit`` phase, and ``score`` has wall 0.  Returns
+    ``(fit, score, counts)`` as ``run_graddot`` does.
     """
     ev = "true" if method == "ekfac" else "false"
-    # EK-FAC still forbids projection outright -- hessian_approximations.py
-    # raises when ev_correction is set and index_cfg.projection_dim != 0, and
-    # step 2 above inherits index_cfg.  So EK-FAC is full-dimension only and its
-    # cell belongs in the full-dim column whatever the preset asks for.
+    # Bergson requires projection_dim == 0 when ev_correction is set, so EK-FAC
+    # always runs at full dimension.
     proj = 0 if (task.get("proj_mode", "rank64") == "full" or method == "ekfac") \
         else PROJ_DIM
+    chunk = int(task.get("block_size", CHUNK))
 
     args = ["ekfac", run_path, "--overwrite", "true",
             "--model", task["model"], "--method", "kfac",
             "--hessian_cfg.ev_correction", ev,
             "--projection_dim", str(proj),
             "--data.dataset", data_str, "--data.split", f"train[:{train_rows}]",
-            "--data.chunk_length", str(CHUNK),
+            "--data.chunk_length", str(chunk),
             "--query.dataset", data_str, "--query.split", f"train[:{query_rows}]",
-            "--query.chunk_length", str(CHUNK),
+            "--query.chunk_length", str(chunk),
             "--hessian_pipeline_cfg.inversion_cfg.damping_factor", str(DAMPING),
-            # HessianPipelineConfig.query_aggregation defaults to "mean", which
-            # collapses the whole query set into ONE mean gradient and emits a
-            # single score column -- 1/16th of the query work every other library
-            # in the table performs, and the reason bergson's hessian cells never
-            # hit the memory wall.  "none" gives one column per query.
+            # "none": one score column per query (the default, "mean", scores
+            # the mean query gradient).
             "--query_aggregation", "none"]
     if subset:
         args += ["--data.subset", subset, "--query.subset", subset]
@@ -544,54 +563,49 @@ def run(task: dict, out_root: Path) -> None:
         msg = f"bergson adapter covers graddot/kfac/ekfac, not {method!r}"
         raise ValueError(msg)
     data_str, subset = DATASETS[task["dataset"]]
-    # bergson splits by ROW and re-chunks itself, so convert the benchmark's
-    # chunk-count workload into row counts (see ROWS_PER_CHUNK).
-    # Exact row splits: the benchmark asks for n_train / n_test blocks of CHUNK
-    # tokens, and every other library gets exactly that from a pre-chunked pool.
-    # Warm-up / measured split with run_ours.py's semantics: ``warmup_train``
-    # chunks go through the whole pipeline untimed (throwaway store), then
-    # ``measure_train`` chunks are timed.  bergson re-chunks a row split
-    # itself, so the measured set is the first ``measure_train`` chunks (its
-    # content does not affect cost at fixed chunk length).  Without
-    # ``measure_train`` the old meaning -- all ``n_train`` chunks timed, no
-    # warm-up -- is kept, which is what reproduces earlier rows.
+    # Bergson splits by row and re-chunks itself, so the task's chunk counts
+    # are converted into row counts (``_rows_for_chunks``).
+    # Warm-up / measured split, as in run_ours.py: ``warmup_train`` chunks go
+    # through the whole pipeline untimed (throwaway store), then the first
+    # ``measure_train`` chunks of the train split are timed.  ``measure_train``
+    # defaults to ``n_train``.  ``bergson_docs`` overrides the train row count.
     n_warm = int(task.get("warmup_train", 0) or 0)
     n_meas = int(task.get("measure_train") or task.get("n_train", 1024))
+    chunk = int(task.get("block_size", CHUNK))
     train_rows = task.get("bergson_docs") or _rows_for_chunks(
-        task["model"], data_str, subset, n_meas)
-    warm_rows = _rows_for_chunks(task["model"], data_str, subset, n_warm) \
+        task["model"], data_str, subset, n_meas, chunk=chunk)
+    warm_rows = _rows_for_chunks(task["model"], data_str, subset, n_warm, chunk=chunk) \
         if n_warm else 0
     query_rows = _rows_for_chunks(
-        task["model"], data_str, subset, task.get("n_test", 16))
-    # proj_mode MUST be in the tag: the r=64 and full arrays are separate SLURM
-    # jobs and run concurrently, so a shared store dir means one run's `rm -rf`
-    # races the other's build and leaves a stale `<path>.part` behind, which
-    # validate_run_path then refuses.
+        task["model"], data_str, subset, task.get("n_test", 16), chunk=chunk)
+    # One store directory per cell (the tag includes proj_mode), so cells can
+    # run concurrently.  An existing store of the same cell is removed.
     tag = (f"{task.get('family','?')}-{task.get('scale','?')}-{task['dataset']}"
-           f"-{method}-{proj_mode}")
+           f"-{method}-{proj_mode}-T{chunk}")
     _bergson_precision(task)  # validate up front, before any store is touched
     store = f"{STORE_ROOT}/{tag}"
     subprocess.run(["rm", "-rf", store], check=False)
 
-    global _SHARDED
+    global _SHARDED, _WORLD
+    _WORLD = int(task.get("n_gpus", 1) or 1)
     _SHARDED = task.get("parallelism") == "fsdp" and int(task.get("n_gpus", 1) or 1) > 1
     runner = run_graddot if method == "graddot" else functools.partial(
         run_hessian, method=method)
     t_start = time.perf_counter()
     if n_warm:
-        # Same pipeline on ``warmup_train`` chunks into a throwaway store; this
-        # is also where the (memoized, timed) model load happens.
+        # Same pipeline on ``warmup_train`` chunks into a throwaway store; the
+        # (memoized, timed) model load happens here.
         warm_store = f"{store}_warm"
         subprocess.run(["rm", "-rf", warm_store], check=False)
         runner(task, data_str=data_str, subset=subset, train_rows=warm_rows,
                query_rows=query_rows, run_path=warm_store)
         subprocess.run(["rm", "-rf", warm_store], check=False)
         torch.cuda.empty_cache()
+    measured_from = len(_WORKER_OVERHEAD)  # calls before this are the warm-up's
     fit, score, counts = runner(task, data_str=data_str, subset=subset,
                                 train_rows=train_rows, query_rows=query_rows,
                                 run_path=store)
-    # What bergson actually scored, so an unequal workload can never again hide
-    # behind a row count that looked like a sample count.
+    # [n_train, n_query] of the score store Bergson wrote.
     score_shape = [counts.get("scores", {}).get("num_rows"),
                    counts.get("scores", {}).get("num_scores")]
 
@@ -599,16 +613,21 @@ def run(task: dict, out_root: Path) -> None:
         "dtype": task.get("dtype", "float32"),  # what _precision_flags passed
         "bergson_nproc_per_node": int(task.get("n_gpus", 1) or 1),
         "bergson_distributed_mode": "fsdp" if _SHARDED else "data-parallel",
-        # sharded: bergson's workers reload the model every step in their own
-        # processes, which cannot be excluded from the timing from outside
+        # True for a sharded run: Bergson's workers load the model in their own
+        # processes, and the phases' ``wall_s`` includes those loads.
         "bergson_worker_model_loads_timed": _SHARDED,
+        # One _worker_overhead() summary per measured fit / score call, in
+        # order (timed inside the workers, see bergson_site/).  Subtract
+        # ``load_s`` (and ``startup_s``) from a phase's ``wall_s`` to exclude them.
+        "bergson_worker_overhead": _WORKER_OVERHEAD[measured_from:],
         "lib": LIB,
-        "task": {**task, "block_size": CHUNK, "proj_dim": (0 if proj_mode=="full" else PROJ_DIM), "proj_mode": proj_mode,
+        "task": {**task, "block_size": chunk, "proj_dim": (0 if proj_mode=="full" else PROJ_DIM), "proj_mode": proj_mode,
                  "bergson_train_rows": train_rows, "bergson_query_rows": query_rows,
                  "warmup_train": n_warm, "measure_train": n_meas,
                  "bergson_warm_rows": warm_rows,
                  "bergson_counts": counts, "strategy": "native"},
-        # 1 means every bergson step reused the one loaded model
+        # number of model loads in this process; 1 means every step run here
+        # reused one loaded model
         "bergson_model_loads": _MODEL_CACHE.n_loads if _MODEL_CACHE else None,
         "bergson_data_loads": _DATA_TIMER.n_calls if _DATA_TIMER else None,
         "total_wall_s": round(time.perf_counter() - t_start, 3),
@@ -632,8 +651,7 @@ def run(task: dict, out_root: Path) -> None:
 
 
 def main() -> None:
-    # Refuse to benchmark against anything but the pinned baseline
-    # (versions.py); the version is part of the result.
+    # Requires the Bergson version pinned in versions.py.
     require("bergson")
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)

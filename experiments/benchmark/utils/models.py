@@ -1,8 +1,8 @@
-"""Model registry: family x scale -> HF model id and true parameter count.
+"""Model registry: family x scale -> HF model id and parameter count.
 
-Scale labels are the nominal ladder; the mapped model is the closest real
-release (e.g. "1b" -> Qwen2.5-1.5B) and its true size is recorded so every
-x-axis is honest.
+A scale label is a nominal size; it maps to a released model of that family
+(e.g. "1b" -> Qwen2.5-1.5B) together with that model's parameter count in
+billions, which is stored in the task as ``params_b``.
 """
 
 from __future__ import annotations
@@ -17,8 +17,7 @@ MODELS: dict[str, dict[str, tuple[str, float]]] = {
         "14b": ("Qwen/Qwen2.5-14B", 14.77),
         "32b": ("Qwen/Qwen2.5-32B", 32.5),
         "72b": ("Qwen/Qwen2.5-72B", 72.7),
-        # Qwen1.5: the 2.5 line stops at 72B, and 110B is the only dense Qwen
-        # release between there and what four H200s hold.
+        # The 110B scale is a Qwen1.5 model.
         "110b": ("Qwen/Qwen1.5-110B", 111.2),
     },
     "pythia": {
@@ -36,8 +35,8 @@ def resolve(family: str, scale: str) -> tuple[str, float]:
 
 
 def dtype_for(params_b: float, override: str | None = None) -> str:
-    """Model dtype for a run.  Every experiment states its dtype; the size rule
-    is a fallback for ad-hoc task dicts only."""
+    """Model dtype for a run: *override* (the task's ``dtype`` field) if given,
+    else float32 below 1B parameters and bfloat16 from 1B up."""
     if override is not None:
         return override
     return "float32" if params_b < 1.0 else "bfloat16"

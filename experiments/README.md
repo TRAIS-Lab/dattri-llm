@@ -1,16 +1,9 @@
 # Experiments
 
-| directory | paper |
+This directory contains experiments evaluating the efficiency and attribution fidelity of `dattri-LLM`. The experiments cover runtime, memory usage, and scalability across attribution libraries, as well as attribution accuracy against leave-one-out retraining.
+
+| directory | measures |
 |---|---|
-| `benchmark/` | efficiency: the cross-library tables (one and sixteen queries), the scaling figure, and ordinary versus invasive capture |
-| `fidelity/` | fidelity of optimizer-aware attribution against leave-one-out retraining |
-
-Each is self-contained, with one launcher and a README. This tree holds the
-code only. Runs happen in `experiments_exe/` at the repository root, a copy
-of this tree that also holds every result, cache and figure and is not
-tracked:
-
-```bash
-rsync -a experiments/ experiments_exe/      # refresh the code there
-cd experiments_exe/benchmark && python benchmark.py --experiment query1 --run
-```
+| `benchmark/` | efficiency of four attribution libraries: time and memory on one model, scaling up a model ladder, throughput at the largest batch, cost against the sequence length |
+| `fidelity/` | fidelity of attribution methods against leave-one-out retraining, and their cost |
+| `capture/` | dattri-llm's ordinary versus invasive gradient capture: time saved and score agreement, on the workload of `benchmark/` |

@@ -1,14 +1,26 @@
-"""kronfluence adapter for the universal benchmark (EK-FAC column).
+"""Kronfluence adapter for the benchmark.
 
-Runs kronfluence's Analyzer (fit_all_factors strategy="ekfac" + pairwise scores)
-on a universal (HF model, dataset) task, tracking every attention/MLP linear
-(auto-detected, family-agnostic).  kronfluence fits *full-dimension* EK-FAC
-factors (no projection) -- a different strategy from our proj-64 EK-FAC, which is
-exactly the kind of strategy difference the benchmark is meant to expose.
+Runs Kronfluence's ``Analyzer`` (``fit_all_factors``, then
+``compute_pairwise_scores``) on a (HF model, dataset) task and logs through
+``log.BenchRun``.  The tracked modules are every ``nn.Linear`` outside the
+embedding and the LM head.  Kronfluence fits full-dimension factors: the row
+records ``proj_mode="full"`` and the task's ``proj_mode`` is not read.
 
-    method -> strategy:  graddot -> "identity", kfac -> "kfac", ekfac -> "ekfac".
-    proj_mode is ignored -- kronfluence has no rank-64 mode and always fits
-    full-dimension factors, so its cells belong in the full-dim column.
+    method -> strategy:  graddot -> "identity",  kfac -> "kfac",  ekfac -> "ekfac"
+
+Task fields: ``model``, ``params_b``, ``dataset``, ``method``, and optionally
+``dtype``, ``n_train``, ``n_test``, ``block_size``, ``batch``, ``seed``,
+``warmup_train``, ``measure_train`` and ``parallelism``.  The timed phases are
+``fit_factors`` and ``pairwise_scores``.
+
+Multi-GPU (under torchrun): ``parallelism="ddp"`` (default) replicates the
+model through Accelerate's ``prepare_model``; ``"fsdp"`` shards it with
+``FullyShardedDataParallel`` after Kronfluence's ``prepare_model``, with
+``use_orig_params=True`` and one FSDP unit per transformer block.  Rank 0
+records the row and saves the scores.
+
+    python run_kronfluence.py --task-file plan.json --out <dir>
+    torchrun --nproc_per_node=4 run_kronfluence.py --task-file plan.json --out <dir>
 """
 
 from __future__ import annotations
@@ -16,6 +28,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -25,9 +38,7 @@ sys.path.insert(0, str(BENCH))
 
 import torch
 
-# Same matmul precision as run_ours.py / run_logix.py: TF32 tensor-core
-# matmuls in the float32 tables (Ampere).  Set in this process, which is where
-# the single-card library calls run; the bf16 scaling runs are unaffected.
+# TF32 matrix multiplies for float32 runs; every adapter sets this.
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
 from torch.utils.data import Subset
@@ -51,7 +62,7 @@ LIB = "kronfluence"
 
 
 class LMTask(Task):
-    """kronfluence LM task with auto-detected tracked linears."""
+    """Kronfluence ``Task`` for a causal LM: token-summed next-token loss."""
 
     def __init__(self, tracked: list[str]) -> None:
         self._tracked = tracked
@@ -109,24 +120,18 @@ def run(task: dict, out_root: Path) -> None:
     tag = f"{task.get('family','?')}-{task.get('scale','?')}-{task['dataset']}-{task['method']}"
     run_dir = out_root / "runs" / f"kronfluence-{tag}"
     store = run_dir / "kf_store"
-    # Distributed via Accelerate, which is how kronfluence's own examples do it
-    # (openwebtext/fit_factors.py): Accelerator() initializes the process group
-    # and places the model, and it is a no-op at world size 1, so the same code
-    # serves single-GPU and torchrun launches.
+    # Accelerator() initializes the process group under torchrun and does
+    # nothing at world size 1.
     accelerator = Accelerator()
     main = accelerator.is_main_process
 
-    # Only rank 0 records.  Every rank writing would give N concurrent appenders
-    # to one results.jsonl and N copies of every row.
+    # Rank 0 records the row.
     bench = BenchRun({**task, "n_train": n_train, "n_test": n_test,
                       "block_size": block_size, "batch": batch, "proj_mode": "full",
                       "strategy": "full-dim",
                       "world_size": accelerator.num_processes,
-                      # Accelerator() with no plugin gives DistributedDataParallel:
-                      # every rank holds a FULL copy of the model. That multiplies
-                      # throughput and does NOT reduce per-device memory, so this
-                      # path cannot cross a single-card memory wall -- at 7.62B all
-                      # four ranks OOMed at the same 139 GB the 1-GPU cell hit.
+                      # Updated to the task's ``parallelism`` once the model
+                      # is built.
                       "distributed_mode": ("ddp" if accelerator.num_processes > 1
                                            else "single")},
                      results_path=out_root / "results.jsonl",
@@ -140,22 +145,39 @@ def run(task: dict, out_root: Path) -> None:
             bench.set(**kv)
 
     with phase("build_model"):
-        # The experiment's dtype, not models.dtype_for's size rule.  Without the
-        # override this adapter built bf16 at >=1.0B while run_ours.py honoured
-        # an fp32 experiment, so three of four scales in a cross-library ladder
-        # compared our fp32 against kronfluence's bf16 -- roughly a 2x throughput
-        # advantage, invisible because the record copied the task's dtype rather
-        # than the one actually built.
+        # The task's ``dtype`` takes precedence over models.dtype_for's size
+        # rule; the row records the dtype the model is built in.
         dtype_name = models.dtype_for(task["params_b"], task.get("dtype"))
         record(dtype=dtype_name)
         model, _ = build_model(task["model"], task["params_b"], task.get("dtype"))
         tracked = tracked_linears(model)
         kf_task = LMTask(tracked)
         model = prepare_model(model, kf_task)
-        # accelerator.prepare_model, not .cuda(): under torchrun this wraps the
-        # model for the active backend and pins it to this rank's device.
-        model = accelerator.prepare_model(model)
-        record(n_tracked_modules=len(tracked))
+        parallelism = str(task.get("parallelism", "ddp")) if accelerator.num_processes > 1 else "single"
+        if parallelism == "fsdp":
+            import functools
+
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import ShardingStrategy
+            from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+            from run_ours_fsdp import transformer_block_classes
+
+            model = FSDP(
+                model.to(accelerator.device),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                auto_wrap_policy=functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls=transformer_block_classes(model),
+                ),
+                use_orig_params=True,
+                device_id=accelerator.device,
+            )
+        else:
+            # Places the model on this rank's device and, under torchrun,
+            # wraps it in DistributedDataParallel.
+            model = accelerator.prepare_model(model)
+        record(n_tracked_modules=len(tracked), distributed_mode=parallelism)
     with phase("load_data"):
         train_ds, test_ds = load_task_data(task["model"], task["dataset"],
                                            block_size, n_train, n_test, seed)
@@ -164,14 +186,10 @@ def run(task: dict, out_root: Path) -> None:
                         output_dir=str(store))
     analyzer.set_dataloader_kwargs(DataLoaderKwargs(collate_fn=default_data_collator))
 
-    # Warm-up / measured split with run_ours.py's semantics: ``warmup_train``
-    # samples go through the full fit + score once, untimed and under
-    # throwaway names, then the next ``measure_train`` samples are timed.  The
-    # first pass through a model pays CUDA-context, cuBLAS/cuSOLVER and
-    # allocator first-touch costs that are not attribution work; without a
-    # warm-up they land in the timed phases and, being fixed, distort the
-    # smallest cells most.  Without ``measure_train`` the old meaning -- all
-    # ``n_train`` samples timed, no warm-up -- is kept.
+    # Warm-up / measured split, as in run_ours.py: the first ``warmup_train``
+    # samples go through the full fit + score once, untimed and under separate
+    # factor/score names; the next ``measure_train`` samples are timed.
+    # ``measure_train`` defaults to ``n_train - warmup_train``.
     n_warm = int(task.get("warmup_train", 0) or 0)
     n_meas = int(task.get("measure_train") or (n_train - n_warm))
     if n_warm + n_meas > n_train:
@@ -191,6 +209,12 @@ def run(task: dict, out_root: Path) -> None:
 
     if n_warm:
         fit_and_score(f"{strategy}_warm", Subset(train_ds, range(n_warm)))
+        # The warm-up's factors and scores are removed, so the recorded disk
+        # usage is the measured run's.
+        accelerator.wait_for_everyone()
+        if main:
+            for warm in store.rglob(f"*_{strategy}_warm"):
+                shutil.rmtree(warm, ignore_errors=True)
         torch.cuda.empty_cache()
     measured = Subset(train_ds, range(n_warm, n_warm + n_meas))
 
@@ -219,8 +243,7 @@ def run(task: dict, out_root: Path) -> None:
 
 
 def main() -> None:
-    # Refuse to benchmark against anything but the pinned baseline
-    # (versions.py); the version is part of the result.
+    # Requires the Kronfluence version pinned in versions.py.
     require("kronfluence")
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)

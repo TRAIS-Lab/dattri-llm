@@ -3,21 +3,20 @@
 One deterministic training trajectory (fixed batch order, no dropout) is run
 three ways:
 
-1. **Reference**, wrapped in a ``HookManager`` so the per-sample gradients,
-   the optimizer's moments around every update, and the applied learning
-   rates are cached (the store-then-attribute workflow).
+1. **Reference**, wrapped in a ``HookManager`` so the per-sample gradients
+   and the optimizer's moments around every update are cached (the
+   store-then-attribute workflow), or snapshotted for a later replay
+   (``recompute``, the full-dimension setting).
 2. **Query capture** at the final model: raw gradients of the validation
-   points.
-3. **TSLOO retraining**: for each selected training sample the same
-   trajectory is rerun with that sample dropped from every batch it sits in;
-   the ground truth is the change in each validation point's loss.
+   blocks.
+3. **TSLOO retraining**: for each selected training block the same
+   trajectory is rerun with that block dropped from its batch; the ground
+   truth is the change in each validation block's loss.
 
-AdamW-influence and DVEmb ("SGD-influence" on the same AdamW trajectory) are
-then scored from the same caches and compared with the ground truth by the
-Spearman correlation across the selected samples, averaged over validation
-points -- the protocol of arXiv:2605.18814, Table 1.  ``run`` drives one
-(setting, learning rate, seed) run end to end; ``fidelity.py`` lists the
-runs behind the paper.
+AdamW-influence is then scored from the caches and compared with the ground
+truth by the Spearman correlation across the selected blocks, averaged over
+validation blocks.  ``run`` drives one run end to end; ``fidelity.py`` lists
+the runs.
 """
 
 from __future__ import annotations
@@ -25,19 +24,17 @@ from __future__ import annotations
 import hashlib
 import os
 import json
-import math
 import pathlib
 import shutil
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
 from torch import nn
 
-from dattri_llm.attribution import AdamWInfluenceAttributor, DVEmbAttributor
+from dattri_llm.attribution import AdamWInfluenceAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
-from dattri_llm.attribution.utils import write_lr_schedule
 from dattri_llm.gradient.callbacks import (
     HookManagerCallback,
     OffloadCallback,
@@ -52,11 +49,10 @@ from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import DiskGradientSource, ReplayGradientSource
 
 DYNAMICS_FILE = "adamw_dynamics.pt"
-# Sign each method's score carries relative to TSLOO (loss-after minus
-# loss-before): DVEmb predicts the loss change of removal directly;
-# AdamW-influence follows the paper's ``-grad^T W Z``.
-SIGN = {"adamw_influence": -1.0, "dvemb": 1.0}
-METHODS = tuple(SIGN)
+METHOD = "adamw_influence"
+# TSLOO is the loss without the block minus the reference loss;
+# AdamW-influence scores ``-grad^T W Z``, the opposite sign.
+SIGN = -1.0
 
 # A loss over the samples at ``idx`` of a dataset: (model, idx) -> scalar.
 StepFn = Callable[[nn.Module, torch.Tensor], torch.Tensor]
@@ -64,7 +60,7 @@ StepFn = Callable[[nn.Module, torch.Tensor], torch.Tensor]
 
 @dataclass
 class Setting:
-    """Everything one (dataset, lr, seed) run needs."""
+    """Everything one (scale, lr, seed) run needs."""
 
     name: str
     out_dir: pathlib.Path
@@ -80,24 +76,14 @@ class Setting:
     n_val: int
     val_batch_size: int
     selected: torch.Tensor  # train indices with TSLOO ground truth
-    hook_layers: list[str] | None = None  # linear_io regexes (None: every layer)
     n_masks: int | None = None  # random-mask ensemble (None: every coordinate)
     mask_dim: int = 512  # coordinates per mask and layer
+    hook_layers: list[str] | None = None  # linear_io regexes (None: every layer)
     tsloo_from: pathlib.Path | None = None  # reuse another run's ground truth
-    # Ground truth of removing the sample at every step it appears in
-    # (None, scored by the sum over its steps); only at its "first" / "last"
-    # occurrence (scored by that step's row); or "each": one retrain per
-    # (sample, occurrence) pair, every pair scored by its own row -- the
-    # unbiased per-step protocol.
-    tsloo_at: str | None = None
-    skip_tsloo: bool = False  # timing runs: capture + attribution only
-    # Attribution methods to run (a subset of METHODS); timing runs use one.
-    methods: tuple[str, ...] = METHODS
+    tsloo_only: bool = False  # ground truth only: no capture, no attribution
     # Snapshot the trajectory (parameters, batches, moments) instead of
     # storing gradients, and recompute them at attribution time through the
-    # library's replay source -- the no-mask (full-dimension) setting.  The
-    # AdamW-influence recurrence is then carried through the queries
-    # (``propagation="test"``) instead of the paper's (p, 3p) summary.
+    # library's replay source -- the no-mask (full-dimension) setting.
     recompute: bool = False
     batch: Callable[[torch.Tensor], object] | None = None  # indices -> batch
     loss_fn: Callable[[nn.Module, object], torch.Tensor] | None = None
@@ -176,7 +162,8 @@ class _IdRecorder(HookManagerCallback):
         self.hashes[record.step] = list(h) if isinstance(h, list) else [h]
 
 
-def _selector(s: Setting):
+def _linear_io(s: Setting):
+    """The ``linear_io`` selector of the setting."""
     return REGISTER_ALL if s.hook_layers is None else list(s.hook_layers)
 
 
@@ -185,7 +172,7 @@ def hooked_layers(s: Setting) -> tuple[list[str], dict[str, int]]:
     torch.manual_seed(s.seed)
     model = s.build_model()
     opt, _ = s.make_optimizer(model, 1)
-    hm = HookManager(model, config=HookManagerConfig(linear_io=_selector(s)))
+    hm = HookManager(model, config=HookManagerConfig(linear_io=_linear_io(s)))
     names = list(hm.layer_names)
     hm.remove()
     snap = OptimizerSnapshot(model, opt)
@@ -211,7 +198,7 @@ def mask_projection(s: Setting) -> dict[str, dict] | None:
 
 def snapshot_dir(s: Setting) -> pathlib.Path:
     """Where a recompute run keeps its snapshots: under the run directory, or
-    under ``$FIDELITY_SNAPSHOT_DIR`` (a node-local disk on a cluster)."""
+    under ``$FIDELITY_SNAPSHOT_DIR`` when it is set."""
     root = os.environ.get("FIDELITY_SNAPSHOT_DIR")
     if root:
         return pathlib.Path(root) / s.out_dir.name / "train_snapshots"
@@ -220,8 +207,8 @@ def snapshot_dir(s: Setting) -> pathlib.Path:
 
 def capture_reference(
     s: Setting, batches: list[torch.Tensor], projection: dict | None
-) -> tuple[nn.Module, dict[str, int], dict[int, float]]:
-    """The reference run under hooks; caches train gradients, dynamics, LRs."""
+) -> tuple[nn.Module, dict[str, int]]:
+    """The reference run under hooks; caches the train gradients and the optimizer dynamics."""
     train_dir = snapshot_dir(s) if s.recompute else s.out_dir / "train_grads"
     shutil.rmtree(train_dir, ignore_errors=True)
     torch.manual_seed(s.seed)
@@ -243,13 +230,11 @@ def capture_reference(
         callbacks = [OffloadCallback(1, store), recorder, ids]
     hm = HookManager(
         model,
-        config=HookManagerConfig(linear_io=_selector(s), projection_kwargs=projection),
+        config=HookManagerConfig(linear_io=_linear_io(s), projection_kwargs=projection),
         callbacks=callbacks,
     )
-    lrs: dict[int, float] = {}
     with hm.collect():
         for t, idx in enumerate(batches):
-            lrs[t] = float(optimizer.param_groups[0]["lr"])
             if snaps is not None:
                 snaps.save_batch(t, s.batch(idx))
             optimizer.zero_grad(set_to_none=True)
@@ -261,12 +246,11 @@ def capture_reference(
     hm.remove()
     if snaps is None:
         torch.save(recorder.dynamics(), train_dir / DYNAMICS_FILE)
-    write_lr_schedule(str(train_dir), lrs)
     hash_to_index: dict[str, int] = {}
     for t, idx in enumerate(batches):
         for h, i in zip(ids.hashes[t], idx.tolist(), strict=True):
             hash_to_index.setdefault(h, i)
-    return model, hash_to_index, lrs
+    return model, hash_to_index
 
 
 def capture_queries(
@@ -279,7 +263,7 @@ def capture_queries(
     ids = _IdRecorder()
     hm = HookManager(
         model,
-        config=HookManagerConfig(linear_io=_selector(s), projection_kwargs=projection),
+        config=HookManagerConfig(linear_io=_linear_io(s), projection_kwargs=projection),
         callbacks=[OffloadCallback(1, store), ids],
     )
     order = []
@@ -306,19 +290,11 @@ def occurrences(batches: list[torch.Tensor], i: int) -> list[int]:
     return [t for t, idx in enumerate(batches) if bool((idx == i).any())]
 
 
-def removal_step(s: Setting, batches: list[torch.Tensor], i: int) -> int | None:
-    """The step a single-occurrence TSLOO removes sample *i* at."""
-    if s.tsloo_at is None:
-        return None
-    steps = occurrences(batches, i)
-    return steps[0] if s.tsloo_at == "first" else steps[-1]
-
-
 def tsloo_pairs(s: Setting, batches: list[torch.Tensor]) -> list[tuple[int, int]]:
-    """``(sample, step)`` pairs the ground truth is computed for."""
-    if s.tsloo_at == "each":
-        return [(i, t) for i in s.selected.tolist() for t in occurrences(batches, i)]
-    return [(i, removal_step(s, batches, i)) for i in s.selected.tolist()]
+    """``(block, step)`` pairs of the ground truth: each selected block and
+    the step it is removed at (its last occurrence; with one epoch, its only
+    one)."""
+    return [(i, occurrences(batches, i)[-1]) for i in s.selected.tolist()]
 
 
 def tsloo(
@@ -401,9 +377,8 @@ def _stable_seed(name: str) -> int:
 def _slice_mask(train_dir, test_dir, dynamics, layers, k_of, mask, n_masks, root):
     """Per-mask memory stores holding one disjoint column group per layer.
 
-    The capture's coordinates are sorted, so the groups are drawn from a
-    seeded random permutation of the columns; a contiguous slice would be a
-    position band, not a random mask.
+    The groups are drawn from a seeded random permutation of the captured
+    columns.
     """
     cols = {}
     for n in layers:
@@ -444,20 +419,17 @@ def attribute(
     s: Setting,
     train_map: dict[str, int],
     test_map: dict[str, int],
-    lrs: dict[int, float],
     projection: dict | None,
     log: Callable,
     model: nn.Module | None = None,
-) -> dict[str, Rows]:
-    """AdamW-influence and DVEmb row-level scores (averaged over masks)."""
+) -> Rows:
+    """AdamW-influence row-level scores (averaged over the masks)."""
     args = _args(s)
     test_dir = s.out_dir / "test_grads"
     if s.recompute:
         # The trajectory is replayed from its snapshots by the library: the
         # attributors pull each step's gradients through the same hooks the
         # capture used, and read the moments from the snapshot store.
-        if set(s.methods) - {"adamw_influence", "dvemb"}:
-            raise ValueError("recompute supports adamw_influence and dvemb only.")
         train_dir = snapshot_dir(s)
         replay = ReplayGradientSource(
             model,
@@ -465,7 +437,7 @@ def attribute(
             TrajectorySnapshots(train_dir),
             loss_fn=s.loss_fn,
             config=HookManagerConfig(
-                linear_io=_selector(s), projection_kwargs=projection
+                linear_io=_linear_io(s), projection_kwargs=projection
             ),
         )
         dynamics = None
@@ -473,47 +445,29 @@ def attribute(
         train_dir = s.out_dir / "train_grads"
         dynamics = torch.load(train_dir / DYNAMICS_FILE, weights_only=False)
 
-    def both(train_src, test_src, dyn):
-        out, times = {}, []
+    def score(train_src, test_src, dyn) -> Rows:
+        # The recurrence is carried on the query side ("test").
         t0 = time.time()
-        if "adamw_influence" in s.methods:
-            adamw = AdamWInfluenceAttributor(args).attribute_from_cache(
-                train_src,
-                test_src,
-                dynamics=dyn,
-                loss_reduction="mean",
-                propagation="test" if s.recompute else "train",
-                loop_over_test=s.recompute,
-                block_dtype=torch.bfloat16 if s.recompute else torch.float32,
-            )
-            out["adamw_influence"] = Rows.of(adamw)
-            times.append(f"adamw {time.time() - t0:.1f}s")
-            t0 = time.time()
-        if "dvemb" in s.methods:
-            dvemb = DVEmbAttributor(args).attribute_from_cache(
-                train_src,
-                test_src,
-                learning_rate=lrs,
-                loss_reduction="mean",
-                propagation="test",
-                loop_over_test=s.recompute,
-                block_dtype=torch.bfloat16 if s.recompute else torch.float32,
-                hessian_mode="full",
-            )
-            out["dvemb"] = Rows.of(dvemb)
-            times.append(f"dvemb {time.time() - t0:.1f}s")
-            t0 = time.time()
-        log("  attribution: " + ", ".join(times))
-        return out
+        rows = Rows.of(AdamWInfluenceAttributor(args).attribute_from_cache(
+            train_src,
+            test_src,
+            dynamics=dyn,
+            loss_reduction="mean",
+            propagation="test",
+            loop_over_test=s.recompute,
+            block_dtype=torch.bfloat16 if s.recompute else torch.float32,
+        ))
+        log(f"  attribution: {time.time() - t0:.1f}s")
+        return rows
 
     if s.recompute:
         with replay:
-            return both(replay, str(test_dir), None)
+            return score(replay, str(test_dir), None)
     if projection is None:
-        return both(str(train_dir), str(test_dir), dynamics)
+        return score(str(train_dir), str(test_dir), dynamics)
     layers = sorted(projection)
     k_of = {n: projection[n]["proj_dim"] // s.n_masks for n in layers}
-    total = {}
+    total: Rows | None = None
     for mask in range(s.n_masks):
         tr, te, dyn = _slice_mask(
             train_dir,
@@ -526,15 +480,13 @@ def attribute(
             s.out_dir / "masks",
         )
         with tr, te:
-            part = both(tr, te, dyn)
-        for k, v in part.items():
-            if k in total:
-                total[k].add(v)
-            else:
-                total[k] = v
+            part = score(tr, te, dyn)
+        if total is None:
+            total = part
+        else:
+            total.add(part)
         log(f"  mask {mask + 1}/{s.n_masks} done")
-    for v in total.values():
-        v.scores /= s.n_masks
+    total.scores /= s.n_masks
     return total
 
 
@@ -561,6 +513,32 @@ def peak_gb() -> str:
     return f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB"
 
 
+def run_tsloo_only(s: Setting, batches: list[torch.Tensor], log: Callable) -> dict:
+    """The ground truth alone: reference trajectory, validation losses and the
+    leave-one-out reruns; ``matrices.pt`` then serves later attribution runs
+    through ``--tsloo-from``."""
+    t0 = time.time()
+    model, _ = run_trajectory(s, batches)
+    ref_losses = s.val_losses(model).cpu()
+    log(f"  reference: {time.time() - t0:.0f}s, {len(batches)} steps, {peak_gb()}")
+    pairs = tsloo_pairs(s, batches)
+    t0 = time.time()
+    truth = tsloo(s, batches, ref_losses, log)
+    torch.save(
+        {"tsloo": truth, "selected": s.selected, "pairs": pairs, "ref_losses": ref_losses},
+        s.out_dir / "matrices.pt",
+    )
+    result = {
+        "name": s.name, "seed": s.seed, **s.extra,
+        "n_selected": int(s.selected.numel()), "n_val": int(ref_losses.numel()),
+        "tsloo_s": round(time.time() - t0, 1), "tsloo_abs_mean": float(truth.abs().mean()),
+        "tsloo_abs_max": float(truth.abs().max()), "tsloo_only": True,
+    }
+    log(f"  result: {json.dumps(result)}")
+    (s.out_dir / "result.json").write_text(json.dumps(result, indent=2))
+    return result
+
+
 def run(s: Setting) -> dict:
     s.out_dir.mkdir(parents=True, exist_ok=True)
     log_path = s.out_dir / "log.txt"
@@ -575,38 +553,42 @@ def run(s: Setting) -> dict:
     if s.device != "cpu":
         torch.cuda.reset_peak_memory_stats()
     batches = make_batches(s.n_train, s.batch_size, s.epochs, s.seed)
+    if s.tsloo_only:
+        return run_tsloo_only(s, batches, log)
     projection = mask_projection(s)
     if projection is not None:
         log(f"  masks: {s.n_masks} x {s.mask_dim} over {len(projection)} layers")
     t0 = time.time()
-    model, train_map, lrs = capture_reference(s, batches, projection)
+    model, train_map = capture_reference(s, batches, projection)
     ref_losses = s.val_losses(model).cpu()
     test_map = capture_queries(s, model, projection)
+    if s.device != "cpu":
+        torch.cuda.synchronize()
+    timing = {"train_s": round(time.time() - t0, 1)}
+    peaks = [torch.cuda.max_memory_allocated() / 2**30 if s.device != "cpu" else 0.0]
     log(
         f"  reference + capture: {time.time() - t0:.0f}s, {len(batches)} steps, {peak_gb()}"
     )
-    # A content hash shared by two selected samples would alias their rows.
+    # Keep the selected samples whose content hash maps back to them.
     ids = {v: k for k, v in train_map.items()}
     keep = [i for i in s.selected.tolist() if i in ids]
     s.selected = torch.tensor(keep)
     if s.device != "cpu":
         torch.cuda.reset_peak_memory_stats()
     t_attr = time.time()
-    rows = attribute(s, train_map, test_map, lrs, projection, log, model=model)
-    torch.save({"selected": s.selected, **rows}, s.out_dir / "rows.pt")
+    rows = attribute(s, train_map, test_map, projection, log, model=model)
+    if s.device != "cpu":
+        torch.cuda.synchronize()
+    timing["attribute_s"] = round(time.time() - t_attr, 1)
+    timing["total_s"] = round(timing["train_s"] + timing["attribute_s"], 1)
+    peaks.append(torch.cuda.max_memory_allocated() / 2**30 if s.device != "cpu" else 0.0)
+    timing["peak_gb"] = round(max(peaks), 2)
     log(f"  attribution total: {time.time() - t_attr:.0f}s, {peak_gb()}")
-    if s.recompute:  # the snapshots are an intermediate (parameters x steps)
+    if s.recompute:  # delete the intermediate snapshots and query gradients
         shutil.rmtree(snapshot_dir(s), ignore_errors=True)
         shutil.rmtree(s.out_dir / "test_grads", ignore_errors=True)
-    if s.skip_tsloo:
-        log("  skip_tsloo: done")
-        result = {"name": s.name, "seed": s.seed, **s.extra, "skip_tsloo": True}
-        (s.out_dir / "result.json").write_text(json.dumps(result, indent=2))
-        return result
     pairs = tsloo_pairs(s, batches)
-    scores = {
-        k: _matrix(v, train_map, test_map, pairs, s.n_val) for k, v in rows.items()
-    }
+    scores = _matrix(rows, train_map, test_map, pairs, s.n_val)
     if s.tsloo_from is not None:
         saved = torch.load(s.tsloo_from / "matrices.pt")
         assert torch.equal(saved["selected"], s.selected)
@@ -615,32 +597,14 @@ def run(s: Setting) -> dict:
     else:
         truth = tsloo(s, batches, ref_losses, log)
     torch.save(
-        {"tsloo": truth, "selected": s.selected, "pairs": pairs, **scores},
+        {"tsloo": truth, "selected": s.selected, "pairs": pairs, METHOD: scores},
         s.out_dir / "matrices.pt",
     )
+    rho = spearman_per_column(scores, SIGN * truth)
     result = {
-        "name": s.name,
-        "seed": s.seed,
-        **s.extra,
-        "tsloo_at": s.tsloo_at or "all",
-        "n_selected": len(keep),
+        "name": s.name, "seed": s.seed, **s.extra, "n_selected": len(keep), **timing,
+        METHOD: float(rho.mean()), f"{METHOD}_std_over_val": float(rho.std()),
     }
-    for k, v in scores.items():
-        # TSLOO is loss-after minus loss-before.  DVEmb's score is the
-        # predicted loss change of removing the sample (same sign);
-        # AdamW-influence follows the paper's ``-grad^T W Z_push`` (opposite).
-        rho = spearman_per_column(v, SIGN[k] * truth)
-        result[k] = float(rho.mean())
-        result[f"{k}_std_over_val"] = float(rho.std())
-        if s.tsloo_at == "each":
-            # Per occurrence rank (epoch): Spearman across the samples removed
-            # at their e-th occurrence.
-            rank = {(i, t): occurrences(batches, i).index(t) for i, t in pairs}
-            for e in sorted(set(rank.values())):
-                sel = [k2 for k2, pr in enumerate(pairs) if rank[pr] == e]
-                result[f"{k}_epoch{e}"] = float(
-                    spearman_per_column(v[sel], SIGN[k] * truth[sel]).mean()
-                )
     log(f"  result: {json.dumps(result)}")
     with (s.out_dir / "result.json").open("w") as f:
         json.dump(result, f, indent=2)

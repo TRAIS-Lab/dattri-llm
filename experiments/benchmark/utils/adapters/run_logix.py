@@ -1,37 +1,41 @@
-"""logix adapter for the universal benchmark (modal tree).
+"""LogIX adapter for the benchmark.
 
-Runs logix's own LoGra pipeline -- rank-64 LoRA compression, extract
-(gradients + optional Hessian statistics), then ``compute_influence_all`` --
-on a universal (HF model, dataset) task and logs through ``log.BenchRun``.
-This is the baseline whose projection is closest to ours: LoGra's random
-Kronecker compression is a per-side rank-64 projection of each linear layer,
-the same regime as our rank-64 capture.
+Runs LogIX's LoGra pipeline -- rank-64 LoRA compression (``add_lora``),
+extraction (gradients and, for K-FAC/EK-FAC, Hessian statistics), then
+``compute_influence_all`` -- on a (HF model, dataset) task and logs through
+``log.BenchRun``.  LoGra's compression is a per-side rank-64 projection of
+each linear layer.  With ``proj_mode="full"`` the LoRA step is skipped.
 
     method -> logix hessian:  graddot -> "none",  kfac -> "kfac",  ekfac -> "ekfac"
 
-GradDot is ``hessian="none"`` with ``precondition=False``: logged LoGra
-gradients, dotted.  It is NOT ``hessian="raw"`` -- in logix "raw" schedules a
-dense gradient *covariance* (a 4096 x 4096 Gram per layer at rank 64, ~11 GB
-of state on a 0.5B model) and ``precondition_raw`` inverts it, i.e. a dense
-Hessian influence function.  The parent-tree adapter mapped GradDot to "raw",
-so its LogIX GradDot cells timed that heavier method; fixed here and there.
+GradDot is ``hessian="none"`` with ``precondition=False``: dot products of the
+logged gradients.  K-FAC and EK-FAC score with ``precondition=True``.
 
-Warm-up / measured split with run_ours.py's semantics: ``warmup_train``
-samples go through the full pipeline first (own ``LogIX`` instance, throwaway
-project), then ``measure_train`` samples are timed.  logix wraps linear layers
-in place when LoRA is added, so between the two runs the warm-up instance's
-hooks are cleared and its LoRA wrappers removed (``LoraLinear._linear`` is the
-original layer); the measured ``extract`` phase then contains exactly what the
-A40 tables timed: ``add_lora`` + extraction.
+Task fields: ``model``, ``params_b``, ``dataset``, ``method``, and optionally
+``dtype``, ``proj_mode``, ``n_train``, ``n_test``, ``block_size``, ``batch``,
+``seed``, ``warmup_train`` and ``measure_train``.  The timed phases are
+``extract`` (``add_lora`` + extraction) and ``score``.
 
-dtype follows the task like every other adapter.  logix creates its LoRA
-modules in float32 whatever the model's dtype, which is the "dtype-mismatch
-matmul" that made the parent-tree adapter force float32; casting the LoRA
-modules to the model's dtype after ``add_lora`` resolves it; the on-disk log
-(numpy, no bf16) is written as float32 via logix's ``logging.log_dtype``.
-Covariance eigendecompositions are done in double by logix itself, so bf16
-statistics are fine.  Single process; the layer name filter ["att", "mlp"] matches attention
-+ MLP linears across gpt2 / GPT-NeoX (pythia) / Qwen / Llama.
+Warm-up / measured split, as in run_ours.py: the first ``warmup_train``
+samples go through the full pipeline untimed (own ``LogIX`` instance and
+project), then the next ``measure_train`` samples are timed.  LogIX wraps
+linear layers in place when LoRA is added, so between the two passes the
+warm-up instance's hooks are cleared and its LoRA wrappers removed
+(``LoraLinear._linear`` is the original layer).
+
+The model dtype follows the task.  LogIX creates its LoRA modules in float32,
+so they are cast to the model's dtype after ``add_lora``.  LogIX writes its
+log through numpy, which has no bfloat16, so for a bfloat16 model the log is
+stored in float32 (LogIX's ``logging.log_dtype`` option).  The layer name
+filter ``["att", "mlp"]`` selects the attention and MLP linears of GPT-2,
+GPT-NeoX (Pythia), Qwen and Llama models.
+
+Multi-GPU (under torchrun): one model replica per GPU, each extracting its
+shard of the training set; rank 0 scores from the merged logs and records the
+row.
+
+    python run_logix.py --task-file plan.json --out <dir>
+    torchrun --nproc_per_node=4 run_logix.py --task-file plan.json --out <dir>
 """
 
 from __future__ import annotations
@@ -51,7 +55,7 @@ sys.path.insert(0, str(BENCH))
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 import models
 from data import load_task_data
@@ -66,9 +70,9 @@ LORA_RANK = 64
 _HESSIAN = {"kfac": "kfac", "graddot": "none", "ekfac": "ekfac"}
 NAME_FILTER = ["att", "mlp"]
 
-# logix predates torch 2.6's weights_only=True default; its saved state holds
-# populated defaultdicts the weights-only unpickler cannot rebuild.  Every file
-# loaded here is this run's own output, so restore the pre-2.6 behaviour.
+# LogIX's saved state holds populated defaultdicts, which
+# ``torch.load(weights_only=True)`` does not rebuild.  Every file loaded here
+# is this run's own output, so ``weights_only`` defaults to False.
 _orig_load = torch.load
 
 
@@ -99,13 +103,20 @@ def build_model(model_id: str, params_b: float, dtype_override: str | None):
     return model.cuda().eval(), tok, dtype_name
 
 
+def _world() -> tuple[int, int]:
+    """``(rank, world_size)`` under torchrun, ``(0, 1)`` otherwise."""
+    import os
+
+    return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+
+
 def _lora_modules(model):
     return [(n, m) for n, m in model.named_modules()
             if type(m).__name__ in ("LoraLinear", "LoraConv2d", "LoraEmbedding")]
 
 
 def _cast_lora(model, dtype: torch.dtype) -> None:
-    """logix builds LoRA modules in float32; match the model's dtype."""
+    """Cast LogIX's LoRA modules (created in float32) to the model's dtype."""
     for _, m in _lora_modules(model):
         m.to(dtype)
 
@@ -124,10 +135,11 @@ def _remove_lora(model) -> int:
 def extract_and_score(model, tok, train_ds, test_ds, *, hessian: str, proj_mode: str,
                       batch: int, n_test: int, project: str, log_root: Path,
                       dtype: torch.dtype, seed: int = 0, phase=None):
-    """One full logix pass: watch (+ LoRA), extract, score.  Returns (lx, score).
+    """One full LogIX pass: watch (+ LoRA), extract, score.  Returns (lx, score).
 
     ``phase(name, units)`` wraps the two timed sections when given; the warm-up
-    passes ``None`` and is not timed.
+    passes ``None`` and is not timed.  Under torchrun, ``score`` is ``None`` on
+    every rank but 0.
     """
     from logix import LogIX, LogIXScheduler
     from logix.utils import merge_logs
@@ -135,26 +147,39 @@ def extract_and_score(model, tok, train_ds, test_ds, *, hessian: str, proj_mode:
 
     phase = phase or (lambda *_: contextlib.nullcontext())
     cfg = log_root / f"{project}.yaml"
-    # logix writes its log through numpy, which has no bfloat16; for a bf16
-    # model the logged tensors -- the rank-64 compressed gradients, tiny -- are
-    # stored as float32 (logix's own ``logging.log_dtype`` option).  Model
-    # forward/backward and the LoRA compression stay in the model's dtype.
+    # LogIX writes its log through numpy, which has no bfloat16; for a
+    # bfloat16 model the logged gradients are stored as float32 (LogIX's
+    # ``logging.log_dtype`` option).  Model forward/backward and the LoRA
+    # compression stay in the model's dtype.
     log_dtype = "float32" if dtype == torch.bfloat16 else "none"
-    cfg.write_text(f"root_dir: {log_root}/logs\nlora:\n  init: random\n  rank: {LORA_RANK}\n"
-                   f"logging:\n  log_dtype: {log_dtype}\n")
+    if _world()[0] == 0:
+        cfg.write_text(f"root_dir: {log_root}/logs\nlora:\n  init: random\n  rank: {LORA_RANK}\n"
+                       f"logging:\n  log_dtype: {log_dtype}\n")
+    if _world()[1] > 1:
+        import torch.distributed as dist
+
+        dist.barrier()  # the config file is written before anyone reads it
     lx = LogIX(project, config=str(cfg))
+    if _world()[1] > 1:
+        import torch.distributed as dist
+
+        dist.barrier()  # rank 0 creates the log directory the others write to
     lx.watch(model, name_filter=NAME_FILTER)
 
     with phase("extract", len(train_ds)):
         if proj_mode != "full":
-            # logix draws the LoRA encoder/decoder (its random projection) from
-            # torch's global RNG with no seed of its own; pin it so two runs of
-            # the same cell project identically and their scores can be compared.
+            # LogIX draws the LoRA encoder/decoder (its random projection) from
+            # torch's global RNG; seeding it makes the projection reproducible.
             torch.manual_seed(seed)
             lx.add_lora()  # rank-64 LoRA projection; full-dim skips this
             _cast_lora(model, dtype)
         scheduler = LogIXScheduler(lx, lora="none", hessian=hessian, save="grad")
-        loader = DataLoader(train_ds, batch_size=batch, shuffle=False,
+        # Multi-GPU: each rank extracts its own shard; LogIX writes per-rank
+        # log chunks and all-reduces its covariance state at finalize().
+        rank, world = _world()
+        sampler = (DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=False)
+                   if world > 1 else None)
+        loader = DataLoader(train_ds, batch_size=batch, shuffle=False, sampler=sampler,
                             collate_fn=default_data_collator)
         for _ in scheduler:
             for b in loader:
@@ -166,6 +191,14 @@ def extract_and_score(model, tok, train_ds, test_ds, *, hessian: str, proj_mode:
                     loss = shift_ce_sum(model(**b).logits, tgt)
                     loss.backward()
             lx.finalize()
+
+    rank, world = _world()
+    if world > 1:
+        import torch.distributed as dist
+
+        dist.barrier()  # every rank's log chunks are on disk
+        if rank != 0:
+            return lx, None  # rank 0 scores from the merged logs
 
     with phase("score", len(train_ds) + n_test):
         lx.initialize_from_log()
@@ -184,9 +217,9 @@ def extract_and_score(model, tok, train_ds, test_ds, *, hessian: str, proj_mode:
                 loss = shift_ce_sum(model(**b).logits, tgt)
                 loss.backward()
             test_logs.append(copy.deepcopy(lx.get_log()))
-        # GradDot: plain dot products of the logged gradients.  With a Hessian,
-        # logix's "auto" picks K-FAC/EK-FAC preconditioning from the statistics
-        # the extract pass accumulated.
+        # GradDot: dot products of the logged gradients.  With a Hessian,
+        # LogIX preconditions with the K-FAC/EK-FAC statistics accumulated
+        # during extraction.
         result = lx.influence.compute_influence_all(
             merge_logs(test_logs), log_loader, precondition=(hessian != "none"))
 
@@ -209,32 +242,59 @@ def run(task: dict, out_root: Path) -> None:
 
     tag = f"{task.get('family','?')}-{task.get('scale','?')}-{task['dataset']}-{method}"
     run_dir = out_root / "runs" / f"logix-{tag}"
+    # Multi-GPU (``distributed_mode="ddp"`` in the row): one full model replica
+    # per rank under torchrun, without a DDP wrapper.  LogIX's hooks read
+    # activations and output gradients, and its collectives merge the per-rank
+    # covariance state.  Rank 0 records and scores.
+    rank, world = _world()
+    if world > 1:
+        import os
+
+        import torch.distributed as dist
+
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        dist.init_process_group("nccl")
     bench = BenchRun({**task, "n_train": n_train, "n_test": n_test,
                       "block_size": block_size, "batch": batch,
                       "lora_rank": LORA_RANK, "proj_mode": proj_mode,
-                      "strategy": "logra"},
+                      "strategy": "logra", "world_size": world,
+                      "distributed_mode": "ddp" if world > 1 else "single"},
                      results_path=out_root / "results.jsonl",
-                     run_dir=run_dir, lib=LIB)
+                     run_dir=run_dir, lib=LIB) if rank == 0 else None
 
-    with bench.phase("build_model"):
+    def phase(name: str, units: int | None = None):
+        return bench.phase(name, units) if bench else contextlib.nullcontext()
+
+    def record(**kv) -> None:
+        if bench:
+            bench.set(**kv)
+
+    with phase("build_model"):
         model, tok, dtype_name = build_model(task["model"], task["params_b"],
                                              task.get("dtype"))
-        bench.set(dtype=dtype_name, proj_mode=proj_mode)
-    with bench.phase("load_data"):
+        record(dtype=dtype_name, proj_mode=proj_mode)
+    with phase("load_data"):
         train_ds, test_ds = load_task_data(task["model"], task["dataset"],
                                            block_size, n_train, n_test, seed)
     dtype = getattr(torch, dtype_name)
 
-    # Warm-up / measured split (see module docstring).  Without ``measure_train``
-    # the old meaning -- all ``n_train`` samples timed, no warm-up -- is kept.
+    # Warm-up / measured split (see module docstring).  ``measure_train``
+    # defaults to ``n_train - warmup_train``.
     n_warm = int(task.get("warmup_train", 0) or 0)
     n_meas = int(task.get("measure_train") or (n_train - n_warm))
     if n_warm + n_meas > n_train:
         msg = f"n_train={n_train} < warmup_train + measure_train = {n_warm + n_meas}"
         raise ValueError(msg)
-    bench.set(warmup_train=n_warm, measure_train=n_meas)
+    record(warmup_train=n_warm, measure_train=n_meas)
 
-    log_root = Path(tempfile.mkdtemp(prefix="logix_"))
+    # One log root for every rank (LogIX merges the per-rank chunks from it).
+    log_root = Path(tempfile.mkdtemp(prefix="logix_")) if rank == 0 else None
+    if world > 1:
+        import torch.distributed as dist
+
+        holder = [str(log_root)]
+        dist.broadcast_object_list(holder, src=0)
+        log_root = Path(holder[0])
     common = dict(hessian=hessian, proj_mode=proj_mode, batch=batch, n_test=n_test,
                   log_root=log_root, dtype=dtype, seed=seed)
     if n_warm:
@@ -242,15 +302,27 @@ def run(task: dict, out_root: Path) -> None:
                                        test_ds, project=f"{tag}_warm", **common)
         lx_warm.clear()                     # remove the warm-up instance's hooks
         removed = _remove_lora(model)       # so the timed run adds LoRA itself
-        bench.set(warmup_lora_removed=removed)
-        shutil.rmtree(log_root / "logs" / f"{tag}_warm", ignore_errors=True)
+        record(warmup_lora_removed=removed)
+        if world > 1:
+            import torch.distributed as dist
+
+            dist.barrier()  # rank 0 is done reading the warm-up logs
+        if rank == 0:
+            shutil.rmtree(log_root / "logs" / f"{tag}_warm", ignore_errors=True)
         del lx_warm
         torch.cuda.empty_cache()
 
     measured = Subset(train_ds, range(n_warm, n_warm + n_meas))
     project = f"{tag}_{hessian}"
     _lx, score = extract_and_score(model, tok, measured, test_ds, project=project,
-                                   phase=bench.phase, **common)
+                                   phase=phase, **common)
+    if world > 1:
+        import torch.distributed as dist
+
+        dist.barrier()
+        dist.destroy_process_group()
+    if rank != 0:
+        return
 
     bench.record_disk("log_store", log_root / "logs" / project)
     torch.save({"score": score}, run_dir / "score.pt")
@@ -261,8 +333,7 @@ def run(task: dict, out_root: Path) -> None:
 
 
 def main() -> None:
-    # Refuse to benchmark against anything but the pinned baseline
-    # (versions.py); the version is part of the result.
+    # Requires the LogIX version pinned in versions.py.
     require("logix")
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)

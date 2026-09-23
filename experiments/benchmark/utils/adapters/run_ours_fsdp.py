@@ -1,19 +1,27 @@
-"""dattri_llm FSDP adapter for the universal benchmark.
+"""dattri_llm FSDP adapter for the benchmark.
 
-Runs attribution under FSDP across N GPUs (``torchrun --nproc_per_node=N``).
+Runs attribution under FSDP across N GPUs (``torchrun --nproc_per_node=N``)
+and logs through ``log.BenchRun``.
 
-The library's streamer/`attribute()` path builds the forward with
-``torch.func.functional_call``, which is incompatible with FSDP (it bypasses
-FSDP's parameter all-gather and cannot resolve the ``_fsdp_wrapped_module``
-names).  The FSDP-correct route -- the one the library's FSDP *tests* use -- is
-HookManager-direct capture: register the ghost (`linear_io`) hooks on the
-unwrapped model, wrap it in FSDP, and run a plain ``fsdp_model(**batch)`` forward
-+ backward; the hooks fire on the (surviving) submodules and OffloadCallback
-persists each per-sample gradient to a per-rank store.  Scoring then runs on
-rank 0 from the merged store (DiskGradientSource concatenates every rank's
-shards), yielding the FSDP-correctness invariant: FSDP scores == single-device.
+The model is wrapped in FSDP (one unit per decoder block) and handed to the
+attributor as a :class:`dattri_llm.task.AttributionTask`.  Every rank scores
+its shard of the training set against every query; rank 0 gathers the score
+rows and aligns the matrix to input order by content hash.  GradDot runs
+``attribute()``; K-FAC/EK-FAC run ``attribute()`` with a disk gradient store,
+which holds the materialized rank-``PROJ_DIM`` block and collects the
+covariances during capture.
 
-    torchrun --nproc_per_node=2 adapters/run_ours_fsdp.py --task-file plan.json
+    method -> attributor:  graddot -> TracInAttributor,  kfac -> KFACAttributor,
+                           ekfac -> EKFACAttributor
+
+Task fields: ``model``, ``params_b``, ``dataset``, ``method``, and optionally
+``dtype``, ``n_train``, ``n_test``, ``block_size``, ``batch``, ``seed``,
+``warmup_train``, ``measure_train`` and ``freeze``.  The timed phase is
+``attribute``.  Gradients are projected to ``PROJ_DIM`` per side;
+K-FAC/EK-FAC use damping ``DAMPING``.  ``DATTRI_FSDP_CPU_INIT=1`` keeps the
+model on the CPU until FSDP shards it.
+
+    torchrun --nproc_per_node=2 run_ours_fsdp.py --task-file plan.json --out <dir>
 """
 
 from __future__ import annotations
@@ -24,7 +32,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -37,19 +44,17 @@ import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.utils.data import DataLoader, DistributedSampler, Subset
+from torch.utils.data import Subset
 
 import models
 from data import load_task_data
 from log import BenchRun
 
-from dattri.task import AttributionTask
 from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttributor
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
-from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.gradient.storage_manager import GradientStorageManager
+from dattri_llm.gradient.hooks import HookManagerConfig
+from dattri_llm.task import AttributionTask
 from dattri_llm.utils.hashing import hash_sample
 
 if torch.cuda.is_available():
@@ -71,10 +76,8 @@ def linear_layer_names(model) -> list[str]:
 def transformer_block_classes(model) -> set:
     """The repeated decoder-block classes, for FSDP's transformer wrap policy.
 
-    Without a policy FSDP treats the whole model as ONE unit, so the forward
-    all-gather reconstructs every parameter on every rank -- sharding is undone
-    exactly at the memory peak.  HF exposes the block class via
-    ``_no_split_modules``; the ModuleList fallback covers models that do not.
+    Read from the HF model's ``_no_split_modules``; for a model without it,
+    the element class of the first ``ModuleList`` with more than one element.
     """
     names = set(getattr(model, "_no_split_modules", None) or ())
     cls = {type(m) for _, m in model.named_modules() if type(m).__name__ in names}
@@ -86,40 +89,27 @@ def transformer_block_classes(model) -> set:
     return cls
 
 
-def capture_split(model, fsdp_model, ds, batch_size, layers, proj, out_dir, dev):
-    """Ghost-capture one split under FSDP into a per-rank on-disk store."""
-    fm = GradientStorageManager(out_dir)  # auto rank_N/ subdirs under dist
-    hm = HookManager(
-        model,
-        config=HookManagerConfig(
-            linear_io=layers, projection_kwargs=proj, capture_style=capture_style
-        ),
-        callbacks=[
-            OffloadCallback(
-                offload_interval=1, file_manager=fm, recording_type="per_sample"
-            )
-        ],
+def direct_loss(model, batch) -> torch.Tensor:
+    """Token-summed next-token loss of *model* (the FSDP wrapper) on *batch*."""
+    out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    logits = out.logits if hasattr(out, "logits") else out
+    labels = batch["input_ids"].masked_fill(batch["attention_mask"] == 0, -100)
+    return F.cross_entropy(
+        logits[:, :-1].flatten(0, 1),
+        labels[:, 1:].flatten(),
+        reduction="sum",
+        ignore_index=-100,
     )
-    sampler = DistributedSampler(ds, shuffle=False)  # disjoint shard per rank
-    loader = DataLoader(ds, batch_size=batch_size, sampler=sampler)
-    with hm.collect():
-        for b in loader:
-            ids = b["input_ids"].to(dev)
-            am = b["attention_mask"].to(dev)
-            fsdp_model.zero_grad(set_to_none=True)
-            out = fsdp_model(input_ids=ids, attention_mask=am)
-            logits = out.logits if hasattr(out, "logits") else out
-            labels = ids.masked_fill(am == 0, -100)
-            loss = F.cross_entropy(
-                logits[:, :-1].flatten(0, 1),
-                labels[:, 1:].flatten(),
-                reduction="sum",
-                ignore_index=-100,
-            )
-            loss.backward()
-    hm.remove()
-    fsdp_model.zero_grad(set_to_none=True)
-    return out_dir
+
+
+def gather_rows(score, world: int) -> tuple[list[str], torch.Tensor] | None:
+    """Every rank's ``(train_ids, rows)`` concatenated on rank 0 (``None`` elsewhere)."""
+    ids, matrix = score.agnostic_matrix()
+    parts: list = [None] * world
+    dist.all_gather_object(parts, (list(ids), matrix.cpu().float()))
+    if dist.get_rank() != 0:
+        return None
+    return [i for ids_r, _ in parts for i in ids_r], torch.cat([m for _, m in parts], dim=0)
 
 
 def run(task: dict, out_root: Path) -> None:
@@ -167,24 +157,28 @@ def run(task: dict, out_root: Path) -> None:
     tok = AutoTokenizer.from_pretrained(model_id)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    # CPU init: a model larger than one device cannot be materialized on GPU
-    # before FSDP shards it (72B in bf16 is ~145GB vs a 141GB H200).  FSDP's
-    # ``device_id`` moves each unit to the device as it shards, so GPU peak
-    # during init is one block plus the local shard, not the whole model.
+    # ``DATTRI_FSDP_CPU_INIT=1`` (for a model larger than one device) keeps
+    # the model on the CPU; FSDP's ``device_id`` then moves each unit to the
+    # device as it is sharded.
     cpu_init = os.environ.get("DATTRI_FSDP_CPU_INIT", "0") == "1"
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
     if not cpu_init:
         model = model.to(dev)
     model = model.eval()
-    # Store style per method: GradDot captures "auto" (the library's cost rule
-    # materializes the projected 64x64 block per layer once S >= 32, so the
-    # store is 16x smaller than factorized), while K-FAC/EK-FAC keep the
-    # factorized (a, g) store that rank 0's fit() sweeps for the covariances.
-    # (The single-GPU adapter instead collects the covariances at capture with
-    # KroneckerCovarianceCallback and stores the materialized block; under
-    # FSDP each rank sees only its shard of the data, so that callback's
-    # per-rank covariances would first have to be reduced across ranks.)
-    capture_style = "factorized" if method in ("kfac", "ekfac") else "auto"
+    # ``task["freeze"]`` (default True) freezes every parameter but the input
+    # embedding, which keeps gradients flowing through the activations, and
+    # captures the frozen layers (``include_frozen``).  Autograd then computes
+    # no weight gradient and FSDP allocates no sharded gradients.  With
+    # ``False`` every parameter stays trainable.
+    freeze = bool(task.get("freeze", True))
+    if freeze:
+        model.requires_grad_(False)
+        model.get_input_embeddings().requires_grad_(True)
+    # Capture style per method: GradDot captures with ``capture_style="auto"``
+    # (the library's cost rule picks factorized or materialized per layer);
+    # K-FAC/EK-FAC store the materialized projected block and collect the
+    # covariances during capture.
+    capture_style = "materialized" if method in ("kfac", "ekfac") else "auto"
     proj = {
         "__default__": {
             "style": "logra",
@@ -195,15 +189,14 @@ def run(task: dict, out_root: Path) -> None:
         }
     }
     if bench is not None:
-        bench.set(capture_style=capture_style)
+        bench.set(capture_style=capture_style, freeze=freeze)
 
     train_ds, test_ds = load_task_data(
         model_id, task["dataset"], block_size, n_train, n_test, seed
     )
 
-    # Wrap FSDP once; use_orig_params keeps the hooked submodules addressable.
-    # The auto-wrap policy is what makes sharding pay off: one unit per decoder
-    # block gathers one block at a time instead of the whole model.
+    # One FSDP unit per decoder block; ``use_orig_params`` keeps the hooked
+    # submodules addressable.
     wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls=transformer_block_classes(model),
@@ -216,23 +209,20 @@ def run(task: dict, out_root: Path) -> None:
         use_orig_params=True,
     )
 
-    # Hooked-layer names MUST be read after wrapping: nested wrapping rewrites
-    # every path (``layers.0.mlp`` -> ``layers.0._fsdp_wrapped_module.mlp``) and
-    # these patterns are anchored, so pre-wrap names match nothing and capture
-    # silently yields an empty store.
+    # Hooked-layer names are read after wrapping: nested wrapping rewrites
+    # every path (``layers.0.mlp`` -> ``layers.0._fsdp_wrapped_module.mlp``)
+    # and the patterns are anchored.
     layers = linear_layer_names(model)
 
     cache_dir = out_root / "store" / tag
-    train_dir = str(cache_dir / "train")
-    test_dir = str(cache_dir / "test")
     if rank == 0:
         shutil.rmtree(cache_dir, ignore_errors=True)
     dist.barrier()
 
-    # Warm-up / measured split with run_ours.py's semantics: ``warmup_train``
-    # samples are captured (all ranks) and scored (rank 0) untimed into a
-    # throwaway store, then ``measure_train`` samples are timed.  Without
-    # ``measure_train`` the old meaning -- all ``n_train`` timed -- is kept.
+    # Warm-up / measured split, as in run_ours.py: the first ``warmup_train``
+    # samples run through the whole pipeline untimed, then the next
+    # ``measure_train`` samples are timed.  ``measure_train`` defaults to
+    # ``n_train - warmup_train``.
     n_warm = int(task.get("warmup_train", 0) or 0)
     n_meas = int(task.get("measure_train") or (n_train - n_warm))
     if n_warm + n_meas > n_train:
@@ -240,87 +230,63 @@ def run(task: dict, out_root: Path) -> None:
         raise ValueError(msg)
     if bench is not None:
         bench.set(warmup_train=n_warm, measure_train=n_meas)
-    warm_dir = cache_dir / "warm"
     measured = Subset(train_ds, range(n_warm, n_warm + n_meas))
 
-    def _capture(ds, root):
-        capture_split(
-            model, fsdp_model, ds, batch, layers, proj, str(root / "train"), dev
-        )
-        capture_split(
-            model, fsdp_model, test_ds, batch, layers, proj, str(root / "test"), dev
-        )
-
-    if n_warm:
-        _capture(Subset(train_ds, range(n_warm)), warm_dir)
-        dist.barrier()
-        torch.cuda.empty_cache()
-    if rank == 0:
-        with bench.phase("cache", n_meas + n_test):
-            _capture(measured, cache_dir)
-    else:
-        _capture(measured, cache_dir)
-    dist.barrier()  # all ranks' shards flushed before rank 0 reads the merge
-    dist.destroy_process_group()  # scoring is single-process; tear the group down
-    if rank != 0:
-        return
-
-    # Rank 0 scores alone from the MERGED store.  Clear the distributed env so
-    # the attributor's args see world_size==1 and issue no collectives (rank 1
-    # has exited).  The task model is unused by attribute_from_cache (it reads
-    # gradients off disk), so a dummy stands in.
-    for v in (
-        "RANK",
-        "WORLD_SIZE",
-        "LOCAL_RANK",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "GROUP_RANK",
-        "ROLE_RANK",
-        "LOCAL_WORLD_SIZE",
-    ):
-        os.environ.pop(v, None)
-    args = AttributionArguments(
-        output_dir=tempfile.mkdtemp(prefix="bench_fsdp_"),
-        per_device_train_batch_size=batch,
-        per_device_eval_batch_size=batch,
-        dataloader_pin_memory=False,
-        use_cpu=False,
-    )
-    dummy = torch.nn.Linear(1, 1)
-    task_obj = AttributionTask(
-        loss_func=lambda p, b: torch.tensor(0.0),
-        model=dummy,
-        checkpoints=[{}],
-        target_func=lambda p, b: torch.tensor(0.0),
+    # The wrapped model as the task: hooks on the module, forward on the
+    # wrapper, the current parameters as the checkpoint.
+    task_obj = AttributionTask(direct_loss, fsdp_model)
+    hook_config = HookManagerConfig(
+        linear_io=layers, projection_kwargs=proj, capture_style=capture_style,
+        include_frozen=freeze,
     )
     cls = {
         "graddot": TracInAttributor,
         "kfac": KFACAttributor,
         "ekfac": EKFACAttributor,
     }[method]
-    attributor = cls(args, task=task_obj)
-    if n_warm:  # untimed: warms the scoring path (store read, fit, cuSOLVER)
+    calls = 0
+
+    def attribute(ds):
+        """One attribution of *ds* against the test set; each call has its own
+        output directory (and, for K-FAC/EK-FAC, its own rank-local store)."""
+        nonlocal calls
+        calls += 1
+        args = AttributionArguments(
+            output_dir=str(cache_dir / f"run{calls}" / f"rank{rank}"),
+            per_device_train_batch_size=batch,
+            per_device_eval_batch_size=batch,  # queries in batches of the training batch size
+            dataloader_pin_memory=False,
+        )
+        attributor = cls(args, task=task_obj)
         if method == "graddot":
-            attributor.attribute_from_cache(
-                str(warm_dir / "train"), str(warm_dir / "test")
-            )
+            score = attributor.attribute(ds, test_ds, hook_config=hook_config)
         else:
-            attributor.attribute_from_cache(
-                str(warm_dir / "train"), str(warm_dir / "test"), damping=DAMPING
+            score = attributor.attribute(
+                ds, test_ds, hook_config=hook_config,
+                gradient_cache_residency="disk", damping=DAMPING,
             )
-        shutil.rmtree(warm_dir, ignore_errors=True)
+        return score, gather_rows(score, world)
+
+    if n_warm:  # untimed
+        attribute(Subset(train_ds, range(n_warm)))
+        if rank == 0:
+            shutil.rmtree(cache_dir / "run1", ignore_errors=True)
+        dist.barrier()
         torch.cuda.empty_cache()
+    if rank == 0:
+        with bench.phase("attribute", n_meas):
+            score, gathered = attribute(measured)
+    else:
+        score, gathered = attribute(measured)
+    dist.barrier()
+    dist.destroy_process_group()
+    if rank != 0:
+        return
     bench.record_disk("store", cache_dir)
-    with bench.phase("score", n_meas + n_test):
-        if method == "graddot":
-            score = attributor.attribute_from_cache(train_dir, test_dir)
-        else:
-            score = attributor.attribute_from_cache(
-                train_dir, test_dir, damping=DAMPING
-            )
-    # Align rows/cols to INPUT order by content hash (the sharded sampler stores
-    # them out of order); makes the matrix element-wise identical to single-GPU.
+    train_ids, rows = gathered
+
+    # Align rows/columns to input order by content hash; the sharded sampler
+    # stores the samples in a different order.
     th = [
         hash_sample(
             {
@@ -339,7 +305,8 @@ def run(task: dict, out_root: Path) -> None:
         )
         for i in range(len(test_ds))
     ]
-    matrix = score.query(th, vh).cpu().float()
+    row_of = {h: i for i, h in enumerate(train_ids)}
+    matrix = rows[[row_of[h] for h in th]][:, [score.test_index[h] for h in vh]]
     torch.save({"score": matrix}, run_dir / "score.pt")
     bench.set(score_shape=list(matrix.shape), n_linear_layers=len(layers))
     bench.finish(status="ok")
