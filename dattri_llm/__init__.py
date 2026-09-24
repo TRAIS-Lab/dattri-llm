@@ -11,7 +11,8 @@ The gradient-capture core (hooks, callbacks, data model, storage) is imported
 eagerly and needs only ``torch``.  The attribution layer (attributors, score,
 arguments) and the live streamer are resolved lazily on first attribute
 access, so ``import dattri_llm`` stays light and does not require their
-optional dependencies (``dattri``, ``tqdm``) until they are actually used.
+optional dependencies (``transformers`` for the live streamer, ``dattri`` for
+its random projectors) until they are actually used.
 """
 
 from importlib import import_module

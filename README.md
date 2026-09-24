@@ -98,7 +98,8 @@ tensor([[20337.7832],       # <- "Influence functions trace a model's ..."
 git clone https://github.com/TRAIS-Lab/dattri-llm
 cd dattri-llm
 pip install -e .
-pip install -e ".[transformers]"  # [Optional] + HF Trainer
+pip install -e ".[transformers]"  # live attribution (attribute / GradientStreamer), HF Trainer
+pip install -e ".[attribution]"   # dattri: its AttributionTask (as below) and random projectors
 ```
 
 ### 1. Attribution from disk offloading
