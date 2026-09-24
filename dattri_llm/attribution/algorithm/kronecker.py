@@ -613,9 +613,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):  # noqa: PLR0904 - the wo
             if name in factors:
                 # Cached factors come to the device one layer at
                 # a time (a no-op when they already live there).
-                layer_factors = _map_tensors(
-                    factors[name], lambda t: t.to(device, non_blocking=True)
-                )
+                layer_factors = _map_tensors(factors[name], lambda t: t.to(device))
                 return self.precondition_test_layer(value, layer_type, layer_factors)
             if name in fisher_inverse:
                 # F_l^-1 is symmetric, so it is applied wholly on this side.
@@ -1542,8 +1540,8 @@ class EKFACAttributor(KroneckerAttributor):
                 M = ops.ekfac_materialize(
                     train_g.data[layer],
                     train_g.layer_types[layer],
-                    U_A.to(device, non_blocking=True),
-                    U_G.to(device, non_blocking=True),
+                    U_A.to(device),
+                    U_G.to(device),
                 )  # (B, D)
                 lam_sum[layer] = lam_sum.get(layer, 0) + (M * M).sum(0)
                 counts[layer] = counts.get(layer, 0) + M.shape[0]
