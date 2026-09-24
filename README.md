@@ -172,6 +172,25 @@ All attributors consume the same `GradientSource` contract (per-step
 `(step, Gradient, hashes)` blocks), read either from disk or computed live, so new
 methods plug into the same capture/storage/streaming infrastructure.
 
+### Capture requirements
+
+Each method's live `attribute(...)` sets up this capture itself. When you capture
+from your own training loop and score with `attribute_from_cache(...)`, record what
+the method reads. All callbacks below are importable from `dattri_llm`.
+
+| Attributor | Train-side gradients | Also recorded |
+|---|---|---|
+| `TracInAttributor` | raw | — |
+| `KFACAttributor`, `EKFACAttributor` | raw | Kronecker covariances: a fit pass over the store, or `KroneckerCovarianceCallback` at capture, passed as `fit(covariances=...)` |
+| `LESSAttributor` | preconditioned, captured with `HookManager(optimizer=...)`; queries are raw | the learning rate per step (trajectory form), or the optimizer state per checkpoint (frozen form, `optimizers=`) |
+| `AdamWInfluenceAttributor` | raw, per step; or parameter snapshots (`ParameterSnapshotCallback`) to recompute them | the moments before and after every update: `OptimizerStateCallback`, with `record_post(step)` called after each `optimizer.step()`; pass `callback.dynamics()` as `dynamics=` |
+| `DVEmbAttributor` | raw, per step; or parameter snapshots | the learning-rate schedule, passed as `learning_rate=` |
+
+Preconditioned capture needs exact gradient entries: it takes no projection, a
+`"mask"` or a `"dense"` projection (applied after the map), but not the `"logra"`
+factor projection, and it rejects `param_grad` layers. Without a mask, each
+hooked layer's per-sample gradient is materialized before the map.
+
 ## Supported Models & Frameworks
 
 **Models** — Our hook-based implementation is compatible with any `nn.Module`, enabling support for a broad range of LLM architectures, including the GPT-2, Llama, Qwen, and Gemma families.

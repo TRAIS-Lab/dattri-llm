@@ -26,7 +26,10 @@ from dattri_llm.gradient import (
     HookManager,
     HookManagerCallback,
     HookManagerConfig,
+    KroneckerCovarianceCallback,
     OffloadCallback,
+    OptimizerStateCallback,
+    ParameterSnapshotCallback,
     default_hook_assignment,
 )
 from dattri_llm.gradient.gradient import Factorized, Gradient
@@ -77,8 +80,11 @@ __all__ = [
     "HookManagerConfig",
     "KFACAttributor",
     "KroneckerAttributor",
+    "KroneckerCovarianceCallback",
     "LESSAttributor",
     "OffloadCallback",
+    "OptimizerStateCallback",
+    "ParameterSnapshotCallback",
     "TracInAttributor",
     "default_hook_assignment",
     "hash_batch",

@@ -6,7 +6,10 @@ from dattri_llm.gradient.callbacks import (
     CaptureCallback,
     DataSelectionCallback,
     HookManagerCallback,
+    KroneckerCovarianceCallback,
     OffloadCallback,
+    OptimizerStateCallback,
+    ParameterSnapshotCallback,
 )
 from dattri_llm.gradient.gradient import GradientRecord
 from dattri_llm.gradient.hooks import (
@@ -46,9 +49,12 @@ __all__ = [
     "HookManagerCallback",
     "HookManagerConfig",
     "KroneckerAccumulator",
+    "KroneckerCovarianceCallback",
     "LayerFisherAccumulator",
     "LayerKroneckerAccumulator",
     "OffloadCallback",
+    "OptimizerStateCallback",
+    "ParameterSnapshotCallback",
     "canonical_class_name",
     "default_hook_assignment",
     "dot",
