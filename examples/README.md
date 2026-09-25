@@ -23,6 +23,7 @@ additionally supports multi-process (and multi-GPU) launches via `torchrun`.
 | [`data_selection/gpt2_data_selection.py`](data_selection/gpt2_data_selection.py) | online data selection on GPT-2 | `transformers` |
 | [`trainers/transformers_trainer.py`](trainers/transformers_trainer.py) | wrapping the Hugging Face `Trainer` | `transformers`, `accelerate` |
 | [`trainers/trl_trainer.py`](trainers/trl_trainer.py) | wrapping TRL's `SFTTrainer` | `trl` |
+| [`trainers/trl_grpo_trainer.py`](trainers/trl_grpo_trainer.py) | wrapping TRL's `GRPOTrainer` (reinforcement learning) | `trl` |
 | [`trainers/olmo_trainer.py`](trainers/olmo_trainer.py) | wrapping the OLMo `Trainer` | `ai2-olmo` |
 
 ("—" means the capture core's only dependency, `torch`, suffices.)
