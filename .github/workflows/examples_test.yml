@@ -43,8 +43,10 @@ jobs:
           python examples/projection/gradient_projection.py
           python examples/attribution/attribution_from_disk.py
           python examples/attribution/attribution_on_the_fly.py
+          python examples/attribution/token_attribution.py
           python examples/trainers/transformers_trainer.py
           python examples/trainers/trl_trainer.py
+          python examples/trainers/trl_grpo_trainer.py
       - name: Uninstall the package
         run: |
           pip uninstall -y dattri-llm
