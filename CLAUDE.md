@@ -32,9 +32,9 @@ pip install -e ".[dev]"            # library + test and integration dependencies
 pip install -e ".[transformers]"   # only the Hugging Face integration
 ```
 
-Python 3.10 or newer; `torch` is the only hard dependency. The gradient layer
-imports with torch alone; `transformers`, `dattri`, `trl` and `ai2-olmo` are
-optional and imported lazily where they are used.
+Python 3.10 or newer; `torch` and `tqdm` are the only hard dependencies. The
+gradient layer imports with torch alone; `transformers`, `dattri`, `trl` and
+`ai2-olmo` are optional and imported lazily where they are used.
 
 ## Commands
 
