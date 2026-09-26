@@ -101,6 +101,12 @@ from dattri_llm.attribution.algorithm.trajectory import (
 from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.snapshots import TrajectorySnapshots
 from dattri_llm.gradient.storage_manager import GradientStorageManager
+from dattri_llm.options import (
+    CacheResidency,
+    HessianMode,
+    LossReduction,
+    Propagation,
+)
 from dattri_llm.utils.cache import CACHE_RESIDENCIES
 
 if TYPE_CHECKING:
@@ -166,9 +172,9 @@ class DVEmbAttributor(TrajectoryAttributor):
         dvemb_dir: str | None = None,
         *,
         selected_training_steps: Iterable[int] | None = None,
-        hessian_mode: str = "full",
+        hessian_mode: HessianMode = "full",
         final_step: int | None = None,
-        loss_reduction: str = "mean",
+        loss_reduction: LossReduction = "mean",
         verbose: bool = False,
         layer_name: str | list[str] | None = None,
         learning_rate: LearningRate = 1.0,
@@ -390,8 +396,8 @@ class DVEmbAttributor(TrajectoryAttributor):
         output_steps: set,
         *,
         learning_rate: float | dict[int, float],
-        loss_reduction: str = "mean",
-        hessian_mode: str = "full",
+        loss_reduction: LossReduction = "mean",
+        hessian_mode: HessianMode = "full",
         verbose: bool = False,
     ) -> Iterator[StreamBlock]:
         """The train-side sweep: turn the recorded trajectory into **data value
@@ -597,12 +603,12 @@ class DVEmbAttributor(TrajectoryAttributor):
         hook_config: HookManagerConfig | None = None,
         verbose: bool = False,
         loop_over_test: bool = False,
-        gradient_cache_residency: str = "disk",
-        propagation: str = "train",
+        gradient_cache_residency: CacheResidency = "disk",
+        propagation: Propagation = "train",
         dvemb_dir: str | None = None,
-        hessian_mode: str = "full",
+        hessian_mode: HessianMode = "full",
         selected_training_steps: Iterable[int] | None = None,
-        loss_reduction: str = "mean",
+        loss_reduction: LossReduction = "mean",
         learning_rate: LearningRate = 1.0,
     ) -> AttributionScore:
         """Score **on the fly**: collect the trajectory, then attribute from it.
@@ -707,11 +713,11 @@ class DVEmbAttributor(TrajectoryAttributor):
         verbose: bool = False,
         loop_over_test: bool = False,
         algorithm_meta: dict | None = None,
-        propagation: str = "train",
+        propagation: Propagation = "train",
         dvemb_dir: str | None = None,
-        hessian_mode: str = "full",
+        hessian_mode: HessianMode = "full",
         final_step: int | None = None,
-        loss_reduction: str = "mean",
+        loss_reduction: LossReduction = "mean",
         learning_rate: LearningRate = 1.0,
         recorded_lr: Mapping[int, float] | None = None,
         hook_config: HookManagerConfig | None = None,

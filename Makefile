@@ -4,12 +4,14 @@ PYTHON = python3
 
 .PHONY: check ruff darglint test
 
-# The full required check: lint + formatting.
+# The full required check: lint + formatting, the same commands CI runs
+# (.github/workflows/lint.yml) with the ruff it pins (ruff==0.15.20, in the
+# dev extra; pyproject's required-version refuses any other).
 check: ruff
 
 ruff:
-	$(PYTHON) -m ruff check dattri_llm tests examples
-	$(PYTHON) -m ruff format --check dattri_llm tests examples
+	$(PYTHON) -m ruff check .
+	$(PYTHON) -m ruff format --check .
 
 # Optional: docstring-signature checking.  darglint reads .darglint (google
 # style, strictness=long).  Slow on the large modules; not part of `check`.

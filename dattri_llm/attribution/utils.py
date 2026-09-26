@@ -20,6 +20,7 @@ import torch
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.streaming import rebatch_blocks
+from dattri_llm.options import AttributionGranularity
 from dattri_llm.utils.cache import CacheBudget, TensorCache
 
 if TYPE_CHECKING:
@@ -246,7 +247,7 @@ def score_sources(
     batch_size: int = 1,
     loop_over_test: bool = False,
     cache_budget: CacheBudget | None = None,
-    granularity: str = "instance",
+    granularity: AttributionGranularity = "instance",
     inner_product_per_token: InnerProduct | None = None,
 ) -> tuple[torch.Tensor, list[str], list[int], list[str], list[int] | None]:
     """The inner-product scoring loop shared by the trajectory-agnostic attributors.

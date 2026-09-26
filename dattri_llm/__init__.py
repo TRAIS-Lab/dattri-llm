@@ -16,6 +16,7 @@ its random projectors) until they are actually used.
 """
 
 from importlib import import_module
+from typing import TYPE_CHECKING
 
 from dattri_llm.gradient import (
     REGISTER_ALL,
@@ -30,10 +31,35 @@ from dattri_llm.gradient import (
     OffloadCallback,
     OptimizerStateCallback,
     ParameterSnapshotCallback,
+    TrajectorySnapshots,
     default_hook_assignment,
 )
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.utils.hashing import hash_batch, hash_sample
+
+if TYPE_CHECKING:
+    # The lazily resolved exports below, imported for type checkers and IDEs
+    # only: at runtime they still resolve on first access (module __getattr__).
+    from dattri_llm.attribution import (
+        AdamWInfluenceAttributor,
+        AttributionArguments,
+        AttributionScore,
+        BaseAttributor,
+        BaseInnerProductAttributor,
+        DVEmbAttributor,
+        EKFACAttributor,
+        KFACAttributor,
+        KroneckerAttributor,
+        LESSAttributor,
+        TracInAttributor,
+        TrajectoryAttributor,
+    )
+    from dattri_llm.gradient.streaming import (
+        DiskGradientSource,
+        GradientStreamer,
+        ReplayGradientSource,
+    )
+    from dattri_llm.task import AttributionTask
 
 __version__ = "0.1.0"
 
@@ -42,6 +68,7 @@ __version__ = "0.1.0"
 _LAZY_EXPORTS = {
     "GradientStreamer": "dattri_llm.gradient.streaming",
     "DiskGradientSource": "dattri_llm.gradient.streaming",
+    "ReplayGradientSource": "dattri_llm.gradient.streaming",
     "AttributionArguments": "dattri_llm.attribution.arguments",
     "AttributionTask": "dattri_llm.task",
     "AttributionScore": "dattri_llm.attribution.score",
@@ -54,6 +81,7 @@ _LAZY_EXPORTS = {
     "DVEmbAttributor": "dattri_llm.attribution",
     "LESSAttributor": "dattri_llm.attribution",
     "AdamWInfluenceAttributor": "dattri_llm.attribution",
+    "TrajectoryAttributor": "dattri_llm.attribution",
 }
 
 __all__ = [
@@ -85,7 +113,10 @@ __all__ = [
     "OffloadCallback",
     "OptimizerStateCallback",
     "ParameterSnapshotCallback",
+    "ReplayGradientSource",
     "TracInAttributor",
+    "TrajectoryAttributor",
+    "TrajectorySnapshots",
     "default_hook_assignment",
     "hash_batch",
     "hash_sample",

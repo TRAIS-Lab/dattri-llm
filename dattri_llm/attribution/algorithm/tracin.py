@@ -33,6 +33,7 @@ import torch
 
 from dattri_llm.attribution.base import BaseInnerProductAttributor
 from dattri_llm.gradient import ops
+from dattri_llm.options import AttributionGranularity
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -160,7 +161,7 @@ class TracInAttributor(BaseInnerProductAttributor):
         loop_over_test: bool = False,
         enable_update: bool = False,
         gradient_cache_residency: str | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
         normalized_grad: bool = False,
     ) -> AttributionScore:
         """Score by collecting gradients **live** (the on-the-fly workflow).
@@ -192,7 +193,7 @@ class TracInAttributor(BaseInnerProductAttributor):
         verbose: bool = False,
         loop_over_test: bool = False,
         algorithm_meta: dict | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
         normalized_grad: bool = False,
     ) -> AttributionScore:
         """Score collected gradients; ``normalized_grad`` selects GradCos.

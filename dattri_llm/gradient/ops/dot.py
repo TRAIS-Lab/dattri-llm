@@ -18,6 +18,7 @@ from dattri_llm.gradient.ops.types import (
     is_embedding,
     is_norm,
 )
+from dattri_llm.options import DotReduce, RoutingMode
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -37,7 +38,7 @@ def cross_gram(
     a2: torch.Tensor,
     g2: torch.Tensor,
     layer_type: str,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
 ) -> torch.Tensor:
     """Cross-gram ``K[i, j] = <dW1_i, dW2_j>`` on *already-preprocessed* factors.
 
@@ -113,7 +114,7 @@ def cross_dot_factors(
     module_kwargs1: dict | None = None,
     module_kwargs2: dict | None = None,
     include_bias: bool = True,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
 ) -> torch.Tensor:
     """Return the (B1, B2) cross-gram ``K[i, j] = <dW1_i, dW2_j>``.
 
@@ -138,7 +139,7 @@ def pairwise_dot_factors(
     layer_type: str,
     module_kwargs: dict | None = None,
     include_bias: bool = True,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
 ) -> torch.Tensor:
     """Return (B, B) pairwise dot product matrix of per-sample gradients.
 
@@ -340,7 +341,7 @@ def grad_norm_sq_factors(
     layer_type: str,
     module_kwargs: dict | None = None,
     include_bias: bool = True,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
 ) -> torch.Tensor:
     """Return (B,) per-sample squared Frobenius norms of weight gradients.
 
@@ -380,7 +381,7 @@ def grad_norm_sq(
     f: Factorized | torch.Tensor,
     layer_type: str,
     include_bias: bool = True,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
 ) -> torch.Tensor:
     """Per-sample squared gradient norms ``(B,)`` of one layer, whatever its form.
 
@@ -406,7 +407,7 @@ def pairwise_dot(
     f: Factorized,
     layer_type: str,
     include_bias: bool = True,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
 ) -> torch.Tensor:
     """:func:`pairwise_dot_factors` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
@@ -445,7 +446,7 @@ def cross_dot(
     f2: Factorized | torch.Tensor,
     layer_type: str,
     include_bias: bool = True,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
 ) -> torch.Tensor:
     """``(B1, B2)`` cross-gram ``K[i, j] = <dW1_i, dW2_j>`` of one layer, in
     whatever form each side holds.
@@ -499,9 +500,9 @@ def layerwise_cross_dot(
     test: Gradient,
     *,
     layers: Iterable[str] | None = None,
-    mode: str = "auto",
+    mode: RoutingMode = "auto",
     dense_cache: TensorCache | None = None,
-    reduce: str = "sum",
+    reduce: DotReduce = "sum",
 ) -> torch.Tensor | dict[str, torch.Tensor]:
     """Layer-by-layer cross-gram of two gradient blocks, summed over layers.
 
@@ -571,7 +572,7 @@ def layerwise_cross_dot_per_token(
     test: Gradient,
     *,
     layers: Iterable[str] | None = None,
-    reduce: str = "sum",
+    reduce: DotReduce = "sum",
 ) -> torch.Tensor | dict[str, torch.Tensor]:
     """Layer-by-layer per-token cross-gram of two gradient blocks: the
     ``(B_train, T_train, B_test)`` contribution of every *train* token position

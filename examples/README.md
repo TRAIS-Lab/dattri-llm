@@ -4,8 +4,13 @@ Example scripts demonstrating each part of `dattri-llm`, from
 layer selection to full attribution workflows and training-framework integration.
 
 ```bash
+pip install -e .                  # from the repository root, once
 python examples/<group>/<script>.py
 ```
+
+The scripts import the installed package through its public API
+(`from dattri_llm import ...`), so install it first, with the extras a script
+lists below (e.g. `pip install -e ".[transformers]"`).
 
 All examples run on CPU in seconds to a few minutes; `hooks/multi_gpu_collect.py`
 additionally supports multi-process (and multi-GPU) launches via `torchrun`.
@@ -19,6 +24,7 @@ additionally supports multi-process (and multi-GPU) launches via `torchrun`.
 | [`projection/gradient_projection.py`](projection/gradient_projection.py) | random projection (`logra` / `dense` / `mask` styles), per-layer config, custom layers | `dattri` |
 | [`attribution/attribution_from_disk.py`](attribution/attribution_from_disk.py) | store-then-attribute workflow | — |
 | [`attribution/attribution_on_the_fly.py`](attribution/attribution_on_the_fly.py) | one-call live attribution | `transformers` |
+| [`attribution/method_tour.py`](attribution/method_tour.py) | K-FAC, EK-FAC, LESS, DVEmb and AdamW-influence on one toy problem | `transformers` |
 | [`attribution/token_attribution.py`](attribution/token_attribution.py) | token-level attribution (`attribution_granularity="token"`), GradDot and K-FAC | `transformers` |
 | [`data_selection/gpt2_data_selection.py`](data_selection/gpt2_data_selection.py) | online data selection on GPT-2 | `transformers` |
 | [`trainers/transformers_trainer.py`](trainers/transformers_trainer.py) | wrapping the Hugging Face `Trainer` | `transformers`, `accelerate` |

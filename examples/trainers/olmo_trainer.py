@@ -16,12 +16,7 @@ Run (with ai2-olmo installed):
 from __future__ import annotations
 
 import os
-import pathlib
-import sys
 import tempfile
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.distributed as dist
@@ -39,10 +34,13 @@ except ImportError as exc:
         "ai2-olmo is required for this example.\nInstall with:  pip install ai2-olmo",
     ) from exc
 
-from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.gradient.storage_manager import GradientStorageManager
-from dattri_llm.utils.hashing import hash_sample
+from dattri_llm import (
+    GradientStorageManager,
+    HookManager,
+    HookManagerConfig,
+    OffloadCallback,
+    hash_sample,
+)
 
 VOCAB, SEQ, BATCH = 256, 32, 2
 

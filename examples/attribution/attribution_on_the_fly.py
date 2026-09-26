@@ -3,20 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import pathlib
-import sys
 import tempfile
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-from dattri_llm.attribution.algorithm.tracin import TracInAttributor
-from dattri_llm.attribution.arguments import AttributionArguments
-from dattri_llm.task import AttributionTask
+from dattri_llm import AttributionArguments, AttributionTask, TracInAttributor
 
 IN, HID, OUT = 8, 16, 4
 

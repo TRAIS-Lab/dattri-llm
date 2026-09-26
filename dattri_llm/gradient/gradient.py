@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from dattri_llm.gradient import ops
+from dattri_llm.options import CaptureStyle
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -555,7 +556,7 @@ class Gradient:
         projector: Callable | ops.DattriProjector | None,
         proj_kwargs: dict[str, dict],
         *,
-        capture_style: str = "factorized",
+        capture_style: CaptureStyle = "factorized",
     ) -> Gradient:
         """Reduce each layer's per-sample gradient to a smaller dimension.
 

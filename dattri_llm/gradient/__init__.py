@@ -35,6 +35,7 @@ from dattri_llm.gradient.ops import (
     materialize,
     pairwise_dot,
 )
+from dattri_llm.gradient.snapshots import TrajectorySnapshots
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 __all__ = [
@@ -55,6 +56,7 @@ __all__ = [
     "OffloadCallback",
     "OptimizerStateCallback",
     "ParameterSnapshotCallback",
+    "TrajectorySnapshots",
     "canonical_class_name",
     "default_hook_assignment",
     "dot",

@@ -70,6 +70,9 @@ olmo-core = [
     "ai2-olmo-core==2.6.0",
 ]
 dev = [
+    # Lint toolchain: pinned to the version CI runs (.github/workflows/lint.yml).
+    "ruff==0.15.20",
+    "pre-commit>=3",
     "pytest>=8",
     "dattri>=0.3.0",
     "transformers>=4.40",
@@ -89,6 +92,9 @@ dattri_llm = ["py.typed"]
 version = { attr = "dattri_llm.__version__" }
 
 [tool.ruff]
+# select = ["ALL"] + preview = true is version-sensitive: refuse any other ruff
+# than the one CI pins (.github/workflows/lint.yml, the dev extra, pre-commit).
+required-version = "==0.15.20"
 exclude = [
     "docs/",
     "scripts/",
@@ -173,3 +179,8 @@ ignore = [
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.ruff.lint.flake8-type-checking]
+# dattri_llm.options holds only Literal aliases; importing it at runtime keeps
+# the annotations that use them resolvable by typing.get_type_hints.
+exempt-modules = ["typing", "dattri_llm.options"]

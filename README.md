@@ -117,7 +117,7 @@ and its callbacks), the on-disk store, and attribution from a cache
 | `olmo` | `ai2-olmo` | the OLMo `Trainer` example ([`examples/trainers/olmo_trainer.py`](examples/trainers/olmo_trainer.py)) |
 | `olmo-core` | `ai2-olmo-core==2.6.0` | the OLMo-core runs of [`experiments/fidelity`](experiments/fidelity) |
 | `test` | `pytest` | running the test suite |
-| `dev` | all of the above except `olmo-core` | development (see [CONTRIBUTING.md](CONTRIBUTING.md)) |
+| `dev` | all of the above except `olmo-core`, plus the pinned lint tools (`ruff`, `pre-commit`) | development (see [CONTRIBUTING.md](CONTRIBUTING.md)) |
 
 Extras combine, e.g. `pip install -e ".[transformers,attribution]"`.
 
@@ -179,7 +179,8 @@ Because the loss calls the model itself, the same task runs through a DDP or
 FSDP wrapper; pass the wrapped model as `model`.
 
 See [`examples/`](examples/) for complete runnable scripts, including multi-GPU
-collection and online data selection.
+collection, online data selection, and one script per attribution method
+([`examples/attribution/method_tour.py`](examples/attribution/method_tour.py)).
 
 ### 3. Hugging Face norm layers (Llama / Qwen `RMSNorm`)
 
@@ -305,7 +306,10 @@ dattri_llm/
 [`docs/API.md`](docs/API.md) indexes the public API: what `dattri_llm` exports
 at the top level and what each subpackage (`dattri_llm.gradient`,
 `dattri_llm.gradient.ops`, `dattri_llm.attribution`, `dattri_llm.utils`)
-provides. Every public class and function carries a docstring; use
+provides, and the `Literal` option types in `dattri_llm.options`. The package
+ships a `py.typed` marker, so type checkers read its inline annotations.
+Extension bases are exported too: `TrajectoryAttributor` (the trajectory
+methods' base), `ReplayGradientSource` and `TrajectorySnapshots`. Every public class and function carries a docstring; use
 `help(dattri_llm.TracInAttributor)` and the like for signatures.
 
 ## Contributing

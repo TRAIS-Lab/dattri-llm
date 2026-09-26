@@ -58,6 +58,7 @@ from dattri_llm.gradient.callbacks.optimizer_state_callback import (
 from dattri_llm.gradient.snapshots import LazyDynamics, TrajectorySnapshots
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import DiskGradientSource, ReplayGradientSource
+from dattri_llm.options import LossReduction, Propagation
 
 if TYPE_CHECKING:
     from torch import nn
@@ -228,7 +229,7 @@ class AdamWInfluenceAttributor(TrajectoryAttributor):
         layers: list[str],
         prop_steps: list[int],
         output_steps: set[int],
-        loss_reduction: str = "mean",
+        loss_reduction: LossReduction = "mean",
         verbose: bool = False,
     ) -> tuple[torch.Tensor, list[str], list[int]]:
         """Algorithm 1 on the training side: carry ``W`` (``(p, 3p)``) from
@@ -296,7 +297,7 @@ class AdamWInfluenceAttributor(TrajectoryAttributor):
         layers: list[str],
         prop_steps: list[int],
         output_steps: set[int],
-        loss_reduction: str = "mean",
+        loss_reduction: LossReduction = "mean",
         verbose: bool = False,
         block_dtype: torch.dtype = torch.float32,
     ) -> tuple[torch.Tensor, list[str], list[int]]:
@@ -458,8 +459,8 @@ class AdamWInfluenceAttributor(TrajectoryAttributor):
         selected_training_steps: Iterable[int] | None = None,
         layer_name: str | list[str] | None = None,
         verbose: bool = False,
-        loss_reduction: str = "mean",
-        propagation: str = "train",
+        loss_reduction: LossReduction = "mean",
+        propagation: Propagation = "train",
         loop_over_test: bool = False,
         final_step: int | None = None,
         hook_config: HookManagerConfig | None = None,

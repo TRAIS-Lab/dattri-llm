@@ -2,18 +2,11 @@
 
 from __future__ import annotations
 
-import pathlib
-import sys
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-
 import torch
 from torch import nn
 
+from dattri_llm import REGISTER_ALL, CaptureCallback, HookManager, HookManagerConfig
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.callbacks import CaptureCallback
-from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 from dattri_llm.utils.module import rms_norm_module_kwargs
 
 B, T, VOCAB, EMBED, HIDDEN, OUT = 8, 6, 128, 128, 256, 32

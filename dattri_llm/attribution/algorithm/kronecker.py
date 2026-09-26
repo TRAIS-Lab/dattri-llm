@@ -61,6 +61,7 @@ from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
 from dattri_llm.gradient.datasets import resolve_steps
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.storage_manager import GradientStorageManager
+from dattri_llm.options import AttributionGranularity, EKFACMode
 from dattri_llm.utils.cache import CACHE_RESIDENCIES, CacheBudget, TensorCache
 from dattri_llm.utils.distributed import all_reduce_sum, dist_rank
 
@@ -1000,7 +1001,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):  # noqa: PLR0904 - the wo
         verbose: bool = False,
         loop_over_test: bool = False,
         gradient_cache_residency: str | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
         damping: float = 1e-3,
         non_kfac_strategy: NonKfacStrategy = "ignore",
         direct_fim_max_params: int = 4096,
@@ -1101,7 +1102,7 @@ class KroneckerAttributor(BaseInnerProductAttributor):  # noqa: PLR0904 - the wo
         verbose: bool = False,
         loop_over_test: bool = False,
         algorithm_meta: dict | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
         damping: float = 1e-3,
         preconditioned_test_dir: str | None = None,
         preconditioned_test_cache_residency: str | None = None,
@@ -1466,7 +1467,7 @@ class EKFACAttributor(KroneckerAttributor):
         args: AttributionArguments,
         *,
         task: AttributionTask | None = None,
-        mode: str = "exact",
+        mode: EKFACMode = "exact",
     ) -> None:
         if mode not in self.EKFAC_MODES:
             raise ValueError(

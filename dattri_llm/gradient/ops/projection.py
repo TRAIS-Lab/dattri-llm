@@ -35,6 +35,7 @@ from dattri_llm.gradient.ops.types import (
     is_linear,
     is_norm,
 )
+from dattri_llm.options import CaptureStyle, ProjectionStyle
 from dattri_llm.utils.cache import TensorCache
 
 if TYPE_CHECKING:
@@ -853,7 +854,7 @@ def maybe_materialize_projected(
 
 
 def should_materialize(
-    capture_style: str,
+    capture_style: CaptureStyle,
     seq_len: int,
     k_a: int,
     k_g: int,
@@ -882,8 +883,8 @@ def project_layer(
     layer_type: str,
     projector: Callable | DattriProjector | None,
     *,
-    style: str = "logra",
-    capture_style: str = "factorized",
+    style: ProjectionStyle = "logra",
+    capture_style: CaptureStyle = "factorized",
     **proj_kwargs,
 ) -> tuple[object, bool]:
     """Route one layer through a projection style.

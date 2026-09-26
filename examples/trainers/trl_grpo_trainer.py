@@ -24,11 +24,7 @@ from __future__ import annotations
 
 import operator
 import pathlib
-import sys
 import tempfile
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -41,9 +37,13 @@ except ImportError as exc:
         "Install with:  pip install trl",
     ) from exc
 
-from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.gradient.storage_manager import GradientStorageManager
+from dattri_llm import (
+    GradientStorageManager,
+    HookManager,
+    HookManagerCallback,
+    HookManagerConfig,
+    OffloadCallback,
+)
 
 MODEL_ID = "sshleifer/tiny-gpt2"  # 2-layer GPT-2, runs on CPU
 PROMPTS = [

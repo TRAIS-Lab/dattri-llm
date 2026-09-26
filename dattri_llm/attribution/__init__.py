@@ -8,6 +8,7 @@ from dattri_llm.attribution.algorithm import (
     KroneckerAttributor,
     LESSAttributor,
     TracInAttributor,
+    TrajectoryAttributor,
 )
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.attribution.base import BaseAttributor, BaseInnerProductAttributor
@@ -25,4 +26,5 @@ __all__ = [
     "KroneckerAttributor",
     "LESSAttributor",
     "TracInAttributor",
+    "TrajectoryAttributor",
 ]

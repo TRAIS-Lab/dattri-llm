@@ -1,14 +1,15 @@
 # API reference
 
-An index of the public API, generated from each package's `__all__` and the
-first line of each docstring. The docstrings are the reference: use
-`help(obj)` or your editor for signatures and full descriptions.
+An index of the public API, generated from each package's `__all__` (and the
+aliases defined in `dattri_llm.options`) and the first line of each docstring.
+The docstrings are the reference: use `help(obj)` or your editor for
+signatures and full descriptions.
 
 Names are listed where they are defined for users; many are re-exported at
 several levels (for example `HookManager` is importable from `dattri_llm`,
 `dattri_llm.gradient` and `dattri_llm.gradient.hooks`).
 
-Contents: [`dattri_llm`](#dattri_llm), [`dattri_llm.attribution`](#dattri_llmattribution), [`dattri_llm.gradient`](#dattri_llmgradient), [`dattri_llm.gradient.hooks`](#dattri_llmgradienthooks), [`dattri_llm.gradient.callbacks`](#dattri_llmgradientcallbacks), [`dattri_llm.gradient.ops`](#dattri_llmgradientops), [`dattri_llm.utils`](#dattri_llmutils)
+Contents: [`dattri_llm`](#dattri_llm), [`dattri_llm.attribution`](#dattri_llmattribution), [`dattri_llm.gradient`](#dattri_llmgradient), [`dattri_llm.gradient.hooks`](#dattri_llmgradienthooks), [`dattri_llm.gradient.callbacks`](#dattri_llmgradientcallbacks), [`dattri_llm.gradient.ops`](#dattri_llmgradientops), [`dattri_llm.utils`](#dattri_llmutils), [`dattri_llm.options`](#dattri_llmoptions)
 
 ## `dattri_llm`
 
@@ -43,7 +44,10 @@ Contents: [`dattri_llm`](#dattri_llm), [`dattri_llm.attribution`](#dattri_llmatt
 | `OffloadCallback` | class | Periodically saves :class:`GradientRecord` objects to disk. |
 | `OptimizerStateCallback` | class | Snapshot an Adam-family optimizer's moments on each layer's coordinates. |
 | `ParameterSnapshotCallback` | class | Store the trainable parameters at every capture step. |
+| `ReplayGradientSource` | class | Per-step blocks recomputed from a trajectory's snapshots. |
 | `TracInAttributor` | class | TracIn / GradCos attributor. |
+| `TrajectoryAttributor` | class | Base class of the trajectory-sweeping attributors (see the module docstring). |
+| `TrajectorySnapshots` | class | Per-step parameters, batches and optimizer moments of a trajectory. |
 | `default_hook_assignment` | function | Discover the default-style assignment for layers that actually fire. |
 | `hash_batch` | function | Per-sample content hashes for a **batched** input dict, in batch order. |
 | `hash_sample` | function | SHA-256 content hash identifying **one sample** by its model inputs. |
@@ -52,7 +56,7 @@ Contents: [`dattri_llm`](#dattri_llm), [`dattri_llm.attribution`](#dattri_llmatt
 
 **Attribution.** Attributors, their configuration and the score container.
 
-Also re-exported here (listed above): `AdamWInfluenceAttributor`, `AttributionArguments`, `AttributionScore`, `BaseAttributor`, `BaseInnerProductAttributor`, `DVEmbAttributor`, `EKFACAttributor`, `KFACAttributor`, `KroneckerAttributor`, `LESSAttributor`, `TracInAttributor`.
+Also re-exported here (listed above): `AdamWInfluenceAttributor`, `AttributionArguments`, `AttributionScore`, `BaseAttributor`, `BaseInnerProductAttributor`, `DVEmbAttributor`, `EKFACAttributor`, `KFACAttributor`, `KroneckerAttributor`, `LESSAttributor`, `TracInAttributor`, `TrajectoryAttributor`.
 
 ## `dattri_llm.gradient`
 
@@ -78,7 +82,7 @@ Also re-exported here (listed above): `AdamWInfluenceAttributor`, `AttributionAr
 | `register_param_grad_hooks` | function | Register parameter-gradient hooks on general module layers. |
 | `remove_hooks` | function | Remove all registered hooks and clear the handle list. |
 
-Also re-exported here (listed above): `REGISTER_ALL`, `CaptureCallback`, `DataSelectionCallback`, `GradientRecord`, `GradientStorageManager`, `HookManager`, `HookManagerCallback`, `HookManagerConfig`, `KroneckerCovarianceCallback`, `OffloadCallback`, `OptimizerStateCallback`, `ParameterSnapshotCallback`, `default_hook_assignment`.
+Also re-exported here (listed above): `REGISTER_ALL`, `CaptureCallback`, `DataSelectionCallback`, `GradientRecord`, `GradientStorageManager`, `HookManager`, `HookManagerCallback`, `HookManagerConfig`, `KroneckerCovarianceCallback`, `OffloadCallback`, `OptimizerStateCallback`, `ParameterSnapshotCallback`, `TrajectorySnapshots`, `default_hook_assignment`.
 
 ## `dattri_llm.gradient.hooks`
 
@@ -204,6 +208,26 @@ Also re-exported here (listed above): `FisherAccumulator`, `KroneckerAccumulator
 | `tensor_nbytes` | function | Bytes held by *value*: a tensor, an object exposing ``nbytes``, or a ``dict``/``list``/``tuple`` of those (recursively). |
 
 Also re-exported here (listed above): `hash_batch`, `hash_sample`.
+
+## `dattri_llm.options`
+
+**Option types.** `Literal` aliases naming the values each enumerated string option accepts, for annotations; the options are still validated at runtime.
+
+| name | kind | summary |
+|---|---|---|
+| `AttributionGranularity` | type alias | `Literal['instance', 'token']`: One score row per training sample, or one per training token position. |
+| `CacheResidency` | type alias | `Literal['disk', 'memory', 'tiered']`: Where a cache or gradient store keeps its entries (``CACHE_RESIDENCIES``). |
+| `CaptureStyle` | type alias | `Literal['factorized', 'materialized', 'auto']`: The representation a captured layer is buffered in (``CAPTURE_STYLES``). |
+| `DiskFormat` | type alias | `Literal['pickle', 'memmap']`: The on-disk format of a gradient store (``DISK_FORMATS``). |
+| `DotReduce` | type alias | `Literal['sum', 'none']`: Sum the layerwise cross-grams over layers, or keep them per layer. |
+| `EKFACMode` | type alias | `Literal['exact', 'approx']`: EK-FAC's eigenvalue estimate (``EKFACAttributor.EKFAC_MODES``). |
+| `HessianMode` | type alias | `Literal['full', 'diagonal']`: DVEmb's per-step Hessian (Fisher) approximation. |
+| `LossReduction` | type alias | `Literal['mean', 'sum']`: How the training loss was reduced over each batch. |
+| `ProjectionStyle` | type alias | `Literal['logra', 'dense', 'mask']`: How a layer is projected (``PROJECTION_STYLES``). |
+| `Propagation` | type alias | `Literal['train', 'test']`: Which side of a trajectory sweep carries the propagation. |
+| `RecordingType` | type alias | `Literal['per_sample', 'per_batch']`: The granularity an ``OffloadCallback`` records at. |
+| `RoutingMode` | type alias | `Literal['factorized', 'materialized', 'auto']`: How an inner-product kernel forms its result; ``"auto"`` uses the cost rule. |
+| `ScoreTrajectory` | type alias | `Literal['aware', 'agnostic']`: One row per training sample, or one per ``(sample, step)`` pair. |
 
 ## Extras
 

@@ -36,6 +36,7 @@ from dattri_llm.attribution.base import BaseInnerProductAttributor
 from dattri_llm.attribution.utils import read_lr_schedule, write_lr_schedule
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.streaming import GradientStreamer
+from dattri_llm.options import AttributionGranularity
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -216,7 +217,7 @@ class LESSAttributor(BaseInnerProductAttributor):
         *,
         loop_over_test: bool = False,
         transform_test: Callable[[Gradient], Gradient] | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
     ) -> tuple[torch.Tensor, list[str], list[int], list[str], list[int] | None]:
         """Score with the train blocks unit-normalized and weighted per step,
         so the plain layerwise inner product is the weighted cosine.
@@ -262,7 +263,7 @@ class LESSAttributor(BaseInnerProductAttributor):
         loop_over_test: bool = False,
         enable_update: bool = False,
         gradient_cache_residency: str | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
     ) -> AttributionScore:
         """Score live, in the per-step or the frozen-checkpoint form.
 

@@ -4,22 +4,20 @@ its text's influence on a query, printed as a colored heatmap.
 
 from __future__ import annotations
 
-import pathlib
 import sys
 import tempfile
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from dattri_llm.attribution.algorithm.kronecker import KFACAttributor
-from dattri_llm.attribution.algorithm.tracin import TracInAttributor
-from dattri_llm.attribution.arguments import AttributionArguments
-from dattri_llm.gradient.hooks import HookManagerConfig
-from dattri_llm.task import AttributionTask
+from dattri_llm import (
+    AttributionArguments,
+    AttributionTask,
+    HookManagerConfig,
+    KFACAttributor,
+    TracInAttributor,
+)
 
 MODEL_ID = "sshleifer/tiny-gpt2"  # 2-layer GPT-2, runs on CPU
 MAX_LENGTH = 16

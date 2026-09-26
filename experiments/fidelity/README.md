@@ -6,6 +6,10 @@ Qwen2.5 at 0.5B, 1.5B and 3B, and OLMo-2-1B and OLMo-3-7B. GPT-2 and Qwen2.5
 are trained by the protocol's own training loop; the OLMo models by
 OLMo-core's trainer, with dattri-llm's capture wrapped around it.
 
+**Main and extended scales.** The main ladder is GPT-2, Qwen2.5-1.5B and
+OLMo-3-7B. Qwen2.5-0.5B, Qwen2.5-3B and OLMo-2-1B are extended scales: same
+protocol, run to fill in the ladder between them.
+
 ## Protocol
 
 **Trajectory.** The pretrained model is trained for one epoch on 512 random

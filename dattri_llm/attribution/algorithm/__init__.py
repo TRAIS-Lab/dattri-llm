@@ -9,6 +9,7 @@ from dattri_llm.attribution.algorithm.kronecker import (
 )
 from dattri_llm.attribution.algorithm.less import LESSAttributor
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
+from dattri_llm.attribution.algorithm.trajectory import TrajectoryAttributor
 
 __all__ = [
     "AdamWInfluenceAttributor",
@@ -18,4 +19,5 @@ __all__ = [
     "KroneckerAttributor",
     "LESSAttributor",
     "TracInAttributor",
+    "TrajectoryAttributor",
 ]

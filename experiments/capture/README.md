@@ -34,6 +34,14 @@ Results are written next to the launcher. The launcher shares the cell
 runner, the data, the model registry and the result logger of
 `experiments/benchmark`, which must sit beside this directory.
 
+**Hardware.** Run locally, the workload is sized for one A40. The launcher
+can also run on Modal (`modal run capture.py::bench ...`), which offers no
+A40: there each experiment and method runs on one L40S (48 GB, the A40's
+memory), so both runs of a pair share a card (`GPU` in `capture.py`). Every
+row records the GPU it ran on (`device.gpu_name`, written by
+`experiments/benchmark/utils/log.py`); state the card from that field when
+reporting a result.
+
 ```bash
 export PYTHONPATH=/path/to/dattri-llm            # the repository root, so that dattri_llm is importable
 python capture.py --experiment capture-query16 --dry-run
@@ -43,6 +51,15 @@ python capture.py --experiment capture-shared-fit --run    # only if scores diff
 python capture.py --table                        # results/<experiment>/ or out/<experiment>/
 ```
 
+On Modal:
+
+```bash
+modal run capture.py::bench --experiment capture-query1 --smoke   # one pair each
+modal run --detach capture.py::bench --all
+modal run capture.py::fetch --all          # after a detached run
+```
+
 Runs append to `out/<experiment>/results.jsonl` and write the score matrices
-to `out/<experiment>/runs/`; `--table` reads `results/<experiment>/` when it
+to `out/<experiment>/runs/`; Modal runs land in `results/<experiment>/` with
+the report in `report.txt`. `--table` reads `results/<experiment>/` when it
 exists and `out/<experiment>/` otherwise.

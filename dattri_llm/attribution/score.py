@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from dattri_llm.options import ScoreTrajectory
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -349,7 +351,7 @@ class AttributionScore:
         self,
         train_hashes: Sequence[str] | None = None,
         test_hashes: Sequence[str] | None = None,
-        trajectory: str = "agnostic",
+        trajectory: ScoreTrajectory = "agnostic",
     ) -> torch.Tensor:
         """Recover the submatrix for arbitrary train/test queries.
 

@@ -36,6 +36,7 @@ from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.gradient.streaming import DiskGradientSource, GradientStreamer
+from dattri_llm.options import AttributionGranularity
 from dattri_llm.task import AttributionTask, as_task
 from dattri_llm.utils.cache import CACHE_RESIDENCIES, CacheBudget
 
@@ -707,7 +708,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         *,
         loop_over_test: bool = False,
         transform_test: Callable[[Gradient], Gradient] | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
     ) -> tuple[torch.Tensor, list[str], list[int], list[str], list[int] | None]:
         """Score every train block against every test block with this
         attributor's hooks (see :func:`~dattri_llm.attribution.utils.score_sources`).
@@ -797,7 +798,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         loop_over_test: bool = False,
         enable_update: bool = False,
         gradient_cache_residency: str | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
         **attribution_kwargs: object,
     ) -> AttributionScore:
         """Attribute **on the fly** over the task's checkpoints.
@@ -1044,7 +1045,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         verbose: bool = False,
         loop_over_test: bool = False,
         algorithm_meta: dict | None = None,
-        attribution_granularity: str = "instance",
+        attribution_granularity: AttributionGranularity = "instance",
         **attribution_kwargs: object,
     ) -> AttributionScore:
         """Score previously collected gradients (the *store-then-attribute* path).

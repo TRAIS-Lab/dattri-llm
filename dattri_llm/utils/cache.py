@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dattri_llm.options import CacheResidency
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable
 
@@ -155,7 +157,7 @@ class TensorCache:
 
     def __init__(
         self,
-        residency: str = "memory",
+        residency: CacheResidency = "memory",
         *,
         budget: CacheBudget | int | None = None,
         spill_dir: str | Path | Callable[[], Path] | None = None,

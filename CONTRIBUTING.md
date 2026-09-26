@@ -22,13 +22,15 @@ CI (`.github/workflows/lint.yml`) runs ruff at a pinned version, because the
 configuration (`select = ["ALL"]` with `preview = true`) is version-sensitive:
 
 ```bash
-pip install ruff==0.15.20
-ruff check .
-ruff format --check .       # `ruff format .` applies the formatting
+make check                  # ruff check . && ruff format --check .
+ruff format .               # apply the formatting
+pre-commit install          # optional: run both on every commit
 ```
 
-Run both before every commit. The rule set and its documented exceptions live
-in `pyproject.toml` under `[tool.ruff]`.
+The `dev` extra installs that exact ruff (and `pre-commit`), and
+`[tool.ruff] required-version` in `pyproject.toml` refuses any other version.
+`.pre-commit-config.yaml` pins the same release. The rule set and its
+documented exceptions live in `pyproject.toml` under `[tool.ruff]`.
 
 ## Tests
 

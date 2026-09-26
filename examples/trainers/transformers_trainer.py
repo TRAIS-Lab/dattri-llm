@@ -17,11 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import pathlib
-import sys
 import tempfile
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from torch.utils.data import Dataset as TorchDataset
 from transformers import (
@@ -32,10 +28,13 @@ from transformers import (
     TrainingArguments,
 )
 
-from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.gradient.storage_manager import GradientStorageManager
-from dattri_llm.utils.hashing import hash_sample
+from dattri_llm import (
+    GradientStorageManager,
+    HookManager,
+    HookManagerConfig,
+    OffloadCallback,
+    hash_sample,
+)
 
 MODEL_ID = "sshleifer/tiny-gpt2"  # 2-layer GPT-2, runs on CPU
 MAX_LENGTH = 32

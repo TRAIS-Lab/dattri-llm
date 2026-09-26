@@ -19,6 +19,7 @@ from dattri_llm.gradient.ops import (
     ALL_LAYER_TYPES,
     canonical_class_name,
 )
+from dattri_llm.options import CaptureStyle
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -306,7 +307,7 @@ class HookManagerConfig:
         module_kwargs: dict[str, dict] | None = None,
         projection_kwargs: dict[str, dict] | None = None,
         projector: Callable | None = None,
-        capture_style: str = "factorized",
+        capture_style: CaptureStyle = "factorized",
         include_frozen: bool = False,
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)

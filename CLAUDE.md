@@ -46,7 +46,9 @@ pytest tests/gradient/test_hooks.py -q      # one file
 make darglint                               # docstring/signature agreement (optional, slow)
 ```
 
-Run `make check` before every commit; CI enforces it.
+Run `make check` before every commit; CI runs the same ruff commands at the
+same pinned version (`ruff==0.15.20`, in the `dev` extra). `pre-commit install`
+runs them on every commit through `.pre-commit-config.yaml`.
 
 ## Code Style
 
@@ -82,8 +84,9 @@ against an unhooked or single-device reference where one exists.
 
 ### CI/CD
 
-- `pytest.yml` and `lint.yml` run on every push and pull request (CPU tests
-  and `make check`); `examples_test.yml` runs the examples that need no large
+- `pytest.yml` and `lint.yml` run on every push and pull request (CPU tests;
+  ruff==0.15.20 `ruff check .` and `ruff format --check .`, the same commands
+  as `make check`); `examples_test.yml` runs the examples that need no large
   download.
 - Expensive checks run on a pull-request comment: `run gpu test` (the GPU
   suite), `run expensive examples` (examples that download checkpoints),

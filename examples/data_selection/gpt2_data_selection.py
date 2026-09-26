@@ -10,20 +10,20 @@ training loop.
 from __future__ import annotations
 
 import argparse
-import pathlib
-import sys
 import textwrap
 from collections import defaultdict
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from dattri_llm.gradient.callbacks import CaptureCallback, DataSelectionCallback
-from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm import (
+    REGISTER_ALL,
+    CaptureCallback,
+    DataSelectionCallback,
+    HookManager,
+    HookManagerConfig,
+)
 
 MODEL_ID = "gpt2"  # 124M parameters -- large enough for meaningful score spread
 MAX_LEN = 32  # keep sequences short for CPU speed

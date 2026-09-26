@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.options import CacheResidency, DiskFormat
 from dattri_llm.utils.cache import CACHE_RESIDENCIES, TensorCache, available_host_bytes
 from dattri_llm.utils.distributed import dist_rank
 from dattri_llm.utils.hashing import hash_sample
@@ -300,9 +301,9 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         self,
         save_dir: str,
         *,
-        residency: str = "disk",
+        residency: CacheResidency = "disk",
         budget_bytes: int | None = None,
-        disk_format: str = "memmap",
+        disk_format: DiskFormat = "memmap",
     ) -> None:
         if residency not in CACHE_RESIDENCIES:
             raise ValueError(

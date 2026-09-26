@@ -7,3 +7,7 @@ This directory contains experiments evaluating the efficiency and attribution fi
 | `benchmark/` | efficiency of four attribution libraries: time and memory on one model, scaling up a model ladder, throughput at the largest batch, cost against the sequence length |
 | `fidelity/` | fidelity of attribution methods against leave-one-out retraining, and their cost |
 | `capture/` | dattri-llm's ordinary versus invasive gradient capture: time saved and score agreement, on the workload of `benchmark/` |
+
+[`REPRODUCE.md`](REPRODUCE.md) maps each measurement to its command, hardware
+and result files, and lists what every result row records about the machine
+it ran on.

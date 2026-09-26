@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from dattri_llm.gradient.callbacks.base import HookManagerCallback
 from dattri_llm.gradient.gradient import GradientRecord
+from dattri_llm.options import RecordingType
 
 if TYPE_CHECKING:
     from dattri_llm.gradient.storage_manager import GradientStorageManager
@@ -57,7 +58,7 @@ class OffloadCallback(HookManagerCallback):
         self,
         offload_interval: int,
         file_manager: GradientStorageManager,
-        recording_type: str = "per_batch",
+        recording_type: RecordingType = "per_batch",
         gradient_accumulation_steps: int = 1,
         async_write: bool = False,
         max_pending_writes: int = 2,

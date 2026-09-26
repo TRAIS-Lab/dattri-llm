@@ -54,6 +54,7 @@ from dattri_llm.gradient.ops import (
     is_embedding,
     to_3d,
 )
+from dattri_llm.options import CaptureStyle
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -183,7 +184,7 @@ def register_linear_io_hooks(
     type_overrides: dict[str, str] | None = None,
     kwargs_overrides: dict[str, dict] | None = None,
     projection_kwargs: dict[str, dict] | None = None,
-    capture_style: str = "factorized",
+    capture_style: CaptureStyle = "factorized",
     projector: ops.DattriProjector | None = None,
     offload_to_cpu: bool = False,
     preconditioner: GradientPreconditioner | None = None,

@@ -49,3 +49,22 @@ terminal: red tokens push the query's loss down, blue tokens push it up.
 ```bash
 python examples/attribution/token_attribution.py
 ```
+
+## `method_tour.py` — every other attributor
+
+One toy MLP and dataset, scored by each attributor beyond TracIn through the
+one-call `attribute(...)`: `KFACAttributor` and `EKFACAttributor` at the
+model's current weights (`damping=1e-3`), and the three trajectory methods,
+whose `attribute(...)` trains the model for one epoch while it captures —
+`LESSAttributor` (`enable_update=True`), `DVEmbAttributor` (`learning_rate=`
+matching the run's constant schedule) and `AdamWInfluenceAttributor` (from the
+recorded optimizer moments). The optimizer settings come from `AttributionArguments`
+(`learning_rate`, `weight_decay`, `lr_scheduler_type`, ...). Each method
+starts from a freshly built model and prints the most influential training
+sample per test sample. The README's "Capture requirements" table lists what
+each method needs when you capture from your own loop and score with
+`attribute_from_cache(...)` instead.
+
+```bash
+python examples/attribution/method_tour.py
+```
