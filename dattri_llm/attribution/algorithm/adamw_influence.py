@@ -137,6 +137,14 @@ class AdamWInfluenceAttributor(TrajectoryAttributor):
         """The moments recorder, on the captured coordinates; to disk when
         recomputing.
         """
+        if self.args.gradient_accumulation_steps > 1:
+            # The sweep takes every captured step as one optimizer update; a
+            # micro-batch that is not followed by an update has none to read.
+            raise NotImplementedError(
+                f"{type(self).__name__} needs one optimizer update per captured "
+                "step; gradient_accumulation_steps="
+                f"{self.args.gradient_accumulation_steps} is not supported.",
+            )
         if self._projection is None and self._hook_config is not None:
             self._projection = self._hook_config.projection_kwargs
         self._recorder = OptimizerStateCallback(

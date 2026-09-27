@@ -553,6 +553,43 @@ class TestCovariancesAtCapture:
         subset = SimpleNamespace(file_manager=train.file_manager, steps=[])
         assert attr._covariances_for(subset) is None  # noqa: SLF001
 
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_layer_filter_restricts_covariances(self, cls, tmp_path):
+        """With ``layer_name`` only the scored layers' collected covariances
+        are used, so the fit matches one swept from those layers alone.
+        """
+        scores = {}
+        for at_capture in (False, True):
+            task, tr, te = _make_task_and_data()
+            attr = cls(_args(tmp_path / str(at_capture)), task=task)
+            ((train_dir, test_dir),) = attr.cache(
+                tr,
+                te,
+                hook_config=self._config("factorized"),
+                covariances_at_capture=at_capture,
+            )
+            scores[at_capture] = attr.attribute_from_cache(
+                train_dir, test_dir, layer_name="mlp.fc1", damping=self.DAMP
+            ).agnostic_matrix()
+        (ids_ref, ref), (ids, got) = scores[False], scores[True]
+        assert ids == ids_ref
+        assert torch.allclose(ref, got, atol=1e-4, rtol=1e-3)
+
+    def test_layer_filter_without_collected_layers(self, tmp_path):
+        """A layer filter no collected covariance matches sweeps the fit."""
+        task, tr, te = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path), task=task)
+        ((train_dir, _test_dir),) = attr.cache(
+            tr, te, hook_config=self._config("factorized")
+        )
+        from types import SimpleNamespace
+
+        train = attr.load_train_rep(train_dir)
+        other = SimpleNamespace(
+            file_manager=train.file_manager, steps=train.steps, layer_name=["other"]
+        )
+        assert attr._covariances_for(other) is None  # noqa: SLF001
+
 
 class TestFactorCacheResidency:
     """``factor_cache_residency``: the fitted factors held off the device, in a

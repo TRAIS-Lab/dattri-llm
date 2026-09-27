@@ -248,6 +248,21 @@ class TestAdamWInfluence:
             r = next(i for i, (h, s) in enumerate(rows) if h == tid and s == last)
             assert torch.allclose(score.scores[r], -(test_rep @ th_dot), atol=1e-5)
 
+    def test_gradient_accumulation_is_rejected(self, tmp_path):
+        """Every captured step must be an optimizer update: accumulation is
+        refused before the trajectory runs.
+        """
+        _, task, train, test = _setup()
+        attr = AdamWInfluenceAttributor(
+            _args(tmp_path, gradient_accumulation_steps=2), task=task
+        )
+        with pytest.raises(NotImplementedError, match="gradient_accumulation_steps"):
+            attr.attribute(
+                train,
+                test,
+                hook_config=HookManagerConfig(linear_io=[f"{n}$" for n in LAYERS]),
+            )
+
     def test_rows_cover_every_sample_and_step(self, tmp_path):
         _, task, train, test = _setup()
         score = AdamWInfluenceAttributor(_args(tmp_path), task=task).attribute(

@@ -310,6 +310,7 @@ class LESSAttributor(BaseInnerProductAttributor):
         *,
         checkpoint_weight: float | None = None,
         learning_rates: float | Mapping[int, float] | None = None,
+        algorithm_meta: dict | None = None,
         **kwargs: object,
     ) -> AttributionScore:
         """Score stored **preconditioned** train gradients against raw queries.
@@ -326,6 +327,7 @@ class LESSAttributor(BaseInnerProductAttributor):
             learning_rates: Per-step weights for a trajectory store, as a
                 constant or a ``{step: lr}`` map.  Unset, the schedule
                 :meth:`cache` recorded beside the store is used when present.
+            algorithm_meta: Extra entries for the score's metadata.
             **kwargs: Passed to the base class (``selected_training_steps``,
                 ``layer_name``, ``loop_over_test``, ...).
         """
@@ -350,6 +352,6 @@ class LESSAttributor(BaseInnerProductAttributor):
         return super().attribute_from_cache(
             train_store,
             test_source,
-            algorithm_meta=meta,
+            algorithm_meta={**meta, **(algorithm_meta or {})},
             **kwargs,
         )

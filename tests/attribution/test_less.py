@@ -375,3 +375,24 @@ class TestLESSPerStep:
         assert torch.allclose(
             _ordered(doubled, train, test), 2 * _ordered(cached, train, test), atol=1e-5
         )
+
+    @pytest.mark.parametrize("residency", ["memory", "tiered"])
+    def test_cache_residency_matches_a_replayed_trajectory(self, residency, tmp_path):
+        torch.manual_seed(0)
+        model = MLP()
+        train, test = _data()
+        ckpt = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        attr = LESSAttributor(_trajectory_args(tmp_path), task=_task(model, [ckpt]))
+        score = attr.attribute(
+            train,
+            test,
+            hook_config=HOOKS,
+            enable_update=True,
+            gradient_cache_residency=residency,
+        )
+        assert score.algorithm_meta["gradient_cache_residency"] == residency
+        got = _ordered(score, train, test)
+        want = _trajectory_oracle(ckpt, train, test, score)
+        assert torch.allclose(got, want, atol=1e-4), (
+            f"max diff {(got - want).abs().max():.2e}"
+        )

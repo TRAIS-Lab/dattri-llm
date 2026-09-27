@@ -546,9 +546,27 @@ class GradientStorageManager:  # noqa: PLR0904 - load-family pairs + residency A
         return self._write_group_to_disk(records, base_name)
 
     def _commit_group(self, location: str, records: list[GradientRecord]) -> None:
-        """Hand an indexed in-RAM group to the residency cache (no-op for disk)."""
-        if self._residency in ("memory", "tiered"):
-            self._groups.put(location, records)
+        """Hand an indexed in-RAM group to the residency cache (no-op for disk).
+
+        Raises:
+            MemoryError: If a ``memory`` store's budget refuses the group (a
+                ``tiered`` one spills instead); the group is not indexed.
+        """
+        if self._residency in ("memory", "tiered") and not self._groups.put(
+            location, records
+        ):
+            # Never serialized, so an un-cached group would be lost: un-index
+            # it and fail the save rather than fail every later read.
+            self._group_entries.pop(location, None)
+            for h in list(self._index):
+                self._index[h] = [e for e in self._index[h] if e["file"] != location]
+                if not self._index[h]:
+                    del self._index[h]
+            raise MemoryError(
+                f"memory store budget_bytes={self._budget_bytes} cannot hold "
+                f"another record group ({_records_nbytes(records)} bytes); use "
+                "residency='tiered' to spill to disk, or a larger budget.",
+            )
 
     def _resident_group(self, location: str) -> list[GradientRecord] | None:
         """The in-RAM record group at *location*, or ``None`` if it is on disk."""

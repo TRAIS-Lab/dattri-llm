@@ -492,7 +492,8 @@ class KroneckerAttributor(BaseInnerProductAttributor):  # noqa: PLR0904 - the wo
 
     def _covariances_for(self, train_source: GradientSource) -> dict | None:
         """The covariances collected with *train_source*'s store, when the
-        source reads every stored step (a step filter changes the fit).
+        source reads every stored step (a step filter changes the fit),
+        restricted to the source's layers.
         """
         store = getattr(train_source, "file_manager", None)
         if not self._covariances_at_capture or store is None:
@@ -505,6 +506,10 @@ class KroneckerAttributor(BaseInnerProductAttributor):  # noqa: PLR0904 - the wo
             covariances = torch.load(
                 root / self._COVARIANCE_FILE, map_location="cpu", weights_only=True
             )
+        layers = getattr(train_source, "layer_name", None)
+        if covariances is not None and layers is not None:
+            # None when no selected layer has any: the fit then sweeps them.
+            covariances = {k: v for k, v in covariances.items() if k in layers} or None
         return covariances
 
     def prepare_scoring(

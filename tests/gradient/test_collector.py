@@ -736,6 +736,28 @@ class TestBatchSaving:
             assert location.startswith("batch_")
             assert group_count(Path(tmpdir)) == 1
 
+    def test_memory_over_budget_refuses_the_save(self, tiny_model, tiny_batch):
+        """A memory store is never serialized: a group its budget refuses
+        fails the save and is not indexed; the groups it holds stay readable.
+        """
+        rec_a = self._make_record(0, self._HASH_A, tiny_model, tiny_batch)
+        rec_b = self._make_record(1, self._HASH_B, tiny_model, tiny_batch)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with GradientStorageManager(tmpdir, residency="memory") as probe:
+                probe.save_bulk([rec_a])
+                budget = probe.resident_bytes
+            with GradientStorageManager(
+                tmpdir, residency="memory", budget_bytes=budget
+            ) as manager:
+                manager.save_bulk([rec_a])
+                with pytest.raises(MemoryError, match="residency='tiered'"):
+                    manager.save_bulk([rec_b])
+                assert self._HASH_B not in manager.index
+                assert manager.available_steps() == [0]
+                (loaded,) = manager.load_all_by_hash(self._HASH_A)
+                assert loaded.step == 0
+            assert not any(Path(tmpdir).iterdir())
+
     def test_save_bulk_indexes_all_hashes(self, tiny_model, tiny_batch):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = GradientStorageManager(tmpdir)
