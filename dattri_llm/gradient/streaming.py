@@ -34,6 +34,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import warnings
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager
 from typing import (
@@ -342,6 +343,74 @@ def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
     return loss
 
 
+class _ProbePassState:
+    """What one frozen-probe pass must hand back to the model it shares: the
+    parameters' gradients (a trajectory's partially accumulated window, or the
+    gradient of a step whose update is deferred), the modules' train/eval
+    modes, and the global torch RNG state.
+    """
+
+    def __init__(self, model: nn.Module, forward_model: nn.Module) -> None:
+        # Clones, not references: a DDP bucket view or an FSDP flat-gradient
+        # view would be overwritten in place by the probe's own backward.
+        self._grads = [
+            (p, None if p.grad is None else p.grad.detach().clone())
+            for p in model.parameters()
+        ]
+        self.holds_grads = any(g is not None for _, g in self._grads)
+        self._modes = [(m, m.training) for m in forward_model.modules()]
+        self._cpu_rng = torch.get_rng_state()
+        self._cuda_rng = (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available() and torch.cuda.is_initialized()
+            else None
+        )
+
+    def restore(self) -> None:
+        """Hand the saved gradients, modes and RNG state back.
+
+        Every gradient is attempted and the modes and RNG state are always
+        restored; a gradient that cannot be handed back raises afterwards.
+        """
+        with torch.no_grad():
+            failed = [
+                err
+                for p, grad in self._grads
+                if (err := self._hand_back(p, grad)) is not None
+            ]
+        for m, training in self._modes:
+            m.training = training
+        torch.set_rng_state(self._cpu_rng)
+        if self._cuda_rng is not None:
+            torch.cuda.set_rng_state_all(self._cuda_rng)
+        if failed:
+            raise RuntimeError(
+                f"A frozen probe could not copy {len(failed)} saved gradient(s) back "
+                f"into the model it shares: {failed[0]}",
+            ) from failed[0]
+
+    @staticmethod
+    def _hand_back(p: nn.Parameter, grad: torch.Tensor | None) -> RuntimeError | None:
+        # In place when the storage is still there (the pass zeroes, not
+        # frees, the gradients it hands back): keeps a wrapper's gradient
+        # storage (a DDP bucket view, an FSDP flat gradient) and works for
+        # low-precision gradients a direct assignment would reject.
+        in_place = (
+            grad is not None
+            and p.grad is not None
+            and p.grad.shape == grad.shape
+            and p.grad.dtype == grad.dtype
+        )
+        try:
+            if in_place:
+                p.grad.copy_(grad)
+            else:
+                p.grad = grad
+        except RuntimeError as err:
+            return err
+        return None
+
+
 class GradientStreamer(GradientSource):
     """Yields per-step ``(step, Gradient, hashes)`` from a live forward+backward pass.
 
@@ -436,6 +505,19 @@ class GradientStreamer(GradientSource):
             sharded.  Every rank must still run the same number of steps, so
             all ranks stream the same (unsharded) dataset.  No effect on a
             single process.
+        defer_update: Under ``enable_update``, yield each block **before**
+            the optimizer update its accumulation window ends with, and apply
+            that update when the next block is requested (or when the pass
+            ends, or on a clean ``__exit__``).  The consumer then sees the
+            model at the parameters the block's gradient was taken at, so a
+            frozen probe sharing the model (``loop_over_test``) is evaluated at
+            the same ``theta_t``.  The trajectory itself is unchanged, but
+            anything read at yield time -- the parameters, the optimizer
+            state, the scheduler -- is pre-update, so do not combine it with
+            consumers that expect the update applied (e.g. a callback
+            recording post-update optimizer moments).  Also settable as the
+            :attr:`defer_update` attribute before iterating.
+
     """
 
     def __init__(
@@ -457,6 +539,7 @@ class GradientStreamer(GradientSource):
         snapshots: TrajectorySnapshots | str | None = None,
         forward_model: nn.Module | None = None,
         shard: bool = True,
+        defer_update: bool = False,
     ) -> None:
         self._model = model
         self._dataset = dataset
@@ -464,6 +547,9 @@ class GradientStreamer(GradientSource):
         self._batch_size = batch_size
         self._shard = shard
         self.enable_update = enable_update
+        self.defer_update = defer_update
+        # An update held back by ``defer_update``, applied on the next request.
+        self._update_pending: bool = False
         if snapshots is not None and not isinstance(snapshots, TrajectorySnapshots):
             snapshots = TrajectorySnapshots(snapshots)
         if snapshots is not None and not enable_update:
@@ -595,10 +681,12 @@ class GradientStreamer(GradientSource):
         # Per-step LR actually applied (``enable_update``), keyed by step index --
         # so a trajectory attributor can use/verify the true schedule.
         self._step_lrs: dict[int, float] = {}
-        # Saved-state for frozen probes (restored on __exit__).
+        # Context state.
         self._entered: bool = False
         self._collect_ctx = None
-        self._saved_grads: dict[str, torch.Tensor | None] | None = None
+        # A frozen probe's per-pass save of the shared model's gradients and
+        # the RNG state (restored when the pass ends).
+        self._pass_state: _ProbePassState | None = None
 
     # ------------------------------------------------------------------ #
     # GradientSource contract                                            #
@@ -673,14 +761,9 @@ class GradientStreamer(GradientSource):
             enable_full_determinism(self._args.seed)
         else:
             set_seed(self._args.seed)
-        if not self.enable_update:
-            # Freeze: snapshot grads so the probe leaves them untouched.  (The
-            # eval() that keeps repeated passes bit-identical -- e.g. K-FAC's fit
-            # and score passes -- is applied per-pass in __iter__.)
-            self._saved_grads = {
-                n: (p.grad.detach().clone() if p.grad is not None else None)
-                for n, p in self._model.named_parameters()
-            }
+        # A frozen probe leaves the model's gradients untouched per pass (see
+        # the class doc and __iter__, which also applies the eval() that keeps
+        # repeated passes bit-identical -- e.g. K-FAC's fit and score passes).
         # Only the owner registers/activates hooks; a sharer rides the owner's
         # collection context (the owner is entered first under ``with a, b:``).
         if self._owns_hm:
@@ -690,18 +773,44 @@ class GradientStreamer(GradientSource):
 
     def __exit__(self, *exc) -> bool:
         try:
-            if self._owns_hm and self._collect_ctx is not None:
-                self._collect_ctx.__exit__(*exc)
+            ctx_exc = exc
+            try:
+                pending, self._update_pending = self._update_pending, False
+                if pending and exc[0] is None:
+                    # The last update of a pass the consumer stopped early (an
+                    # exception drops it instead).
+                    self._optimizer_step()
+            except BaseException as err:
+                ctx_exc = (type(err), err, err.__traceback__)
+                raise
+            finally:
+                if self._owns_hm and self._collect_ctx is not None:
+                    self._collect_ctx.__exit__(*ctx_exc)
         finally:
+            try:
+                self._release()
+            except Exception as err:
+                if exc[0] is None:
+                    raise
+                # Never mask the error already propagating.
+                warnings.warn(
+                    f"While handling {exc[0].__name__}: {err}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            finally:
+                self._entered = False
+        return False
+
+    def _release(self) -> None:
+        """Remove owned hooks and hand back an unfinished probe pass."""
+        try:
             if self._owns_hm:
                 self._hm.remove()
-            # The mode is owned per-pass by __iter__, so it is left as-is; only a
-            # frozen probe's snapshotted grads need restoring.
-            if not self.enable_update and self._saved_grads is not None:
-                for n, p in self._model.named_parameters():
-                    p.grad = self._saved_grads[n]
-            self._entered = False
-        return False
+        finally:
+            # A frozen probe's pass the consumer did not finish (an early
+            # break, or an exception) hands the model back here.
+            self._end_probe_pass()
 
     # ------------------------------------------------------------------ #
     # Iteration                                                           #
@@ -718,6 +827,12 @@ class GradientStreamer(GradientSource):
                 "This streamer is single-shot (enable_update=True) and was "
                 "already consumed; the training trajectory cannot be replayed.",
             )
+        self._update_pending = False
+        if not self.enable_update:
+            # Before the mode switch and iter(loader), which draws the loader's
+            # base seed from the RNG.
+            self._end_probe_pass()
+            self._pass_state = _ProbePassState(self._model, self._fwd_model)
         # Set the train/eval mode for THIS pass on the (possibly shared) model: a
         # training trajectory runs in train() to match real training (dropout/BN
         # active); a frozen probe runs in eval() for deterministic, repeatable
@@ -739,7 +854,13 @@ class GradientStreamer(GradientSource):
     def __next__(self) -> StreamBatch:
         if self._batch_iter is None:
             raise RuntimeError("Call iter(streamer) before next(streamer).")
-        batch = next(self._batch_iter)  # raises StopIteration at the end
+        if self._update_pending:
+            self._apply_pending_update()
+        try:
+            batch = next(self._batch_iter)  # raises StopIteration at the end
+        except StopIteration:
+            self._end_probe_pass()
+            raise
         batch = self._to_device(batch)
         if self._snapshots is not None:
             # The parameters this micro-batch's gradient is taken at: those of
@@ -779,7 +900,10 @@ class GradientStreamer(GradientSource):
             if self._accum_count >= self._accum_steps or self._batch_index + 1 >= len(
                 self._loader
             ):
-                self._optimizer_step()
+                if self.defer_update:
+                    self._update_pending = True
+                else:
+                    self._optimizer_step()
                 self._accum_count = 0
 
         record = self._capture.record
@@ -809,6 +933,12 @@ class GradientStreamer(GradientSource):
             if isinstance(record.input_hash, list)
             else [record.input_hash]
         )
+        if self._pass_state is not None and not self._pass_state.holds_grads:
+            # A frozen pass that found no gradients hands none back, so its
+            # own serve nobody once captured: freeing them spares a probe
+            # nested in it copying them.  (A pass that will hand gradients
+            # back keeps their storage, so they are restored in place.)
+            self._fwd_model.zero_grad(set_to_none=True)
         self._batch_index += 1
         return step, grad, hashes
 
@@ -836,8 +966,11 @@ class GradientStreamer(GradientSource):
         if self._accum_count == 0:
             # Start of an accumulation window (every batch when N == 1):
             # under accumulation, Trainer zero-grads only after an optimizer
-            # update, letting the window's micro-batch gradients sum.
-            self._fwd_model.zero_grad(set_to_none=True)
+            # update, letting the window's micro-batch gradients sum.  A
+            # frozen pass that hands gradients back zeroes them in place
+            # instead, keeping their storage for the restore.
+            hands_back = self._pass_state is not None and self._pass_state.holds_grads
+            self._fwd_model.zero_grad(set_to_none=not hands_back)
         self._capture.record = None
         with self._autocast():
             loss = self._loss_fn(self._fwd_model, batch)
@@ -871,6 +1004,17 @@ class GradientStreamer(GradientSource):
             self._optimizer.step()  # type: ignore[union-attr]
         if self._scheduler is not None:
             self._scheduler.step()
+
+    def _apply_pending_update(self) -> None:
+        """Apply the update ``defer_update`` held back (see the class doc)."""
+        self._update_pending = False
+        self._optimizer_step()
+
+    def _end_probe_pass(self) -> None:
+        """Restore what a frozen probe's pass saved, if a pass is open."""
+        state, self._pass_state = self._pass_state, None
+        if state is not None:
+            state.restore()  # closes the pass even if a gradient fails
 
     def _clip_gradients(self) -> None:
         """Clip gradients to ``max_grad_norm``, dispatching on the wrapping.

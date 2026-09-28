@@ -212,7 +212,7 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
 
     Everything else -- collection into a store of any residency, the
     checkpoint ensemble, the scoring loop with its dense-materialization
-    cache, the ``loop_over_test`` memory mode, the layer / step filters, and
+    cache, the ``loop_over_test`` mode, the layer / step filters, and
     the :class:`AttributionScore` assembly -- is inherited.
     """
 
@@ -815,8 +815,17 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             hook_config: Capture configuration for the internal streamers.
                 The test streamer shares the train streamer's hooks.
             verbose: Accepted for API parity (live streams show no bars).
-            loop_over_test: Re-stream the test blocks per train block (low
-                memory) instead of caching them once (default).
+            loop_over_test: Re-stream the test blocks per train block instead
+                of caching them once (default).  Frozen passes: a pure
+                memory mode, identical scores.  ``enable_update=True``: the
+                query gradient is re-taken for every step at the parameters
+                that step's train gradient is taken at (``theta_t``, before
+                its update) -- the per-step TracIn / LESS definition --
+                whereas ``False`` takes it once, at ``theta_0``, before the
+                trajectory.  Needs ``gradient_cache_residency=None``: a store
+                holds the query gradients taken once at ``theta_0``.  On this
+                live path the score's ``algorithm_meta["query_at"]`` records
+                which.
             enable_update: Trajectory vs. frozen multi-checkpoint scoring.
             gradient_cache_residency: ``None`` (default) streams the
                 gradients straight into scoring, re-running the model for any
@@ -837,6 +846,15 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
         self.require_task("attribute")
         _check_granularity(attribution_granularity)
         if gradient_cache_residency is not None:
+            if enable_update and loop_over_test:
+                raise ValueError(
+                    "loop_over_test=True with enable_update=True takes the query "
+                    "gradient at every step's parameters, which needs "
+                    "gradient_cache_residency=None: a gradient store holds the "
+                    "query gradients taken once, before the trajectory.  Use "
+                    "gradient_cache_residency=None for the per-step query, or "
+                    "loop_over_test=False for the query at the start.",
+                )
             if gradient_cache_residency not in CACHE_RESIDENCIES:
                 raise ValueError(
                     "gradient_cache_residency must be one of "
@@ -890,6 +908,16 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 shard=False,
             )
             hooked_layers = list(train.hook_manager.layer_name)
+            if enable_update and loop_over_test:
+                # Hold each step's update until its block has been scored, so
+                # the re-streamed query sees the step's own theta_t.
+                if not isinstance(train, GradientStreamer):
+                    raise TypeError(
+                        "loop_over_test=True with enable_update=True needs "
+                        "generate_train_rep() to return a GradientStreamer, got "
+                        f"{type(train).__name__}.",
+                    )
+                train.defer_update = True
             with train, test:
                 sc, rids, rsteps, tids, rtoks = self.score_sources(
                     train,
@@ -910,6 +938,13 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
             algorithm_meta={
                 "n_checkpoints": len(checkpoints),
                 "enable_update": enable_update,
+                # Where the query gradients were taken: each checkpoint (frozen),
+                # or theta_0 / every step's theta_t along a trajectory.
+                "query_at": (
+                    ("theta_t" if loop_over_test else "theta_0")
+                    if enable_update
+                    else "checkpoint"
+                ),
                 "attribution_granularity": attribution_granularity,
                 **attribution_kwargs,
             },
@@ -1068,8 +1103,9 @@ class BaseInnerProductAttributor(BaseAttributor):  # noqa: PLR0904 - the workflo
                 supplies every column.
             layer_name: Restrict scoring to this subset of the *stored* layers.
             verbose: Show progress bars on the logging process.
-            loop_over_test: Re-stream the test blocks per train block (low
-                memory) instead of caching them once (default).
+            loop_over_test: Re-read the test blocks per train block (low
+                memory) instead of caching them once (default); the stored
+                test gradients are fixed, so the scores are identical.
             algorithm_meta: Extra entries for the score's metadata.
             attribution_granularity: ``"instance"`` (default) or ``"token"``
                 (one row per training token position; see :meth:`attribute`).

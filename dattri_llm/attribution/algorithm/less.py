@@ -277,7 +277,9 @@ class LESSAttributor(BaseInnerProductAttributor):
             verbose: Accepted for API parity.
             loop_over_test: Re-stream the test blocks per train block.  In the
                 per-step form this evaluates the query gradient at every
-                step's parameters; ``False`` takes it once, at the start.
+                step's parameters ``theta_t`` (before its update, as in the
+                definition above; needs ``gradient_cache_residency=None``);
+                ``False`` takes it once, at the start.
             enable_update: ``True`` for the per-step form (a trajectory from
                 the first checkpoint, each step weighted by its applied
                 learning rate); ``False`` for the frozen form over the task's

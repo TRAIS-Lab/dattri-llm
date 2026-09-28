@@ -285,10 +285,12 @@ def _trajectory_args(out_dir, batch=2):
     )
 
 
-def _trajectory_oracle(ckpt, train, test, score, batch=2):
+def _trajectory_oracle(ckpt, train, test, score, batch=2, per_step_query=False):
     """Replay the recorded trajectory (batch order from the score's rows) and
     accumulate ``lr * cos(grad(z'; theta_0), Gamma(z; theta_t))`` per step,
-    with the query gradient taken once at the start (``loop_over_test=False``).
+    with the query gradient taken once at the start (``loop_over_test=False``)
+    -- or, with *per_step_query*, ``cos(grad(z'; theta_t), Gamma(z; theta_t))``
+    (``loop_over_test=True``).
     """
     torch.manual_seed(0)
     model = MLP()
@@ -329,6 +331,14 @@ def _trajectory_oracle(ckpt, train, test, score, batch=2):
             ]
         )
         gamma /= gamma.norm(dim=1, keepdim=True)
+        if per_step_query:
+            query = torch.stack(
+                [
+                    _features(r, model, opt, apply_map=False, subset=None)
+                    for r in _per_sample_grads(model, test.x, test.y)
+                ]
+            )
+            query /= query.norm(dim=1, keepdim=True)
         scores[rows] += 0.05 * (gamma @ query.T)
         opt.zero_grad()
         ((model(x) - y) ** 2).sum().backward()
@@ -347,6 +357,21 @@ class TestLESSPerStep:
         assert sorted(set(score.row_steps)) == list(range(N_TRAIN // 2))
         got = _ordered(score, train, test)
         want = _trajectory_oracle(ckpt, train, test, score)
+        assert torch.allclose(got, want, atol=1e-4), (
+            f"max diff {(got - want).abs().max():.2e}"
+        )
+
+    def test_looped_query_is_taken_at_each_steps_parameters(self, tmp_path):
+        torch.manual_seed(0)
+        model = MLP()
+        train, test = _data()
+        ckpt = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        attr = LESSAttributor(_trajectory_args(tmp_path), task=_task(model, [ckpt]))
+        score = attr.attribute(
+            train, test, hook_config=HOOKS, enable_update=True, loop_over_test=True
+        )
+        got = _ordered(score, train, test)
+        want = _trajectory_oracle(ckpt, train, test, score, per_step_query=True)
         assert torch.allclose(got, want, atol=1e-4), (
             f"max diff {(got - want).abs().max():.2e}"
         )

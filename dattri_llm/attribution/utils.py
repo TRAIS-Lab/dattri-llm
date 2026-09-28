@@ -290,7 +290,12 @@ def score_sources(
             are likewise stacked into a single block when they are all dense.
         loop_over_test: Re-stream + re-transform the test blocks per train block
             (low memory) instead of caching them once (default).  This path
-            scores block-by-block (no train-side re-batching).
+            scores block-by-block (no train-side re-batching).  A live test
+            probe is re-streamed right after each train block is received, at
+            whatever parameters the model then has (a trajectory streamer
+            with ``defer_update`` keeps them at the block's ``theta_t``), so
+            against a live trajectory it changes the scores, not only the
+            memory (see ``BaseInnerProductAttributor.attribute``).
         cache_budget: Budget of the per-train-block dense cache; ``None`` uses
             the default fraction of free memory on *device*.
         granularity: ``"instance"`` (default) scores one row per training

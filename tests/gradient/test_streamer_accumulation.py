@@ -176,6 +176,253 @@ class TestAccumulationTrajectory:
         assert lrs[2] == pytest.approx(LR / 2)  # linear decay over 2 updates
 
 
+class TestProbeMidTrajectory:
+    """A frozen probe re-streamed between the blocks of a trajectory (the
+    ``loop_over_test`` interleaving) must not disturb it, and ``defer_update``
+    must hand out each block before the update its window ends with.
+    """
+
+    def test_probe_pass_keeps_window_gradient_and_rng(self, tmp_path):
+        torch.manual_seed(SEED)
+        model = MLP()
+        train = GradientStreamer(
+            model,
+            _make_data(6),
+            _args(tmp_path, gradient_accumulation_steps=2),
+            batch_size=BATCH,
+            enable_update=True,
+            loss_fn=_loss_fn,
+        )
+        probe = GradientStreamer(
+            model,
+            _make_data(4),
+            _args(tmp_path),
+            batch_size=BATCH,
+            loss_fn=_loss_fn,
+            hook_manager=train.hook_manager,
+            forward_model=train.forward_model,
+        )
+        with train, probe:
+            it = iter(train)
+            next(it)  # first micro-batch of a window: gradient half-accumulated
+            grads = {n: p.grad.clone() for n, p in model.named_parameters()}
+            rng = torch.get_rng_state()
+            assert len(list(probe)) == 2
+            for n, p in model.named_parameters():
+                assert torch.equal(p.grad, grads[n]), n
+            assert torch.equal(torch.get_rng_state(), rng)
+            assert model.training  # the probe's eval() is handed back too
+            # A pass stopped early is handed back on the next pass / exit.
+            next(iter(probe))
+            assert not model.training
+        for n, p in model.named_parameters():
+            assert torch.equal(p.grad, grads[n]), n
+        assert model.training
+
+    def _mid_window(self, tmp_path, query_loss):
+        """A trajectory halfway through an accumulation window and a probe
+        sharing its model with ``query_loss``.
+        """
+        torch.manual_seed(SEED)
+        model = MLP()
+        train = GradientStreamer(
+            model,
+            _make_data(6),
+            _args(tmp_path, gradient_accumulation_steps=2),
+            batch_size=BATCH,
+            enable_update=True,
+            loss_fn=_loss_fn,
+        )
+        probe = GradientStreamer(
+            model,
+            _make_data(4),
+            _args(tmp_path),
+            batch_size=BATCH,
+            loss_fn=query_loss,
+            hook_manager=train.hook_manager,
+            forward_model=train.forward_model,
+        )
+        return model, train, probe
+
+    def test_probe_keeps_the_gradient_storage_it_hands_back(self, tmp_path):
+        model, train, probe = self._mid_window(tmp_path, _loss_fn)
+        with train, probe:
+            next(iter(train))
+            storage = {n: p.grad for n, p in model.named_parameters()}
+            window = {n: g.clone() for n, g in storage.items()}
+            for _block in probe:
+                # Zeroed, not freed: a wrapper's gradient view (or a
+                # low-precision FSDP gradient, which a plain ``.grad``
+                # assignment rejects) is still there to be restored into.
+                assert all(p.grad is storage[n] for n, p in model.named_parameters())
+            for n, p in model.named_parameters():
+                assert p.grad is storage[n], n
+                assert torch.equal(p.grad, window[n]), n
+
+    def test_failing_probe_hands_back_and_keeps_its_error(self, tmp_path):
+        def failing(model, batch):
+            raise KeyError("query loss failed")
+
+        model, train, probe = self._mid_window(tmp_path, failing)
+        with train:
+            next(iter(train))
+            window = {n: p.grad.clone() for n, p in model.named_parameters()}
+            seen = {}
+
+            def query():
+                with probe:  # entering seeds, as training does
+                    seen["rng"] = torch.get_rng_state()
+                    next(iter(probe))
+
+            with pytest.raises(KeyError, match="query loss failed"):
+                query()
+            rng = seen["rng"]
+            for n, p in model.named_parameters():
+                assert torch.equal(p.grad, window[n]), n
+            assert torch.equal(torch.get_rng_state(), rng)
+            assert model.training
+            assert not probe._entered
+            assert probe._pass_state is None
+
+    def test_unrestorable_gradient_still_closes_the_pass(self, tmp_path, monkeypatch):
+        from dattri_llm.gradient import streaming
+
+        def refuse(p, grad):
+            return RuntimeError("storage replaced")
+
+        monkeypatch.setattr(
+            streaming._ProbePassState, "_hand_back", staticmethod(refuse)
+        )
+        model, train, probe = self._mid_window(tmp_path, _loss_fn)
+        with train:
+            next(iter(train))
+            with probe:
+                rng = torch.get_rng_state()
+                with pytest.raises(RuntimeError, match="storage replaced"):
+                    list(probe)
+                # Modes, RNG and the pass itself are handed back regardless.
+                assert model.training
+                assert torch.equal(torch.get_rng_state(), rng)
+                assert probe._pass_state is None
+
+            def fail_mid_pass():
+                with probe:
+                    next(iter(probe))
+                    raise KeyError("consumer failed")
+
+            # The error already propagating is not masked by the restore's.
+            with (
+                pytest.warns(RuntimeWarning, match="storage replaced"),
+                pytest.raises(KeyError, match="consumer failed"),
+            ):
+                fail_mid_pass()
+            assert model.training
+            assert not probe._entered
+
+    def test_frozen_pass_frees_gradients_it_does_not_hand_back(self, tmp_path):
+        torch.manual_seed(SEED)
+        model = MLP()
+        frozen = GradientStreamer(
+            model, _make_data(4), _args(tmp_path), batch_size=BATCH, loss_fn=_loss_fn
+        )
+        with frozen:
+            for _block in frozen:
+                assert all(p.grad is None for p in model.parameters())
+
+    def test_deferred_update_matches_and_yields_pre_update(self, tmp_path):
+        final = {}
+        for defer in (False, True):
+            torch.manual_seed(SEED)
+            model = MLP()
+            streamer = GradientStreamer(
+                model,
+                _make_data(6),
+                _args(tmp_path, gradient_accumulation_steps=2),
+                batch_size=BATCH,
+                enable_update=True,
+                loss_fn=_loss_fn,
+                defer_update=defer,
+            )
+            start = [p.detach().clone() for p in model.parameters()]
+            with streamer:
+                for i, _block in enumerate(streamer):
+                    moved = any(
+                        not torch.equal(p, s)
+                        for p, s in zip(model.parameters(), start, strict=True)
+                    )
+                    # Micro-batch 1 closes the first window: its update is
+                    # already applied when it is yielded, unless deferred to
+                    # the request for micro-batch 2.
+                    assert moved == (i >= (2 if defer else 1)), (defer, i)
+            final[defer] = torch.cat(
+                [p.detach().reshape(-1) for p in model.parameters()]
+            )
+        assert torch.equal(final[False], final[True])
+
+    def _streamer(self, tmp_path, *, defer):
+        torch.manual_seed(SEED)
+        model = MLP()
+        return model, GradientStreamer(
+            model,
+            _make_data(6),
+            _args(tmp_path, gradient_accumulation_steps=2),
+            batch_size=BATCH,
+            enable_update=True,
+            loss_fn=_loss_fn,
+            defer_update=defer,
+        )
+
+    def test_early_stop_applies_the_held_update_on_exit(self, tmp_path):
+        final = {}
+        for defer in (False, True):
+            model, streamer = self._streamer(tmp_path, defer=defer)
+            with streamer:
+                it = iter(streamer)
+                next(it)
+                next(it)  # closes the first window
+            final[defer] = torch.cat(
+                [p.detach().reshape(-1) for p in model.parameters()]
+            )
+        assert torch.equal(final[False], final[True])
+
+    def test_exception_drops_the_held_update(self, tmp_path):
+        model, streamer = self._streamer(tmp_path, defer=True)
+        start = torch.cat([p.detach().reshape(-1).clone() for p in model.parameters()])
+
+        def consume_then_fail():
+            with streamer:
+                it = iter(streamer)
+                next(it)
+                next(it)  # closes the first window; its update is held
+                raise KeyError  # the consumer fails while scoring the block
+
+        with pytest.raises(KeyError):
+            consume_then_fail()
+        with streamer:  # dropped, not postponed to a later exit
+            pass
+        assert torch.equal(
+            torch.cat([p.detach().reshape(-1) for p in model.parameters()]), start
+        )
+
+    def test_failing_held_update_still_closes_the_collection(self, tmp_path):
+        _, streamer = self._streamer(tmp_path, defer=True)
+
+        def failing_step():
+            raise ArithmeticError
+
+        streamer._optimizer_step = failing_step
+
+        def stop_early():
+            with streamer:
+                it = iter(streamer)
+                next(it)
+                next(it)  # its update is held and fails on exit
+
+        with pytest.raises(ArithmeticError):
+            stop_early()
+        assert not streamer.hook_manager._collecting
+
+
 class TestFrozenProbeIgnoresAccumulation:
     def test_records_identical_to_no_accumulation(self, tmp_path):
         def run(accum: int):

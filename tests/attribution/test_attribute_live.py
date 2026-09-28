@@ -22,6 +22,7 @@ from dattri_llm.attribution.algorithm.dvemb import DVEmbAttributor
 from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttributor
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.utils.hashing import hash_sample
 
 IN_DIM, HID_DIM, OUT_DIM = 4, 8, 3
 N_TRAIN, N_TEST = 6, 4
@@ -117,6 +118,185 @@ class TestLiveLoopOverTest:
         assert torch.allclose(m_c, m_l, atol=1e-5), (
             f"max diff {(m_c - m_l).abs().max():.2e}"
         )
+
+
+class DropoutMLP(MLP):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mlp.add_module("drop", nn.Dropout(0.3))
+        self.mlp.add_module("out", nn.Linear(OUT_DIM, OUT_DIM, bias=False))
+
+
+def _updating_run(
+    tmp_path,
+    *,
+    loop_over_test,
+    accumulation,
+    dropout=False,
+    residency=None,
+    **overrides,
+):
+    """A TracIn updating run (SGD) from a fresh model; returns the score and
+    the trained model (the live streamer trains the task's model in place).
+    """
+    torch.manual_seed(SEED)
+    model = DropoutMLP() if dropout else MLP()
+    _, train_ds, test_ds = _make_task_and_data()
+
+    def loss_func(params, data):
+        yhat = torch.func.functional_call(model, params, (data["x"],))
+        return ((yhat - data["y"]) ** 2).sum()
+
+    checkpoint = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    task = AttributionTask(loss_func=loss_func, model=model, checkpoints=[checkpoint])
+    kwargs = {
+        "output_dir": str(tmp_path),
+        "per_device_train_batch_size": 2,
+        "per_device_eval_batch_size": 2,
+        "use_cpu": True,
+        "dataloader_pin_memory": False,
+        "optim": "sgd",
+        "learning_rate": 0.1,
+        "lr_scheduler_type": "constant",
+        "max_grad_norm": None,
+        "gradient_accumulation_steps": accumulation,
+    }
+    args = AttributionArguments(**{**kwargs, **overrides})
+    score = TracInAttributor(args, task=task).attribute(
+        train_ds,
+        test_ds,
+        enable_update=True,
+        loop_over_test=loop_over_test,
+        gradient_cache_residency=residency,
+    )
+    return score, model, train_ds, test_ds
+
+
+class TestUpdatingLoopOverTest:
+    """``loop_over_test=True`` in a training trajectory: the query gradient is
+    taken at every step's pre-update parameters, and re-streaming it between
+    train blocks leaves the trajectory itself untouched.
+    """
+
+    @pytest.mark.parametrize("accumulation", [1, 2])
+    def test_query_is_taken_at_each_steps_parameters(self, tmp_path, accumulation):
+        score, _, train_ds, test_ds = _updating_run(
+            tmp_path, loop_over_test=True, accumulation=accumulation
+        )
+
+        def per_sample(model, x, y, scale=1.0):
+            rows = []
+            for i in range(x.shape[0]):
+                model.zero_grad()
+                (scale * ((model(x[i : i + 1]) - y[i : i + 1]) ** 2).sum()).backward()
+                rows.append(torch.cat([p.grad.reshape(-1) for p in model.parameters()]))
+            return torch.stack(rows)
+
+        # Replay the recorded batch order window by window: every micro-batch
+        # gradient (of the loss / N the trajectory backpropagates) and the
+        # query are taken at the window's parameters, before its update.
+        index = {hash_sample({"_arg0": train_ds.x[i]}): i for i in range(N_TRAIN)}
+        order: dict[int, list[int]] = {}
+        for h, step in zip(score.row_train_ids, score.row_steps, strict=True):
+            order.setdefault(step, []).append(index[h])
+        steps = sorted(order)
+        torch.manual_seed(SEED)
+        model = MLP()
+        want = torch.zeros(N_TRAIN, N_TEST)
+        for w in range(0, len(steps), accumulation):
+            window = steps[w : w + accumulation]
+            query = per_sample(model, test_ds.x, test_ds.y)
+            model.zero_grad()
+            for step in window:
+                rows = order[step]
+                want[rows] += (
+                    per_sample(
+                        model, train_ds.x[rows], train_ds.y[rows], 1 / accumulation
+                    )
+                    @ query.T
+                )
+            model.zero_grad()
+            for step in window:
+                rows = order[step]
+                x, y = train_ds.x[rows], train_ds.y[rows]
+                (((model(x) - y) ** 2).sum() / accumulation).backward()
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.sub_(0.1 * p.grad)
+
+        ids, matrix = score.agnostic_matrix()
+        row = {h: i for i, h in enumerate(ids)}
+        col = {h: i for i, h in enumerate(score.test_ids)}
+        got = matrix[
+            [row[hash_sample({"_arg0": train_ds.x[i]})] for i in range(N_TRAIN)]
+        ][:, [col[hash_sample({"_arg0": test_ds.x[i]})] for i in range(N_TEST)]]
+        assert torch.allclose(got, want, atol=1e-4, rtol=1e-4), (
+            f"max diff {(got - want).abs().max():.2e}"
+        )
+        assert score.algorithm_meta["query_at"] == "theta_t"
+
+    @pytest.mark.parametrize("dropout", [False, True])
+    @pytest.mark.parametrize("accumulation", [1, 2])
+    def test_training_does_not_depend_on_loop_over_test(
+        self, tmp_path, accumulation, dropout
+    ):
+        # AdamW with clipping and a warmup schedule: the whole deferred update
+        # (clip -> step -> schedule) must match.  The memory-residency run
+        # collects the queries in a pass of their own, so its training never
+        # meets a probe: the reference trajectory.
+        trained, modes = {}, {}
+        for run in ("cached", "looped", "memory"):
+            _, model, _, _ = _updating_run(
+                tmp_path / run,
+                loop_over_test=run == "looped",
+                accumulation=accumulation,
+                dropout=dropout,
+                residency="memory" if run == "memory" else None,
+                optim="adamw_torch",
+                learning_rate=0.05,
+                max_grad_norm=0.5,
+                lr_scheduler_type="linear",
+                warmup_steps=1,
+            )
+            trained[run] = torch.cat(
+                [p.detach().reshape(-1) for p in model.parameters()]
+            )
+            modes[run] = model.training
+        for run in ("cached", "looped"):
+            assert torch.equal(trained[run], trained["memory"]), (
+                f"{run}: max diff {(trained[run] - trained['memory']).abs().max():.2e}"
+            )
+        assert modes["looped"] == modes["cached"]
+
+    @pytest.mark.parametrize("residency", ["memory", "tiered", "disk"])
+    def test_stores_reject_the_per_step_query(self, tmp_path, residency):
+        task, train_ds, test_ds = _make_task_and_data()
+        with pytest.raises(ValueError, match="gradient_cache_residency=None"):
+            TracInAttributor(_args(tmp_path), task=task).attribute(
+                train_ds,
+                test_ds,
+                enable_update=True,
+                loop_over_test=True,
+                gradient_cache_residency=residency,
+            )
+
+    def test_holding_updates_needs_a_streamer(self, tmp_path):
+        class Proxy:  # a train source that cannot hold its updates
+            def __init__(self, inner) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        class ProxiedTracIn(TracInAttributor):
+            def generate_train_rep(self, *args, **kwargs):
+                return Proxy(super().generate_train_rep(*args, **kwargs))
+
+        task, train_ds, test_ds = _make_task_and_data()
+        with pytest.raises(TypeError, match="GradientStreamer"):
+            ProxiedTracIn(_args(tmp_path), task=task).attribute(
+                train_ds, test_ds, enable_update=True, loop_over_test=True
+            )
 
 
 class TestAsyncDiskWrite:
