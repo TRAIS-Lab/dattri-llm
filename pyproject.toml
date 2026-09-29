@@ -5,14 +5,45 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dattri-llm"
-version = "0.1.0"
+# Single source of truth: dattri_llm/__init__.py (read statically by setuptools).
+dynamic = ["version"]
 description = "Efficient training data attribution (TDA) infrastructure for LLM-scale models."
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "TRAIS Lab" }]
+keywords = [
+    "training data attribution",
+    "data attribution",
+    "influence functions",
+    "large language models",
+    "per-sample gradients",
+    "pytorch",
+]
+# No "License ::" classifier: PEP 639 deprecates it when `license` is an SPDX string.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
+    # Imported at module level by dattri_llm.gradient.datasets and the
+    # trajectory attributors, so every attributor import needs it.
+    "tqdm>=4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/TRAIS-Lab/dattri-llm"
+Repository = "https://github.com/TRAIS-Lab/dattri-llm"
+Issues = "https://github.com/TRAIS-Lab/dattri-llm/issues"
 
 [project.optional-dependencies]
 test = [
@@ -29,10 +60,19 @@ transformers = [
 trl = [
     "trl>=0.19",
 ]
+# `olmo`: the ai2-olmo `Trainer` wrapped by examples/trainers/olmo_trainer.py.
 olmo = [
     "ai2-olmo",
 ]
+# `olmo-core`: the OLMo-core `Trainer` used by the OLMo runs of
+# experiments/fidelity (pinned to the version those runs require).
+olmo-core = [
+    "ai2-olmo-core==2.6.0",
+]
 dev = [
+    # Lint toolchain: pinned to the version CI runs (.github/workflows/lint.yml).
+    "ruff==0.15.20",
+    "pre-commit>=3",
     "pytest>=8",
     "dattri>=0.3.0",
     "transformers>=4.40",
@@ -44,7 +84,17 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["dattri_llm*"]
 
+[tool.setuptools.package-data]
+# PEP 561 marker: ship the inline type hints to downstream type checkers.
+dattri_llm = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "dattri_llm.__version__" }
+
 [tool.ruff]
+# select = ["ALL"] + preview = true is version-sensitive: refuse any other ruff
+# than the one CI pins (.github/workflows/lint.yml, the dev extra, pre-commit).
+required-version = "==0.15.20"
 exclude = [
     "docs/",
     "scripts/",
@@ -129,3 +179,8 @@ ignore = [
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.ruff.lint.flake8-type-checking]
+# dattri_llm.options holds only Literal aliases; importing it at runtime keeps
+# the annotations that use them resolvable by typing.get_type_hints.
+exempt-modules = ["typing", "dattri_llm.options"]

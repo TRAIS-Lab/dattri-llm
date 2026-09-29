@@ -34,23 +34,51 @@ own tokenization, collation, and label masking, and the wrapped
 `trainer.train()` captures per-sample gradients below all of it. Retrieval
 works by the content hash of the model inputs TRL actually produced: the same
 sample lands at different `(step, sample_idx)` positions across shuffled
-epochs, and the hash ties its occurrences together.
+epochs, and the hash ties its occurrences together. The hash is taken over a
+sample's unpadded tokens, so it does not depend on the batch the sample was
+padded with, and batch-level inputs such as TRL's `num_items_in_batch` count
+do not enter it.
 
-Three TRL-specific settings in the script are deliberate:
+Two things about the hook selection are worth knowing:
 
-- **gradient checkpointing is disabled** — TRL enables it by default, and its
-  non-reentrant recomputation runs each block forward twice with grad enabled,
-  which would double-capture activations;
 - **`lm_head` is not hooked** — TRL's SFT loss applies the tied output weight
-  functionally (fused linear + cross-entropy), so the module's hooks would
-  never fire and step completion would stall;
-- **one fixed-length batch per epoch** — TRL feeds the batch-dependent
-  `num_items_in_batch` count into the model forward, so a sample's content
-  hash only stays epoch-stable when its batch context is stable.
+  functionally (fused linear + cross-entropy), so the module is never invoked
+  and has no captured gradient; a selected layer that does not run in a step
+  is simply not part of that step's record;
+- **`wpe` is not hooked** — GPT-2's position embedding takes one position
+  tensor shared by the batch, so its gradient is not per-sample.
+
+TRL's default gradient checkpointing (either `use_reentrant` variant) is
+supported: the recomputed forward is matched to its backward and each step is
+captured once. The script keeps it off only to keep the tiny run fast.
 
 ```bash
 pip install trl
 python examples/trainers/trl_trainer.py
+```
+
+## `trl_grpo_trainer.py` — TRL `GRPOTrainer`
+
+Trains a tiny GPT-2 policy with TRL's `GRPOTrainer` against a toy reward
+function, with the same wrapped `trainer.train()` call. Rollout generation and
+the reward-model pass run without gradients, so the hooks skip them and each
+captured step is one policy update. Every sample is a prompt together with one
+sampled completion, identified by the content hash of the policy's inputs, so
+the completions drawn for the same prompt are separate samples. After
+training, the script pairs every stored gradient with its prompt, completion,
+and reward: a callback reads, at the end of each captured step, the model
+inputs the manager hashed into that step's sample identities, and the reward
+function records the reward of each sequence it scores. It prints the samples
+of the first update with their reward relative to the other completions of
+the same prompt, which is the weight GRPO puts on each completion's
+log-likelihood gradient.
+
+TRL trains with bf16 autocast by default, so the captured gradients carry
+bf16 rounding, as the parameter gradients of the same step do.
+
+```bash
+pip install trl
+python examples/trainers/trl_grpo_trainer.py
 ```
 
 ## `olmo_trainer.py` — OLMo `Trainer`

@@ -93,6 +93,9 @@ class AttributionArguments:
         dataloader_prefetch_factor: Number of batches each DataLoader worker
             prefetches.  ``None`` uses the PyTorch default (``2`` when
             ``num_workers > 0``).
+        async_disk_write: Write gradient files from a background thread
+            during attributor-driven collection, overlapping D2H + disk IO
+            with compute.  The finished store matches a synchronous run.
         ddp_find_unused_parameters: Passed to
             :class:`torch.nn.parallel.DistributedDataParallel` as
             ``find_unused_parameters``.  ``None`` lets PyTorch choose.
@@ -348,6 +351,34 @@ class AttributionArguments:
         },
     )
 
+    async_disk_write: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "During attributor-driven collection, write gradient files "
+                "from a background thread (bounded queue), overlapping the "
+                "device-to-host copy and disk IO with the next block's "
+                "forward/backward.  The finished store is identical to a "
+                "synchronous run."
+            ),
+        },
+    )
+
+    recompute_gradients: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Trajectory attributors (DVEmb, AdamW-influence): store each "
+                "step's parameters and batch during the trajectory and "
+                "recompute its per-sample gradients at attribution time, "
+                "instead of storing the gradients.  Trades one backward pass "
+                "per step per sweep for a store that is independent of the "
+                "batch size and holds no gradients -- what makes an "
+                "unprojected sweep affordable."
+            ),
+        },
+    )
+
     # -- Distributed / large-model --------------------------------------------
 
     ddp_find_unused_parameters: bool | None = field(
@@ -381,7 +412,12 @@ class AttributionArguments:
             "help": (
                 "FSDP configuration passed to the ``FullyShardedDataParallel`` "
                 "constructor.  May be a ``dict``, a JSON string, or a path to a "
-                "JSON file."
+                "JSON file.  Two HF-style keys build an ``auto_wrap_policy`` "
+                "instead of passing through: ``transformer_layer_cls_to_wrap`` "
+                "(module class name or list; each instance becomes its own "
+                "FSDP unit -- required for large models so parameters gather "
+                "per block, not all at once) and ``min_num_params`` "
+                "(size-based wrapping)."
             ),
         },
     )

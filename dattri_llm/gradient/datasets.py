@@ -2,10 +2,9 @@
 
 Shared building blocks for consumers of pre-collected on-disk gradients (the
 :class:`~dattri_llm.gradient.streaming.DiskGradientSource`, and through it the
-attributors).  Reading on-disk gradients one *sample* at a time would re-read
-each batch file once per sample; these helpers instead expose one *file* per
-item so a standard DataLoader with ``num_workers > 0`` can prefetch whole
-batch blocks in parallel.
+attributors).  Each dataset item is one *file*, read with a single
+``torch.load``, so a standard DataLoader with ``num_workers > 0`` prefetches
+whole batch blocks in parallel and no batch file is read more than once.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING
 
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 from tqdm.auto import tqdm
 
 from dattri_llm.gradient import ops
@@ -23,8 +22,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
     from dattri_llm.attribution.arguments import AttributionArguments
-    from dattri_llm.gradient.file_manager import GradientFileManager
     from dattri_llm.gradient.gradient import Gradient
+    from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 
 def identity_collate(batch: list) -> object:
@@ -109,7 +108,7 @@ class GradientFileMultiStepDataset(Dataset):
 
     def __init__(
         self,
-        file_manager: GradientFileManager,
+        file_manager: GradientStorageManager,
         steps: list[int],
         layer_name: list[str] | None = None,
     ) -> None:
@@ -124,7 +123,7 @@ class GradientFileMultiStepDataset(Dataset):
     def __getitem__(self, i: int) -> dict[int, tuple[Gradient, list[str]]]:
         file_rel, by_step = self._files[i]
         records = self._fm.load_records(file_rel)
-        return {
+        blocks = {
             step: _records_to_block(
                 records,
                 idxs,
@@ -134,25 +133,40 @@ class GradientFileMultiStepDataset(Dataset):
             )
             for step, idxs in by_step.items()
         }
+        if get_worker_info() is not None:
+            # Tensors handed from a worker to the parent process must own heap
+            # storage: a memmap-backed view cannot be shared across the
+            # worker IPC.  In-process loading (``num_workers=0``) keeps the
+            # zero-copy view.
+            blocks = {
+                step: (block.clone(), hashes)
+                for step, (block, hashes) in blocks.items()
+            }
+        return blocks
 
 
 def make_gradient_multistep_dataloader(
-    file_manager: GradientFileManager,
+    file_manager: GradientStorageManager,
     steps: list[int],
     args: AttributionArguments,
     layer_name: list[str] | None = None,
 ) -> DataLoader:
     """Build a DataLoader yielding per-file blocks for multiple steps."""
     dataset = GradientFileMultiStepDataset(file_manager, steps, layer_name=layer_name)
+    # Worker processes serve a ``disk`` store, overlapping file reads with
+    # compute.  An in-RAM (``memory``/``tiered``) store already holds its
+    # records in this process and is read in-process, so no record is
+    # pickled across a process boundary.
+    num_workers = args.dataloader_num_workers if file_manager.residency == "disk" else 0
     kwargs: dict = {
         "dataset": dataset,
         "batch_size": 1,
         "shuffle": False,
         "collate_fn": identity_collate,
-        "num_workers": args.dataloader_num_workers,
+        "num_workers": num_workers,
         "pin_memory": args.dataloader_pin_memory,
     }
-    if args.dataloader_num_workers > 0:
+    if num_workers > 0:
         kwargs["persistent_workers"] = args.dataloader_persistent_workers
         if args.dataloader_prefetch_factor is not None:
             kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
@@ -160,7 +174,7 @@ def make_gradient_multistep_dataloader(
 
 
 def resolve_steps(
-    file_manager: GradientFileManager,
+    file_manager: GradientStorageManager,
     requested: Iterable[int] | None,
 ) -> list[int]:
     """Resolve which on-disk steps an attributor should consume.
@@ -168,8 +182,8 @@ def resolve_steps(
     ``requested=None`` selects every step present on disk.  Otherwise the
     requested steps are intersected with what is available, so an over-specified
     range (e.g. ``range(0, 1000)`` against checkpoints saved every 50 steps) is
-    accepted and simply keeps the steps that exist.  An empty intersection is an
-    error -- it almost always means a typo'd or wrong step set.
+    accepted and keeps the steps that exist.  An empty intersection is an
+    error.
 
     Args:
         file_manager: Manager opened on the gradient directory.
@@ -195,7 +209,7 @@ def resolve_steps(
 
 
 def iter_gradient_blocks(
-    file_manager: GradientFileManager,
+    file_manager: GradientStorageManager,
     steps: list[int],
     args: AttributionArguments,
     layer_name: list[str] | None = None,

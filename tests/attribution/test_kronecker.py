@@ -17,6 +17,8 @@ weight gradient is exactly the rank-1 outer product ``g a^T``.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
@@ -26,9 +28,9 @@ from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttr
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import Factorized
+from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_sample
 
 DAMPING = 1e-2
@@ -42,7 +44,7 @@ LAYERS = TT.LAYER_NAMES  # ["mlp.fc1", "mlp.fc2"]
 
 def _load_factors(test_dir, step, layers):
     """Return ``{hash: {layer: (a, g)}}`` for one step (per-sample records)."""
-    fm = GradientFileManager(str(test_dir))
+    fm = GradientStorageManager(str(test_dir))
     out = {}
     for file_rel, by_step in fm.iter_steps(step):
         recs = fm.load_records(file_rel)
@@ -183,8 +185,8 @@ class TestKFAC:
     def test_matches_kronecker_oracle(self, collected, tmp_path):
         res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         matrix = res.query(
             collected["train_hashes"],
@@ -207,8 +209,8 @@ class TestKFAC:
     def test_algorithm_label_and_shape(self, collected, tmp_path):
         res = _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         assert res.algorithm == "KFAC"
         assert res.scores.shape == (TT.N_TRAIN, TT.N_TEST)
@@ -218,8 +220,8 @@ class TestEKFAC:
     def test_matches_eigenbasis_oracle(self, collected, tmp_path):
         res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         matrix = res.query(
             collected["train_hashes"],
@@ -242,8 +244,8 @@ class TestEKFAC:
     def test_algorithm_label(self, collected, tmp_path):
         res = _make(EKFACAttributor, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         assert res.algorithm == "EKFAC"
 
@@ -259,8 +261,8 @@ class TestEKFAC:
                 dataloader_pin_memory=False,
             ),
         ).attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             damping=damping,
         )
         matrix = (
@@ -284,10 +286,9 @@ class TestEKFAC:
         )
 
     def test_transposed_projection_is_sign_sensitive(self):
-        """Design rationale for the faithful projection ``U_G^T dW U_A``: its
-        score is invariant to an (arbitrary) eigenvector sign flip, whereas the
-        transposed ``U_G dW U_A^T`` (dattri's original) is not -- which is why the
-        'approx' mode was fixed to use the faithful projection too.
+        """The projection ``U_G^T dW U_A`` gives a score that is invariant to an
+        (arbitrary) eigenvector sign flip, whereas the transposed
+        ``U_G dW U_A^T`` does not; both EK-FAC modes use the former.
         """
         torch.manual_seed(0)
         B, out, inn = 30, 4, 5
@@ -311,7 +312,7 @@ class TestEKFAC:
 
         U_G_flip = U_G.clone()
         U_G_flip[:, 0] *= -1  # a different but equally valid eigenbasis
-        # Faithful projection: invariant.  Transposed (dattri): not.
+        # Faithful projection: invariant.  Transposed: not.
         assert torch.allclose(
             score(U_A, U_G, transposed=False),
             score(U_A, U_G_flip, transposed=False),
@@ -324,7 +325,7 @@ class TestEKFAC:
         )
 
     def test_modes_agree(self, collected, tmp_path):
-        """The fixed 'approx' mode now produces the same scores as 'exact'."""
+        """The 'approx' mode produces the same scores as 'exact'."""
 
         def run(mode):
             return (
@@ -338,8 +339,8 @@ class TestEKFAC:
                 )
                 .attribute_from_cache(
                     damping=DAMPING,
-                    train_gradients_dir=str(collected["train_dir"]),
-                    test_gradients_dir=str(collected["test_dir"]),
+                    train_source=str(collected["train_dir"]),
+                    test_source=str(collected["test_dir"]),
                 )
                 .query(
                     collected["train_hashes"],
@@ -391,6 +392,32 @@ def _kfac_oracle_mt(tr_f, te_f, train_hashes, test_hashes, layer, damping):
     return torch.einsum("nop,mop->nm", T, dW_te)
 
 
+class TestKFACFactorizedPreconditioning:
+    """K-FAC preconditions a factorized query on its factors, and the score
+    against raw train factors equals the dense two-sided preconditioning.
+    """
+
+    def test_factorized_query_matches_dense(self, tmp_path):
+        torch.manual_seed(0)
+        b_tr, b_te, t, k, d = 4, 2, 3, 5, 6
+        train = Factorized(torch.randn(b_tr, t, k), torch.randn(b_tr, t, d))
+        query = Factorized(torch.randn(b_te, t, k), torch.randn(b_te, t, d))
+        A, G = ops.kfac_factors(
+            train.activation, train.pre_activation_grad, "nn.Linear"
+        )
+        A_inv, G_inv = ops.sym_inverse(A, 0.1), ops.sym_inverse(G, 0.1)
+        attr = KFACAttributor(AttributionArguments(output_dir=str(tmp_path)))
+        rep = attr.precondition_test_layer(query, "nn.Linear", (A_inv, G_inv))
+        assert isinstance(rep, Factorized)
+        dense = ops.kfac_precondition_materialized(
+            ops.materialize(query, "nn.Linear"), A_inv, G_inv
+        )
+        expected = ops.materialize(train, "nn.Linear") @ dense.T
+        for mode in ("factorized", "materialized"):
+            got = ops.cross_dot(train, rep, "nn.Linear", mode=mode)
+            assert torch.allclose(got, expected, atol=1e-5, rtol=1e-5)
+
+
 class TestKFACMultiToken:
     def test_matches_oracle_with_token_dim(self, tmp_path):
         """KFAC's token-summed factorised path must match the explicit sum_t oracle."""
@@ -402,7 +429,7 @@ class TestKFACMultiToken:
         x_te = torch.randint(0, 16, (4, T), generator=gen)
 
         def collect(x, out_dir):
-            fm = GradientFileManager(str(out_dir))
+            fm = GradientStorageManager(str(out_dir))
             hm = HookManager(
                 model,
                 config=HookManagerConfig(linear_io=[r"fc"]),
@@ -431,8 +458,8 @@ class TestKFACMultiToken:
             dataloader_pin_memory=False,
         )
         res = KFACAttributor(args).attribute_from_cache(
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
             damping=DAMPING,
         )
         matrix = res.query(train_hashes, test_hashes, trajectory="agnostic")
@@ -462,8 +489,10 @@ def collected_step1(tmp_path):
     TT._collect_to_disk(model, checkpoints, x_te, y_te, raw_test)
 
     train_dir, test_dir = tmp_path / "tr_s1", tmp_path / "te_s1"
-    GradientFileManager(str(train_dir)).save_bulk(TT._load_step_records(raw_train, 1))
-    GradientFileManager(str(test_dir)).save_bulk(TT._load_step_records(raw_test, 1))
+    GradientStorageManager(str(train_dir)).save_bulk(
+        TT._load_step_records(raw_train, 1)
+    )
+    GradientStorageManager(str(test_dir)).save_bulk(TT._load_step_records(raw_test, 1))
 
     train_hashes = [
         hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
@@ -478,14 +507,14 @@ def collected_step1(tmp_path):
 
 
 class TestRowStepsTracked:
-    """Regression: rows are stamped with the gradient's recorded step, not 0."""
+    """Rows are stamped with the gradient's recorded step, not 0."""
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_row_steps_reflect_recorded_step(self, collected_step1, tmp_path, cls):
         res = _make(cls, tmp_path / "o").attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected_step1["train_dir"]),
-            test_gradients_dir=str(collected_step1["test_dir"]),
+            train_source=str(collected_step1["train_dir"]),
+            test_source=str(collected_step1["test_dir"]),
         )
         assert res.row_steps == [1] * TT.N_TRAIN
         # The hash->step pairing must be correct sample-by-sample, not just in bulk.
@@ -498,7 +527,9 @@ class TestRowStepsTracked:
 
 
 class TestStepSelection:
-    """``steps=`` restricts which training checkpoints the Fisher + rows use."""
+    """``selected_training_steps`` restricts which training checkpoints the
+    Fisher and the rows use.
+    """
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
     def test_selected_steps_equal_curated_single_step_dir(self, tmp_path, cls):
@@ -516,7 +547,9 @@ class TestStepSelection:
         TT._collect_to_disk(model, checkpoints[:1], x_te, y_te, test_dir)
 
         curated = tmp_path / "tr_s1"
-        GradientFileManager(str(curated)).save_bulk(TT._load_step_records(raw_train, 1))
+        GradientStorageManager(str(curated)).save_bulk(
+            TT._load_step_records(raw_train, 1)
+        )
 
         train_hashes = [
             hash_sample({"x": x_tr[i], "y": y_tr[i]}) for i in range(TT.N_TRAIN)
@@ -535,8 +568,8 @@ class TestStepSelection:
             )
             return attr.attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(train_dir),
-                test_gradients_dir=str(test_dir),
+                train_source=str(train_dir),
+                test_source=str(test_dir),
                 selected_training_steps=steps,
             )
 
@@ -554,8 +587,8 @@ class TestStepSelection:
         with pytest.raises(ValueError, match=r"requested steps"):
             attr.attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 selected_training_steps=[99],
             )
 
@@ -563,15 +596,15 @@ class TestStepSelection:
 class TestKroneckerShared:
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make(KFACAttributor, tmp_path / "o")
-        with pytest.raises(TypeError, match=r"train_gradients_dir"):
+        with pytest.raises(TypeError, match=r"train_source"):
             attr.attribute_from_cache(
                 damping=DAMPING,
-                test_gradients_dir=str(collected["test_dir"]),
+                test_source=str(collected["test_dir"]),
             )
-        with pytest.raises(TypeError, match=r"test_gradients_dir"):
+        with pytest.raises(TypeError, match=r"test_source"):
             attr.attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
+                train_source=str(collected["train_dir"]),
             )
 
     @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
@@ -585,8 +618,8 @@ class TestKroneckerShared:
                 _make(cls, tmp_path / tag)
                 .attribute_from_cache(
                     damping=DAMPING,
-                    train_gradients_dir=str(collected["train_dir"]),
-                    test_gradients_dir=str(collected["test_dir"]),
+                    train_source=str(collected["train_dir"]),
+                    test_source=str(collected["test_dir"]),
                     loop_over_test=loop,
                 )
                 .query(
@@ -609,8 +642,8 @@ class TestKroneckerShared:
         for cls, label in ((KFACAttributor, "KFAC"), (EKFACAttributor, "EKFAC")):
             res = _make(cls, tmp_path / label).attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
             )
             m = res.query(
                 collected["train_hashes"],
@@ -648,7 +681,7 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
     """
 
     def load(d, hashes):
-        fm = GradientFileManager(str(d))
+        fm = GradientStorageManager(str(d))
         out = {}
         for file_rel, by_step in fm.iter_steps(0):
             recs = fm.load_records(file_rel)
@@ -677,7 +710,7 @@ def _fim_oracle(train_dir, test_dir, train_hashes, test_hashes, layer, damping):
 
 def _collect_norm_model(tmp_path, patterns):
     """Collect the _NormModel's factorised gradients to disk (one step), hooking
-    only the layers matching *patterns* -- layer selection now happens at capture
+    only the layers matching *patterns* -- layer selection happens at capture
     (via the hook config), not at scoring.
     """
     torch.manual_seed(0)
@@ -687,7 +720,7 @@ def _collect_norm_model(tmp_path, patterns):
     x_te = torch.randint(0, 16, (4, 3), generator=gen)
 
     def collect(x, out_dir):
-        fm = GradientFileManager(str(out_dir))
+        fm = GradientStorageManager(str(out_dir))
         hm = HookManager(
             model,
             config=HookManagerConfig(linear_io=patterns),
@@ -734,8 +767,8 @@ class TestDirectFIM:
     def _run(self, collected, out_dir, **kw):
         res = _attr(KFACAttributor, out_dir).attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             **kw,
         )
         return res.query(
@@ -792,8 +825,8 @@ class TestDirectFIM:
                 _attr(cls, tmp_path / tag)
                 .attribute_from_cache(
                     damping=DAMPING,
-                    train_gradients_dir=str(norm_collected["train_dir"]),
-                    test_gradients_dir=str(norm_collected["test_dir"]),
+                    train_source=str(norm_collected["train_dir"]),
+                    test_source=str(norm_collected["test_dir"]),
                     non_kfac_strategy="direct",
                     loop_over_test=loop,
                 )
@@ -852,7 +885,7 @@ class TestDirectFIM:
         x_te = torch.randint(0, 16, (4, 3), generator=gen)
 
         def collect(x, out_dir):
-            fm = GradientFileManager(str(out_dir))
+            fm = GradientStorageManager(str(out_dir))
             hm = HookManager(
                 model,
                 config=HookManagerConfig(linear_io=[r"embedding", r"norm", r"head"]),
@@ -876,8 +909,8 @@ class TestDirectFIM:
         with pytest.warns(UserWarning, match="embedding"):
             _attr(KFACAttributor, tmp_path / "o").attribute_from_cache(
                 damping=DAMPING,
-                train_gradients_dir=str(tmp_path / "tr"),
-                test_gradients_dir=str(tmp_path / "te"),
+                train_source=str(tmp_path / "tr"),
+                test_source=str(tmp_path / "te"),
                 non_kfac_strategy="direct",
             ).query(train_hashes, test_hashes, trajectory="agnostic")
 
@@ -899,7 +932,7 @@ class _TrakMLP(nn.Module):
 
 def _collect_trak_mixed(tmp_path):
     """Collect a cache where ``fc1`` is LoGRA-projected (stays factorized) and
-    ``fc2`` is TRAK-projected (``factorize=False`` -> a materialized
+    ``fc2`` is TRAK-projected (``style="dense"`` -> a materialized
     ``(B, proj_dim)`` tensor that keeps its ``nn.Linear`` layer type).
     """
     torch.manual_seed(0)
@@ -915,14 +948,14 @@ def _collect_trak_mixed(tmp_path):
     }
     cfg = HookManagerConfig(
         linear_io=[r"fc"],
-        projection={
-            "fc1": dict(proj, factorize=True),
-            "fc2": dict(proj, factorize=False),
+        projection_kwargs={
+            "fc1": dict(proj, style="logra"),
+            "fc2": dict(proj, style="dense"),
         },
     )
 
     def collect(x, out_dir):
-        fm = GradientFileManager(str(out_dir))
+        fm = GradientStorageManager(str(out_dir))
         hm = HookManager(
             model,
             config=cfg,
@@ -941,7 +974,7 @@ def _collect_trak_mixed(tmp_path):
 
 def _stacked_trak_rows(grad_dir, layer):
     """Stack one materialized layer's stored rows across a dir's records."""
-    fm = GradientFileManager(str(grad_dir))
+    fm = GradientStorageManager(str(grad_dir))
     rows = [
         fm.load_records(file_rel)[i].gradient.data[layer]
         for file_rel, by_step in fm.iter_steps(0)
@@ -959,21 +992,19 @@ def _fim_score(g_tr: torch.Tensor, g_te: torch.Tensor) -> torch.Tensor:
 class TestMaterializedLayers:
     """K-FAC/EK-FAC over caches holding materialized (TRAK-projected) layers.
 
-    Regression: ``_kfac_layers`` selected by layer *type* only, so a
+    ``kfac_layers`` selects by representation as well as layer type: a
     TRAK-projected layer (materialized tensor, original ``nn.Linear`` type)
-    reached ``KroneckerAccumulator.update`` and crashed with
-    ``AttributeError: 'Tensor' object has no attribute 'as_batch_first'``.
-    A materialized layer can never enter K-FAC, so it is now **always**
-    preconditioned by the direct dense Fisher (with a warning), under either
-    ``non_kfac_strategy``.
+    never enters the Kronecker accumulator.  Without capture-time covariances a
+    materialized layer is preconditioned by the direct dense Fisher (with a
+    warning), under either ``non_kfac_strategy``.
     """
 
     def _run(self, cls, dirs, out_dir, **kw):
         train_dir, test_dir = dirs
         return _attr(cls, out_dir).attribute_from_cache(
             damping=DAMPING,
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
             **kw,
         )
 
@@ -1020,7 +1051,7 @@ class TestMaterializedLayers:
 
     def test_all_materialized_scores_pure_fim(self, tmp_path):
         """Every layer TRAK-projected: the score is the summed per-layer dense
-        Fisher (previously this crashed outright).
+        Fisher.
         """
         torch.manual_seed(0)
         model = _TrakMLP().eval()
@@ -1029,15 +1060,15 @@ class TestMaterializedLayers:
             "proj_max_batch_size": 8,
             "proj_type": "rademacher",
             "proj_seed": 3,
-            "factorize": False,
+            "style": "dense",
         }
         cfg = HookManagerConfig(
             linear_io=[r"fc"],
-            projection={"__default__": proj},
+            projection_kwargs={"__default__": proj},
         )
         gen = torch.Generator().manual_seed(1)
         for split, n in (("tr", 6), ("te", 4)):
-            fm = GradientFileManager(str(tmp_path / split))
+            fm = GradientStorageManager(str(tmp_path / split))
             hm = HookManager(
                 model,
                 config=cfg,
@@ -1062,12 +1093,485 @@ class TestMaterializedLayers:
         )
 
     def test_kronecker_accumulator_rejects_tensor_loudly(self, tmp_path):
-        """The ops-layer accumulator itself now fails with a clear TypeError
-        instead of an AttributeError deep inside ``as_batch_first``.
+        """The ops-layer accumulator rejects a materialized layer with a
+        TypeError naming the factorized requirement.
         """
         dirs = _collect_trak_mixed(tmp_path)
-        fm = GradientFileManager(str(dirs[0]))
+        fm = GradientStorageManager(str(dirs[0]))
         rec = fm.load_records(fm.iter_steps(0)[0][0])[0]
         acc = ops.KroneckerAccumulator()
         with pytest.raises(TypeError, match="factorized"):
             acc.update(rec.gradient, ["fc2"])
+
+
+# --------------------------------------------------------------------------- #
+# Test-side preconditioning equivalences                                        #
+# --------------------------------------------------------------------------- #
+
+
+class TestPreconditionedTestSide:
+    """The whole preconditioner is applied once on the test side: every path
+    -- in-memory loop, disk-persisted loop, and the public
+    ``cache_preconditioned_test`` + TracIn scoring -- must reproduce the
+    default score up to float tolerance.
+    """
+
+    CLASSES = (KFACAttributor, EKFACAttributor)
+
+    def _default(self, cls, collected, out):
+        return (
+            _make(cls, out)
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_loop_over_test_matches_cached(self, cls, collected, tmp_path):
+        base = self._default(cls, collected, tmp_path / "base")
+        looped = (
+            _make(cls, tmp_path / "loop")
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                loop_over_test=True,
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
+        )
+        assert torch.allclose(base, looped, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}: max diff {(base - looped).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_disk_persisted_loop_matches_cached(self, cls, collected, tmp_path):
+        base = self._default(cls, collected, tmp_path / "base")
+        disk = (
+            _make(cls, tmp_path / "disk")
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                loop_over_test=True,
+                preconditioned_test_dir=str(tmp_path / "pre_te"),
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
+        )
+        assert torch.allclose(base, disk, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}: max diff {(base - disk).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_cache_then_tracin_matches_cached(self, cls, collected, tmp_path):
+        from dattri_llm.attribution.algorithm.tracin import TracInAttributor
+
+        base = self._default(cls, collected, tmp_path / "base")
+        pre_dir = _make(cls, tmp_path / "cache").cache_preconditioned_test(
+            train_gradients_dir=str(collected["train_dir"]),
+            test_gradients_dir=str(collected["test_dir"]),
+            preconditioned_test_dir=str(tmp_path / "pre_te"),
+            damping=DAMPING,
+        )
+        # Scoring a fully-preconditioned test store against raw train
+        # gradients is a plain inner product -> TracIn reproduces the score.
+        scored = (
+            TracInAttributor(
+                AttributionArguments(
+                    output_dir=str(tmp_path / "tr_out"),
+                    dataloader_num_workers=0,
+                    dataloader_pin_memory=False,
+                ),
+            )
+            .attribute_from_cache(
+                train_source=str(collected["train_dir"]),
+                test_source=pre_dir,
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
+        )
+        assert torch.allclose(base, scored, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}: max diff {(base - scored).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    @pytest.mark.parametrize("residency", ["memory", "tiered"])
+    def test_residency_preconditioned_store_matches_cached(
+        self,
+        cls,
+        residency,
+        collected,
+        tmp_path,
+    ):
+        """An ephemeral (RAM/tiered) preconditioned-test store must reproduce
+        the default score exactly -- residency only relocates the reps, and a
+        tiered store's spill is cleaned up on return.
+        """
+        base = self._default(cls, collected, tmp_path / "base")
+        cached = (
+            _make(cls, tmp_path / f"res_{residency}")
+            .attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                loop_over_test=True,
+                preconditioned_test_cache_residency=residency,
+            )
+            .query(
+                collected["train_hashes"],
+                collected["test_hashes"],
+                trajectory="agnostic",
+            )
+        )
+        assert torch.allclose(base, cached, atol=1e-4, rtol=1e-3), (
+            f"{cls.__name__}/{residency}: max diff {(base - cached).abs().max():.2e}"
+        )
+
+    def test_preconditioned_dir_requires_loop(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="loop_over_test=True"):
+            _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                preconditioned_test_dir=str(tmp_path / "pre_te"),
+            )
+
+    def test_preconditioned_residency_requires_loop(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="loop_over_test=True"):
+            _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                preconditioned_test_cache_residency="memory",
+            )
+
+    def test_invalid_preconditioned_residency_raises(self, collected, tmp_path):
+        with pytest.raises(ValueError, match="preconditioned_test_cache_residency"):
+            _make(KFACAttributor, tmp_path / "o").attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                loop_over_test=True,
+                preconditioned_test_cache_residency="nope",
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Persisted (dataset-size-independent) Fisher factors                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestPersistedFisher:
+    """``fit()`` persists the damping-free Fisher factors; then
+    ``attribute_from_cache(fisher_dir=...)`` re-damps them and skips the Fisher
+    pre-pass.  The score must equal a fresh fit -- for any queries (the fit
+    never sees the test set) and any ``damping`` (folded in only at load).
+    """
+
+    CLASSES = (KFACAttributor, EKFACAttributor)
+
+    def _score(self, attr, collected, **kw):
+        return attr.attribute_from_cache(
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
+            **kw,
+        ).query(
+            collected["train_hashes"],
+            collected["test_hashes"],
+            trajectory="agnostic",
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_persisted_matches_fresh(self, cls, collected, tmp_path):
+        fresh = self._score(_make(cls, tmp_path / "fresh"), collected, damping=DAMPING)
+        fdir = _make(cls, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        loaded = self._score(
+            _make(cls, tmp_path / "load"),
+            collected,
+            damping=DAMPING,
+            fisher_dir=fdir,
+        )
+        assert torch.allclose(fresh, loaded, atol=1e-5, rtol=1e-4), (
+            f"{cls.__name__}: max diff {(fresh - loaded).abs().max():.2e}"
+        )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_one_fit_reused_across_damping(self, cls, collected, tmp_path):
+        """A single persisted fit re-damps correctly for any damping -- the raw
+        factors are damping-free.
+        """
+        fdir = _make(cls, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        for damping in (1e-3, 1e-1):
+            fresh = self._score(
+                _make(cls, tmp_path / f"fresh_{damping}"),
+                collected,
+                damping=damping,
+            )
+            loaded = self._score(
+                _make(cls, tmp_path / f"load_{damping}"),
+                collected,
+                damping=damping,
+                fisher_dir=fdir,
+            )
+            assert torch.allclose(fresh, loaded, atol=1e-5, rtol=1e-4), (
+                f"{cls.__name__} @ damping={damping}: "
+                f"max diff {(fresh - loaded).abs().max():.2e}"
+            )
+
+    def test_persisted_direct_fim_matches_fresh(self, norm_collected, tmp_path):
+        """The direct dense-Fisher factors persist and reload too."""
+
+        def score(attr, **kw):
+            return attr.attribute_from_cache(
+                damping=DAMPING,
+                train_source=str(norm_collected["train_dir"]),
+                test_source=str(norm_collected["test_dir"]),
+                **kw,
+            ).query(
+                norm_collected["train_hashes"],
+                norm_collected["test_hashes"],
+                trajectory="agnostic",
+            )
+
+        fresh = score(
+            _attr(KFACAttributor, tmp_path / "fresh"),
+            non_kfac_strategy="direct",
+        )
+        fdir = _attr(KFACAttributor, tmp_path / "fit").fit(
+            str(norm_collected["train_dir"]),
+            str(tmp_path / "fisher"),
+            non_kfac_strategy="direct",
+        )
+        loaded = score(
+            _attr(KFACAttributor, tmp_path / "load"),
+            fisher_dir=fdir,
+            non_kfac_strategy="direct",
+        )
+        assert torch.allclose(fresh, loaded, atol=1e-4, rtol=1e-3), (
+            f"max diff {(fresh - loaded).abs().max():.2e}"
+        )
+
+    def test_load_wrong_algorithm_raises(self, collected, tmp_path):
+        fdir = _make(KFACAttributor, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        with pytest.raises(ValueError, match="KFAC"):
+            self._score(
+                _make(EKFACAttributor, tmp_path / "x"),
+                collected,
+                damping=DAMPING,
+                fisher_dir=fdir,
+            )
+
+    def test_load_missing_fisher_dir_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="No fitted Fisher"):
+            _make(KFACAttributor, tmp_path / "x").load_fisher(
+                str(tmp_path / "does_not_exist")
+            )
+
+    @pytest.mark.parametrize("cls", CLASSES)
+    def test_empty_fisher_dir_is_filled_and_reused(self, cls, collected, tmp_path):
+        """A call given a directory without a fit writes its fit there; the
+        next call loads it instead of fitting.
+        """
+        fdir = str(tmp_path / "fisher")
+        first = self._score(
+            _make(cls, tmp_path / "first"), collected, damping=DAMPING, fisher_dir=fdir
+        )
+        blob = torch.load(
+            Path(fdir) / cls._FISHER_FILE, map_location="cpu", weights_only=True
+        )
+        assert blob["meta"]["damping"] == DAMPING
+        assert blob["meta"]["relative_damping"] is False
+
+        attr = _make(cls, tmp_path / "second")
+        attr.fit_raw = None  # a refit would fail
+        second = self._score(attr, collected, damping=DAMPING, fisher_dir=fdir)
+        assert torch.equal(first, second)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"non_kfac_strategy": "direct"},
+            {"direct_fim_max_params": 16},
+            {"selected_training_steps": [0]},
+            {"layer_name": [LAYERS[0]]},
+        ],
+    )
+    def test_fit_under_other_options_raises(self, options, collected, tmp_path):
+        fdir = _make(KFACAttributor, tmp_path / "fit").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        with pytest.raises(ValueError, match="other options"):
+            _make(KFACAttributor, tmp_path / "x").attribute_from_cache(
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+                damping=DAMPING,
+                fisher_dir=fdir,
+                **options,
+            )
+
+    def test_ekfac_mode_mismatch_raises(self, collected, tmp_path):
+        args = AttributionArguments(
+            output_dir=str(tmp_path / "fit"),
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
+        fdir = EKFACAttributor(args, mode="exact").fit(
+            str(collected["train_dir"]),
+            str(tmp_path / "fisher"),
+        )
+        other = AttributionArguments(
+            output_dir=str(tmp_path / "load"),
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
+        )
+        with pytest.raises(ValueError, match="mode"):
+            self._score(
+                EKFACAttributor(other, mode="approx"),
+                collected,
+                damping=DAMPING,
+                fisher_dir=fdir,
+            )
+
+
+class TestFactorPlacement:
+    """The fit hands buffers over instead of copying them, and the factors may
+    rest on the host without changing a score.
+    """
+
+    def test_accumulator_result_consume_hands_buffers_over(self):
+        from dattri_llm.gradient.ops.kronecker import LayerKroneckerAccumulator
+
+        gen = torch.Generator().manual_seed(0)
+        a, g = torch.randn(4, 3, 5, generator=gen), torch.randn(4, 3, 2, generator=gen)
+        copied, consumed = LayerKroneckerAccumulator(), LayerKroneckerAccumulator()
+        for acc in (copied, consumed):
+            acc.update(a, g, "nn.Linear", {"has_bias": False})
+        buffer = consumed._A
+        A, G = consumed.result(consume=True)
+        A_ref, G_ref = copied.result()
+        assert A.data_ptr() == buffer.data_ptr()  # no second copy
+        assert consumed._A is None  # and the accumulator let go of it
+        assert torch.allclose(A, A_ref)
+        assert torch.allclose(G, G_ref)
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "tiered", "disk"])
+    def test_cached_factors_give_the_same_preconditioner(
+        self, cls, residency, tmp_path
+    ):
+        gen = torch.Generator().manual_seed(0)
+        raw = {
+            "l0": (torch.randn(6, 6, generator=gen), torch.randn(4, 4, generator=gen))
+        }
+        raw["l0"] = tuple(m @ m.T + torch.eye(m.shape[0]) for m in raw["l0"])
+        if cls is EKFACAttributor:
+            U_A = torch.linalg.eigh(raw["l0"][0])[1]
+            U_G = torch.linalg.eigh(raw["l0"][1])[1]
+            raw["l0"] = (U_A, U_G, torch.rand(4 * 6, generator=gen) + 0.1)
+        args = AttributionArguments(output_dir=str(tmp_path))
+        block = Gradient(
+            representation={"l0": "factorized"},
+            data={
+                "l0": Factorized(
+                    activation=torch.randn(3, 2, 6, generator=gen),
+                    pre_activation_grad=torch.randn(3, 2, 4, generator=gen),
+                    module_kwargs={"has_bias": False},
+                )
+            },
+            layer_types={"l0": "nn.Linear"},
+            indexing={"l0": "batch_token"},
+        )
+        outs = []
+        for cached in (None, residency):
+            attr = cls(args)
+            attr._set_options(
+                1e-3,
+                "ignore",
+                4096,
+                relative_damping=False,
+                factor_cache_residency=cached,
+                covariances_at_capture=True,
+            )
+            attr._preconditioner = attr.damp_fit((raw, {}), 1e-3)
+            factors = attr._preconditioner[0]["l0"]
+            if cached:
+                assert all(t.device.type == "cpu" for t in factors)
+            if cached == "memory" and cls is EKFACAttributor:
+                # The eigenbases pass through damping: the off-device
+                # original is handed back instead of a copy.
+                assert factors[0] is raw["l0"][0]
+            out = attr.transform_test_rep(block.clone()).data["l0"]
+            outs.append(ops.materialize(out, "nn.Linear"))
+            if cached:
+                spill = attr._preconditioner[0]._cache.spill_dir
+                attr._release_factor_caches()
+                assert spill is None or not spill.exists()  # nothing left on disk
+        assert torch.allclose(outs[0], outs[1], atol=1e-6)
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_relative_damping_scales_with_the_mean_eigenvalue(self, cls, tmp_path):
+        """``relative_damping``: the damping added to a spectrum is a multiple
+        of its mean eigenvalue, so it equals absolute damping of that size.
+        """
+        gen = torch.Generator().manual_seed(0)
+        A, G = (torch.randn(n, n, generator=gen) for n in (6, 4))
+        A, G = A @ A.T + torch.eye(6), G @ G.T + torch.eye(4)
+        args = AttributionArguments(output_dir=str(tmp_path))
+        rel, absolute = cls(args), cls(args)
+        rel._set_options(
+            0.1,
+            "ignore",
+            4096,
+            relative_damping=True,
+            factor_cache_residency=None,
+            covariances_at_capture=True,
+        )
+        if cls is KFACAttributor:
+            raw = {"l0": (A, G)}
+            got = rel.damp(raw, 0.1)["l0"]
+            for m, inv in zip((A, G), got, strict=True):
+                want = ops.sym_inverse(m, 0.1 * float(torch.linalg.eigvalsh(m).mean()))
+                assert torch.allclose(inv, want, atol=1e-5)
+        else:
+            lam = torch.rand(24, generator=gen) + 0.1
+            raw = {"l0": (torch.eye(6), torch.eye(4), lam)}
+            got = rel.damp(raw, 0.1)["l0"][2]
+            assert torch.allclose(got, lam + 0.1 * lam.mean())
+            assert torch.allclose(absolute.damp(raw, 0.1)["l0"][2], lam + 0.1)
+
+    def test_factor_cache_residency_is_validated(self, tmp_path):
+        with pytest.raises(ValueError, match="factor_cache_residency"):
+            KFACAttributor(
+                AttributionArguments(output_dir=str(tmp_path))
+            ).attribute_from_cache(
+                str(tmp_path / "train"),
+                str(tmp_path / "test"),
+                factor_cache_residency="cpu",
+            )

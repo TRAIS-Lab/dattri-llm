@@ -16,12 +16,7 @@ Run (with ai2-olmo installed):
 from __future__ import annotations
 
 import os
-import pathlib
-import sys
 import tempfile
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.distributed as dist
@@ -39,10 +34,13 @@ except ImportError as exc:
         "ai2-olmo is required for this example.\nInstall with:  pip install ai2-olmo",
     ) from exc
 
-from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.utils.hashing import hash_sample
+from dattri_llm import (
+    GradientStorageManager,
+    HookManager,
+    HookManagerConfig,
+    OffloadCallback,
+    hash_sample,
+)
 
 VOCAB, SEQ, BATCH = 256, 32, 2
 
@@ -109,7 +107,7 @@ if __name__ == "__main__":
         # select OLMo's feed-forward projections by regex -- the layers live at
         # transformer.blocks.<i>.ff_proj / ff_out and are plain nn.Linear, so
         # the factorized ("ghost") linear_io hooks apply directly
-        fm = GradientFileManager(grad_dir)
+        fm = GradientStorageManager(grad_dir)
         collector = HookManager(
             model,
             config=HookManagerConfig(linear_io=[r"ff_proj", r"ff_out"]),
@@ -133,9 +131,9 @@ if __name__ == "__main__":
         # Retrieval: the content hash of ONE sample's model inputs -- here
         # simply sequences[0], since OLMo's train step feeds the model
         # input_ids -- identifies the sample independently of where shuffling
-        # put it; lookup() then reveals every (step, sample_idx) position it was
-        # recorded at, and load_sample() retrieves each pair's gradient by
-        # direct slicing.
+        # put it; lookup_by_hash() then gives every (step, sample_idx) position
+        # it was recorded at, and load_sample_by_hash() retrieves each pair's
+        # gradient by direct slicing.
         h0 = hash_sample(sequences[0])
         pairs = fm.lookup_by_hash(h0)  # [(step, sample_idx), ...]
         g_first = fm.load_sample_by_hash(h0, *pairs[0])

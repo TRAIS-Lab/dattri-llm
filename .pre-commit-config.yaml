@@ -1,0 +1,8 @@
+# Runs the same ruff version and commands as CI (.github/workflows/lint.yml).
+# Install once with `pip install -e ".[dev]" && pre-commit install`.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.20  # keep in sync with lint.yml, the dev extra and [tool.ruff] required-version
+    hooks:
+      - id: ruff-check
+      - id: ruff-format

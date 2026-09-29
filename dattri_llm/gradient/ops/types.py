@@ -77,6 +77,18 @@ def is_embedding(layer_type: str) -> bool:
     return layer_type in EMBEDDING_TYPES
 
 
+def is_kfac_eligible(layer_type: str) -> bool:
+    """Return True if layer_type carries K-FAC (Kronecker) covariances.
+
+    The Kronecker factorisation ``F ~ A x G`` is defined for the layers whose
+    per-sample gradient is an outer product of an input-activation and an
+    output-gradient factor: linear and (transposed) convolution layers.  Norm
+    layers (diagonal gradient), embeddings (one-hot inputs, heavily
+    parametrised) and batch-level ``param_grad`` captures are not eligible.
+    """
+    return is_linear(layer_type) or is_conv(layer_type) or is_conv_transpose(layer_type)
+
+
 # ---------------------------------------------------------------------------
 # Canonical class name
 # ---------------------------------------------------------------------------

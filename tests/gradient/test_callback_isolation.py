@@ -30,9 +30,9 @@ from dattri_llm.gradient.callbacks import (
     HookManagerCallback,
     OffloadCallback,
 )
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 from dattri_llm.utils.hashing import hash_batch
 
 SEED = 0
@@ -94,12 +94,12 @@ class SpyCallback(HookManagerCallback):
         self.layer_forward_counts: dict[str, int] = {}
         self.layer_backward_counts: dict[str, int] = {}
 
-    def on_layer_forward(self, layer_name, activation):
+    def on_layer_forward(self, layer_name, activation, layer_type, module_kwargs):
         self.layer_forward_counts[layer_name] = (
             self.layer_forward_counts.get(layer_name, 0) + 1
         )
 
-    def on_layer_backward(self, layer_name, grad_output):
+    def on_layer_backward(self, layer_name, grad_output, layer_type, module_kwargs):
         self.layer_backward_counts[layer_name] = (
             self.layer_backward_counts.get(layer_name, 0) + 1
         )
@@ -217,23 +217,21 @@ def _callback_factory(kind: str, tmp_path):
     if kind == "capture":
         return lambda _model: CaptureCallback()
     if kind == "offload":
-        fm = GradientFileManager(str(tmp_path / "grads"))
+        fm = GradientStorageManager(str(tmp_path / "grads"))
         return lambda _model: OffloadCallback(offload_interval=2, file_manager=fm)
     if kind == "ds_batch":
         return lambda model: DataSelectionCallback(
             model=model,
-            threshold_mode="bottom_fraction",
-            threshold=0.5,
             target="batch",
+            selection_kwargs={"threshold_mode": "bottom_fraction", "threshold": 0.5},
         )
     if kind == "ds_fixed":
         target = _fixed_target()
         return lambda model: DataSelectionCallback(
             model=model,
-            threshold_mode="bottom_fraction",
-            threshold=0.5,
             target="fixed",
             target_gradient=target,
+            selection_kwargs={"threshold_mode": "bottom_fraction", "threshold": 0.5},
         )
     raise ValueError(kind)
 
@@ -278,11 +276,13 @@ class TestValLoaderException:
         def factory(model):
             return DataSelectionCallback(
                 model=model,
-                threshold_mode="bottom_fraction",
-                threshold=0.5,
                 target="val_loader",
                 val_loader=[VAL_BATCH],
                 val_loss_fn=_val_loss_fn,
+                selection_kwargs={
+                    "threshold_mode": "bottom_fraction",
+                    "threshold": 0.5,
+                },
             )
 
         fps, spy_before, spy_after, last = _run(factory)
@@ -319,8 +319,8 @@ class TestValLoaderException:
         for r_b, r_a in zip(before_val, after_val, strict=True):
             assert _records_equal(r_b, r_a)
 
-        # Layer events fire twice per step (train + val pass) -- the hooks are
-        # live during the val pass by design.
+        # Layer events fire twice per step (train + val pass): the hooks stay
+        # live during the val pass.
         for name, n in ctrl_spy.layer_forward_counts.items():
             assert spy_before.layer_forward_counts[name] == 2 * n
 

@@ -1,14 +1,12 @@
 """``on_step_end`` runs outside the manager's lock and supports reentrancy.
 
-Regression under test: callbacks used to be dispatched while
-``HookManager._step_lock`` (a non-reentrant ``threading.Lock``) was held, so
-the most natural custom callback -- "run a validation backward when the step
-completes" -- deadlocked silently on same-thread lock re-acquisition.  The
-contract now (see :meth:`HookManagerCallback.on_step_end`): dispatch happens
-with the per-step state already reset and the lock released, a reentrant
-backward completes a capture step of its own, and
-``save_state``/``clear_state``/``load_state`` keeps the training-facing state
-pristine around it.
+``HookManager._step_lock`` is a non-reentrant ``threading.Lock``, so a
+callback that runs a validation backward when the step completes would
+deadlock if it were dispatched while the lock is held.  The contract (see
+:meth:`HookManagerCallback.on_step_end`): dispatch happens with the per-step
+state already reset and the lock released, a reentrant backward completes a
+capture step of its own, and ``save_state``/``clear_state``/``load_state``
+keeps the training-facing state pristine around it.
 """
 
 from __future__ import annotations
@@ -90,10 +88,10 @@ class TestDispatchOutsideLock:
 
 class TestReentrantBackward:
     def test_secondary_backward_completes_and_state_is_restored(self):
-        """The previously-deadlocking scenario, done per contract: training
-        steps keep consecutive numbering, each step yields exactly one val
-        gradient, and the training records are byte-identical to a run without
-        the reentrant callback.
+        """A validation backward inside ``on_step_end``, done per contract:
+        training steps keep consecutive numbering, each step yields exactly one
+        val gradient, and the training records are byte-identical to a run
+        without the reentrant callback.
         """
         # Control run: no reentrant callback.
         model = _model()

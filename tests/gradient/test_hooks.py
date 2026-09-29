@@ -14,13 +14,13 @@ from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
     HookManager,
     HookManagerConfig,
-    _is_linear_io_capable,
     default_hook_assignment,
     register_linear_io_hooks,
     register_param_grad_hooks,
     remove_hooks,
     resolve_hook_assignments,
 )
+from dattri_llm.gradient.hooks.hooks import _is_linear_io_capable
 
 # --------------------------------------------------------------------------- #
 # _is_linear_io_capable -- purely type-based, never name-based                  #
@@ -55,8 +55,7 @@ class TestLinearIoCapable:
 class _TopLevelLinear(nn.Module):
     """Model whose only layer is a top-level ``nn.Linear`` named ``linear``.
 
-    Regression guard: the old name-based heuristic skipped a top-level layer
-    named ``linear`` and silently registered zero layers.
+    Hook assignment is type-based, so a layer is hooked whatever its name.
     """
 
     def __init__(self) -> None:
@@ -69,7 +68,7 @@ class _TopLevelLinear(nn.Module):
 
 class TestResolveHookAssignments:
     def test_default_hooks_top_level_linear(self):
-        # The reported bug: a top-level layer named "linear" must be hooked.
+        # A top-level layer named "linear" is hooked like any other Linear.
         model = _TopLevelLinear()
         assignment = resolve_hook_assignments(model, HookManagerConfig())
         assert assignment == {"linear": "linear_io"}
@@ -656,8 +655,8 @@ class TestTrainabilityFilter:
         x = torch.randn(4, 8)
 
         cb = _Recording()
-        # REGISTER_ALL now works out of the box: the frozen base_layer is skipped,
-        # only the trainable lora_A / lora_B adapters are captured.
+        # With REGISTER_ALL the frozen base_layer is skipped; only the trainable
+        # lora_A / lora_B adapters are captured.
         hm = HookManager(
             model,
             config=HookManagerConfig(linear_io=REGISTER_ALL),
@@ -685,26 +684,44 @@ class TestTrainabilityFilter:
 
 
 # --------------------------------------------------------------------------- #
-# HookManagerConfig(projection=...) -- per-layer random projection on capture    #
+# HookManagerConfig(projection_kwargs=...) -- per-layer projection on capture   #
 # --------------------------------------------------------------------------- #
 
 
 class TestProjectionConfig:
     def test_validation_rejects_non_dict(self):
-        with pytest.raises(TypeError, match="projection must be a dict"):
-            HookManagerConfig(projection=[{"proj_dim": 8}])  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="projection_kwargs must be a dict"):
+            HookManagerConfig(projection_kwargs=[{"proj_dim": 8}])  # type: ignore[arg-type]
 
     def test_validation_rejects_non_dict_values(self):
-        with pytest.raises(TypeError, match="projection must be a dict"):
-            HookManagerConfig(projection={"__default__": 8})  # type: ignore[dict-item]
+        with pytest.raises(TypeError, match="projection_kwargs must be a dict"):
+            HookManagerConfig(projection_kwargs={"__default__": 8})  # type: ignore[dict-item]
+
+    def test_validation_rejects_unknown_style(self):
+        with pytest.raises(ValueError, match="not a valid projection style"):
+            HookManagerConfig(
+                projection_kwargs={"__default__": {"style": "bogus", "proj_dim": 8}},
+            )
+
+    def test_validation_rejects_seq_len(self):
+        with pytest.raises(ValueError, match="seq_len"):
+            HookManagerConfig(
+                projection_kwargs={"__default__": {"proj_dim": 8, "seq_len": 64}},
+            )
+
+    def test_validation_rejects_unknown_capture_style(self):
+        with pytest.raises(ValueError, match="capture_style"):
+            HookManagerConfig(capture_style="bogus")
 
     def test_none_keeps_projection_off(self):
-        assert HookManagerConfig().projection is None
+        assert HookManagerConfig().projection_kwargs is None
 
     def test_projection_does_not_affect_is_default(self):
-        assert HookManagerConfig(projection={"__default__": {"proj_dim": 8}}).is_default
+        assert HookManagerConfig(
+            projection_kwargs={"__default__": {"proj_dim": 8}}
+        ).is_default
 
-    def _run(self, projection, projector=None):
+    def _run(self, projection, projector=None, capture_style="factorized"):
         torch.manual_seed(0)  # identical weights + input across calls, for comparisons
         model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 8))
         cb = _Recording()
@@ -712,8 +729,9 @@ class TestProjectionConfig:
             model,
             config=HookManagerConfig(
                 linear_io=REGISTER_ALL,
-                projection=projection,
+                projection_kwargs=projection,
                 projector=projector,
+                capture_style=capture_style,
             ),
             callbacks=[cb],
         )
@@ -725,7 +743,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "__default__": {
-                    "factorize": False,
+                    "style": "dense",
                     "proj_dim": 64,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -740,7 +758,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "__default__": {
-                    "factorize": True,
+                    "style": "logra",
                     "proj_dim": 16,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -751,6 +769,59 @@ class TestProjectionConfig:
             assert g.representation[n] == "factorized"
             assert g.data[n].activation.shape[-1] == 16
 
+    def test_materialized_logra_is_materialized_factors(self):
+        # A materialized "logra" capture stores exactly the token-summed
+        # outer product of the factorized "logra" projected factors -- one
+        # compact (B, proj_dim*proj_dim) block, and scoring by dot equals the
+        # factorized cross-gram.
+        from dattri_llm.gradient import ops
+
+        cfg = {
+            "proj_dim": 16,
+            "proj_max_batch_size": 8,
+            "proj_type": "rademacher",
+            "proj_seed": 5,
+        }
+        fac = self._run({"__default__": {"style": "logra", **cfg}})
+        mat = self._run(
+            {"__default__": {"style": "logra", **cfg}}, capture_style="materialized"
+        )
+        for n in mat.layer_names:
+            assert mat.representation[n] == "materialized"
+            assert mat.data[n].shape == (4, 16 * 16)  # compact outer product
+            ref = ops.materialize(fac.data[n], "nn.Linear")
+            assert torch.allclose(mat.data[n], ref, atol=1e-5), n
+
+    def test_subset_projection_keeps_exact_coordinates(self):
+        # "mask": a dense (B, k) block of exact gradient entries,
+        # equal to a gather on the materialized raw capture.
+        from dattri_llm.gradient import ops
+
+        cfg = {"style": "mask", "proj_dim": 12, "proj_seed": 7}
+        raw = self._run(None)
+        sub = self._run({"__default__": dict(cfg)})
+        proj = ops.DattriProjector()
+        for n in sub.layer_names:
+            assert sub.representation[n] == "materialized"
+            assert sub.data[n].shape == (4, 12)
+            full = ops.materialize(raw.data[n], "nn.Linear")
+            idx = proj.mask_indices(
+                full.shape[1], proj_dim=12, proj_seed=7, device=full.device
+            )
+            assert torch.allclose(sub.data[n], full[:, idx], atol=1e-5), n
+
+    def test_validation_rejects_projector_kwargs_for_subset(self):
+        with pytest.raises(ValueError, match="mask"):
+            HookManagerConfig(
+                projection_kwargs={
+                    "__default__": {
+                        "style": "mask",
+                        "proj_dim": 8,
+                        "proj_type": "rademacher",
+                    },
+                },
+            )
+
     def test_off_by_default_keeps_factorized(self):
         g = self._run(None)
         assert all(g.representation[n] == "factorized" for n in g.layer_names)
@@ -760,7 +831,7 @@ class TestProjectionConfig:
         g = self._run(
             {
                 "0": {
-                    "factorize": False,
+                    "style": "dense",
                     "proj_dim": 64,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -780,15 +851,23 @@ class TestProjectionConfig:
             return lambda x, ensemble_id=0: x[:, :proj_dim]
 
         g = self._run(
-            {"__default__": {"factorize": False, "proj_dim": 4}},
+            {"__default__": {"style": "dense", "proj_dim": 4}},
             projector=fake_projector,
         )
         assert called["n"] > 0
         for n in g.layer_names:
             assert g.data[n].shape == (4, 4)
 
-    @pytest.mark.parametrize("factorize", [True, False])
-    def test_capture_time_equals_assembly_time_projection(self, factorize):
+    @pytest.mark.parametrize(
+        ("style", "capture_style"),
+        [
+            ("logra", "factorized"),
+            ("logra", "materialized"),
+            ("dense", "factorized"),
+            ("mask", "factorized"),
+        ],
+    )
+    def test_capture_time_equals_assembly_time_projection(self, style, capture_style):
         # Projecting at capture (per micro-batch) must be bit-identical to
         # projecting the fully-assembled gradient -- project(cat) == cat(project).
         from dattri.func.projection import random_project
@@ -796,16 +875,16 @@ class TestProjectionConfig:
         from dattri_llm.gradient import ops
         from dattri_llm.gradient.gradient import Factorized
 
-        cfg = {
-            "factorize": factorize,
-            "proj_dim": 12,
-            "proj_max_batch_size": 8,
-            "proj_type": "rademacher",
-            "proj_seed": 7,
-        }
+        cfg = {"style": style, "proj_dim": 12, "proj_seed": 7}
+        if style != "mask":  # no projector behind a subset
+            cfg.update({"proj_max_batch_size": 8, "proj_type": "rademacher"})
         raw = self._run(None)  # un-projected capture
-        ref = raw.project(random_project, {"__default__": dict(cfg)})
-        cap = self._run({"__default__": dict(cfg)})  # capture-time projection
+        ref = raw.project(
+            random_project, {"__default__": dict(cfg)}, capture_style=capture_style
+        )
+        cap = self._run(
+            {"__default__": dict(cfg)}, capture_style=capture_style
+        )  # capture-time projection
         for n in cap.layer_names:
             a, b = cap.data[n], ref.data[n]
             if isinstance(a, Factorized):
@@ -832,9 +911,9 @@ class TestProjectionConfig:
             m,
             config=HookManagerConfig(
                 linear_io=REGISTER_ALL,
-                projection={
+                projection_kwargs={
                     "__default__": {
-                        "factorize": False,
+                        "style": "dense",
                         "proj_dim": 12,
                         "proj_max_batch_size": 8,
                         "proj_type": "rademacher",
@@ -873,7 +952,7 @@ class _SeqFirstModel(nn.Module):
 
 class TestNonBatchFirstLayers:
     def test_seq_first_layer_collects_without_error(self):
-        # Regression: a (T, B, d) layer must not raise "same batch size".
+        # A flagged (T, B, d) layer collects without a "same batch size" error.
         model = _SeqFirstModel()
         cb = _Recording()
         hm = HookManager(model, callbacks=[cb], non_batch_first_layers={"proj"})
@@ -925,8 +1004,7 @@ class _NanoGPT(nn.Module):
 
 class TestUnbatchedPositionalEmbedding:
     def test_collects_without_validation_error(self):
-        # Regression: a (T,) positional-embedding input previously failed with
-        # "invalid embedding factor dimensions".
+        # A (T,) positional-embedding input passes factor validation.
         model = _NanoGPT()
         cb = _Recording()
         hm = HookManager(model, callbacks=[cb])
@@ -1074,3 +1152,142 @@ class TestHookLifecycle:
         grad = hm.get_gradient()
         assert grad is not None
         assert grad.batch_size == 3
+
+
+class _EmbedMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(20, 8)
+        self.fc1 = nn.Linear(8, 12)
+        self.fc2 = nn.Linear(12, 5)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.fc2(torch.relu(self.fc1(self.embedding(input_ids))))
+
+
+class TestIncludeFrozen:
+    """``include_frozen`` hooks layers whose parameters do not require grad;
+    a frozen probe captures the same factors and computes no weight gradient.
+    """
+
+    LAYERS = (r"^fc1$", r"^fc2$")
+
+    def _capture(self, *, freeze: bool, include_frozen: bool):
+        torch.manual_seed(0)
+        model = _EmbedMLP()
+        if freeze:
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in model.embedding.parameters():  # keeps gradients flowing
+                p.requires_grad = True
+        rec = _Recording()
+        hm = HookManager(
+            model,
+            config=HookManagerConfig(
+                linear_io=list(self.LAYERS), include_frozen=include_frozen
+            ),
+            callbacks=[rec],
+        )
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        with hm.collect():
+            model(ids).pow(2).sum().backward()
+        hm.remove()
+        return model, rec
+
+    def test_frozen_layers_skipped_by_default(self):
+        _, rec = self._capture(freeze=True, include_frozen=False)
+        assert rec.records == []
+
+    def test_frozen_probe_matches_unfrozen_capture(self):
+        _, want = self._capture(freeze=False, include_frozen=False)
+        model, got = self._capture(freeze=True, include_frozen=True)
+        assert len(got.records) == len(want.records) == 1
+        g_want, g_got = want.records[0].gradient, got.records[0].gradient
+        assert set(g_got.layer_names) == set(g_want.layer_names) == {"fc1", "fc2"}
+        for name in g_want.layer_names:
+            a, b = g_want.data[name], g_got.data[name]
+            assert torch.equal(a.activation, b.activation)
+            assert torch.equal(a.pre_activation_grad, b.pre_activation_grad)
+        # Autograd was never asked for the frozen weights' gradients.
+        assert model.fc1.weight.grad is None
+        assert model.fc2.weight.grad is None
+
+    def test_frozen_layers_warn_at_registration(self):
+        with pytest.warns(
+            UserWarning, match="no trainable parameter .include_frozen=True"
+        ):
+            self._capture(freeze=True, include_frozen=True)
+
+    def test_nothing_hooked_warns_at_registration(self):
+        with pytest.warns(UserWarning, match="No layer hooked"):
+            self._capture(freeze=True, include_frozen=False)
+
+    def test_trainable_layers_do_not_warn(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            warnings.filterwarnings("ignore", message="Full backward hook")
+            self._capture(freeze=False, include_frozen=False)
+
+    def test_frozen_probe_completes_under_nonreentrant_checkpointing(self):
+        """Forward fires twice (original + recomputation), backward once; the
+        end-of-backward reconciliation must run for frozen layers too, or
+        the step never completes and the buffers grow step over step.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        class Ckpt(_EmbedMLP):
+            def forward(self, input_ids):
+                h = self.embedding(input_ids)
+                return checkpoint(
+                    lambda x: self.fc2(torch.relu(self.fc1(x))), h, use_reentrant=False
+                )
+
+        torch.manual_seed(0)
+        model = Ckpt()
+        model.requires_grad_(requires_grad=False)
+        model.embedding.requires_grad_(requires_grad=True)
+        rec = _Recording()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            hm = HookManager(
+                model,
+                config=HookManagerConfig(
+                    linear_io=list(self.LAYERS), include_frozen=True
+                ),
+                callbacks=[rec],
+            )
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        with hm.collect():
+            for _ in range(3):
+                model(ids).pow(2).sum().backward()
+        hm.remove()
+        assert [r.step for r in rec.records] == [0, 1, 2]
+        assert all(set(r.gradient.layer_names) == {"fc1", "fc2"} for r in rec.records)
+
+    def test_no_gradient_reaching_hooked_layers_raises(self):
+        """Everything frozen but a layer *after* the hooked ones: the backward
+        never reaches them.  The step must fail loudly at the end of that
+        backward (silently it would leak, and stall the ranks under DDP/FSDP).
+        """
+        torch.manual_seed(0)
+        model = _EmbedMLP()
+        model.requires_grad_(requires_grad=False)
+        model.fc2.requires_grad_(requires_grad=True)  # only the last layer trains
+        rec = _Recording()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            hm = HookManager(
+                model,
+                config=HookManagerConfig(linear_io=[r"^fc1$"], include_frozen=True),
+                callbacks=[rec],
+            )
+        ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        try:
+            with hm.collect():  # noqa: SIM117
+                with pytest.raises(
+                    RuntimeError, match="No hooked layer received a gradient"
+                ):
+                    model(ids).pow(2).sum().backward()
+        finally:
+            hm.remove()
+        assert rec.records == []

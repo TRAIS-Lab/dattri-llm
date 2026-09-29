@@ -208,7 +208,7 @@ def _preprocess_conv_transpose(
 
 def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
     """Extract the minimal hyperparameters from *module* needed by
-    :func:`_preprocess_factorized`.
+    :func:`preprocess_factors`.
 
     Returns a plain serialisable dict -- no reference to the module object is
     retained, so the result can be pickled cheaply alongside gradient tensors.
@@ -239,13 +239,9 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
         "scale_grad_by_freq",
         False,
     ):
-        # TODO: supportable in principle -- the inverse-frequency scaling is a
-        # whole-forward-call statistic, so it must be applied to ``g`` at
-        # capture/assembly time (per buffered part, while the call's full id
-        # tensor is intact); preprocess-time counting is wrong once records
-        # are sliced or concatenated.  No modern architecture sets the flag
-        # (0 of 665 nn.Embedding sites in transformers 4.55), so refuse until
-        # someone needs it.
+        # The inverse-frequency scaling is a statistic of the whole forward
+        # call's id tensor; it cannot be recovered at preprocess time once
+        # records have been sliced or concatenated.
         raise NotImplementedError(
             f"{layer_type} with scale_grad_by_freq=True is not supported: the "
             "inverse-frequency gradient scaling is a whole-batch statistic "
@@ -279,7 +275,7 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
     return kwargs
 
 
-def _preprocess_factorized(
+def preprocess_factors(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -328,7 +324,7 @@ def _preprocess_factorized(
             to ``True``.
 
     Returns:
-        ``(a_processed, g_processed)`` ready for :func:`_materialize` and
+        ``(a_processed, g_processed)`` ready for :func:`materialize_factors` and
         related functions.
     """
     if module_kwargs is None:
@@ -415,7 +411,7 @@ def _preprocess_factorized(
 # ---------------------------------------------------------------------------
 
 
-def _to_3d(x: torch.Tensor) -> torch.Tensor:
+def to_3d(x: torch.Tensor) -> torch.Tensor:
     """Expand a (B, D) tensor to (B, 1, D); leave (B, T, D) unchanged.
 
     All ops work on 3-D (B, T, D) tensors internally.  This helper lets
@@ -428,16 +424,16 @@ def _to_3d(x: torch.Tensor) -> torch.Tensor:
 # Public Factorized-input API
 # ---------------------------------------------------------------------------
 #
-# The private ``_``-prefixed functions above operate on raw
+# The ``*_factors`` functions above operate on raw
 # ``(activation, pre_activation_grad)`` tensors and **always assume batch-first**
-# ``(B, T, ...)`` input.  The public functions below take the
+# ``(B, T, ...)`` input.  The functions below take the
 # :class:`~dattri_llm.gradient.gradient.Factorized` container instead: they call
 # :meth:`Factorized.as_batch_first` to normalise a sequence-first capture, unpack
-# ``module_kwargs``, and delegate to the private version.  These are the entry
-# points to prefer -- the call is both shorter and automatically correct for
-# non-batch-first layers, so nothing downstream needs to reason about tensor
-# layout.  Reach for the raw ``_``-prefixed kernels only when you already hold
-# bare, batch-first factor tensors (e.g. inside another kernel).
+# ``module_kwargs``, and delegate to the ``_factors`` version.  These are the
+# entry points to prefer: they are correct for non-batch-first layers without
+# the caller reasoning about tensor layout.  Use the raw ``_factors`` kernels
+# only when already holding bare, batch-first factor tensors (e.g. inside
+# another kernel).
 
 
 def preprocess_factorized(
@@ -445,9 +441,9 @@ def preprocess_factorized(
     layer_type: str,
     include_bias: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """:func:`_preprocess_factorized` on a :class:`Factorized` (batch-first-safe)."""
+    """:func:`preprocess_factors` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
-    return _preprocess_factorized(
+    return preprocess_factors(
         bf.activation,
         bf.pre_activation_grad,
         layer_type,

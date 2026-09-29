@@ -1,13 +1,16 @@
 """Gradient collection utilities for training data attribution."""
 
 from dattri_llm.gradient import ops
+from dattri_llm.gradient.async_writer import AsyncGradientWriter
 from dattri_llm.gradient.callbacks import (
     CaptureCallback,
     DataSelectionCallback,
     HookManagerCallback,
+    KroneckerCovarianceCallback,
     OffloadCallback,
+    OptimizerStateCallback,
+    ParameterSnapshotCallback,
 )
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import GradientRecord
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
@@ -32,21 +35,28 @@ from dattri_llm.gradient.ops import (
     materialize,
     pairwise_dot,
 )
+from dattri_llm.gradient.snapshots import TrajectorySnapshots
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 __all__ = [
     "REGISTER_ALL",
+    "AsyncGradientWriter",
     "CaptureCallback",
     "DataSelectionCallback",
     "FisherAccumulator",
-    "GradientFileManager",
     "GradientRecord",
+    "GradientStorageManager",
     "HookManager",
     "HookManagerCallback",
     "HookManagerConfig",
     "KroneckerAccumulator",
+    "KroneckerCovarianceCallback",
     "LayerFisherAccumulator",
     "LayerKroneckerAccumulator",
     "OffloadCallback",
+    "OptimizerStateCallback",
+    "ParameterSnapshotCallback",
+    "TrajectorySnapshots",
     "canonical_class_name",
     "default_hook_assignment",
     "dot",

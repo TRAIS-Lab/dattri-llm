@@ -2,18 +2,11 @@
 
 from __future__ import annotations
 
-import pathlib
-import sys
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-
 import torch
 from torch import nn
 
+from dattri_llm import REGISTER_ALL, CaptureCallback, HookManager, HookManagerConfig
 from dattri_llm.gradient import ops
-from dattri_llm.gradient.callbacks import CaptureCallback
-from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
 from dattri_llm.utils.module import rms_norm_module_kwargs
 
 B, T, VOCAB, EMBED, HIDDEN, OUT = 8, 6, 128, 128, 256, 32
@@ -69,26 +62,32 @@ class CustomNet(nn.Module):
         return self.norm(self.fc(self.embed(input_ids)))
 
 
-# Per-layer projection config.  Two styles exist, chosen per layer by
-# ``factorize``: True (LoGRA) projects the two factors independently and the
-# layer stays factorized at width proj_dim -- defined for outer-product
-# gradients (linear/conv families, embeddings via one-hot inputs); False
-# (TRAK) materializes the per-sample weight gradient and projects it to a
-# dense (B, proj_dim) block -- required for norm layers.  "__default__"
-# covers every hooked layer without its own entry.  Keep ``proj_seed`` fixed
-# and the projection device consistent across everything scored together:
-# different seeds (or dattri's CPU vs CUDA projectors) are different
-# projections.
+# Per-layer projection config.  Three styles exist, chosen per layer by
+# ``style``:
+#   * "logra" projects the two factors independently (a Kronecker projection
+#     of the gradient) -- defined for outer-product gradients (linear/conv
+#     families, embeddings via one-hot inputs).  Whether the layer then stays
+#     factorized at width proj_dim or is materialized into a compact
+#     (B, proj_dim*proj_dim) block is the config's ``capture_style``
+#     ("factorized", "materialized", or "auto" for the cheaper of the two);
+#   * "dense" materializes the per-sample weight gradient and projects it
+#     with one matrix to a dense (B, proj_dim) block -- required for norm
+#     layers;
+#   * "mask" keeps proj_dim fixed random coordinates of the gradient.
+# "__default__" covers every hooked layer without its own entry.  Keep
+# ``proj_seed`` fixed and the projection device consistent across everything
+# scored together: different seeds (or dattri's CPU vs CUDA projectors) are
+# different projections.
 PROJ_KWARGS = {
-    "__default__": {  # LoGRA: project both factors, stay factorized
-        "factorize": True,
+    "__default__": {  # project both factors, stay factorized
+        "style": "logra",
         "proj_dim": PROJ_DIM,
         "proj_max_batch_size": 8,
         "proj_type": "rademacher",
         "proj_seed": 7,
     },
-    "norm": {  # TRAK: materialize the per-sample gradient, then project
-        "factorize": False,
+    "norm": {  # materialize the per-sample gradient, then project
+        "style": "dense",
         "proj_dim": PROJ_DIM,
         "proj_max_batch_size": 8,
         "proj_type": "rademacher",
@@ -148,12 +147,12 @@ if __name__ == "__main__":
     # factors on the fly, so the raw factors are never buffered and every
     # projected layer's stored width becomes proj_dim regardless of its size.
     projected = collect_one_step(
-        HookManagerConfig(linear_io=REGISTER_ALL, projection=PROJ_KWARGS),
+        HookManagerConfig(linear_io=REGISTER_ALL, projection_kwargs=PROJ_KWARGS),
         batch,
     )
     n_proj = describe(
         projected,
-        "2. Capture-time projection (LoGRA default, TRAK norm)",
+        "2. Capture-time projection (logra default, dense norm)",
     )
     print(
         f"stored payload: {n_proj}/{n_raw} elements ({n_proj / n_raw:.0%}); "
@@ -194,16 +193,16 @@ if __name__ == "__main__":
     mixed = collect_one_step(
         HookManagerConfig(
             linear_io=REGISTER_ALL,
-            projection={
+            projection_kwargs={
                 "mlp.fc1": {  # wide layer, generous budget
-                    "factorize": True,
+                    "style": "logra",
                     "proj_dim": 128,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
                     "proj_seed": 7,
                 },
                 "mlp.fc2": {  # same family, tighter budget
-                    "factorize": True,
+                    "style": "logra",
                     "proj_dim": 32,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
@@ -248,4 +247,4 @@ if __name__ == "__main__":
 
     # Declared layers flow through projection like any native layer.
     custom_projected = custom.project(random_project, {"norm": PROJ_KWARGS["norm"]})
-    print(f"norm projected (TRAK): {tuple(custom_projected.data['norm'].shape)}")
+    print(f"norm projected (dense): {tuple(custom_projected.data['norm'].shape)}")

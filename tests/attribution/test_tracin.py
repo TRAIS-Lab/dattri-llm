@@ -4,7 +4,7 @@ These collect real per-sample gradients to disk with the repo's
 ``HookManager`` + ``OffloadCallback`` pipeline, then check the attributor's
 score against an independent autograd oracle.
 
-The simplified attributor computes the full ``(num_train, num_test)`` gradient
+The attributor computes the full ``(num_train, num_test)`` gradient
 cross-gram -- every train record against every test record, with no train/test
 step alignment -- structurally identical to the K-FAC family.  Rows are stamped
 with the step each train gradient was recorded at, so a sample collected at
@@ -23,14 +23,16 @@ import pytest
 import torch
 from torch import nn
 
+from dattri_llm.attribution import base
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
 from dattri_llm.gradient.callbacks import OffloadCallback
 from dattri_llm.gradient.datasets import make_gradient_multistep_dataloader
-from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.gradient import Gradient, GradientRecord
+from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES
+from dattri_llm.gradient.storage_manager import GradientStorageManager
+from dattri_llm.utils.cache import CacheBudget
 from dattri_llm.utils.hashing import hash_sample
 
 if TYPE_CHECKING:
@@ -89,7 +91,7 @@ def _grads_at(model, sd, x, y, *, normalized):
 
 
 def _collect_to_disk(model, checkpoints, x, y, out_dir: Path):
-    fm = GradientFileManager(str(out_dir))
+    fm = GradientStorageManager(str(out_dir))
     offload = OffloadCallback(
         offload_interval=1,
         file_manager=fm,
@@ -112,7 +114,7 @@ def _collect_to_disk(model, checkpoints, x, y, out_dir: Path):
 
 def _disk_test_column_order(test_dir: Path, step: int):
     """Reconstruct the expected column order directly from the on-disk index."""
-    fm = GradientFileManager(str(test_dir))
+    fm = GradientStorageManager(str(test_dir))
     ids = []
     for file_rel, by_step in fm.iter_steps(step):
         records = fm.load_records(file_rel)
@@ -123,7 +125,7 @@ def _disk_test_column_order(test_dir: Path, step: int):
 
 
 def _load_step_records(test_dir: Path, step: int):
-    fm = GradientFileManager(str(test_dir))
+    fm = GradientStorageManager(str(test_dir))
     recs = []
     for file_rel, by_step in fm.iter_steps(step):
         all_recs = fm.load_records(file_rel)
@@ -169,6 +171,113 @@ def collected(tmp_path):
     }
 
 
+def _query_block(n_test: int, seed: int = 0, *, s: int = 4, k: int = 8, d: int = 8):
+    gen = torch.Generator().manual_seed(seed)
+    data = {
+        f"l{i}": Factorized(
+            activation=torch.randn(n_test, s, k, generator=gen),
+            pre_activation_grad=torch.randn(n_test, s, d, generator=gen),
+        )
+        for i in range(2)
+    }
+    return Gradient(
+        representation=dict.fromkeys(data, "factorized"),
+        data=data,
+        layer_types=dict.fromkeys(data, "nn.Linear"),
+        indexing=dict.fromkeys(data, "batch_token"),
+    )
+
+
+class TestTestRepRouting:
+    """The transformed test block is converted, per layer, to whichever
+    form the cross-gram cost rule picks for it against the train batch
+    (shared by every inner-product attributor; TracIn is the concrete
+    class whose transform is the identity).
+    """
+
+    def _attr(self, tmp_path, train_bs: int = 8):
+        args = AttributionArguments(
+            output_dir=str(tmp_path), per_device_train_batch_size=train_bs
+        )
+        return TracInAttributor(args)
+
+    def test_one_query_stays_factorized(self, tmp_path):
+        rep = self._attr(tmp_path)._route_test_rep(_query_block(1))
+        assert all(isinstance(v, Factorized) for v in rep.data.values())
+
+    def test_many_queries_go_dense(self, tmp_path):
+        rep = self._attr(tmp_path)._route_test_rep(_query_block(16))
+        assert all(isinstance(v, torch.Tensor) for v in rep.data.values())
+        assert all(r == "materialized" for r in rep.representation.values())
+
+    def test_over_budget_stays_factorized(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            base, "CacheBudget", lambda device: CacheBudget(limit_bytes=0)
+        )
+        # k = d = 16: the dense form is larger than the factors, so it costs.
+        rep = self._attr(tmp_path)._route_test_rep(_query_block(16, k=16, d=16))
+        assert all(isinstance(v, Factorized) for v in rep.data.values())
+
+    def test_budget_admits_largest_saving_first(self, tmp_path, monkeypatch):
+        # Both layers grow when densified; the narrower l1 saves more flops
+        # (the ghost route's S^2 term is what the dense route removes).
+        block = _query_block(16, k=16, d=16)
+        block.data["l1"] = Factorized(
+            activation=torch.randn(16, 4, 12),
+            pre_activation_grad=torch.randn(16, 4, 12),
+        )
+        layer = block.select_layers(["l1"])
+        growth = layer.materialized_nbytes - layer.nbytes
+        monkeypatch.setattr(
+            base, "CacheBudget", lambda device: CacheBudget(limit_bytes=growth)
+        )
+        rep = self._attr(tmp_path)._route_test_rep(block)
+        assert isinstance(rep.data["l1"], torch.Tensor)
+        assert isinstance(rep.data["l0"], Factorized)
+
+    def test_factorized_query_layers_are_preprocessed_once(self, tmp_path):
+        """A query layer that stays factorized is cached as final factors, so
+        no train block repeats its preprocessing.
+        """
+        gen = torch.Generator().manual_seed(0)
+
+        def raw_block(n):
+            data = {
+                "l0": Factorized(
+                    activation=torch.randn(n, 4, 8, generator=gen),
+                    pre_activation_grad=torch.randn(n, 4, 8, generator=gen),
+                    module_kwargs={"has_bias": True},
+                )
+            }
+            return Gradient(
+                representation={"l0": "factorized"},
+                data=data,
+                layer_types={"l0": "nn.Linear"},
+                indexing={"l0": "batch_token"},
+            )
+
+        attr = self._attr(tmp_path)
+        train, query = raw_block(8), raw_block(1)
+        expected = attr.inner_product(train.clone(), query.clone())
+        routed = attr._route_test_rep(query)
+        layer = routed.data["l0"]
+        assert isinstance(layer, Factorized)
+        assert layer.module_kwargs is None
+        assert layer.activation.shape[-1] == 9  # the bias column, folded once
+        assert torch.allclose(attr.inner_product(train, routed), expected, atol=1e-5)
+
+    def test_routes_agree_on_scores(self, tmp_path, monkeypatch):
+        attr = self._attr(tmp_path)
+        train = _query_block(8, seed=1)
+        query = _query_block(16, seed=2)
+        dense = attr.inner_product(train, attr._route_test_rep(query.clone()))
+        monkeypatch.setattr(
+            base, "CacheBudget", lambda device: CacheBudget(limit_bytes=0)
+        )
+        ghost = attr.inner_product(train, attr._route_test_rep(query.clone()))
+        assert torch.allclose(dense, ghost, atol=1e-5, rtol=1e-5)
+
+
 class TestTracInOnDisk:
     @pytest.mark.parametrize("normalized", [False, True])
     @pytest.mark.parametrize("loop_over_test", [False, True])
@@ -198,8 +307,8 @@ class TestTracInOnDisk:
 
         attr = _make_attr(tmp_path / f"out_{normalized}_{loop_over_test}")
         result = attr.attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             loop_over_test=loop_over_test,
             normalized_grad=normalized,
         )
@@ -215,8 +324,8 @@ class TestTracInOnDisk:
 
     def test_algorithm_label_and_shape(self, collected, tmp_path):
         res = _make_attr(tmp_path / "a").attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
         )
         assert res.algorithm == "TracIn"
         assert res.scores.shape == (N_TRAIN, N_TEST)
@@ -224,11 +333,12 @@ class TestTracInOnDisk:
             "normalized_grad": False,
             "selected_training_steps": [0],
             "sample_id_key": {"train": None, "test": None},
+            "attribution_granularity": "instance",
         }
 
         gradcos = _make_attr(tmp_path / "b").attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             normalized_grad=True,
         )
         assert gradcos.algorithm == "GradCos"
@@ -252,8 +362,8 @@ class TestTracInOnDisk:
             @ fc1_grads(collected["x_te"], collected["y_te"]).T
         )
         res = _make_attr(tmp_path / "s").attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             layer_name="mlp.fc1",  # str form; normalized to a list
         )
         matrix = res.query(
@@ -267,8 +377,8 @@ class TestTracInOnDisk:
     def test_layer_name_unknown_raises(self, collected, tmp_path):
         with pytest.raises(KeyError, match="Unknown layers"):
             _make_attr(tmp_path / "u").attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 layer_name=["nope"],
             )
 
@@ -277,13 +387,13 @@ class TestTracInOnDisk:
         discovered columns must equal the on-disk order.
         """
         res_false = _make_attr(tmp_path / "a").attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             loop_over_test=False,
         )
         res_true = _make_attr(tmp_path / "b").attribute_from_cache(
-            train_gradients_dir=str(collected["train_dir"]),
-            test_gradients_dir=str(collected["test_dir"]),
+            train_source=str(collected["train_dir"]),
+            test_source=str(collected["test_dir"]),
             loop_over_test=True,
         )
         assert res_false.test_ids == res_true.test_ids
@@ -309,7 +419,7 @@ class TestTracInOnDisk:
                 mixed.append(
                     GradientRecord(record.step, record.input_hash, mixed_gradient),
                 )
-            GradientFileManager(str(destination)).save_bulk(mixed)
+            GradientStorageManager(str(destination)).save_bulk(mixed)
 
         train_dir = tmp_path / "mixed_train"
         test_dir = tmp_path / "mixed_test"
@@ -318,17 +428,64 @@ class TestTracInOnDisk:
         attr = TracInAttributor(_args(tmp_path / "mixed_out"))
         with pytest.warns(UserWarning, match="Skipping batch-level param_grad"):
             result = attr.attribute_from_cache(
-                train_gradients_dir=str(train_dir),
-                test_gradients_dir=str(test_dir),
+                train_source=str(train_dir),
+                test_source=str(test_dir),
             )
         assert result.scores.shape == (N_TRAIN, N_TEST)
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"per_device_train_batch_size": 1},
+            {"per_device_train_batch_size": 64},
+            {"dataloader_num_workers": 2},
+        ],
+        ids=["score-bs1", "score-bs64", "workers2"],
+    )
+    def test_performance_knobs_do_not_change_scores(
+        self,
+        collected,
+        tmp_path,
+        overrides,
+    ):
+        """Scoring batch size and loader workers are performance-only knobs:
+        rows, columns, and scores must not move.
+
+        The worker count leaves the compute identical (bitwise equality); the
+        scoring batch size regroups the same dot products into different GEMM
+        shapes, so it is checked to numerical tolerance.
+        """
+
+        def run(out_dir: Path, **kwargs):
+            defaults = {
+                "dataloader_num_workers": 0,
+                "dataloader_pin_memory": False,
+            }
+            args = AttributionArguments(
+                output_dir=str(out_dir),
+                **{**defaults, **kwargs},
+            )
+            return TracInAttributor(args).attribute_from_cache(
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
+            )
+
+        base = run(tmp_path / "base")
+        res = run(tmp_path / "res", **overrides)
+        assert res.test_ids == base.test_ids
+        assert res.row_train_ids == base.row_train_ids
+        assert res.row_steps == base.row_steps
+        if "per_device_train_batch_size" in overrides:
+            assert torch.allclose(res.scores, base.scores, atol=1e-6, rtol=1e-5)
+        else:
+            assert torch.equal(res.scores, base.scores)
+
     def test_missing_gradients_dir_raises(self, collected, tmp_path):
         attr = _make_attr(tmp_path / "o")
-        with pytest.raises(TypeError, match=r"train_gradients_dir"):
-            attr.attribute_from_cache(test_gradients_dir=str(collected["test_dir"]))
-        with pytest.raises(TypeError, match=r"test_gradients_dir"):
-            attr.attribute_from_cache(train_gradients_dir=str(collected["train_dir"]))
+        with pytest.raises(TypeError, match=r"train_source"):
+            attr.attribute_from_cache(test_source=str(collected["test_dir"]))
+        with pytest.raises(TypeError, match=r"test_source"):
+            attr.attribute_from_cache(train_source=str(collected["train_dir"]))
 
     def test_multistep_loader_loads_mixed_step_file_once(
         self,
@@ -344,18 +501,18 @@ class TestTracInOnDisk:
         _collect_to_disk(model, checkpoints, x_tr, y_tr, raw)
 
         mixed = tmp_path / "mixed"
-        fm_out = GradientFileManager(str(mixed))
+        fm_out = GradientStorageManager(str(mixed))
         fm_out.save_bulk(_load_step_records(raw, 0) + _load_step_records(raw, 1))
-        reader = GradientFileManager(str(mixed))
+        reader = GradientStorageManager(str(mixed))
 
         calls = []
-        original = GradientFileManager.load_records
+        original = GradientStorageManager.load_records
 
         def counted(self, file_relpath):
             calls.append(file_relpath)
             return original(self, file_relpath)
 
-        monkeypatch.setattr(GradientFileManager, "load_records", counted)
+        monkeypatch.setattr(GradientStorageManager, "load_records", counted)
         blocks = list(
             make_gradient_multistep_dataloader(reader, [0, 1], _args(tmp_path / "o")),
         )
@@ -384,8 +541,8 @@ class TestTracInOnDisk:
         test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
         )
         # Two steps per train sample -> 2 * N_TRAIN rows, stamped {0, 1}.
         assert res.scores.shape[0] == 2 * N_TRAIN
@@ -422,8 +579,8 @@ class TestTracInOnDisk:
         test_hashes = [hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)]
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
             selected_training_steps=[1],
         )
 
@@ -442,8 +599,8 @@ class TestTracInOnDisk:
         attr = _make_attr(tmp_path / "o")
         with pytest.raises(ValueError, match=r"requested steps"):
             attr.attribute_from_cache(
-                train_gradients_dir=str(collected["train_dir"]),
-                test_gradients_dir=str(collected["test_dir"]),
+                train_source=str(collected["train_dir"]),
+                test_source=str(collected["test_dir"]),
                 selected_training_steps=[99],
             )
 
@@ -460,8 +617,8 @@ class TestTracInOnDisk:
         _collect_to_disk(model, [sd], x_te, y_te, test_dir)
 
         res = _make_attr(tmp_path / "o").attribute_from_cache(
-            train_gradients_dir=str(train_dir),
-            test_gradients_dir=str(test_dir),
+            train_source=str(train_dir),
+            test_source=str(test_dir),
         )
         distinct = len(
             {hash_sample({"x": x_te[j], "y": y_te[j]}) for j in range(N_TEST)},

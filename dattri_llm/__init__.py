@@ -11,25 +11,55 @@ The gradient-capture core (hooks, callbacks, data model, storage) is imported
 eagerly and needs only ``torch``.  The attribution layer (attributors, score,
 arguments) and the live streamer are resolved lazily on first attribute
 access, so ``import dattri_llm`` stays light and does not require their
-optional dependencies (``dattri``, ``tqdm``) until they are actually used.
+optional dependencies (``transformers`` for the live streamer, ``dattri`` for
+its random projectors) until they are actually used.
 """
 
 from importlib import import_module
+from typing import TYPE_CHECKING
 
 from dattri_llm.gradient import (
     REGISTER_ALL,
     CaptureCallback,
     DataSelectionCallback,
-    GradientFileManager,
     GradientRecord,
+    GradientStorageManager,
     HookManager,
     HookManagerCallback,
     HookManagerConfig,
+    KroneckerCovarianceCallback,
     OffloadCallback,
+    OptimizerStateCallback,
+    ParameterSnapshotCallback,
+    TrajectorySnapshots,
     default_hook_assignment,
 )
 from dattri_llm.gradient.gradient import Factorized, Gradient
 from dattri_llm.utils.hashing import hash_batch, hash_sample
+
+if TYPE_CHECKING:
+    # The lazily resolved exports below, imported for type checkers and IDEs
+    # only: at runtime they still resolve on first access (module __getattr__).
+    from dattri_llm.attribution import (
+        AdamWInfluenceAttributor,
+        AttributionArguments,
+        AttributionScore,
+        BaseAttributor,
+        BaseInnerProductAttributor,
+        DVEmbAttributor,
+        EKFACAttributor,
+        KFACAttributor,
+        KroneckerAttributor,
+        LESSAttributor,
+        TracInAttributor,
+        TrajectoryAttributor,
+    )
+    from dattri_llm.gradient.streaming import (
+        DiskGradientSource,
+        GradientStreamer,
+        ReplayGradientSource,
+    )
+    from dattri_llm.task import AttributionTask
 
 __version__ = "0.1.0"
 
@@ -38,19 +68,31 @@ __version__ = "0.1.0"
 _LAZY_EXPORTS = {
     "GradientStreamer": "dattri_llm.gradient.streaming",
     "DiskGradientSource": "dattri_llm.gradient.streaming",
+    "ReplayGradientSource": "dattri_llm.gradient.streaming",
     "AttributionArguments": "dattri_llm.attribution.arguments",
+    "AttributionTask": "dattri_llm.task",
     "AttributionScore": "dattri_llm.attribution.score",
+    "BaseAttributor": "dattri_llm.attribution",
+    "BaseInnerProductAttributor": "dattri_llm.attribution",
+    "KroneckerAttributor": "dattri_llm.attribution",
     "TracInAttributor": "dattri_llm.attribution",
     "KFACAttributor": "dattri_llm.attribution",
     "EKFACAttributor": "dattri_llm.attribution",
     "DVEmbAttributor": "dattri_llm.attribution",
+    "LESSAttributor": "dattri_llm.attribution",
+    "AdamWInfluenceAttributor": "dattri_llm.attribution",
+    "TrajectoryAttributor": "dattri_llm.attribution",
 }
 
 __all__ = [
     "REGISTER_ALL",
     # lazily resolved (see _LAZY_EXPORTS):
+    "AdamWInfluenceAttributor",
     "AttributionArguments",
     "AttributionScore",
+    "AttributionTask",
+    "BaseAttributor",
+    "BaseInnerProductAttributor",
     "CaptureCallback",
     "DVEmbAttributor",
     "DataSelectionCallback",
@@ -58,15 +100,23 @@ __all__ = [
     "EKFACAttributor",
     "Factorized",
     "Gradient",
-    "GradientFileManager",
     "GradientRecord",
+    "GradientStorageManager",
     "GradientStreamer",
     "HookManager",
     "HookManagerCallback",
     "HookManagerConfig",
     "KFACAttributor",
+    "KroneckerAttributor",
+    "KroneckerCovarianceCallback",
+    "LESSAttributor",
     "OffloadCallback",
+    "OptimizerStateCallback",
+    "ParameterSnapshotCallback",
+    "ReplayGradientSource",
     "TracInAttributor",
+    "TrajectoryAttributor",
+    "TrajectorySnapshots",
     "default_hook_assignment",
     "hash_batch",
     "hash_sample",

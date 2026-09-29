@@ -34,6 +34,50 @@ def _digest_field(h: hashlib._hashlib.HASH, key: str, value: object) -> bool:
     return True
 
 
+PAD_MASK_KEY = "attention_mask"
+
+
+def _strip_padding(inputs: dict[str, object]) -> dict[str, object]:
+    """The fields of one sample with its padding removed.
+
+    A batch is padded to its longest sequence, so a padded field carries the
+    batch's length in a sample's identity.  With an ``attention_mask`` in
+    *inputs*, every field whose leading dimension is the mask's length keeps
+    only the positions the mask marks as real (left or right padding alike),
+    and the mask itself, all ones after that, is left out.  Without a mask
+    nothing is stripped.  A field of another length, such as a shifted
+    ``labels`` row, is kept whole.
+    """
+    mask = inputs.get(PAD_MASK_KEY)
+    if isinstance(mask, (list, tuple)):
+        try:
+            mask = torch.tensor(mask)
+        except (TypeError, ValueError, RuntimeError):
+            return inputs
+    if not isinstance(mask, torch.Tensor) or mask.ndim != 1:
+        return inputs
+    keep = mask.bool().cpu()
+    out: dict[str, object] = {}
+    for key, value in inputs.items():
+        if key == PAD_MASK_KEY:
+            continue
+        field = value
+        if isinstance(field, (list, tuple)) and len(field) == keep.numel():
+            try:
+                field = torch.tensor(field)
+            except (TypeError, ValueError, RuntimeError):
+                out[key] = field
+                continue
+        if (
+            isinstance(field, torch.Tensor)
+            and field.ndim >= 1
+            and field.shape[0] == keep.numel()
+        ):
+            field = field[keep.to(field.device)]
+        out[key] = field
+    return out
+
+
 def hash_sample(inputs: dict[str, object]) -> str:
     """SHA-256 content hash identifying **one sample** by its model inputs.
 
@@ -42,7 +86,11 @@ def hash_sample(inputs: dict[str, object]) -> str:
     fields, and numeric scalars are digested (sorted by key for determinism);
     a plain Python list hashes identically to the equivalent tensor, so a raw
     ``dataset[i]`` looks up gradients captured from the collated tensor batch.
-    Non-digestible fields (strings, ``None``, ...) are skipped.  The digest is
+    Non-digestible fields (strings, ``None``, ...) are skipped.  Padding is
+    stripped first: with an ``attention_mask``, every field of the mask's
+    length keeps only its unmasked positions and the mask is left out, so a
+    sample's hash does not depend on the longest sequence of the batch it was
+    padded with, and equals the hash of its unpadded tokens.  The digest is
     over raw bytes, so the same sample hashes identically wherever shuffling
     put it: a ``(T,)`` row, its ``(1, T)`` batched form, and ``batch[i]`` all
     produce the same hash.
@@ -58,6 +106,7 @@ def hash_sample(inputs: dict[str, object]) -> str:
         ValueError: If no field is digestible -- an empty digest would give
             every sample the same identity and silently corrupt lookups.
     """
+    inputs = _strip_padding(inputs)
     h = hashlib.sha256()
     digested = False
     for key in sorted(inputs):

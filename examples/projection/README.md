@@ -12,7 +12,7 @@ in six sections:
 
 1. **Raw capture** — the unprojected reference: per-layer factorized payloads
    whose widths follow the layer dimensions.
-2. **Capture-time projection** — `HookManagerConfig(projection=...)`: each
+2. **Capture-time projection** — `HookManagerConfig(projection_kwargs=...)`: each
    backward pass projects the factors on the fly, so the raw factors are
    never buffered and every layer's stored width becomes `proj_dim`,
    independent of the layer's size. The script prints the payload before and
@@ -25,43 +25,57 @@ in six sections:
    gradients projected later are directly comparable.
 4. **Similarity preservation** — the pairwise gradient dot products of the
    batch, computed raw vs. projected, correlate at r ≈ 0.99.
-5. **Per-layer configuration** — the `projection` mapping is keyed by layer
+5. **Per-layer configuration** — the `projection_kwargs` mapping is keyed by layer
    name, so each layer gets its own budget (`fc1` at 128, `fc2` at 32), and
    **without** a `"__default__"` entry, layers with no entry of their own are
-   captured raw. Mixed configs are first-class.
+   captured raw.
 6. **Custom layer classes** — hooking a hand-rolled layer the library cannot
    recognise, declared with `layer_types` + `module_kwargs` and verified
    against autograd.
 
-## Two projection styles
+## Three projection styles, and the capture style
 
-Chosen per layer via `factorize`:
+`style` says *how* a layer is projected — in which order projection and
+materialization happen:
 
-| style | `factorize` | result | defined for |
-|---|---|---|---|
-| LoGRA | `True` (default) | both factors projected; layer stays **factorized** at width `proj_dim` | linear / conv families, embeddings (ids expanded to one-hot) |
-| TRAK | `False` | per-sample weight gradient materialized, then projected to a dense `(B, proj_dim)` block | any layer; **required** for norm layers |
+| `style` | result | defined for |
+|---|---|---|
+| `"logra"` (default) | both factors projected (a Kronecker projection of the gradient) | linear / conv families, embeddings (ids expanded to one-hot) |
+| `"dense"` | per-sample weight gradient materialized, then projected with one matrix to a dense `(B, proj_dim)` block | any layer; **required** for norm layers |
+| `"mask"` | `proj_dim` fixed random coordinates of the gradient, gathered from the factors; exact entries, no projector | any layer |
+
+Separately, `HookManagerConfig(capture_style=...)` says *what representation*
+a layer is buffered in wherever there is a choice — an unprojected layer, or
+a `"logra"` one: `"factorized"` (default) keeps the factors, `"materialized"`
+contracts them into the per-sample gradient (for `"logra"`, the compact
+`(B, proj_dim*proj_dim)` outer product of the projected factors), and
+`"auto"` takes the cheaper of the two per layer from the actual shapes.
+The two representations score identically for sample-level attribution;
+keep the factors when you need per-token attribution or K-FAC/EK-FAC
+(which read the factors). `"dense"` and `"mask"` layers are dense whatever
+the capture style.
 
 ## Configuring projection per layer
 
-The `projection` mapping takes per-layer entries plus an optional
+The `projection_kwargs` mapping takes per-layer entries plus an optional
 `"__default__"` covering every hooked layer without its own entry; layers
 with neither are captured raw. Section 2 projects everything LoGRA-style and
-overrides the LayerNorm to TRAK:
+overrides the LayerNorm to the dense style:
 
 ```python
 HookManagerConfig(
     linear_io=REGISTER_ALL,
-    projection={
+    projection_kwargs={
         "__default__": {
-            "factorize": True,
+            "style": "logra",
             "proj_dim": 64,
             "proj_max_batch_size": 8,   # required by dattri's random_project
             "proj_type": "rademacher",
             "proj_seed": 7,
         },
-        "norm": {"factorize": False, "proj_dim": 64, "proj_max_batch_size": 8,
-                 "proj_type": "rademacher", "proj_seed": 7},
+        "norm": {"style": "dense", "proj_dim": 64,
+                 "proj_max_batch_size": 8, "proj_type": "rademacher",
+                 "proj_seed": 7},
     },
 )
 ```
@@ -107,16 +121,14 @@ HookManagerConfig(
 `embedding_bag_module_kwargs`, `conv{1,2,3}d_module_kwargs` and their
 transposes, `layer_norm_module_kwargs`, `rms_norm_module_kwargs`,
 `group_norm_module_kwargs`, `instance_norm{1,2,3}d_module_kwargs`). Every
-argument is keyword-only and **required** by design: these helpers describe
-non-standard layers, exactly the situation where a silently assumed default
-(a bias that is not there, a different epsilon) would corrupt the captured
-gradients without any error — a forgotten field fails at config-build time
-instead.
+argument is keyword-only and **required**: a missing field (a bias that is
+not there, a different epsilon) fails at config-build time rather than
+silently changing the captured gradients.
 
 The tutorial closes the loop by *verifying* the declaration: the sum of the
 captured per-sample gradients reproduces autograd's `param.grad` for the
 custom layer (a wrong `eps` shows up here immediately), and the declared
-layer then flows through TRAK projection like any native one.
+layer then flows through `"dense"` projection like any native one.
 
 ```bash
 python examples/projection/gradient_projection.py

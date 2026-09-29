@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import warnings
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -41,6 +43,54 @@ _SCORE_MODES = frozenset({"ghost", "materialized"})
 _TARGET_MODES = frozenset({"batch", "fixed", "val_loader"})
 
 
+def _concat_batches(batches: list[object]) -> object:
+    """Concatenate several val batches into one along the batch axis.
+
+    Used only by ``val_targets_per_pass > 1``, so that ``k`` steps' worth of
+    targets come out of a single forward/backward.  Handles the shapes a
+    ``DataLoader`` actually yields -- a tensor, a mapping of tensors, or a
+    sequence of either -- and requires every non-batch dimension to match.
+
+    No padding is applied: the fill value depends on what a field means
+    (``0`` for ``input_ids`` or an attention mask, ``-100`` for labels), so a
+    loader whose batches differ in length must pad in its own ``collate_fn``.
+    """
+    first = batches[0]
+    if torch.is_tensor(first):
+        shapes = {tuple(b.shape[1:]) for b in batches}
+        if len(shapes) != 1:
+            raise ValueError(
+                "val_targets_per_pass > 1 needs val batches whose non-batch "
+                f"dimensions agree; got {sorted(shapes)}. Pad to a common "
+                "length in the loader's collate_fn, or set "
+                "val_targets_per_pass=1.",
+            )
+        return torch.cat(list(batches), dim=0)
+    if isinstance(first, Mapping):
+        if {frozenset(b.keys()) for b in batches} != {frozenset(first.keys())}:
+            raise ValueError(
+                "val_targets_per_pass > 1 needs every val batch to carry "
+                "the same keys.",
+            )
+        return type(first)(
+            {k: _concat_batches([b[k] for b in batches]) for k in first},
+        )
+    if isinstance(first, (list, tuple)):
+        if len({len(b) for b in batches}) != 1:
+            raise ValueError(
+                "val_targets_per_pass > 1 needs every val batch to have the "
+                "same number of elements.",
+            )
+        return type(first)(
+            _concat_batches([b[i] for b in batches]) for i in range(len(first))
+        )
+    raise TypeError(
+        f"Cannot concatenate val batches of type {type(first).__name__}; "
+        "val_targets_per_pass > 1 supports tensors, mappings and sequences of "
+        "them. Set val_targets_per_pass=1 for other batch types.",
+    )
+
+
 class DataSelectionCallback(HookManagerCallback):
     """Online data selection via per-sample influence scoring.
 
@@ -54,7 +104,23 @@ class DataSelectionCallback(HookManagerCallback):
        dropped samples' influence (see **Renormalization** for the exact
        semantics under a mean-reduced loss).
 
-    **Score modes** (``score_mode`` argument):
+    Each stage is exposed as a **public, self-contained function** so a custom
+    rule can be dropped in by overriding just one of them:
+    :meth:`compute_scores` (per-layer scoring), :meth:`select_samples` (which
+    samples to drop), and :meth:`remove_contributions` (gradient correction).
+    They take no callback state -- their behaviour is fully determined by their
+    arguments.
+
+    **Configuration is hierarchical.** ``scoring_kwargs``
+    (``{'score_mode': ...}``) parameterizes :meth:`compute_scores` and
+    ``selection_kwargs`` (``{'threshold', 'threshold_mode', 'layer_wise'}``)
+    parameterizes selection.  With ``selection_kwargs['layer_wise']=True`` samples
+    are ranked and dropped **independently per layer** (each layer drops its own
+    bottom fraction) rather than as whole samples -- no subclass required.  Each
+    option lives in exactly one dict (there are no flat aliases), and unknown keys
+    raise ``ValueError``.
+
+    **Score modes** (``scoring_kwargs['score_mode']``):
 
     ``"ghost"`` *(default)*
         Ghost inner product -- computes ``score[i] = <dL_i/dW, dL_target/dW>``
@@ -105,7 +171,7 @@ class DataSelectionCallback(HookManagerCallback):
         must be attached to the ``HookManager`` (via
         ``HookManager(callbacks=[...])`` or ``add_callback``).
 
-        Two properties of this design to be aware of:
+        Two consequences:
 
         * The val backward completes a capture step of its own, whose record
           is dispatched to **every** attached callback's ``on_step_end``
@@ -170,6 +236,18 @@ class DataSelectionCallback(HookManagerCallback):
     (``k_r / (B_r - k_r)``), matching the average-of-local-means gradient
     semantics of DDP/FSDP.
 
+    **Val-target prefetch** (``val_targets_per_pass`` argument):
+
+    With ``target="val_loader"`` the target is recomputed every step from one
+    val batch.  ``val_targets_per_pass=k`` draws ``k`` val batches, concatenates
+    them along the batch axis, runs one forward/backward, and slices the
+    captured per-sample gradients into ``k`` targets consumed over the next
+    ``k`` steps, so the fixed cost of a val pass is paid once per ``k`` steps.
+    The batches must agree in their non-batch dimensions (pad in the loader's
+    ``collate_fn``).  Under ``threshold_mode="hard"`` the scores are rescaled
+    by a per-step constant when the val loss averages over its batch; the
+    rank-based threshold modes are unaffected.
+
     **Distributed (DDP / FSDP):**
 
     Both regimes hold the *averaged* global gradient
@@ -197,19 +275,7 @@ class DataSelectionCallback(HookManagerCallback):
     Args:
         model: The model being trained.  ``DataParallel`` / ``DDP`` wrappers
             are unwrapped automatically via ``.module``; for FSDP, pass the
-            FSDP-wrapped module (see "Distributed (FSDP)" above).
-        threshold: Interpretation depends on ``threshold_mode``:
-
-            * ``"hard"`` -- score cutoff (any float, default ``0.0``).
-            * ``"bottom_fraction"`` / ``"negative_bottom_fraction"`` -- fraction
-              of the batch to drop (float in ``[0, 1)``).
-
-        threshold_mode: One of ``"hard"`` (default), ``"bottom_fraction"``,
-            or ``"negative_bottom_fraction"``.  See class docstring for details.
-        score_mode: Scoring algorithm. ``"ghost"`` (default) uses the ghost
-            inner product (no weight-gradient materialisation); ``"materialized"``
-            builds the full per-sample weight gradient and dots it against the
-            target gradient.  Both produce identical scores.
+            FSDP-wrapped module (see "Distributed (DDP / FSDP)" above).
         target: Target gradient source. ``"batch"`` (default), ``"fixed"``,
             or ``"val_loader"``.  See class docstring for details.
         target_gradient: Required when ``target="fixed"``.  A pre-computed
@@ -229,38 +295,93 @@ class DataSelectionCallback(HookManagerCallback):
             mean-reduced loss behaves exactly as if the batch never contained
             the dropped samples.  Default ``False`` (kept samples stay at
             weight ``1/B``).  See **Renormalization** in the class docstring.
+        val_targets_per_pass: Number of val batches drawn and run in one pass
+            when ``target="val_loader"`` (default ``1``).  See **Val-target
+            prefetch** in the class docstring.
+        scoring_kwargs: ``{'score_mode': 'ghost' | 'materialized'}``,
+            parameterizing :meth:`compute_scores`.  ``"ghost"`` (default) uses
+            the ghost inner product (no weight-gradient materialization);
+            ``"materialized"`` builds the full per-sample weight gradient and
+            dots it against the target gradient.  Both produce identical
+            scores.
+        selection_kwargs: ``{'threshold': float, 'threshold_mode': str,
+            'layer_wise': bool}``, parameterizing :meth:`select_samples`.
+            ``threshold`` is a score cutoff under ``threshold_mode="hard"``
+            (any float, default ``0.0``) and the fraction of the batch to drop
+            (float in ``[0, 1)``) under ``"bottom_fraction"`` /
+            ``"negative_bottom_fraction"``; ``threshold_mode`` defaults to
+            ``"hard"``; ``layer_wise`` (default ``False``) ranks and drops
+            samples independently per layer.
     """
+
+    _SCORING_KEYS = frozenset({"score_mode"})
+    _SELECTION_KEYS = frozenset({"threshold", "threshold_mode", "layer_wise"})
 
     def __init__(
         self,
         model: nn.Module,
-        threshold: float = 0.0,
-        threshold_mode: str = "hard",
-        score_mode: str = "ghost",
         target: str = "batch",
         target_gradient: Gradient | None = None,
         val_loader: Iterable[object] | None = None,
         val_loss_fn: Callable[[nn.Module, Any], torch.Tensor] | None = None,
         renormalize: bool = False,
+        val_targets_per_pass: int = 1,
+        *,
+        scoring_kwargs: dict[str, Any] | None = None,
+        selection_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        if threshold_mode not in _THRESHOLD_MODES:
+        """Configure the three stages hierarchically.
+
+        Behaviour is driven entirely by two grouped argument dicts, one per public
+        stage function -- each option has a single home, with no flat aliases:
+
+        * ``scoring_kwargs`` -> :meth:`compute_scores` -- ``{'score_mode': ...}``.
+        * ``selection_kwargs`` -> :meth:`select_samples` --
+          ``{'threshold': ..., 'threshold_mode': ..., 'layer_wise': bool}``.
+          ``layer_wise=True`` ranks samples independently per layer (dropping each
+          layer's bottom fraction from that layer's gradient) instead of scoring
+          whole samples -- no subclass needed.
+
+        Unrecognised keys in either dict raise ``ValueError`` (typo guard).
+        """
+        scoring_kwargs = dict(scoring_kwargs or {})
+        selection_kwargs = dict(selection_kwargs or {})
+        unknown = set(scoring_kwargs) - self._SCORING_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown scoring_kwargs keys: {sorted(unknown)}; "
+                f"allowed: {sorted(self._SCORING_KEYS)}.",
+            )
+        unknown = set(selection_kwargs) - self._SELECTION_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown selection_kwargs keys: {sorted(unknown)}; "
+                f"allowed: {sorted(self._SELECTION_KEYS)}.",
+            )
+        scoring_kwargs.setdefault("score_mode", "ghost")
+        selection_kwargs.setdefault("threshold", 0.0)
+        selection_kwargs.setdefault("threshold_mode", "hard")
+        selection_kwargs.setdefault("layer_wise", False)
+
+        s_mode = scoring_kwargs["score_mode"]
+        t_mode = selection_kwargs["threshold_mode"]
+        thr = selection_kwargs["threshold"]
+        if t_mode not in _THRESHOLD_MODES:
             raise ValueError(
                 f"threshold_mode must be one of {sorted(_THRESHOLD_MODES)}, "
-                f"got {threshold_mode!r}.",
+                f"got {t_mode!r}.",
             )
-        if threshold_mode in (
+        if t_mode in (
             "bottom_fraction",
             "negative_bottom_fraction",
-        ) and not (0.0 <= threshold < 1.0):
+        ) and not (0.0 <= thr < 1.0):
             raise ValueError(
                 f"threshold must be in [0, 1) for "
-                f"threshold_mode={threshold_mode!r}, "
-                f"got {threshold}.",
+                f"threshold_mode={t_mode!r}, got {thr}.",
             )
-        if score_mode not in _SCORE_MODES:
+        if s_mode not in _SCORE_MODES:
             raise ValueError(
-                f"score_mode must be one of {sorted(_SCORE_MODES)}, "
-                f"got {score_mode!r}.",
+                f"score_mode must be one of {sorted(_SCORE_MODES)}, got {s_mode!r}.",
             )
         if target not in _TARGET_MODES:
             raise ValueError(
@@ -276,6 +397,8 @@ class DataSelectionCallback(HookManagerCallback):
             if val_loss_fn is None:
                 raise ValueError("target='val_loader' requires val_loss_fn.")
 
+        self._scoring_kwargs = scoring_kwargs
+        self._selection_kwargs = selection_kwargs
         self._root: nn.Module = getattr(model, "module", model)
         # Top-level model as passed in.  When the model is FSDP-wrapped this is
         # the FSDP module (``_root`` is its unwrapped ``.module``); it is the
@@ -289,11 +412,30 @@ class DataSelectionCallback(HookManagerCallback):
         # convention.
         self._fsdp_shard_map: dict[int, _ShardSpec] | None = None
         self._fsdp_world_size: int = 1
-        self._threshold = threshold
-        self._threshold_mode = threshold_mode
-        self._score_mode = score_mode
+        # Scalar mirrors of the grouped kwargs, for inspection.
+        self._threshold = selection_kwargs["threshold"]
+        self._threshold_mode = selection_kwargs["threshold_mode"]
+        self._score_mode = scoring_kwargs["score_mode"]
         self._target = target
         self._target_gradient = target_gradient
+        if val_targets_per_pass < 1:
+            raise ValueError(
+                f"val_targets_per_pass must be >= 1, got {val_targets_per_pass}.",
+            )
+        hard_threshold = selection_kwargs.get("threshold_mode") == "hard"
+        if val_targets_per_pass > 1 and hard_threshold:
+            warnings.warn(
+                "val_targets_per_pass > 1 with threshold_mode='hard': batching "
+                "the val targets rescales the scores by a per-step constant "
+                "when the val loss averages over its batch, so an absolute "
+                "threshold no longer means what it did at "
+                "val_targets_per_pass=1. Rank-based threshold modes are "
+                "unaffected.",
+                stacklevel=2,
+            )
+        self._val_targets_per_pass = val_targets_per_pass
+        # Per-sample targets already computed and not yet consumed.
+        self._val_targets: list[Gradient] = []
         self._val_loader = val_loader
         self._val_loss_fn = val_loss_fn
         self._val_iter = iter(val_loader) if val_loader is not None else None
@@ -366,23 +508,88 @@ class DataSelectionCallback(HookManagerCallback):
 
         target_grad = self._resolve_target()
 
-        scores = self._compute_scores(record, target_grad)
-        self.last_scores = scores.detach().cpu()
-        dropped = self._select_dropped(self.last_scores)
-        self.last_dropped = dropped
+        # Stage 1 -- per-layer scoring (public, self-contained).
+        layer_scores = self.compute_scores(
+            record.gradient, target_grad, scoring_kwargs=self._scoring_kwargs
+        )
+        # Stage 2 -- selection: a shared drop set for every layer (global), or an
+        # independent one per layer (selection_kwargs['layer_wise']).
+        dropped = self._select_layers(layer_scores)
+        summed = self._sum_layer_scores(layer_scores)
+        self.last_scores = None if summed is None else summed.detach().cpu()
+        union: set[int] = set()
+        for idx in dropped.values():
+            union.update(idx)
+        self.last_dropped = sorted(union)
 
+        # Stage 3 -- gradient correction.
         self._ensure_fsdp_map()
         if self._fsdp_shard_map:
             # FSDP path runs every step (collectives must stay in lock-step
             # across ranks), even when this rank drops nothing.
-            self._remove_contributions_fsdp(record, dropped)
+            self._remove_contributions_fsdp(record, self._global_drop_list(dropped))
         elif is_dist_initialized() and dist_world_size() > 1:
             # Replicated (DDP) gradients: rank-local subtraction would be off
             # by 1/world and diverge the replicas -- remove collectively, in
             # lock-step every step, like the FSDP path.
-            self._remove_contributions_ddp(record, dropped)
-        elif dropped:
-            self._remove_contributions(record, dropped)
+            self._remove_contributions_ddp(record, self._global_drop_list(dropped))
+        elif union:
+            self.remove_contributions(
+                record, dropped, self._root, renormalize=self._renormalize
+            )
+
+    # ---------------------------------------------------------------------- #
+    # Selection orchestration (global vs. per-layer)                          #
+    # ---------------------------------------------------------------------- #
+
+    @staticmethod
+    def _sum_layer_scores(
+        layer_scores: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        """Whole-sample score = sum of the per-layer scores (for diagnostics)."""
+        summed: torch.Tensor | None = None
+        for s in layer_scores.values():
+            summed = s.clone() if summed is None else summed + s
+        return summed
+
+    def _select_layers(
+        self,
+        layer_scores: dict[str, torch.Tensor],
+    ) -> dict[str, list[int]]:
+        """Apply :meth:`select_samples` per ``selection_kwargs['layer_wise']``.
+
+        Returns ``{layer_name: [dropped indices]}``.  In the default (global) mode
+        every layer maps to the *same* list (selection on the summed score); with
+        ``layer_wise=True`` each layer gets its own list.
+        """
+        if self._selection_kwargs.get("layer_wise", False):
+            return {
+                name: self.select_samples(s, selection_kwargs=self._selection_kwargs)
+                for name, s in layer_scores.items()
+            }
+        summed = self._sum_layer_scores(layer_scores)
+        shared = (
+            []
+            if summed is None
+            else self.select_samples(summed, selection_kwargs=self._selection_kwargs)
+        )
+        return {name: list(shared) for name in layer_scores}
+
+    def _global_drop_list(self, dropped: dict[str, list[int]]) -> list[int]:
+        """The single shared drop list for the collective (FSDP/DDP) paths.
+
+        Those paths remove contributions collectively with one drop set for the
+        whole batch; per-layer (``layer_wise``) removal is not supported there
+        and is rejected.
+        """
+        if self._selection_kwargs.get("layer_wise", False):
+            raise NotImplementedError(
+                "selection_kwargs['layer_wise'] is not yet supported under "
+                "FSDP/DDP; use single-device training for per-layer selection.",
+            )
+        for idx in dropped.values():
+            return list(idx)
+        return []
 
     # ---------------------------------------------------------------------- #
     # Target resolution                                                        #
@@ -405,6 +612,14 @@ class DataSelectionCallback(HookManagerCallback):
         # val_loader: gradient was collected by _collect_val_gradient, called
         # from on_step_end right before target resolution.
         return self._pending_val_gradient
+
+    def _next_val_batch(self) -> object:
+        """One batch off the val loader, restarting it when exhausted."""
+        try:
+            return next(self._val_iter)  # type: ignore[arg-type]
+        except StopIteration:
+            self._val_iter = iter(self._val_loader)  # type: ignore[arg-type]
+            return next(self._val_iter)  # type: ignore[arg-type]
 
     def _collect_val_gradient(self) -> None:
         """Sample one val batch, run forward+backward, and store its Gradient.
@@ -444,12 +659,16 @@ class DataSelectionCallback(HookManagerCallback):
                 "add_callback): the val gradient is captured through the "
                 "manager's own hooks.",
             )
-        # Advance the val iterator, cycling when exhausted.
-        try:
-            batch = next(self._val_iter)  # type: ignore[arg-type]
-        except StopIteration:
-            self._val_iter = iter(self._val_loader)  # type: ignore[arg-type]
-            batch = next(self._val_iter)  # type: ignore[arg-type]
+        # Serve a target already computed by an earlier prefetch pass.
+        if self._val_targets:
+            self._pending_val_gradient = self._val_targets.pop(0)
+            return
+
+        # Advance the val iterator, cycling when exhausted.  With
+        # val_targets_per_pass > 1 several batches are drawn and run together,
+        # so the fixed cost of a val pass is paid once per k steps.
+        batches = [self._next_val_batch() for _ in range(self._val_targets_per_pass)]
+        batch = batches[0] if len(batches) == 1 else _concat_batches(batches)
 
         # Save the training step's parameter gradients (scoring/removal read
         # and edit them right after this returns).
@@ -474,6 +693,14 @@ class DataSelectionCallback(HookManagerCallback):
             for n, p in self._root.named_parameters():
                 p.grad = saved_grads[n]
 
+        if self._pending_val_gradient is not None and self._val_targets_per_pass > 1:
+            # One pass covered several steps: split it into per-sample targets
+            # and hand back the first, keeping the rest for later steps.
+            captured = self._pending_val_gradient
+            rows = captured.batch_size
+            self._val_targets = [captured.slice("batch", [i]) for i in range(1, rows)]
+            self._pending_val_gradient = captured.slice("batch", [0])
+
         if self._pending_val_gradient is None:
             raise RuntimeError(
                 "The val backward did not complete a capture step, so no val "
@@ -485,29 +712,42 @@ class DataSelectionCallback(HookManagerCallback):
     # Drop-set selection                                                       #
     # ---------------------------------------------------------------------- #
 
-    def _select_dropped(self, scores: torch.Tensor) -> list[int]:
-        """Return the list of batch indices to drop based on the configured mode.
+    @staticmethod
+    def select_samples(
+        scores: torch.Tensor,
+        *,
+        selection_kwargs: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Batch indices to drop from a 1-D score vector -- public, self-contained.
+
+        This is the atomic selection rule; the global-vs-per-layer choice is made
+        by the caller (see :meth:`_select_layers` / ``selection_kwargs['layer_wise']``).
 
         Args:
             scores: Float tensor of shape ``(B,)`` -- one score per sample.
+            selection_kwargs: ``{'threshold': float, 'threshold_mode': str}``
+                (``'hard'`` / ``'bottom_fraction'`` / ``'negative_bottom_fraction'``).
 
         Returns:
-            Sorted list of batch indices to remove from ``param.grad``.
+            List of batch indices to remove from ``param.grad``.
         """
-        B = scores.shape[0]
+        selection_kwargs = selection_kwargs or {}
+        threshold = selection_kwargs.get("threshold", 0.0)
+        threshold_mode = selection_kwargs.get("threshold_mode", "hard")
+        b = scores.shape[0]
 
-        if self._threshold_mode == "hard":
+        if threshold_mode == "hard":
             # Drop every sample strictly below the threshold value.
-            return (scores < self._threshold).nonzero(as_tuple=True)[0].tolist()
+            return (scores < threshold).nonzero(as_tuple=True)[0].tolist()
 
         # Fraction-based modes: compute how many samples to consider.
-        n_drop = round(B * self._threshold)
+        n_drop = round(b * threshold)
         if n_drop == 0:
             return []
         # Indices of the n_drop lowest-scored samples, in ascending score order.
         bottom_idx = scores.argsort()[:n_drop].tolist()
 
-        if self._threshold_mode == "bottom_fraction":
+        if threshold_mode == "bottom_fraction":
             # Drop all n_drop regardless of sign.
             return bottom_idx
 
@@ -518,60 +758,78 @@ class DataSelectionCallback(HookManagerCallback):
     # Per-sample influence scoring                                             #
     # ---------------------------------------------------------------------- #
 
-    def _compute_scores(
-        self,
-        record: GradientRecord,
+    @staticmethod
+    def compute_scores(
+        gradient: Gradient,
         target: Gradient | None = None,
-    ) -> torch.Tensor:
-        """Compute per-sample influence scores ``score[i] = <dW_i, dW_target>``.
+        *,
+        scoring_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Per-layer influence scores ``{layer_name: (B,)}`` -- public, self-contained.
 
+        For each hooked layer ``l``, ``score[l][i] = <dW_i^l, dW_target^l>``, where
         ``dW_target`` is the sum of the target samples' gradients (the training
-        batch itself when ``target`` is ``None``).  The per-layer inner products
-        are delegated to :meth:`Gradient.similarity` -- the single shared
-        implementation of factorized gradient similarity -- and this method only
-        sums each layer's cross-gram over the target batch and accumulates
-        across layers.
-
-        ``score_mode`` selects the :meth:`~Gradient.similarity` ``mode``
-        (``"ghost"`` -> ``"auto"``, the per-layer cost-optimal routing); both
-        modes are numerically identical.
+        batch itself when ``target`` is ``None``).  The per-layer inner products are
+        delegated to :meth:`Gradient.similarity`; this method sums each layer's
+        cross-gram over the target batch and returns the layers *unreduced*, so the
+        caller can sum them (global selection) or rank each layer independently
+        (layer-wise).
 
         Args:
-            record: Full-batch GradientRecord for this step.
-            target: Optional external target Gradient.  ``None`` -> batch mode.
+            gradient: this step's batch :class:`Gradient`.
+            target: optional external target :class:`Gradient` (``None`` -> batch mode).
+            scoring_kwargs: ``{'score_mode': 'ghost'|'materialized'}`` (``"ghost"``
+                -> the per-layer cost-optimal ``"auto"`` routing; both are
+                numerically identical).
 
         Returns:
-            Float tensor of shape (B,).
+            ``{layer_name: (B,) score tensor}``.
         """
-        gradient = record.gradient
+        scoring_kwargs = scoring_kwargs or {}
+        score_mode = scoring_kwargs.get("score_mode", "ghost")
         if target is not None and target.device != gradient.device:
             # Normalise the target to the captured gradient's device (e.g. a
             # CPU-precomputed fixed target scored against on-device captures).
             target = target.to(gradient.device)
-            if self._target == "fixed":
-                self._target_gradient = target  # cache the moved copy
         other = gradient if target is None else target
-        # "ghost" routes through the per-layer cost heuristic ("auto"): the
-        # factorized and materialized cross-grams are numerically identical,
-        # and a fixed factorized path costs O(B^2 T^2 (d_in+d_out)) per layer
-        # -- more than the training step itself at long sequence lengths.
-        mode = "materialized" if self._score_mode == "materialized" else "auto"
+        mode = "materialized" if score_mode == "materialized" else "auto"
+
+        # Only layers captured per sample can be scored per sample.  A layer
+        # the manager could only hook at batch level (``param_grad`` -- e.g. a
+        # normalization class the per-sample hooks do not recognise) carries
+        # one summed gradient for the whole batch: it says nothing about any
+        # single sample, and ``remove_contributions`` skips it for the same
+        # reason, so it stays out of the score rather than contributing a
+        # mis-shaped term.
+        scorable = [
+            name
+            for name in gradient.layer_names
+            if gradient.layer_types.get(name) != ops.PARAM_GRAD_TYPES
+        ]
+        if len(scorable) < len(gradient.layer_names):
+            gradient = gradient.select_layers(scorable)
+            if target is not None:
+                other = other.select_layers(
+                    [n for n in scorable if n in other.layer_names]
+                )
+            else:
+                other = gradient
 
         # {layer: (B_layer, B_target)} cross-gram per selected scoring mode.
         per_layer = gradient.similarity(other, mode=mode)
 
-        B = gradient.batch_size
-        scores = torch.zeros(B, device=gradient.device)
-        for matrix in per_layer.values():
+        b = gradient.batch_size
+        out: dict[str, torch.Tensor] = {}
+        for name, matrix in per_layer.items():
             # Sum over target samples -> <dW_i, sum_j dW_target_j>.
             layer_scores = matrix.sum(1)
             # A layer whose gradient was summed over the batch during the forward
             # broadcast (e.g. GPT-2 wpe) yields fewer rows; every sample then
             # receives an equal contribution.
-            if layer_scores.shape[0] < B:
-                layer_scores = layer_scores.expand(B)
-            scores += layer_scores
-        return scores
+            if layer_scores.shape[0] < b:
+                layer_scores = layer_scores.expand(b)
+            out[name] = layer_scores
+        return out
 
     # ---------------------------------------------------------------------- #
     # Gradient correction                                                      #
@@ -583,59 +841,71 @@ class DataSelectionCallback(HookManagerCallback):
         {"nn.GroupNorm", "nn.InstanceNorm1d", "nn.InstanceNorm2d", "nn.InstanceNorm3d"},
     )
 
-    def _remove_contributions(
-        self,
+    @staticmethod
+    def remove_contributions(
         record: GradientRecord,
-        dropped: list[int],
+        dropped: dict[str, list[int]],
+        root: nn.Module,
+        *,
+        renormalize: bool = False,
     ) -> None:
-        """Subtract dropped samples' parameter-gradient contributions.
+        """Subtract dropped samples' parameter-gradient contributions -- public,
+        self-contained (the model ``root`` is passed in explicitly).
 
         The per-sample weight gradients are obtained from
         :func:`ops.materialize` (so every supported layer type is handled
         consistently with the rest of the library), and bias gradients are the
-        summed output gradient.  The result is subtracted from each hooked
-        layer's ``param.grad``; with ``renormalize=True`` the kept samples'
-        contribution is rescaled in the same pass (see
-        :meth:`_renorm_weighted_factors`).
+        summed output gradient.  The result is subtracted from each hooked layer's
+        ``param.grad``; with ``renormalize=True`` the kept samples' contribution is
+        rescaled in the same pass (see :meth:`_renorm_weighted_factors`).
 
         Args:
             record: Full-batch :class:`GradientRecord` for this step.
-            dropped: List of batch indices to remove.
+            dropped: ``{layer_name: [batch indices]}`` -- per-layer drop sets. In
+                global selection every layer shares one list; in layer-wise
+                selection each layer carries its own.
+            root: The (unwrapped) model, used for ``get_submodule``.
+            renormalize: Rescale kept samples per layer.
         """
-        B = record.gradient.batch_size
-        renorm = self._renormalize and 0 < len(dropped) < B
+        b = record.gradient.batch_size
         for layer_name, val in record.gradient.data.items():
             if not isinstance(val, Factorized):
                 continue
-            # Normalise sequence-first captures so the batch axis is dim 0 before
-            # we index samples / read the batch size below.
+            drop_l = dropped.get(layer_name, [])
+            if not drop_l:
+                continue
+            renorm = renormalize and 0 < len(drop_l) < b
+            # Normalise sequence-first captures so the batch axis is dim 0
+            # before indexing samples / reading the batch size below.
             bf = val.as_batch_first()
             # Skip layers whose gradient was summed over the batch dim during
             # the forward broadcast (e.g. wpe in GPT-2, where position_ids has
             # shape (1, T)).  Per-sample contributions cannot be isolated.
-            if bf.pre_activation_grad.shape[0] < B:
+            if bf.pre_activation_grad.shape[0] < b:
                 continue
             try:
                 # base_layer_name: a reused layer's extra invocations are
                 # recorded as virtual layers "name@2", ... -- all of them
                 # resolve to (and subtract from) the same real module.
-                module = self._root.get_submodule(base_layer_name(layer_name))
+                module = root.get_submodule(base_layer_name(layer_name))
             except AttributeError:
                 continue
 
             # The record carries the layer type the HookManager captured
-            # under -- including a layer_types declaration for classes whose
+            # under, including a layer_types declaration for classes whose
             # name is not recognisable (e.g. a hand-rolled RMSNorm declared
-            # as "nn.RMSNorm").  Re-deriving from the module class here would
-            # bypass exactly that declaration and mis-materialize the layer.
+            # as "nn.RMSNorm"); it is used as is, never re-derived from the
+            # module class.
             layer_type = record.gradient.layer_types[layer_name]
             if renorm:
-                a_d, g_d = self._renorm_weighted_factors(bf, dropped)
+                a_d, g_d = DataSelectionCallback._renorm_weighted_factors(bf, drop_l)
             else:
-                a_d = bf.activation[dropped]  # (n, ...)
-                g_d = bf.pre_activation_grad[dropped]  # (n, ...)
-            self._subtract_weight(module, layer_type, bf.module_kwargs, a_d, g_d)
-            self._subtract_bias(module, layer_type, g_d)
+                a_d = bf.activation[drop_l]  # (n, ...)
+                g_d = bf.pre_activation_grad[drop_l]  # (n, ...)
+            DataSelectionCallback._subtract_weight(
+                module, layer_type, bf.module_kwargs, a_d, g_d
+            )
+            DataSelectionCallback._subtract_bias(module, layer_type, g_d)
 
     @staticmethod
     def _renorm_weighted_factors(
@@ -711,8 +981,8 @@ class DataSelectionCallback(HookManagerCallback):
             dtype=weight.grad.dtype,
         )
 
+    @staticmethod
     def _subtract_bias(
-        self,
         module: nn.Module,
         layer_type: str,
         g_d: torch.Tensor,
@@ -727,11 +997,13 @@ class DataSelectionCallback(HookManagerCallback):
         if bias is None or bias.grad is None:
             return
         channels = bias.shape[0]
-        g = g_d.float()
+        # fp32 floor: this reduces over every batch/token position, where bf16
+        # accumulation drifts, and the result is only (channels,) wide.
+        (g,) = ops.dtypes.align(g_d, minimum=torch.float32)
         if (
             ops.is_conv(layer_type)
             or ops.is_conv_transpose(layer_type)
-            or layer_type in self._CHANNELS_FIRST_NORMS
+            or layer_type in DataSelectionCallback._CHANNELS_FIRST_NORMS
         ):
             contrib = g.movedim(1, -1).reshape(-1, channels).sum(0)
         else:
@@ -765,7 +1037,7 @@ class DataSelectionCallback(HookManagerCallback):
         The model may be FSDP-wrapped *after* this callback is constructed, so
         discovery is deferred to the first ``on_step_end``.  Leaves an empty
         map (and ``_fsdp_world_size == 1``) for non-FSDP models, which routes
-        ``on_step_end`` through the rank-local :meth:`_remove_contributions`.
+        ``on_step_end`` through the rank-local :meth:`remove_contributions`.
         """
         if self._fsdp_shard_map is not None:
             return
@@ -806,7 +1078,7 @@ class DataSelectionCallback(HookManagerCallback):
         record: GradientRecord,
         dropped: list[int],
     ) -> None:
-        """Shard-aware, collective version of :meth:`_remove_contributions`.
+        """Shard-aware, collective version of :meth:`remove_contributions`.
 
         Runs on every rank in lock-step.  See the section comment above for the
         correctness argument.
@@ -859,7 +1131,7 @@ class DataSelectionCallback(HookManagerCallback):
         dropped: list[int],
     ) -> None:
         """Replicated-gradient (DDP) collective version of
-        :meth:`_remove_contributions`.
+        :meth:`remove_contributions`.
 
         After DDP's allreduce every rank holds the same full
         ``param.grad = (1/world) * sum_r G_r``, so the removal must subtract
@@ -966,7 +1238,7 @@ class DataSelectionCallback(HookManagerCallback):
             except AttributeError:
                 continue
             # Captured (possibly declared-via-layer_types) type; never
-            # re-derive from the module class (see _remove_contributions).
+            # re-derived from the module class (see remove_contributions).
             layer_type = record.gradient.layer_types[layer_name]
             if renorm:
                 a_d, g_d = self._renorm_weighted_factors(bf, dropped)
@@ -1025,9 +1297,9 @@ class DataSelectionCallback(HookManagerCallback):
 
         Mirrors the per-layer-type reshaping in :meth:`_subtract_weight` but
         uses the *unsharded* ``full_shape`` (FSDP shards expose only a 1-D
-        slice, so ``weight.shape`` is unusable).  The offset is always 0 now
-        that embedding materialization covers the full ``num_embeddings``
-        width; it is kept for the partial-coverage case should one return.
+        slice, so ``weight.shape`` is unusable).  The offset is ``0`` for every
+        supported layer type; embedding materialization covers the full
+        ``num_embeddings`` width.
         """
         contrib = ops.materialize(
             Factorized(a_d, g_d, module_kwargs),
@@ -1054,7 +1326,7 @@ class DataSelectionCallback(HookManagerCallback):
         channels: int,
     ) -> torch.Tensor:
         """Full bias-gradient contribution as a 1-D ``(channels,)`` tensor."""
-        g = g_d.float()
+        (g,) = ops.dtypes.align(g_d, minimum=torch.float32)
         if (
             ops.is_conv(layer_type)
             or ops.is_conv_transpose(layer_type)

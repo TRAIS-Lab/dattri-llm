@@ -17,11 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import pathlib
-import sys
 import tempfile
-
-# Make the repo importable when running the script directly (no install needed).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from torch.utils.data import Dataset as TorchDataset
 from transformers import (
@@ -32,10 +28,13 @@ from transformers import (
     TrainingArguments,
 )
 
-from dattri_llm.gradient.callbacks import OffloadCallback
-from dattri_llm.gradient.file_manager import GradientFileManager
-from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
-from dattri_llm.utils.hashing import hash_sample
+from dattri_llm import (
+    GradientStorageManager,
+    HookManager,
+    HookManagerConfig,
+    OffloadCallback,
+    hash_sample,
+)
 
 MODEL_ID = "sshleifer/tiny-gpt2"  # 2-layer GPT-2, runs on CPU
 MAX_LENGTH = 32
@@ -105,7 +104,7 @@ if __name__ == "__main__":
                 logging_steps=100,
                 report_to="none",
             )
-            fm = GradientFileManager(str(pathlib.Path(tmpdir) / "gradients"))
+            fm = GradientStorageManager(str(pathlib.Path(tmpdir) / "gradients"))
             collector = HookManager(
                 model,
                 config=hook_cfg,
@@ -153,9 +152,9 @@ if __name__ == "__main__":
             # Retrieval is a two-step scheme.  The content hash of ONE sample's
             # model inputs -- here simply dataset[0], since the Trainer passes
             # {input_ids, attention_mask, labels} through unchanged -- identifies
-            # WHAT the sample is, independent of shuffling.  lookup() then
-            # reveals WHERE it was recorded: every (step, sample_idx)
-            # pair, and load_sample() retrieves each pair's gradient by a
+            # WHAT the sample is, independent of shuffling.  lookup_by_hash()
+            # then gives WHERE it was recorded: every (step, sample_idx) pair,
+            # and load_sample_by_hash() retrieves each pair's gradient by a
             # direct slice of the stored record (no scan over the batch).
             h0 = hash_sample(dataset[0])
             pairs = fm.lookup_by_hash(h0)  # [(step, sample_idx), ...]

@@ -1199,10 +1199,9 @@ class TestRMSNormGroundTruth:
 class TestQKNormGroundTruth:
     """nn.RMSNorm fed ``(B, T, heads, head_dim)`` -- the extra head axis is a
     broadcast axis and must be folded into the positions, not flattened into
-    the features (see ``_fold_broadcast_axes``).  Regression test for the
-    Qwen3 QK-norm case, where the per-sample gradient previously came out
-    ``(heads, head_dim)``-shaped and pairwise dots silently dropped the
-    cross-head terms.
+    the features (see ``_fold_broadcast_axes``).  This pins the Qwen3 QK-norm
+    case: the per-sample gradient is ``(head_dim,)``-shaped and pairwise dots
+    include the cross-head terms.
     """
 
     HEADS, HEAD_DIM = 3, 4
@@ -1272,9 +1271,8 @@ class TestTokenNormMultiPositionGroundTruth:
     """LayerNorm / RMSNorm fed 3-D ``(B, T, d)`` inputs with ``T > 1``.
 
     The per-sample weight gradient sums the per-position products over T, so
-    dots must include the cross-position terms ``<v(t), v(s)>, t != s`` --
-    previously only ``T == 1`` was covered and the norm dot kernels silently
-    dropped those terms.
+    dots must include the cross-position terms ``<v(t), v(s)>, t != s``, which
+    a ``T == 1`` input cannot exercise.
     """
 
     def _check(self, model, layer_attr: str, with_bias: bool) -> None:

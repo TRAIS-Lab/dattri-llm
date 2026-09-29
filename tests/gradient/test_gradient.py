@@ -308,6 +308,32 @@ class TestTo:
 # --------------------------------------------------------------------------- #
 
 
+class TestMapLayersConsume:
+    def test_consume_releases_selected_layers_from_source(self):
+        g = make_gradient(repr_type="factorized")
+        names = list(g.layer_names)
+        keep, convert = names[0], names[1:]
+        expected = {n: ops.materialize(g.data[n], "nn.Linear") for n in convert}
+        out = g.map_layers(
+            lambda _n, v, t: ops.materialize(v, t), layers=convert, consume=True
+        )
+        # The source gave up the converted layers and kept the rest.
+        assert set(g.data) == {keep}
+        assert isinstance(g.data[keep], Factorized)
+        # The result holds every layer, converted ones dense.
+        assert set(out.data) == set(names)
+        assert isinstance(out.data[keep], Factorized)
+        for n in convert:
+            assert out.representation[n] == "materialized"
+            assert torch.equal(out.data[n], expected[n])
+
+    def test_default_leaves_source_intact(self):
+        g = make_gradient(repr_type="factorized")
+        before = dict(g.data)
+        g.map_layers(lambda _n, v, t: ops.materialize(v, t))
+        assert g.data == before
+
+
 class TestMaterialize:
     def test_factorized_becomes_materialized(self):
         g = make_gradient(repr_type="factorized")
@@ -353,7 +379,7 @@ class TestProject:
         g = make_gradient(repr_type="factorized")
         p = g.project(
             random_project,
-            {"__default__": {"factorize": True, "proj_dim": 32, **_PROJ}},
+            {"__default__": {"style": "logra", "proj_dim": 32, **_PROJ}},
         )
         for name in p.layer_names:
             assert p.representation[name] == "factorized"
@@ -367,7 +393,7 @@ class TestProject:
         g = make_gradient(repr_type="factorized")
         p = g.project(
             random_project,
-            {"__default__": {"factorize": False, "proj_dim": 24, **_PROJ}},
+            {"__default__": {"style": "dense", "proj_dim": 24, **_PROJ}},
         )
         for name in p.layer_names:
             assert p.representation[name] == "materialized"
@@ -385,8 +411,8 @@ class TestProject:
         p = g.project(
             random_project,
             {
-                "l1": {"factorize": True, "proj_dim": 16, **_PROJ},
-                "l2": {"factorize": False, "proj_dim": 16, **_PROJ},
+                "l1": {"style": "logra", "proj_dim": 16, **_PROJ},
+                "l2": {"style": "dense", "proj_dim": 16, **_PROJ},
             },
         )
         assert p.representation["l1"] == "factorized"
@@ -410,7 +436,7 @@ class TestProject:
         )
         p = g.project(
             random_project,
-            {"l1": {"factorize": False, "proj_dim": 8, **_PROJ}},
+            {"l1": {"style": "dense", "proj_dim": 8, **_PROJ}},
         )
         assert p.representation["l1"] == "materialized"
         assert p.data["l1"].shape == (B, 8)
@@ -693,8 +719,8 @@ class TestAggregate:
             g.aggregate(dim="batch")  # type: ignore[arg-type]
 
     def test_aggregate_mean_mode_removed(self):
-        # mode was removed: a mean over tokens double-applies the loss's own
-        # normalization and never computes a gradient.
+        # aggregate takes no mode: a mean over tokens would double-apply the
+        # loss's own normalization and never computes a gradient.
         g = make_gradient(indexing="batch_token")
         with pytest.raises(TypeError):
             g.aggregate(dim="token", mode="mean")  # type: ignore[call-arg]
@@ -1095,7 +1121,7 @@ class TestBatchFirst:
         assert bf.pre_activation_grad.shape == (B, T, D_OUT)
 
     def test_seq_first_batch_size(self):
-        # Regression: a (T, B, d) layer must report B, not T.
+        # A (T, B, d) layer must report B, not T.
         _bf, sf = _seq_first_pair()
         assert sf.batch_size == B
 

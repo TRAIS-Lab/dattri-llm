@@ -10,14 +10,19 @@ identical to the cached (``loop_over_test=False``) path.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 from dattri.task import AttributionTask
 from torch import nn
 from torch.utils.data import Dataset
 
+from dattri_llm.attribution.algorithm.dvemb import DVEmbAttributor
+from dattri_llm.attribution.algorithm.kronecker import EKFACAttributor, KFACAttributor
 from dattri_llm.attribution.algorithm.tracin import TracInAttributor
 from dattri_llm.attribution.arguments import AttributionArguments
+from dattri_llm.utils.hashing import hash_sample
 
 IN_DIM, HID_DIM, OUT_DIM = 4, 8, 3
 N_TRAIN, N_TEST = 6, 4
@@ -87,9 +92,9 @@ class TestLiveLoopOverTest:
     def test_looped_matches_cached(self, tmp_path, normalized_grad):
         """loop_over_test=True must score identically to the cached path.
 
-        Regression: with the shared HookManager, each test-source re-stream
-        reset and advanced the shared step counter mid-train-pass, tripping
-        the streamer's step-desync guard on the second train block.
+        Each test-source re-stream runs on the shared HookManager in the middle
+        of a train pass; the train streamer's step bookkeeping must survive the
+        interleaving so its step-desync guard does not fire on later blocks.
         """
         task, train_ds, test_ds = _make_task_and_data()
 
@@ -113,3 +118,818 @@ class TestLiveLoopOverTest:
         assert torch.allclose(m_c, m_l, atol=1e-5), (
             f"max diff {(m_c - m_l).abs().max():.2e}"
         )
+
+
+class DropoutMLP(MLP):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mlp.add_module("drop", nn.Dropout(0.3))
+        self.mlp.add_module("out", nn.Linear(OUT_DIM, OUT_DIM, bias=False))
+
+
+def _updating_run(
+    tmp_path,
+    *,
+    loop_over_test,
+    accumulation,
+    dropout=False,
+    residency=None,
+    **overrides,
+):
+    """A TracIn updating run (SGD) from a fresh model; returns the score and
+    the trained model (the live streamer trains the task's model in place).
+    """
+    torch.manual_seed(SEED)
+    model = DropoutMLP() if dropout else MLP()
+    _, train_ds, test_ds = _make_task_and_data()
+
+    def loss_func(params, data):
+        yhat = torch.func.functional_call(model, params, (data["x"],))
+        return ((yhat - data["y"]) ** 2).sum()
+
+    checkpoint = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    task = AttributionTask(loss_func=loss_func, model=model, checkpoints=[checkpoint])
+    kwargs = {
+        "output_dir": str(tmp_path),
+        "per_device_train_batch_size": 2,
+        "per_device_eval_batch_size": 2,
+        "use_cpu": True,
+        "dataloader_pin_memory": False,
+        "optim": "sgd",
+        "learning_rate": 0.1,
+        "lr_scheduler_type": "constant",
+        "max_grad_norm": None,
+        "gradient_accumulation_steps": accumulation,
+    }
+    args = AttributionArguments(**{**kwargs, **overrides})
+    score = TracInAttributor(args, task=task).attribute(
+        train_ds,
+        test_ds,
+        enable_update=True,
+        loop_over_test=loop_over_test,
+        gradient_cache_residency=residency,
+    )
+    return score, model, train_ds, test_ds
+
+
+class TestUpdatingLoopOverTest:
+    """``loop_over_test=True`` in a training trajectory: the query gradient is
+    taken at every step's pre-update parameters, and re-streaming it between
+    train blocks leaves the trajectory itself untouched.
+    """
+
+    @pytest.mark.parametrize("accumulation", [1, 2])
+    def test_query_is_taken_at_each_steps_parameters(self, tmp_path, accumulation):
+        score, _, train_ds, test_ds = _updating_run(
+            tmp_path, loop_over_test=True, accumulation=accumulation
+        )
+
+        def per_sample(model, x, y, scale=1.0):
+            rows = []
+            for i in range(x.shape[0]):
+                model.zero_grad()
+                (scale * ((model(x[i : i + 1]) - y[i : i + 1]) ** 2).sum()).backward()
+                rows.append(torch.cat([p.grad.reshape(-1) for p in model.parameters()]))
+            return torch.stack(rows)
+
+        # Replay the recorded batch order window by window: every micro-batch
+        # gradient (of the loss / N the trajectory backpropagates) and the
+        # query are taken at the window's parameters, before its update.
+        index = {hash_sample({"_arg0": train_ds.x[i]}): i for i in range(N_TRAIN)}
+        order: dict[int, list[int]] = {}
+        for h, step in zip(score.row_train_ids, score.row_steps, strict=True):
+            order.setdefault(step, []).append(index[h])
+        steps = sorted(order)
+        torch.manual_seed(SEED)
+        model = MLP()
+        want = torch.zeros(N_TRAIN, N_TEST)
+        for w in range(0, len(steps), accumulation):
+            window = steps[w : w + accumulation]
+            query = per_sample(model, test_ds.x, test_ds.y)
+            model.zero_grad()
+            for step in window:
+                rows = order[step]
+                want[rows] += (
+                    per_sample(
+                        model, train_ds.x[rows], train_ds.y[rows], 1 / accumulation
+                    )
+                    @ query.T
+                )
+            model.zero_grad()
+            for step in window:
+                rows = order[step]
+                x, y = train_ds.x[rows], train_ds.y[rows]
+                (((model(x) - y) ** 2).sum() / accumulation).backward()
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.sub_(0.1 * p.grad)
+
+        ids, matrix = score.agnostic_matrix()
+        row = {h: i for i, h in enumerate(ids)}
+        col = {h: i for i, h in enumerate(score.test_ids)}
+        got = matrix[
+            [row[hash_sample({"_arg0": train_ds.x[i]})] for i in range(N_TRAIN)]
+        ][:, [col[hash_sample({"_arg0": test_ds.x[i]})] for i in range(N_TEST)]]
+        assert torch.allclose(got, want, atol=1e-4, rtol=1e-4), (
+            f"max diff {(got - want).abs().max():.2e}"
+        )
+        assert score.algorithm_meta["query_at"] == "theta_t"
+
+    @pytest.mark.parametrize("dropout", [False, True])
+    @pytest.mark.parametrize("accumulation", [1, 2])
+    def test_training_does_not_depend_on_loop_over_test(
+        self, tmp_path, accumulation, dropout
+    ):
+        # AdamW with clipping and a warmup schedule: the whole deferred update
+        # (clip -> step -> schedule) must match.  The memory-residency run
+        # collects the queries in a pass of their own, so its training never
+        # meets a probe: the reference trajectory.
+        trained, modes = {}, {}
+        for run in ("cached", "looped", "memory"):
+            _, model, _, _ = _updating_run(
+                tmp_path / run,
+                loop_over_test=run == "looped",
+                accumulation=accumulation,
+                dropout=dropout,
+                residency="memory" if run == "memory" else None,
+                optim="adamw_torch",
+                learning_rate=0.05,
+                max_grad_norm=0.5,
+                lr_scheduler_type="linear",
+                warmup_steps=1,
+            )
+            trained[run] = torch.cat(
+                [p.detach().reshape(-1) for p in model.parameters()]
+            )
+            modes[run] = model.training
+        for run in ("cached", "looped"):
+            assert torch.equal(trained[run], trained["memory"]), (
+                f"{run}: max diff {(trained[run] - trained['memory']).abs().max():.2e}"
+            )
+        assert modes["looped"] == modes["cached"]
+
+    @pytest.mark.parametrize("residency", ["memory", "tiered", "disk"])
+    def test_stores_reject_the_per_step_query(self, tmp_path, residency):
+        task, train_ds, test_ds = _make_task_and_data()
+        with pytest.raises(ValueError, match="gradient_cache_residency=None"):
+            TracInAttributor(_args(tmp_path), task=task).attribute(
+                train_ds,
+                test_ds,
+                enable_update=True,
+                loop_over_test=True,
+                gradient_cache_residency=residency,
+            )
+
+    def test_holding_updates_needs_a_streamer(self, tmp_path):
+        class Proxy:  # a train source that cannot hold its updates
+            def __init__(self, inner) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        class ProxiedTracIn(TracInAttributor):
+            def generate_train_rep(self, *args, **kwargs):
+                return Proxy(super().generate_train_rep(*args, **kwargs))
+
+        task, train_ds, test_ds = _make_task_and_data()
+        with pytest.raises(TypeError, match="GradientStreamer"):
+            ProxiedTracIn(_args(tmp_path), task=task).attribute(
+                train_ds, test_ds, enable_update=True, loop_over_test=True
+            )
+
+
+class TestAsyncDiskWrite:
+    def test_async_cache_scores_match_sync(self, tmp_path):
+        """``async_disk_write=True`` is a performance-only knob: the cached
+        store and the scores computed from it must match a synchronous run.
+        """
+        task, train_ds, test_ds = _make_task_and_data()
+
+        def run(out_dir, async_write):
+            args = _args(out_dir)
+            args.async_disk_write = async_write
+            attr = TracInAttributor(args, task=task)
+            ((train_dir, test_dir),) = attr.cache(train_ds, test_ds)
+            return attr.attribute_from_cache(
+                train_source=train_dir,
+                test_source=test_dir,
+            )
+
+        sync_res = run(tmp_path / "sync", async_write=False)
+        async_res = run(tmp_path / "async", async_write=True)
+
+        ids_s, m_s = sync_res.agnostic_matrix()
+        ids_a, m_a = async_res.agnostic_matrix()
+        assert ids_s == ids_a
+        assert sync_res.test_ids == async_res.test_ids
+        assert torch.equal(m_s, m_a), f"max diff {(m_s - m_a).abs().max():.2e}"
+
+
+class TestCachedGradientsMatchLive:
+    """gradient_cache_residency={memory,tiered,disk} (collect the raw
+    representations once into a store, then replay the Fisher sweeps) must
+    score identically to the default re-streaming path.
+    """
+
+    @pytest.mark.parametrize("attr_cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "tiered", "disk"])
+    @pytest.mark.parametrize("loop_over_test", [False, True])
+    def test_cached_matches_restreamed(
+        self,
+        tmp_path,
+        attr_cls,
+        residency,
+        loop_over_test,
+    ):
+        task, train_ds, test_ds = _make_task_and_data()
+
+        # loop_over_test=True re-streams the test set per train block; the cached
+        # run then caches the preconditioned test reps in the same residency, so
+        # this also covers the residency-managed preconditioned store.
+        live = attr_cls(_args(tmp_path / "live"), task=task).attribute(
+            train_ds,
+            test_ds,
+            damping=1e-3,
+            loop_over_test=loop_over_test,
+        )
+        cached = attr_cls(_args(tmp_path / "cached"), task=task).attribute(
+            train_ds,
+            test_ds,
+            damping=1e-3,
+            gradient_cache_residency=residency,
+            loop_over_test=loop_over_test,
+        )
+
+        ids_live, m_live = live.agnostic_matrix()
+        ids_cached, m_cached = cached.agnostic_matrix()
+        assert ids_live == ids_cached
+        assert live.test_ids == cached.test_ids
+        # loop_over_test=True caches *materialized* preconditioned test reps,
+        # so KFAC's whiten-then-materialize adds float32 round-off vs the live
+        # factor-domain contraction (EKFAC is already materialized -> exact).
+        # loop=False stays in the factor domain and is bit-close.
+        atol, rtol = (1e-4, 1e-3) if loop_over_test else (1e-5, 1e-5)
+        assert torch.allclose(m_live, m_cached, atol=atol, rtol=rtol), (
+            f"max diff {(m_live - m_cached).abs().max():.2e}"
+        )
+
+
+class TestDVEmbResidencyMatchesDisk:
+    """DVEmb attribute() must score identically regardless of where the raw
+    representations are stored (disk vs memory vs tiered) -- residency only
+    relocates the trajectory store, never the sweep math.
+    """
+
+    @pytest.mark.parametrize("residency", ["memory", "tiered"])
+    def test_residency_matches_disk(self, tmp_path, residency):
+        # DVEmb collects an *updating* trajectory (enable_update=True) that
+        # mutates the model in place, and its dataloader shuffle consumes global
+        # RNG.  So each run needs a fresh task (model reset to init) and the same
+        # seed, otherwise the two runs descend different trajectories.  With the
+        # trajectory pinned, residency only relocates the store: scores are
+        # bit-identical.
+        task, train_ds, test_ds = _make_task_and_data()
+        torch.manual_seed(SEED)
+        disk = DVEmbAttributor(_args(tmp_path / "disk"), task=task).attribute(
+            train_ds,
+            test_ds,
+            gradient_cache_residency="disk",
+            learning_rate=0.01,
+        )
+        task, train_ds, test_ds = _make_task_and_data()
+        torch.manual_seed(SEED)
+        ram = DVEmbAttributor(_args(tmp_path / "ram"), task=task).attribute(
+            train_ds,
+            test_ds,
+            gradient_cache_residency=residency,
+            learning_rate=0.01,
+        )
+        ids_d, m_d = disk.agnostic_matrix()
+        ids_r, m_r = ram.agnostic_matrix()
+        assert ids_d == ids_r
+        assert disk.test_ids == ram.test_ids
+        assert torch.equal(m_d, m_r), f"max diff {(m_d - m_r).abs().max():.2e}"
+
+
+class TestCollectToDiskOnBlock:
+    """collect_gradients's on_block hook is the OTF covariance path: accumulating
+    K-FAC covariances off the streamed blocks (no callback, no re-pass) must
+    reproduce KFACAttributor.fit's covariances over the resulting store.
+    """
+
+    def _streamer(self, attr, train_ds):
+        from dattri_llm.gradient.streaming import GradientStreamer
+
+        attr.task.load_checkpoint(0)
+        return GradientStreamer(
+            attr.task.model,
+            train_ds,
+            attr.args,
+            batch_size=attr.args.per_device_train_batch_size,
+            loss_fn=attr.task.loss_func,
+        )
+
+    def test_on_block_covariance_matches_fit(self, tmp_path):
+        from dattri_llm.attribution.utils import collect_gradients
+        from dattri_llm.gradient.ops import KroneckerAccumulator
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import DiskGradientSource
+
+        task, train_ds, _ = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path / "o"), task=task)
+
+        fm = GradientStorageManager(str(tmp_path / "store"))
+        kron = KroneckerAccumulator()
+        n_blocks = 0
+
+        def on_block(_step, grad, _hashes):
+            nonlocal n_blocks
+            n_blocks += 1
+            kron.update(grad, attr.kfac_layers(grad))
+
+        collect_gradients(self._streamer(attr, train_ds), fm, on_block=on_block)
+        otf = kron.result()
+        assert n_blocks > 0
+
+        # Re-pass fit over the store the same collection just wrote.
+        raw_ctx, _ = attr.fit_raw(DiskGradientSource(fm, attr.args))
+        assert set(otf) == set(raw_ctx)
+        for layer in raw_ctx:
+            a_o, g_o = otf[layer]
+            a_f, g_f = raw_ctx[layer]
+            assert torch.allclose(a_o, a_f, atol=1e-5), f"A {layer}"
+            assert torch.allclose(g_o, g_f, atol=1e-5), f"G {layer}"
+
+    def test_on_block_none_is_a_noop(self, tmp_path):
+        from dattri_llm.attribution.utils import collect_gradients
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+
+        task, train_ds, _ = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path / "o"), task=task)
+        fm = GradientStorageManager(str(tmp_path / "store"))
+        collect_gradients(self._streamer(attr, train_ds), fm)  # no on_block
+        assert fm.index  # still collected the store
+
+
+class TestCompactKFAC:
+    """K-FAC over a materialized "logra" (compact) store, preconditioned by the
+    projected (A, G) collected at capture, must match K-FAC over a
+    factorized logra store of the same projected gradients -- the logix-style
+    compact path.
+    """
+
+    PROJ = 4
+    DAMP = 1e-3
+
+    def _proj(self, style, capture_style="factorized"):
+        from dattri_llm.gradient.hooks import REGISTER_ALL, HookManagerConfig
+
+        return HookManagerConfig(
+            linear_io=REGISTER_ALL,
+            capture_style=capture_style,
+            projection_kwargs={
+                "__default__": {
+                    "style": style,
+                    "proj_dim": self.PROJ,
+                    "proj_max_batch_size": 32,
+                    "proj_type": "rademacher",
+                    "proj_seed": 0,
+                },
+            },
+        )
+
+    def _collect(self, attr, ds, out, style, capture_style="factorized", cov=None):
+        from dattri_llm.attribution.utils import collect_gradients
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import GradientStreamer
+
+        attr.task.load_checkpoint(0)
+        streamer = GradientStreamer(
+            attr.task.model,
+            ds,
+            attr.args,
+            batch_size=attr.args.per_device_train_batch_size,
+            loss_fn=attr.task.loss_func,
+            config=self._proj(style, capture_style),
+        )
+        if cov is not None:
+            streamer.hook_manager.add_callback(cov)
+        fm = GradientStorageManager(str(out))
+        collect_gradients(streamer, fm)
+        return str(out)
+
+    def test_compact_matches_factorized(self, tmp_path):
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        # -- factorized reference: fit covariances in a re-pass --
+        task, tr, te = _make_task_and_data()
+        attr_f = KFACAttributor(_args(tmp_path / "f"), task=task)
+        train_f = self._collect(attr_f, tr, tmp_path / "tr_f", "logra")
+        test_f = self._collect(attr_f, te, tmp_path / "te_f", "logra")
+        ids_f, s_fac = attr_f.attribute_from_cache(
+            train_f,
+            test_f,
+            damping=self.DAMP,
+        ).agnostic_matrix()
+
+        # -- compact: covariances collected at capture, scored two-sided --
+        task, tr, te = _make_task_and_data()
+        attr_m = KFACAttributor(_args(tmp_path / "m"), task=task)
+        cov = KroneckerCovarianceCallback()
+        train_m = self._collect(
+            attr_m,
+            tr,
+            tmp_path / "tr_m",
+            "logra",
+            "materialized",
+            cov=cov,
+        )
+        test_m = self._collect(attr_m, te, tmp_path / "te_m", "logra", "materialized")
+        fisher = attr_m.save_fisher(cov.result(), str(tmp_path / "fisher"))
+        ids_m, s_mat = attr_m.attribute_from_cache(
+            train_m,
+            test_m,
+            damping=self.DAMP,
+            fisher_dir=fisher,
+        ).agnostic_matrix()
+
+        assert ids_f == ids_m
+        assert torch.allclose(s_fac, s_mat, atol=1e-4, rtol=1e-3), (
+            f"max diff {(s_fac - s_mat).abs().max():.2e}"
+        )
+
+
+class TestCompactEKFAC(TestCompactKFAC):
+    """EK-FAC over a materialized "logra" store: the eigenbases come from the
+    projected (A, G) collected at capture (``fit(covariances=...)``), the
+    corrected spectrum from one sweep over the compact store.  Must match
+    EK-FAC over a factorized logra store of the same projected gradients.
+    """
+
+    def test_compact_matches_factorized(self, tmp_path):
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        # -- factorized reference: two sweeps over the per-token factors --
+        task, tr, te = _make_task_and_data()
+        attr_f = EKFACAttributor(_args(tmp_path / "f"), task=task)
+        train_f = self._collect(attr_f, tr, tmp_path / "tr_f", "logra")
+        test_f = self._collect(attr_f, te, tmp_path / "te_f", "logra")
+        ids_f, s_fac = attr_f.attribute_from_cache(
+            train_f,
+            test_f,
+            damping=self.DAMP,
+        ).agnostic_matrix()
+
+        # -- compact: covariances at capture, spectrum from the dense store --
+        task, tr, te = _make_task_and_data()
+        attr_m = EKFACAttributor(_args(tmp_path / "m"), task=task)
+        cov = KroneckerCovarianceCallback()
+        train_m = self._collect(
+            attr_m,
+            tr,
+            tmp_path / "tr_m",
+            "logra",
+            "materialized",
+            cov=cov,
+        )
+        test_m = self._collect(attr_m, te, tmp_path / "te_m", "logra", "materialized")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # no "stored materialized" fallback
+            fisher = attr_m.fit(
+                train_m, str(tmp_path / "fisher"), covariances=cov.result()
+            )
+        ids_m, s_mat = attr_m.attribute_from_cache(
+            train_m,
+            test_m,
+            damping=self.DAMP,
+            fisher_dir=fisher,
+        ).agnostic_matrix()
+
+        assert ids_f == ids_m
+        assert torch.allclose(s_fac, s_mat, atol=1e-4, rtol=1e-3), (
+            f"max diff {(s_fac - s_mat).abs().max():.2e}"
+        )
+
+    def test_supplied_covariances_must_cover_the_store(self, tmp_path):
+        # Supplied covariances replace the covariance sweep, so a factorized
+        # layer they leave out has no eigenbasis: an error, not a silent drop.
+        # (A materialized layer they leave out keeps the documented
+        # dense-Fisher fallback of ``kfac_layers``.)
+        from dattri_llm.gradient.callbacks import KroneckerCovarianceCallback
+
+        task, tr, _te = _make_task_and_data()
+        attr = EKFACAttributor(_args(tmp_path / "m"), task=task)
+        cov = KroneckerCovarianceCallback()
+        train = self._collect(attr, tr, tmp_path / "tr", "logra", cov=cov)
+        partial = dict(list(cov.result().items())[:1])
+        with pytest.raises(ValueError, match="must cover every K-FAC-eligible"):
+            attr.fit(train, str(tmp_path / "fisher"), covariances=partial)
+
+
+class TestCovariancesAtCapture:
+    """``covariances_at_capture`` (the default): the pass that collects the
+    train gradients into a store also accumulates the Kronecker covariances,
+    so the one-call workflows score a compact (materialized "logra") store and
+    match a fit swept from the stored factors.
+    """
+
+    DAMP = 1e-3
+
+    @staticmethod
+    def _config(capture_style):
+        return TestCompactKFAC()._proj("logra", capture_style)  # noqa: SLF001
+
+    def _attribute(self, cls, out, capture_style, residency, *, at_capture):
+        task, tr, te = _make_task_and_data()
+        attr = cls(_args(out), task=task)
+        return attr.attribute(
+            tr,
+            te,
+            hook_config=self._config(capture_style),
+            gradient_cache_residency=residency,
+            damping=self.DAMP,
+            covariances_at_capture=at_capture,
+        ).agnostic_matrix()
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "disk"])
+    def test_attribute_matches_swept_fit(self, cls, residency, tmp_path):
+        ids_ref, ref = self._attribute(
+            cls, tmp_path / "ref", "factorized", residency, at_capture=False
+        )
+        for capture_style in ("factorized", "materialized"):
+            with warnings.catch_warnings():
+                # the compact store must be K-FAC-preconditioned, not diverted
+                warnings.filterwarnings("error", message=".*stored materialized.*")
+                ids, got = self._attribute(
+                    cls,
+                    tmp_path / capture_style,
+                    capture_style,
+                    residency,
+                    at_capture=True,
+                )
+            assert ids == ids_ref
+            assert torch.allclose(ref, got, atol=1e-4, rtol=1e-3), (
+                f"{capture_style}: max diff {(ref - got).abs().max():.2e}"
+            )
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_cache_persists_covariances(self, cls, tmp_path):
+        """``cache`` saves them next to the train store; a fresh attributor's
+        ``attribute_from_cache`` finds them there.
+        """
+        ids_ref, ref = self._attribute(
+            cls, tmp_path / "ref", "factorized", "disk", at_capture=False
+        )
+        task, tr, te = _make_task_and_data()
+        pairs = cls(_args(tmp_path / "c"), task=task).cache(
+            tr, te, hook_config=self._config("materialized")
+        )
+        ((train_dir, test_dir),) = pairs
+        task, _, _ = _make_task_and_data()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*stored materialized.*")
+            ids, got = (
+                cls(_args(tmp_path / "s"), task=task)
+                .attribute_from_cache(train_dir, test_dir, damping=self.DAMP)
+                .agnostic_matrix()
+            )
+        assert ids == ids_ref
+        assert torch.allclose(ref, got, atol=1e-4, rtol=1e-3)
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "disk"])
+    def test_off_fits_from_the_store(self, cls, residency, tmp_path):
+        """With the option off nothing is collected: a compact store falls back
+        to the direct Fisher, with its warning.  The disk path collects
+        through ``cache``, which keeps the call's setting.
+        """
+        with pytest.warns(UserWarning, match="stored materialized"):
+            self._attribute(cls, tmp_path, "materialized", residency, at_capture=False)
+
+    def test_cache_without_covariances(self, tmp_path):
+        task, tr, te = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path), task=task)
+        ((train_dir, _test_dir),) = attr.cache(
+            tr,
+            te,
+            hook_config=self._config("factorized"),
+            covariances_at_capture=False,
+        )
+        assert attr._covariances_for(attr.load_train_rep(train_dir)) is None  # noqa: SLF001
+
+    def test_step_filter_refits(self, tmp_path):
+        """A step filter changes the fit, so collected covariances are not used."""
+        task, tr, te = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path), task=task)
+        ((train_dir, _test_dir),) = attr.cache(
+            tr, te, hook_config=self._config("factorized")
+        )
+        from types import SimpleNamespace
+
+        train = attr.load_train_rep(train_dir)
+        assert attr._covariances_for(train) is not None  # noqa: SLF001
+        subset = SimpleNamespace(file_manager=train.file_manager, steps=[])
+        assert attr._covariances_for(subset) is None  # noqa: SLF001
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    def test_layer_filter_restricts_covariances(self, cls, tmp_path):
+        """With ``layer_name`` only the scored layers' collected covariances
+        are used, so the fit matches one swept from those layers alone.
+        """
+        scores = {}
+        for at_capture in (False, True):
+            task, tr, te = _make_task_and_data()
+            attr = cls(_args(tmp_path / str(at_capture)), task=task)
+            ((train_dir, test_dir),) = attr.cache(
+                tr,
+                te,
+                hook_config=self._config("factorized"),
+                covariances_at_capture=at_capture,
+            )
+            scores[at_capture] = attr.attribute_from_cache(
+                train_dir, test_dir, layer_name="mlp.fc1", damping=self.DAMP
+            ).agnostic_matrix()
+        (ids_ref, ref), (ids, got) = scores[False], scores[True]
+        assert ids == ids_ref
+        assert torch.allclose(ref, got, atol=1e-4, rtol=1e-3)
+
+    def test_layer_filter_without_collected_layers(self, tmp_path):
+        """A layer filter no collected covariance matches sweeps the fit."""
+        task, tr, te = _make_task_and_data()
+        attr = KFACAttributor(_args(tmp_path), task=task)
+        ((train_dir, _test_dir),) = attr.cache(
+            tr, te, hook_config=self._config("factorized")
+        )
+        from types import SimpleNamespace
+
+        train = attr.load_train_rep(train_dir)
+        other = SimpleNamespace(
+            file_manager=train.file_manager, steps=train.steps, layer_name=["other"]
+        )
+        assert attr._covariances_for(other) is None  # noqa: SLF001
+
+
+class TestFactorCacheResidency:
+    """``factor_cache_residency``: the fitted factors held off the device, in a
+    cache of any residency, score the same as factors kept on the device.
+    """
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", ["memory", "tiered", "disk"])
+    def test_scores_match_on_device_factors(self, cls, residency, tmp_path):
+        def scores(out, factor_cache_residency):
+            task, tr, te = _make_task_and_data()
+            attr = cls(_args(out), task=task)
+            return attr.attribute(
+                tr, te, damping=1e-3, factor_cache_residency=factor_cache_residency
+            ).agnostic_matrix()
+
+        ids_ref, ref = scores(tmp_path / "ref", None)
+        ids, got = scores(tmp_path / residency, residency)
+        assert ids == ids_ref
+        assert torch.allclose(ref, got, atol=1e-5, rtol=1e-4)
+
+
+class TestLiveFisherDir:
+    """``attribute(fisher_dir=...)``: the first live call persists its fit and
+    later calls over the same training set load it.
+    """
+
+    @pytest.mark.parametrize("cls", [KFACAttributor, EKFACAttributor])
+    @pytest.mark.parametrize("residency", [None, "memory"])
+    def test_later_calls_reuse_the_fit(self, cls, residency, tmp_path):
+        task, tr, te = _make_task_and_data()
+        fisher = str(tmp_path / "fisher")
+        kwargs = {"damping": 1e-3, "gradient_cache_residency": residency}
+
+        ids_ref, ref = (
+            cls(_args(tmp_path / "ref"), task=task)
+            .attribute(tr, te, **kwargs)
+            .agnostic_matrix()
+        )
+        attr = cls(_args(tmp_path / "run"), task=task)
+        ids_a, first = attr.attribute(
+            tr, te, fisher_dir=fisher, **kwargs
+        ).agnostic_matrix()
+        attr.fit_raw = None  # a refit would fail
+        attr.load_fisher = None  # and so would reading the file again
+        ids_b, second = attr.attribute(
+            tr, te, fisher_dir=fisher, **kwargs
+        ).agnostic_matrix()
+        fresh = cls(_args(tmp_path / "fresh"), task=task)  # reads the file
+        fresh.fit_raw = None
+        ids_c, third = fresh.attribute(
+            tr, te, fisher_dir=fisher, **kwargs
+        ).agnostic_matrix()
+
+        assert ids_a == ids_b == ids_c == ids_ref
+        assert torch.equal(ref, first)
+        assert torch.equal(first, second)
+        assert torch.allclose(first, third, atol=1e-6, rtol=1e-5)
+
+    @pytest.mark.parametrize("factor_cache_residency", [None, "memory", "disk"])
+    def test_reuse_with_cached_factors(self, factor_cache_residency, tmp_path):
+        task, tr, te = _make_task_and_data()
+        attr = EKFACAttributor(_args(tmp_path / "run"), task=task)
+        kwargs = {
+            "fisher_dir": str(tmp_path / "fisher"),
+            "factor_cache_residency": factor_cache_residency,
+        }
+        _, first = attr.attribute(tr, te, damping=1e-3, **kwargs).agnostic_matrix()
+        _, other = attr.attribute(tr, te, damping=1e-1, **kwargs).agnostic_matrix()
+        _, again = attr.attribute(tr, te, damping=1e-3, **kwargs).agnostic_matrix()
+        assert not torch.allclose(first, other)
+        assert torch.equal(first, again)
+
+
+class TestBatchedScoring:
+    """score_sources always re-batches the train side into
+    ``per_device_train_batch_size`` groups; the batch size only affects
+    speed/memory, so scores must be bit-identical for every value.
+    """
+
+    @staticmethod
+    def _materialized_store(out, n_blocks, per_block, hash_prefix, d=12):
+        from dattri_llm.gradient.gradient import Gradient, GradientRecord
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+
+        fm = GradientStorageManager(str(out))
+        for s in range(n_blocks):
+            g = Gradient(
+                representation={"L0": "materialized", "L1": "materialized"},
+                data={"L0": torch.randn(per_block, d), "L1": torch.randn(per_block, d)},
+                layer_types={"L0": "nn.Linear", "L1": "nn.Linear"},
+            )
+            hashes = [f"{hash_prefix}{s}_{i}" for i in range(per_block)]
+            fm.save_bulk([GradientRecord(step=s, input_hash=hashes, gradient=g)])
+        return str(out)
+
+    def test_batch_size_invariant(self, tmp_path):
+        from dattri_llm.attribution.utils import score_sources
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import DiskGradientSource
+
+        torch.manual_seed(0)
+        train_dir = self._materialized_store(tmp_path / "tr", 4, 3, "t")  # 12 docs
+        test_dir = self._materialized_store(tmp_path / "te", 2, 2, "q")
+
+        def inner_product(train_g, test_g, *, dense_cache=None):
+            total = None
+            for name in train_g.data:
+                b = train_g.data[name].float() @ test_g.data[name].float().T
+                total = b if total is None else total + b
+            return total
+
+        def run(batch):
+            args = _args(tmp_path / "o")
+            train = DiskGradientSource(GradientStorageManager(train_dir), args)
+            test = DiskGradientSource(GradientStorageManager(test_dir), args)
+            return score_sources(
+                train,
+                test,
+                args.device,
+                inner_product=inner_product,
+                batch_size=batch,  # the scoring batch
+            )
+
+        s1, ids1, steps1, tids1, _ = run(1)  # one stored (3-doc) block per batch
+        s5, ids5, steps5, _, _ = run(5)  # 5-doc batches (regroups 3-doc blocks)
+        sn, idsn, stepsn, tidsn, _ = run(100)  # whole 12-doc store as one batch
+        assert (ids1, steps1, tids1) == (idsn, stepsn, tidsn)
+        assert (ids1, steps1) == (ids5, steps5)
+
+        torch.testing.assert_close(s1, s5)
+        torch.testing.assert_close(s1, sn)
+
+    def test_factorized_scored_per_block(self, tmp_path):
+        # A factorized store can't be stacked into a dense (B, D) batch;
+        # score_sources scores it one block at a time (no crash, right row count).
+        from dattri_llm.attribution.utils import score_sources
+        from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+        from dattri_llm.gradient.storage_manager import GradientStorageManager
+        from dattri_llm.gradient.streaming import DiskGradientSource
+
+        torch.manual_seed(0)
+        fm = GradientStorageManager(str(tmp_path / "fac"))
+        for s in range(3):
+            g = Gradient(
+                representation={"L0": "factorized"},
+                data={"L0": Factorized(torch.randn(2, 4, 5), torch.randn(2, 4, 5))},
+                layer_types={"L0": "nn.Linear"},
+                validate_on_init=False,
+            )
+            fm.save_bulk(
+                [GradientRecord(step=s, input_hash=[f"t{s}_0", f"t{s}_1"], gradient=g)],
+            )
+        args = _args(tmp_path / "o")
+        train = DiskGradientSource(GradientStorageManager(str(tmp_path / "fac")), args)
+        test = DiskGradientSource(GradientStorageManager(str(tmp_path / "fac")), args)
+        scores, ids, _steps, _tids, _ = score_sources(
+            train,
+            test,
+            args.device,
+            inner_product=lambda t, r, dense_cache=None: torch.zeros(2, r.batch_size),
+        )
+        assert scores.shape[0] == len(ids) == 6

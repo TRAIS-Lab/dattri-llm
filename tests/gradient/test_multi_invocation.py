@@ -12,9 +12,8 @@ Regimes pinned here:
   one backward comes.  The backward LIFO-matches the recomputed capture (the
   tensors the graph actually used) and the stale original is discarded at
   backward end -- records come out identical to an uncheckpointed run.
-* **Gradient checkpointing, ``use_reentrant=True``** (legacy): the first pass
-  runs under ``no_grad`` and is never captured; only the recomputation is.
-  Already worked; pinned so it stays working.
+* **Gradient checkpointing, ``use_reentrant=True``**: the first pass runs
+  under ``no_grad`` and is never captured; only the recomputation is.
 * **Custom module reuse** (one layer invoked twice per step): each invocation
   is recorded as an independent virtual layer ``name`` / ``name@2`` with its
   own exactly-paired (a, g).
@@ -250,7 +249,11 @@ class TestUnbackwardedForwards:
     def test_detached_branch_does_not_stall(self):
         gen = torch.Generator().manual_seed(5)
         batches = [torch.randn(B, IN_DIM, generator=gen) for _ in range(2)]
-        rec = _collect(DetachedBranchModel(), batches)
+        # The layer no gradient reaches is left out of the record, and said
+        # so once (not once per step).
+        with pytest.warns(UserWarning, match="received no gradient") as caught:
+            rec = _collect(DetachedBranchModel(), batches)
+        assert sum("received no gradient" in str(w.message) for w in caught) == 1
         assert [r.step for r in rec.records] == [0, 1]
         for r in rec.records:
             assert r.gradient.layer_names == {"used"}

@@ -9,7 +9,7 @@ and cached paths are interchangeable.
 Stage 1 collects per-sample gradients to disk: a `HookManager` with factorized
 (`linear_io`) hooks captures one full-batch backward (a **sum** loss, so each captured gradient is
 that sample's own `dL_i/dW`) and an `OffloadCallback` persists per-sample records
-via `GradientFileManager`. Stage 2 attributes from the cache alone —
+via `GradientStorageManager`. Stage 2 attributes from the cache alone —
 `TracInAttributor.attribute_from_cache(train_dir, test_dir)` needs no model and no
 backward pass, so it can be re-run with different settings (layer subsets,
 `normalized_grad=True` for GradCos) for free. Rows/columns are keyed by content
@@ -21,12 +21,50 @@ python examples/attribution/attribution_from_disk.py
 
 ## `attribution_on_the_fly.py` — one-call live attribution (workflow 1)
 
-The attribution target is described with a `dattri` `AttributionTask`
-(functorch-style loss + checkpoint list); `TracInAttributor.attribute(train_ds,
+The attribution target is described with an `AttributionTask` (a
+`(model, batch) -> loss` function on the live model, plus the checkpoints to
+score at; the model's current weights by default); `TracInAttributor.attribute(train_ds,
 test_ds)` then streams the gradients live and scores them in one call — nothing is
 persisted. The full `(num_train, num_test)` matrix is read back with
 `score.agnostic_matrix()`.
 
 ```bash
 python examples/attribution/attribution_on_the_fly.py
+```
+
+## `token_attribution.py` — token-level attribution
+
+The factorized gradient keeps the token axis, so a training text's score
+against a query decomposes exactly over the training text's token positions —
+for every inner-product attributor, since each score is bilinear in the
+training gradient. Passing `attribution_granularity="token"` to `attribute`
+(or `attribute_from_cache`) returns one score row per training token
+position instead of one per training text; `score.token_scores(train_hash)`
+reads a text's positions back, and the instance-level accessors
+(`agnostic_matrix`, ...) of such a score sum the positions, so they give the
+ordinary scores. The example runs TracIn (GradDot) and K-FAC on tiny GPT-2
+against one query and prints each training text as a heatmap in the
+terminal: red tokens push the query's loss down, blue tokens push it up.
+
+```bash
+python examples/attribution/token_attribution.py
+```
+
+## `method_tour.py` — every other attributor
+
+One toy MLP and dataset, scored by each attributor beyond TracIn through the
+one-call `attribute(...)`: `KFACAttributor` and `EKFACAttributor` at the
+model's current weights (`damping=1e-3`), and the three trajectory methods,
+whose `attribute(...)` trains the model for one epoch while it captures —
+`LESSAttributor` (`enable_update=True`), `DVEmbAttributor` (`learning_rate=`
+matching the run's constant schedule) and `AdamWInfluenceAttributor` (from the
+recorded optimizer moments). The optimizer settings come from `AttributionArguments`
+(`learning_rate`, `weight_decay`, `lr_scheduler_type`, ...). Each method
+starts from a freshly built model and prints the most influential training
+sample per test sample. The README's "Capture requirements" table lists what
+each method needs when you capture from your own loop and score with
+`attribute_from_cache(...)` instead.
+
+```bash
+python examples/attribution/method_tour.py
 ```

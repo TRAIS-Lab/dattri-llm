@@ -11,10 +11,15 @@ from torch import nn
 
 from dattri_llm.gradient.hooks.hooks import (
     _has_trainable_params,
+    _is_invasive_capable,
     _is_linear_io_capable,
     remove_hooks,
 )
-from dattri_llm.gradient.ops import ALL_LAYER_TYPES, canonical_class_name
+from dattri_llm.gradient.ops import (
+    ALL_LAYER_TYPES,
+    canonical_class_name,
+)
+from dattri_llm.options import CaptureStyle
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -69,9 +74,13 @@ Selector = _RegisterAll | list[str] | None
 # Hook-family names and the layer_types marker used for materialized grads.
 LINEAR_IO = "linear_io"
 PARAM_GRAD = "param_grad"
+# Like ``linear_io`` but replaces the layer's forward so the weight-gradient
+# matmul is skipped (nn.Linear only).  Produces no ``weight.grad`` -- capture
+# only; see :func:`~dattri_llm.gradient.hooks.hooks.install_invasive_forward`.
+INVASIVE_LINEAR_IO = "invasive_linear_io"
 
 
-_VALID_HOOK_TYPES = frozenset({LINEAR_IO, PARAM_GRAD})
+_VALID_HOOK_TYPES = frozenset({LINEAR_IO, PARAM_GRAD, INVASIVE_LINEAR_IO})
 
 
 class HookManagerConfig:
@@ -169,32 +178,74 @@ class HookManagerConfig:
             }},
         )
 
-    **Per-layer projection** -- :attr:`projection` enables capture-time random
-    projection: instead of buffering a layer's raw factors, each backward pass
-    projects them down to ``proj_dim`` on the training device, and only the
-    small projected result is kept (on CPU).  It maps a layer name -- or
-    ``"__default__"``, covering every hooked layer without its own entry -- to
-    that layer's ``proj_kwargs`` dict.  A layer with neither an entry nor a
-    ``"__default__"`` is captured raw (unprojected), so mixed configs are
-    fine.  :attr:`projector` is the projection factory, following dattri's
-    ``random_project`` protocol; ``None`` (the default) lazily imports
-    dattri's ``random_project``.
+    **Capture style** -- :attr:`capture_style` decides the representation a
+    layer's per-sample gradient is buffered in wherever there is a choice:
+
+    * ``"factorized"`` (default) -- keep the factors ``(a, g)`` (raw, or
+      projected under ``"logra"``).
+    * ``"materialized"`` -- contract them into the dense per-sample gradient
+      (or its projected counterpart) in the backward hook, so the factors are
+      released at once.
+    * ``"auto"`` -- per layer and micro-batch, the cheaper of the two by the
+      cost rule of :func:`~dattri_llm.gradient.ops.should_materialize`: the
+      factors cost ``T (N_i + N_o)`` values per sample and the dense gradient
+      ``N_i N_o`` (projected widths for a ``"logra"`` layer).
+
+    A layer projected with ``"dense"`` or ``"mask"`` is dense by construction,
+    whatever the capture style.  A layer's representation is fixed by its
+    first micro-batch of a step, so accumulation windows never mix the two.
+
+    **Frozen layers** -- by default a ``linear_io`` layer whose parameters do
+    not require grad is not hooked: its gradient is not part of the training
+    signal (the frozen base of a LoRA model, say).  ``include_frozen=True``
+    hooks such layers too.  A layer's per-sample weight gradient is defined
+    by its input activation and output gradient whether or not autograd is
+    asked for ``weight.grad``, so a *probe* can freeze the whole model (keeping
+    one input-side parameter trainable, e.g. the embedding, so gradients still
+    flow through the activations) and capture exactly the factors it would
+    capture unfrozen -- while autograd computes and stores no weight
+    gradient at all.  Under FSDP that is what keeps the sharded gradients
+    (one more copy of the model across the cards) from being allocated.
+
+    **Per-layer projection** -- :attr:`projection_kwargs` enables
+    capture-time random projection: instead of buffering a layer's raw
+    factors, each backward pass projects them down to ``proj_dim`` on the
+    training device, and only the small projected result is kept.  It maps a
+    layer name -- or ``"__default__"``, covering every hooked layer without
+    its own entry -- to that layer's ``proj_kwargs`` dict.  A layer with
+    neither an entry nor a ``"__default__"`` is captured unprojected, so
+    mixed configs are fine.  :attr:`projector` is the projection factory,
+    following dattri's ``random_project`` protocol; ``None`` (the default)
+    lazily imports dattri's ``random_project``.
 
     Keys consumed by the library:
 
     * ``proj_dim`` (int, **required**) -- target width of the projection.
-    * ``factorize`` (bool, default ``True``) -- ``True`` projects the two
-      factors independently (LoGRA style): the layer stays *factorized* at
-      width ``proj_dim`` and is relabelled ``"nn.Linear"``.  This is defined
-      for outer-product gradients: the linear / conv families, and the
-      embedding family (whose integer ids are expanded to one-hot inputs
-      first).  **Norm layers must use** ``factorize=False`` (TRAK style:
-      materialize the per-sample weight gradient, then project it to a dense
-      ``(B, proj_dim)`` block).
-    * ``proj_seed`` (int, default ``0``) -- base seed.  Factorized projection
-      uses ``proj_seed`` for the output-gradient factor and ``proj_seed + 1``
-      for the activation factor (dattri's LoGRA convention).  Keep it fixed
-      per layer so gradients captured at different steps stay comparable.
+    * ``style`` (str, default ``"logra"``) -- how the layer is projected, i.e.
+      in which order projection and materialization happen:
+
+      * ``"logra"`` -- project the two factors independently (double-sided,
+        a Kronecker projection of the gradient); the layer is relabelled
+        ``"nn.Linear"`` at width ``proj_dim`` and its representation follows
+        :attr:`capture_style`.
+      * ``"dense"`` -- materialize the per-sample weight gradient first,
+        then project it with one matrix (single-sided) to a dense
+        ``(B, proj_dim)`` block.
+      * ``"mask"`` -- keep ``proj_dim`` fixed random coordinates of the
+        per-sample weight gradient (drawn once from ``proj_seed``), gathered
+        straight from the factors without materializing; a dense
+        ``(B, proj_dim)`` block whose entries are exact.  Takes only
+        ``proj_dim``, ``proj_seed``, ``include_bias`` and ``device`` -- there
+        is no projector, so ``proj_type`` and the like are rejected.
+
+      ``"logra"`` is defined for outer-product gradients: the linear / conv
+      families, and the embedding family (whose integer ids are expanded to
+      one-hot inputs first).  **Norm layers must use** ``"dense"`` or
+      ``"mask"`` (their gradient is not an outer product).
+    * ``proj_seed`` (int, default ``0``) -- base seed.  ``"logra"`` uses
+      ``proj_seed`` for the output-gradient factor and ``proj_seed + 1`` for
+      the activation factor (dattri's LoGRA convention).  Keep it fixed per
+      layer so gradients captured at different steps stay comparable.
     * ``device`` -- where the projection runs.  The factors are moved to this
       device before projecting (dattri builds a device-specific projector for
       it); the small projected result is then buffered to CPU as usual.
@@ -216,22 +267,23 @@ class HookManagerConfig:
 
     Example -- LoGRA projection on a GPT-2-style model.  The regexes hook the
     attention/MLP linears plus the token embedding; both fall through to
-    ``"__default__"`` (embeddings project factorized too, via one-hot inputs),
-    while a per-layer entry demonstrates overriding one layer to the
-    materialize-then-project (TRAK) style::
+    ``"__default__"`` (embeddings project double-sided too, via one-hot
+    inputs), while a per-layer entry overrides one layer to the
+    materialize-then-project style::
 
         HookManagerConfig(
             linear_io=[r"transformer\.h\.\d+\.(attn|mlp)\.", r"wte$"],
-            projection={
-                "__default__": {          # project both factors (LoGRA)
-                    "factorize": True,
+            capture_style="auto",
+            projection_kwargs={
+                "__default__": {          # project both factors
+                    "style": "logra",
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
                     "proj_type": "rademacher",
                     "device": "cuda",
                 },
-                "transformer.wte": {      # materialize-then-project (TRAK)
-                    "factorize": False,
+                "transformer.wte": {      # materialize, then project
+                    "style": "dense",
                     "proj_dim": 512,
                     "proj_max_batch_size": 8,
                     "device": "cuda",
@@ -239,11 +291,10 @@ class HookManagerConfig:
             },
         )
 
-    Note that a ``"__default__"`` entry with ``factorize=True`` combined with
-    a hook selection that includes norm layers (e.g.
-    ``linear_io=REGISTER_ALL``) raises inside the first backward pass -- give
-    those layers explicit ``factorize=False`` entries, or exclude them from
-    hooking.
+    Note that a ``"__default__"`` entry with style ``"logra"`` combined with a
+    hook selection that includes norm layers (e.g. ``linear_io=REGISTER_ALL``)
+    raises inside the first backward pass -- give those layers explicit
+    ``"dense"`` or ``"mask"`` entries, or exclude them from hooking.
     """
 
     def __init__(
@@ -251,23 +302,41 @@ class HookManagerConfig:
         hook_types: dict[str, str] | None = None,
         linear_io: Selector = None,
         param_grad: Selector = None,
+        invasive_linear_io: Selector = None,
         layer_types: dict[str, str] | None = None,
         module_kwargs: dict[str, dict] | None = None,
-        projection: dict[str, dict] | None = None,
+        projection_kwargs: dict[str, dict] | None = None,
         projector: Callable | None = None,
+        capture_style: CaptureStyle = "factorized",
+        include_frozen: bool = False,
     ) -> None:
         self.hook_types = self._validate_assignment(hook_types)
         self.linear_io = self._validate_selector(LINEAR_IO, linear_io)
         self.param_grad = self._validate_selector(PARAM_GRAD, param_grad)
+        # ``invasive_linear_io`` captures identically to ``linear_io`` but
+        # overrides the nn.Linear forward to skip the weight-gradient matmul.
+        # WARNING: layers hooked this way produce no ``weight.grad`` and are
+        # incompatible with optimizer updates / DataSelectionCallback -- use it
+        # only for gradient capture (attribution).
+        self.invasive_linear_io = self._validate_selector(
+            INVASIVE_LINEAR_IO,
+            invasive_linear_io,
+        )
         self.layer_types = self._validate_layer_types(layer_types)
         self.module_kwargs = self._validate_module_kwargs(module_kwargs)
-        # Optional per-layer random projection applied to every assembled step
-        # gradient (see :meth:`Gradient.project`).  ``projection`` is the per-layer
-        # proj_kwargs map ``{layer_name: {factorize, proj_dim, ...}}`` (a
-        # ``"__default__"`` entry covers unlisted layers); ``projector`` is the
-        # projection factory, defaulting to dattri's ``random_project``.
-        self.projection = self._validate_projection(projection)
+        # Optional per-layer random projection applied at capture (see
+        # :meth:`Gradient.project` for the post-hoc form).  ``projection_kwargs``
+        # is the per-layer proj_kwargs map (``"__default__"`` covers unlisted
+        # layers); ``projector`` is the projection factory, defaulting to
+        # dattri's ``random_project``; ``capture_style`` the buffered
+        # representation.
+        self.projection_kwargs = self._validate_projection(projection_kwargs)
+        self.capture_style = self._validate_capture_style(capture_style)
         self.projector = projector
+        # Frozen layers are skipped by default (their gradient is not part of
+        # the training signal -- e.g. a LoRA base model).  ``include_frozen``
+        # hooks them anyway: see the class docstring.
+        self.include_frozen = bool(include_frozen)
 
     @staticmethod
     def _validate_assignment(
@@ -293,17 +362,51 @@ class HookManagerConfig:
     def _validate_projection(
         projection: dict[str, dict] | None,
     ) -> dict[str, dict] | None:
+        from dattri_llm.gradient.ops import MASK_KEYS, PROJECTION_STYLES
+
         if projection is None:
             return None
         if not isinstance(projection, dict) or not all(
             isinstance(v, dict) for v in projection.values()
         ):
             raise TypeError(
-                "projection must be a dict mapping layer name (or '__default__') "
-                "to a proj_kwargs dict, e.g. "
-                "{'__default__': {'factorize': True, 'proj_dim': 512}}.",
+                "projection_kwargs must be a dict mapping layer name (or "
+                "'__default__') to a proj_kwargs dict, e.g. "
+                "{'__default__': {'style': 'logra', 'proj_dim': 512}}.",
             )
+        for name, kw in projection.items():
+            style = kw.get("style", "logra")
+            if style not in PROJECTION_STYLES:
+                raise ValueError(
+                    f"projection_kwargs[{name!r}]['style'] = {style!r} is not a "
+                    f"valid projection style. Valid styles: "
+                    f"{list(PROJECTION_STYLES)}.",
+                )
+            if "seq_len" in kw:
+                raise ValueError(
+                    f"projection_kwargs[{name!r}] carries 'seq_len', which is no "
+                    "longer used: capture_style='auto' decides from the actual "
+                    "shapes at capture.",
+                )
+            if style == "mask" and set(kw) - MASK_KEYS:
+                raise ValueError(
+                    f"projection_kwargs[{name!r}] is 'mask', which keeps "
+                    "coordinates rather than projecting and takes only "
+                    f"{sorted(MASK_KEYS - {'style'})}; got unexpected "
+                    f"{sorted(set(kw) - MASK_KEYS)}.",
+                )
         return {k: dict(v) for k, v in projection.items()}
+
+    @staticmethod
+    def _validate_capture_style(capture_style: str) -> str:
+        from dattri_llm.gradient.ops import CAPTURE_STYLES
+
+        if capture_style not in CAPTURE_STYLES:
+            raise ValueError(
+                f"capture_style must be one of {list(CAPTURE_STYLES)}, got "
+                f"{capture_style!r}.",
+            )
+        return capture_style
 
     @staticmethod
     def _validate_layer_types(
@@ -360,21 +463,11 @@ class HookManagerConfig:
     def is_default(self) -> bool:
         """True when nothing was requested (the auto fallback applies)."""
         return (
-            not self.hook_types and self.linear_io is None and self.param_grad is None
+            not self.hook_types
+            and self.linear_io is None
+            and self.param_grad is None
+            and self.invasive_linear_io is None
         )
-
-
-def _resolve_projector(projector: Callable | None) -> Callable:
-    """Return *projector*, or lazily fall back to dattri's ``random_project``.
-
-    The import is deferred so configuring projection is the only thing that pulls
-    in dattri's projection backend.
-    """
-    if projector is not None:
-        return projector
-    from dattri.func.projection import random_project
-
-    return random_project
 
 
 def _selector_matches(selector: Selector, name: str) -> bool:
@@ -428,8 +521,8 @@ def resolve_hook_assignments(
                 assignment[name] = LINEAR_IO
             elif _has_trainable_params(module):
                 assignment[name] = PARAM_GRAD
-        # The default never produces conflicts, so skip the zero-layer warning
-        # path below only if something was registered.
+        # The default assignment never conflicts; only the zero-layer case
+        # warns.
         if not assignment:
             _warn_zero_layers()
         return assignment
@@ -462,6 +555,13 @@ def resolve_hook_assignments(
                 f"Layer '{layer_name}' was assigned 'param_grad' but has no "
                 "trainable parameters.",
             )
+        if hook_type == INVASIVE_LINEAR_IO and not _is_invasive_capable(module):
+            raise ValueError(
+                f"Layer '{layer_name}' was assigned 'invasive_linear_io' but "
+                f"its type ({canonical_class_name(module)}) is not nn.Linear. "
+                "The invasive hook overrides the linear forward and only "
+                "supports nn.Linear.",
+            )
         assign(layer_name, hook_type)
 
     # 2. Selector add-ons extend the assignment with applicable layers only.
@@ -476,6 +576,11 @@ def resolve_hook_assignments(
             name,
         ):
             assign(name, PARAM_GRAD)
+        if _is_invasive_capable(module) and _selector_matches(
+            config.invasive_linear_io,
+            name,
+        ):
+            assign(name, INVASIVE_LINEAR_IO)
 
     if not assignment:
         _warn_zero_layers()

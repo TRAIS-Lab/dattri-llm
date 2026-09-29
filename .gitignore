@@ -5,3 +5,24 @@ __pycache__/
 
 # local tooling
 /.claude/
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Benchmark measurements and generated plots under experiments/ -- every one is
+# reproduced by re-running its benchmark.  Scoped to experiments/ so the library
+# itself can still carry .jsonl fixtures if it ever needs to.
+experiments/results/
+experiments/**/*.jsonl
+experiments/**/*.png
+experiments/**/*.ipynb
+
+# Exception: the Modal benchmark's committed record.  `aggregate.jsonl` is the
+# measured run behind the paper's scaling figures and the panels are rendered
+# from it by `plot.py`; keeping them in the tree is what lets a figure be traced
+# to the rows that produced it.  Scoped to that one directory -- everything else
+# under experiments/ stays ignored.
+!experiments/benchmark/modal/results/*.jsonl
+!experiments/benchmark/modal/results/*.png

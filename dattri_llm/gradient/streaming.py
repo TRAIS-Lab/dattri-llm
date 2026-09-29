@@ -5,8 +5,13 @@ those blocks come from is abstracted by :class:`GradientSource`, which has two
 concrete implementations so the same scoring loop serves both workflows:
 
 * :class:`DiskGradientSource` -- *store-then-attribute*: reads pre-collected
-  gradients off disk via a
-  :class:`~dattri_llm.gradient.file_manager.GradientFileManager`.  ``reusable=True``.
+  gradients off disk via a :class:`GradientStorageManager`.
+  ``reusable=True``.
+* :class:`ReplayGradientSource` -- *snapshot-then-recompute*: re-runs each
+  stored step of a trajectory (its parameters and batch, from a
+  :class:`~dattri_llm.gradient.snapshots.TrajectorySnapshots`) under the
+  capture hooks and yields the recomputed block.  ``reusable=True``.
+
 * :class:`GradientStreamer` -- *on-the-fly*: runs a forward+backward pass over a
   dataset and yields each per-step block on demand, never persisting it.  Its
   ``enable_update`` flag selects the two regimes:
@@ -27,7 +32,9 @@ this module is method-agnostic.
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
+import warnings
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager
 from typing import (
@@ -44,12 +51,13 @@ from dattri_llm.gradient.callbacks import CaptureCallback
 from dattri_llm.gradient.datasets import iter_gradient_blocks, resolve_steps
 from dattri_llm.gradient.gradient import Gradient
 from dattri_llm.gradient.hooks import REGISTER_ALL, HookManager, HookManagerConfig
+from dattri_llm.gradient.snapshots import TrajectorySnapshots
 
 if TYPE_CHECKING:
     from typing_extensions import Self
 
     from dattri_llm.attribution.arguments import AttributionArguments
-    from dattri_llm.gradient.file_manager import GradientFileManager
+    from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +95,7 @@ class GradientSource(Protocol):
 class DiskGradientSource(GradientSource):
     """A re-iterable :class:`GradientSource` backed by on-disk gradients.
 
-    Wraps a :class:`GradientFileManager` and yields the same
+    Wraps a :class:`GradientStorageManager` and yields the same
     ``(step, Gradient, hashes)`` blocks as :class:`GradientStreamer`, but read
     from disk (the *store-then-attribute* workflow) rather than computed live.
     Each file is ``torch.load``-ed once even when it holds several requested
@@ -108,7 +116,7 @@ class DiskGradientSource(GradientSource):
 
     def __init__(
         self,
-        file_manager: GradientFileManager,
+        file_manager: GradientStorageManager,
         args: AttributionArguments,
         *,
         steps: Iterable[int] | None = None,
@@ -133,6 +141,26 @@ class DiskGradientSource(GradientSource):
     def reusable(self) -> bool:
         """Disk is immutable for the run, so the source re-reads identically."""
         return True
+
+    @property
+    def args(self) -> AttributionArguments:
+        """The :class:`AttributionArguments` this source reads with."""
+        return self._args
+
+    @property
+    def file_manager(self) -> GradientStorageManager:
+        """The store this source reads from."""
+        return self._fm
+
+    @property
+    def steps(self) -> list[int]:
+        """The ascending stored steps this source yields."""
+        return list(self._steps)
+
+    @property
+    def layer_name(self) -> list[str] | None:
+        """The layer filter applied to every block (``None`` = all layers)."""
+        return None if self._layer_name is None else list(self._layer_name)
 
     def __len__(self) -> int:
         # One block per (file, step) pair -- matches what __iter__ yields.
@@ -166,6 +194,135 @@ class DiskGradientSource(GradientSource):
         )
 
 
+def rebatch_blocks(
+    source: Iterable[StreamBatch],
+    batch_size: int,
+) -> Iterator[tuple[list[int], Gradient, list[str]]]:
+    """Re-batch a source's blocks into ``batch_size``-sample batches.
+
+    Dense (materialized) blocks are concatenated layer by layer -- one ``cat``
+    per layer, O(N) not pairwise -- so the tiny per-block matmuls downstream
+    collapse into big GEMMs.  Factorized blocks cannot be stacked into a dense
+    ``(B, D)`` and are yielded one block at a time (a pending dense batch is
+    flushed first, so a mixed source stays in order).  Nothing is moved
+    between devices.
+
+    A block is never held longer than its consumer holds it: a batch made of a
+    single block reuses that block's tensors (no copy), only the block's
+    metadata is remembered, and the reference to a block is dropped before the
+    source is asked for the next one -- for a live source that request *is*
+    the next forward and backward pass, which is where the memory peak sits.
+
+    Yields:
+        ``(per_row_steps, Gradient, per_row_ids)`` batches in the source's
+        sample order -- every row is stamped with the step it came from.
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
+    pending: dict[str, list[torch.Tensor]] = {}
+    pending_ids: list[str] = []
+    pending_steps: list[int] = []
+    pending_n = 0
+    # (representation, layer_types, indexing) of the pending blocks -- the
+    # metadata only, so the block itself is not kept alive.
+    meta: tuple[dict, dict, dict] | None = None
+
+    def build() -> tuple[list[int], Gradient, list[str]]:
+        nonlocal pending, pending_ids, pending_steps, pending_n
+        data = {
+            name: tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+            for name, tensors in pending.items()
+        }
+        representation, layer_types, indexing = meta
+        big = Gradient(
+            representation=representation,
+            data=data,
+            layer_types=layer_types,
+            indexing=indexing,
+            validate_on_init=False,
+        )
+        batch = (pending_steps, big, pending_ids)
+        pending, pending_ids, pending_steps, pending_n = {}, [], [], 0
+        return batch
+
+    for step, block, hashes in source:
+        if not all(isinstance(v, torch.Tensor) for v in block.data.values()):
+            if pending_n:
+                yield build()
+            batch = ([step] * block.batch_size, block, list(hashes))
+            block = None  # noqa: PLW2901 - released before the next request
+            yield batch
+            del batch
+            continue
+        meta = (block.representation, block.layer_types, block.indexing)
+        for name, tensor in block.data.items():
+            pending.setdefault(name, []).append(tensor)
+        del tensor  # the loop variable would keep the last layer alive
+        pending_ids.extend(hashes)
+        pending_steps.extend([step] * block.batch_size)
+        pending_n += block.batch_size
+        block = None  # noqa: PLW2901 - released before the next request
+        if pending_n >= batch_size:
+            yield build()
+    if pending_n:
+        yield build()
+
+
+def _build_auto_wrap_policy(
+    model: nn.Module,
+    fsdp_config: dict,
+) -> Callable | None:
+    """Build an FSDP ``auto_wrap_policy`` from HF-style ``fsdp_config`` keys.
+
+    Consumes (pops) the policy keys so the remaining dict is pure FSDP kwargs:
+
+    * ``"transformer_layer_cls_to_wrap"`` -- module class name (or list of
+      names); every instance becomes its own FSDP unit, so parameters are
+      gathered one block at a time instead of the whole model at once.  This
+      is what keeps peak memory at ``one_block + shard`` for large models.
+    * ``"min_num_params"`` -- size-based policy: wrap any submodule with at
+      least this many parameters.
+
+    An explicit ``"auto_wrap_policy"`` callable in the config wins and passes
+    through untouched.  With none of the keys present, returns ``None`` and
+    the model is wrapped as a single flat FSDP unit (fine for small models;
+    at large scale every rank then transiently materializes the full
+    parameters each step).
+    """
+    if "auto_wrap_policy" in fsdp_config:
+        return None
+    cls_names = fsdp_config.pop("transformer_layer_cls_to_wrap", None)
+    min_params = fsdp_config.pop("min_num_params", None)
+    if cls_names is None and min_params is None:
+        return None
+    if cls_names is not None and min_params is not None:
+        raise ValueError(
+            "fsdp_config: pass either transformer_layer_cls_to_wrap or "
+            "min_num_params, not both.",
+        )
+    if cls_names is not None:
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+        wanted = {cls_names} if isinstance(cls_names, str) else set(cls_names)
+        classes = {type(m) for m in model.modules() if type(m).__name__ in wanted}
+        missing = wanted - {c.__name__ for c in classes}
+        if missing:
+            raise ValueError(
+                f"transformer_layer_cls_to_wrap: no module of class "
+                f"{sorted(missing)} found in the model.",
+            )
+        return functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=classes,
+        )
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+
+    return functools.partial(
+        size_based_auto_wrap_policy,
+        min_num_params=int(min_params),
+    )
+
+
 def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
     """HuggingFace convention: ``model(**batch).loss``.
 
@@ -186,6 +343,74 @@ def _default_loss_fn(model: nn.Module, batch: object) -> torch.Tensor:
     return loss
 
 
+class _ProbePassState:
+    """What one frozen-probe pass must hand back to the model it shares: the
+    parameters' gradients (a trajectory's partially accumulated window, or the
+    gradient of a step whose update is deferred), the modules' train/eval
+    modes, and the global torch RNG state.
+    """
+
+    def __init__(self, model: nn.Module, forward_model: nn.Module) -> None:
+        # Clones, not references: a DDP bucket view or an FSDP flat-gradient
+        # view would be overwritten in place by the probe's own backward.
+        self._grads = [
+            (p, None if p.grad is None else p.grad.detach().clone())
+            for p in model.parameters()
+        ]
+        self.holds_grads = any(g is not None for _, g in self._grads)
+        self._modes = [(m, m.training) for m in forward_model.modules()]
+        self._cpu_rng = torch.get_rng_state()
+        self._cuda_rng = (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available() and torch.cuda.is_initialized()
+            else None
+        )
+
+    def restore(self) -> None:
+        """Hand the saved gradients, modes and RNG state back.
+
+        Every gradient is attempted and the modes and RNG state are always
+        restored; a gradient that cannot be handed back raises afterwards.
+        """
+        with torch.no_grad():
+            failed = [
+                err
+                for p, grad in self._grads
+                if (err := self._hand_back(p, grad)) is not None
+            ]
+        for m, training in self._modes:
+            m.training = training
+        torch.set_rng_state(self._cpu_rng)
+        if self._cuda_rng is not None:
+            torch.cuda.set_rng_state_all(self._cuda_rng)
+        if failed:
+            raise RuntimeError(
+                f"A frozen probe could not copy {len(failed)} saved gradient(s) back "
+                f"into the model it shares: {failed[0]}",
+            ) from failed[0]
+
+    @staticmethod
+    def _hand_back(p: nn.Parameter, grad: torch.Tensor | None) -> RuntimeError | None:
+        # In place when the storage is still there (the pass zeroes, not
+        # frees, the gradients it hands back): keeps a wrapper's gradient
+        # storage (a DDP bucket view, an FSDP flat gradient) and works for
+        # low-precision gradients a direct assignment would reject.
+        in_place = (
+            grad is not None
+            and p.grad is not None
+            and p.grad.shape == grad.shape
+            and p.grad.dtype == grad.dtype
+        )
+        try:
+            if in_place:
+                p.grad.copy_(grad)
+            else:
+                p.grad = grad
+        except RuntimeError as err:
+            return err
+        return None
+
+
 class GradientStreamer(GradientSource):
     """Yields per-step ``(step, Gradient, hashes)`` from a live forward+backward pass.
 
@@ -197,8 +422,7 @@ class GradientStreamer(GradientSource):
     forward -> backward -> clip -> ``optimizer.step`` -> ``scheduler.step`` ->
     ``zero_grad``.
     DeepSpeed is **not** supported (the hook capture is incompatible with its
-    engine); a ``deepspeed`` config is ignored with a warning.  Verified bit-exact
-    against ``Trainer`` in ``scripts/verify_streamer_vs_trainer.py``.
+    engine); a ``deepspeed`` config raises.
 
     Use as a context manager (it registers/removes the :class:`HookManager`
     hooks), then iterate:
@@ -231,12 +455,11 @@ class GradientStreamer(GradientSource):
             once per window of ``N`` micro-batches (the trailing ragged
             window also updates, as at a Trainer epoch end), and each
             micro-batch loss is scaled by ``1/N`` before backward --
-            Trainer's *classic* convention, the one it applies whenever the
-            model does not accept loss kwargs.  The token-count-corrected
-            accumulation newer Trainer versions use for loss-kwargs-aware
-            models (``num_items_in_batch``) is not replicated; bake any
-            custom normalisation into ``loss_fn``.  Every micro-batch still
-            yields its own gradient block.  If
+            Trainer's convention for a model that does not accept loss
+            kwargs.  Trainer's token-count-corrected accumulation for
+            loss-kwargs-aware models (``num_items_in_batch``) is not
+            replicated; bake any custom normalisation into ``loss_fn``.
+            Every micro-batch still yields its own gradient block.  If
             ``False`` (default) the model is frozen, the source is
             re-iterable, and accumulation settings are ignored.
         loss_fn: ``(model, batch) -> scalar``.  Defaults to ``model(**batch).loss``.
@@ -254,6 +477,47 @@ class GradientStreamer(GradientSource):
         checkpoint_step: The step index stamped on every yielded block when the
             model is frozen (all batches share one checkpoint).  Ignored when
             ``enable_update`` (the per-batch optimizer-step index is used).
+        precondition: Capture the optimizer's per-sample update direction
+            instead of the raw gradient (see ``HookManager(optimizer=...)``):
+            the trajectory's own optimizer under ``enable_update``, else the
+            ``optimizer`` given, which must then be supplied.  A shared
+            ``hook_manager`` must have been built with an optimizer; the
+            flag is set on it per pass, so a raw test probe can share a
+            preconditioned train streamer's hooks.
+        snapshots: Under ``enable_update``, store every step's parameters
+            (before its update) and its batch here, so the step can be
+            replayed later by a :class:`ReplayGradientSource` instead of
+            storing its gradients.  Not supported under FSDP.
+        hook_manager: Share another streamer's hooks (its ``.hook_manager``)
+            instead of registering a second set over the same model.
+        forward_model: The DDP/FSDP-wrapped module forward/backward run on,
+            when ``model`` is already wrapped: the caller's own wrapper (a
+            trainer's, or one built once for several passes), or the
+            :attr:`forward_model` of the streamer whose ``hook_manager`` is
+            shared.  Required with a shared ``hook_manager`` under
+            distributed execution, since a model can only be wrapped once
+            (under FSDP its parameters are already sharded).  ``None``
+            (default) wraps ``model`` per ``args``.
+        shard: Under distributed execution, split ``dataset`` across the
+            ranks (a :class:`~torch.utils.data.DistributedSampler`; the
+            default) or stream all of it on every rank (``False``).  A test
+            set every rank scores its own training shard against must not be
+            sharded.  Every rank must still run the same number of steps, so
+            all ranks stream the same (unsharded) dataset.  No effect on a
+            single process.
+        defer_update: Under ``enable_update``, yield each block **before**
+            the optimizer update its accumulation window ends with, and apply
+            that update when the next block is requested (or when the pass
+            ends, or on a clean ``__exit__``).  The consumer then sees the
+            model at the parameters the block's gradient was taken at, so a
+            frozen probe sharing the model (``loop_over_test``) is evaluated at
+            the same ``theta_t``.  The trajectory itself is unchanged, but
+            anything read at yield time -- the parameters, the optimizer
+            state, the scheduler -- is pre-update, so do not combine it with
+            consumers that expect the update applied (e.g. a callback
+            recording post-update optimizer moments).  Also settable as the
+            :attr:`defer_update` attribute before iterating.
+
     """
 
     def __init__(
@@ -271,19 +535,53 @@ class GradientStreamer(GradientSource):
         collate_fn: Callable | None = None,
         checkpoint_step: int = 0,
         hook_manager: HookManager | None = None,
+        precondition: bool = False,
+        snapshots: TrajectorySnapshots | str | None = None,
+        forward_model: nn.Module | None = None,
+        shard: bool = True,
+        defer_update: bool = False,
     ) -> None:
         self._model = model
         self._dataset = dataset
         self._args = args
         self._batch_size = batch_size
+        self._shard = shard
         self.enable_update = enable_update
+        self.defer_update = defer_update
+        # An update held back by ``defer_update``, applied on the next request.
+        self._update_pending: bool = False
+        if snapshots is not None and not isinstance(snapshots, TrajectorySnapshots):
+            snapshots = TrajectorySnapshots(snapshots)
+        if snapshots is not None and not enable_update:
+            raise ValueError(
+                "snapshots= records a trajectory; needs enable_update=True."
+            )
+        if snapshots is not None and args.fsdp:
+            raise NotImplementedError(
+                "parameter snapshots are not supported under FSDP (the "
+                "parameters are sharded); use DDP or a single device.",
+            )
+        self._snapshots = snapshots
+        self._window_start: int = 0
         self._loss_fn = loss_fn if loss_fn is not None else _default_loss_fn
         self._optimizer = optimizer
         self._scheduler = scheduler
         self._collate_fn = collate_fn
         self._checkpoint_step = checkpoint_step
+        self._precondition = precondition
+        if precondition and not enable_update and optimizer is None:
+            raise ValueError(
+                "precondition=True needs an optimizer to read the state from: "
+                "pass optimizer= (a frozen probe at a checkpoint's optimizer) or "
+                "enable_update=True (the trajectory's own optimizer).",
+            )
 
         if hook_manager is not None:
+            if precondition and not hook_manager.supports_preconditioning:
+                raise ValueError(
+                    "precondition=True on a shared hook_manager that was built "
+                    "without an optimizer.",
+                )
             self._hm = hook_manager
             self._owns_hm = False
             shared = next(
@@ -312,6 +610,9 @@ class GradientStreamer(GradientSource):
                     linear_io=REGISTER_ALL,
                 ),
                 callbacks=[self._capture],
+                # Resolved on first use: an updating pass builds its optimizer
+                # below, after the hooks are registered.
+                optimizer=(lambda: self.optimizer) if precondition else None,
             )
             self._owns_hm = True
 
@@ -320,9 +621,8 @@ class GradientStreamer(GradientSource):
         # training streamer) the same optimizer trajectory. ------------------
         if args.deepspeed:
             raise NotImplementedError(
-                "GradientStreamer does not support DeepSpeed (the hook-based "
-                "capture is incompatible with its engine); the ``deepspeed`` config "
-                "is ignored. Run single-process, DDP, or FSDP instead.",
+                "GradientStreamer does not yet support DeepSpeed. Run "
+                "single-process, DDP, or FSDP instead.",
             )
         # Gradient checkpointing must be enabled on the *unwrapped* model, before
         # DDP/FSDP wrapping -- exactly as Trainer does (Trainer._inner_training_loop).
@@ -350,8 +650,19 @@ class GradientStreamer(GradientSource):
 
         # ``_model`` is the unwrapped reference (hooks, params, eval/grad state);
         # ``_fwd_model`` is what forward/backward actually run on (DDP/FSDP when
-        # distributed, otherwise the same object).
-        self._fwd_model = self._wrap_model(model, args)
+        # distributed, otherwise the same object).  A model the caller (or
+        # the streamer whose hooks are shared) already wrapped is not wrapped
+        # again: it can only be wrapped once.
+        if forward_model is not None:
+            self._fwd_model = forward_model
+        elif hook_manager is not None and args.world_size > 1:
+            raise ValueError(
+                "A shared hook_manager under distributed execution needs the "
+                "sharing streamer's forward_model= as well (the model is "
+                "already wrapped; pass ``other.forward_model``).",
+            )
+        else:
+            self._fwd_model = self._wrap_model(model, args)
 
         self._loader = self._build_loader()
         # Gradient accumulation (enable_update only): micro-batches per
@@ -370,14 +681,21 @@ class GradientStreamer(GradientSource):
         # Per-step LR actually applied (``enable_update``), keyed by step index --
         # so a trajectory attributor can use/verify the true schedule.
         self._step_lrs: dict[int, float] = {}
-        # Saved-state for frozen probes (restored on __exit__).
+        # Context state.
         self._entered: bool = False
         self._collect_ctx = None
-        self._saved_grads: dict[str, torch.Tensor | None] | None = None
+        # A frozen probe's per-pass save of the shared model's gradients and
+        # the RNG state (restored when the pass ends).
+        self._pass_state: _ProbePassState | None = None
 
     # ------------------------------------------------------------------ #
     # GradientSource contract                                            #
     # ------------------------------------------------------------------ #
+
+    @property
+    def args(self) -> AttributionArguments:
+        """The :class:`AttributionArguments` this streamer runs under."""
+        return self._args
 
     @property
     def reusable(self) -> bool:
@@ -390,12 +708,31 @@ class GradientStreamer(GradientSource):
         return self._model
 
     @property
+    def forward_model(self) -> nn.Module:
+        """The module forward/backward run on: the DDP/FSDP wrapper under
+        distributed execution, else :attr:`model` itself.  Pass it, together
+        with :attr:`hook_manager`, to a streamer sharing these hooks.
+        """
+        return self._fwd_model
+
+    @property
     def hook_manager(self) -> HookManager:
         """The underlying :class:`HookManager`.  Pass it to another streamer's
-        ``hook_manager=`` (over the same model) so both share one set of hooks --
-        the cleaner alternative to two managers cross-capturing each backward.
+        ``hook_manager=`` (over the same model) so both share one set of hooks.
         """
         return self._hm
+
+    @property
+    def optimizer(self) -> torch.optim.Optimizer:
+        """The optimizer an updating pass advances (built at construction when
+        none was given), or the one a frozen probe was handed to precondition
+        with.  Optimizer-aware capture and callbacks read its state through it.
+        """
+        if self._optimizer is None:
+            raise RuntimeError(
+                "No optimizer: this streamer is a frozen probe built without one.",
+            )
+        return self._optimizer
 
     @property
     def learning_rates(self) -> dict[int, float]:
@@ -424,14 +761,9 @@ class GradientStreamer(GradientSource):
             enable_full_determinism(self._args.seed)
         else:
             set_seed(self._args.seed)
-        if not self.enable_update:
-            # Freeze: snapshot grads so the probe leaves them untouched.  (The
-            # eval() that keeps repeated passes bit-identical -- e.g. K-FAC's fit
-            # and score passes -- is applied per-pass in __iter__.)
-            self._saved_grads = {
-                n: (p.grad.detach().clone() if p.grad is not None else None)
-                for n, p in self._model.named_parameters()
-            }
+        # A frozen probe leaves the model's gradients untouched per pass (see
+        # the class doc and __iter__, which also applies the eval() that keeps
+        # repeated passes bit-identical -- e.g. K-FAC's fit and score passes).
         # Only the owner registers/activates hooks; a sharer rides the owner's
         # collection context (the owner is entered first under ``with a, b:``).
         if self._owns_hm:
@@ -441,18 +773,44 @@ class GradientStreamer(GradientSource):
 
     def __exit__(self, *exc) -> bool:
         try:
-            if self._owns_hm and self._collect_ctx is not None:
-                self._collect_ctx.__exit__(*exc)
+            ctx_exc = exc
+            try:
+                pending, self._update_pending = self._update_pending, False
+                if pending and exc[0] is None:
+                    # The last update of a pass the consumer stopped early (an
+                    # exception drops it instead).
+                    self._optimizer_step()
+            except BaseException as err:
+                ctx_exc = (type(err), err, err.__traceback__)
+                raise
+            finally:
+                if self._owns_hm and self._collect_ctx is not None:
+                    self._collect_ctx.__exit__(*ctx_exc)
         finally:
+            try:
+                self._release()
+            except Exception as err:
+                if exc[0] is None:
+                    raise
+                # Never mask the error already propagating.
+                warnings.warn(
+                    f"While handling {exc[0].__name__}: {err}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            finally:
+                self._entered = False
+        return False
+
+    def _release(self) -> None:
+        """Remove owned hooks and hand back an unfinished probe pass."""
+        try:
             if self._owns_hm:
                 self._hm.remove()
-            # The mode is owned per-pass by __iter__, so it is left as-is; only a
-            # frozen probe's snapshotted grads need restoring.
-            if not self.enable_update and self._saved_grads is not None:
-                for n, p in self._model.named_parameters():
-                    p.grad = self._saved_grads[n]
-            self._entered = False
-        return False
+        finally:
+            # A frozen probe's pass the consumer did not finish (an early
+            # break, or an exception) hands the model back here.
+            self._end_probe_pass()
 
     # ------------------------------------------------------------------ #
     # Iteration                                                           #
@@ -469,6 +827,12 @@ class GradientStreamer(GradientSource):
                 "This streamer is single-shot (enable_update=True) and was "
                 "already consumed; the training trajectory cannot be replayed.",
             )
+        self._update_pending = False
+        if not self.enable_update:
+            # Before the mode switch and iter(loader), which draws the loader's
+            # base seed from the RNG.
+            self._end_probe_pass()
+            self._pass_state = _ProbePassState(self._model, self._fwd_model)
         # Set the train/eval mode for THIS pass on the (possibly shared) model: a
         # training trajectory runs in train() to match real training (dropout/BN
         # active); a frozen probe runs in eval() for deterministic, repeatable
@@ -490,8 +854,25 @@ class GradientStreamer(GradientSource):
     def __next__(self) -> StreamBatch:
         if self._batch_iter is None:
             raise RuntimeError("Call iter(streamer) before next(streamer).")
-        batch = next(self._batch_iter)  # raises StopIteration at the end
+        if self._update_pending:
+            self._apply_pending_update()
+        try:
+            batch = next(self._batch_iter)  # raises StopIteration at the end
+        except StopIteration:
+            self._end_probe_pass()
+            raise
         batch = self._to_device(batch)
+        if self._snapshots is not None:
+            # The parameters this micro-batch's gradient is taken at: those of
+            # the window start under accumulation (no update in between).
+            if self._accum_count == 0:
+                self._window_start = self._batch_index
+                self._snapshots.save_parameters(self._batch_index, self._model)
+            else:
+                self._snapshots.save_parameters(
+                    self._batch_index, self._model, same_as=self._window_start
+                )
+            self._snapshots.save_batch(self._batch_index, batch)
 
         # Re-align the (possibly shared) capture counter to THIS streamer's
         # next index: another streamer riding the same hooks may have advanced
@@ -500,6 +881,10 @@ class GradientStreamer(GradientSource):
         # owning streamer's pass-local step, and the desync check below keeps
         # catching extra or missing captures within the batch.
         self._hm.reset_steps(self._batch_index)
+        # A shared manager serves passes of both kinds (a preconditioned train
+        # pass and a raw test pass), so each pass sets the mode per batch.
+        if self._hm.supports_preconditioning:
+            self._hm.precondition = self._precondition
         self._forward_backward(batch)
         if self.enable_update:
             # LR that the update consuming this micro-batch will apply (the
@@ -515,14 +900,20 @@ class GradientStreamer(GradientSource):
             if self._accum_count >= self._accum_steps or self._batch_index + 1 >= len(
                 self._loader
             ):
-                self._optimizer_step()
+                if self.defer_update:
+                    self._update_pending = True
+                else:
+                    self._optimizer_step()
                 self._accum_count = 0
 
         record = self._capture.record
         if record is None:
+            # The manager reports the *reason* a step does not complete (a
+            # backward that reached no hooked layer raises at its end); this
+            # is left for a loss_fn that never ran the hooked model at all.
             raise RuntimeError(
-                "No gradient was captured this step. Ensure loss_fn runs the "
-                "model on the batch and backward flows through the hooked layers.",
+                "loss_fn produced no capture step: it must run the streamer's "
+                "model on the batch and its backward must reach the hooked layers.",
             )
         # Consistency check: with both counters zeroed at __iter__, the manager's
         # capture index must advance exactly once per batch.  A mismatch means a
@@ -542,6 +933,12 @@ class GradientStreamer(GradientSource):
             if isinstance(record.input_hash, list)
             else [record.input_hash]
         )
+        if self._pass_state is not None and not self._pass_state.holds_grads:
+            # A frozen pass that found no gradients hands none back, so its
+            # own serve nobody once captured: freeing them spares a probe
+            # nested in it copying them.  (A pass that will hand gradients
+            # back keeps their storage, so they are restored in place.)
+            self._fwd_model.zero_grad(set_to_none=True)
         self._batch_index += 1
         return step, grad, hashes
 
@@ -554,12 +951,7 @@ class GradientStreamer(GradientSource):
         ``autocast_smart_context_manager`` / accelerate autocast).  No-op in
         full precision.
         """
-        if self._amp_dtype is None:
-            return contextlib.nullcontext()
-        device_type = (
-            "cuda" if (torch.cuda.is_available() and not self._args.use_cpu) else "cpu"
-        )
-        return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
+        return autocast_for(self._args)
 
     def _forward_backward(self, batch: object) -> torch.Tensor:
         """One forward + backward, mirroring ``Trainer.training_step``.
@@ -574,8 +966,11 @@ class GradientStreamer(GradientSource):
         if self._accum_count == 0:
             # Start of an accumulation window (every batch when N == 1):
             # under accumulation, Trainer zero-grads only after an optimizer
-            # update, letting the window's micro-batch gradients sum.
-            self._fwd_model.zero_grad(set_to_none=True)
+            # update, letting the window's micro-batch gradients sum.  A
+            # frozen pass that hands gradients back zeroes them in place
+            # instead, keeping their storage for the restore.
+            hands_back = self._pass_state is not None and self._pass_state.holds_grads
+            self._fwd_model.zero_grad(set_to_none=not hands_back)
         self._capture.record = None
         with self._autocast():
             loss = self._loss_fn(self._fwd_model, batch)
@@ -609,6 +1004,17 @@ class GradientStreamer(GradientSource):
             self._optimizer.step()  # type: ignore[union-attr]
         if self._scheduler is not None:
             self._scheduler.step()
+
+    def _apply_pending_update(self) -> None:
+        """Apply the update ``defer_update`` held back (see the class doc)."""
+        self._update_pending = False
+        self._optimizer_step()
+
+    def _end_probe_pass(self) -> None:
+        """Restore what a frozen probe's pass saved, if a pass is open."""
+        state, self._pass_state = self._pass_state, None
+        if state is not None:
+            state.restore()  # closes the pass even if a gradient fails
 
     def _clip_gradients(self) -> None:
         """Clip gradients to ``max_grad_norm``, dispatching on the wrapping.
@@ -720,8 +1126,9 @@ class GradientStreamer(GradientSource):
         # Distributed: each rank streams a disjoint shard via DistributedSampler
         # (sampler and shuffle are mutually exclusive, so set only one). Content
         # hashes stay globally unique, so per-rank rows concatenate cleanly -- the
-        # on-the-fly analogue of GradientFileManager's per-rank index merge.
-        if self._args.world_size > 1:
+        # on-the-fly analogue of GradientStorageManager's per-rank index merge.
+        # ``shard=False`` (a test set) streams the whole dataset on every rank.
+        if self._args.world_size > 1 and self._shard:
             kwargs["sampler"] = DistributedSampler(
                 self._dataset,
                 num_replicas=self._args.world_size,
@@ -775,6 +1182,12 @@ class GradientStreamer(GradientSource):
                     else ShardingStrategy.FULL_SHARD
                 )
                 fsdp_kwargs = dict(args.fsdp_config or {})
+                # HF-style policy keys (transformer_layer_cls_to_wrap /
+                # min_num_params) become an auto_wrap_policy; without one the
+                # model is a single flat FSDP unit.
+                policy = _build_auto_wrap_policy(model, fsdp_kwargs)
+                if policy is not None:
+                    fsdp_kwargs["auto_wrap_policy"] = policy
                 # use_orig_params keeps the original submodule params (what the hooks
                 # captured and what per-sample gradient reads need).
                 fsdp_kwargs.setdefault("use_orig_params", True)
@@ -801,16 +1214,255 @@ class GradientStreamer(GradientSource):
         return model
 
     def _to_device(self, batch: object) -> object:
-        device = self._args.device
-        if isinstance(batch, dict):
-            return {
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                for k, v in batch.items()
-            }
-        if isinstance(batch, (list, tuple)):
-            return type(batch)(
-                v.to(device) if isinstance(v, torch.Tensor) else v for v in batch
+        return move_batch(batch, self._args.device)
+
+
+def autocast_for(args: AttributionArguments) -> AbstractContextManager:
+    """The mixed-precision context ``args`` asks for (``bf16``/``fp16``), or a
+    no-op in full precision.
+    """
+    dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else None
+    if dtype is None:
+        return contextlib.nullcontext()
+    device_type = "cuda" if (torch.cuda.is_available() and not args.use_cpu) else "cpu"
+    return torch.autocast(device_type=device_type, dtype=dtype)
+
+
+def move_batch(batch: object, device: torch.device | str) -> object:
+    """*batch* (a tensor, or a dict / list / tuple of them) on *device*."""
+    if isinstance(batch, dict):
+        return {
+            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+            for k, v in batch.items()
+        }
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(
+            v.to(device) if isinstance(v, torch.Tensor) else v for v in batch
+        )
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    return batch
+
+
+class _ReplayState:
+    """The hooks and the original parameters shared by every view of a replay."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: HookManagerConfig | None,
+        device: torch.device | str,
+    ) -> None:
+        self.model = model.to(device)
+        self.capture = CaptureCallback()
+        self.hm = HookManager(
+            model,
+            config=config
+            if config is not None
+            else HookManagerConfig(linear_io=REGISTER_ALL),
+            callbacks=[self.capture],
+        )
+        self.original = {
+            n: p.detach().to("cpu", copy=True)
+            for n, p in model.named_parameters()
+            if p.requires_grad
+        }
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.hm.remove()
+        with torch.no_grad():
+            for n, p in self.model.named_parameters():
+                if n in self.original:
+                    p.copy_(self.original[n].to(p.device, p.dtype))
+        self.model.zero_grad(set_to_none=True)
+        self.closed = True
+
+
+class ReplayGradientSource(GradientSource):
+    """Per-step blocks recomputed from a trajectory's snapshots.
+
+    For every requested step the stored parameters are loaded into *model*,
+    the stored batch is run forward and backward under the capture hooks,
+    and the resulting per-sample block is yielded -- the same block the
+    trajectory pass would have stored, at the cost of one backward pass per
+    step per iteration instead of ``batch x parameters`` values on disk.
+    ``reusable=True``: every pass reloads the same snapshots.
+
+    The hooks are registered on first use and stay registered across passes
+    (a sweep pulls one step at a time through :meth:`for_steps`); call
+    :meth:`close` -- or use the source as a context manager -- to remove
+    them and restore the parameters the model had before the first replay.
+    The model's ``.grad`` fields are overwritten by every replayed step.
+
+    Args:
+        model: The **unwrapped** model the trajectory was trained on, with
+            the same trainable parameters.
+        args: :class:`AttributionArguments`; supplies the device and the
+            mixed-precision setting the trajectory ran under.
+        snapshots: The snapshot store (or its directory).
+        loss_fn: ``(model, batch) -> scalar``, the training loss the
+            trajectory used; defaults to ``model(**batch).loss``.
+        config: Capture configuration; use the one the trajectory was
+            captured with so the blocks carry the same layers and reduction.
+        steps: Restrict to these stored steps (``None`` = all), replayed in
+            the order given.
+        layer_name: Restrict every block to these layers (``None`` = all).
+        train_mode: Run the forward in ``train()`` mode, as the trajectory
+            did (``False``: ``eval()``).  Layers that draw randomness
+            (dropout) redraw it, so their blocks reproduce the trajectory's
+            only in expectation.
+        desc: Progress-bar label (shown when *verbose*).
+        verbose: Show a per-step progress bar.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        args: AttributionArguments,
+        snapshots: TrajectorySnapshots | str,
+        *,
+        loss_fn: LossFn | None = None,
+        config: HookManagerConfig | None = None,
+        steps: Iterable[int] | None = None,
+        layer_name: str | list[str] | None = None,
+        train_mode: bool = True,
+        desc: str | None = None,
+        verbose: bool = False,
+        _state: _ReplayState | None = None,
+    ) -> None:
+        if args.world_size > 1:
+            raise NotImplementedError(
+                "ReplayGradientSource runs single-process; the replayed steps "
+                "are not sharded across ranks.",
             )
-        if isinstance(batch, torch.Tensor):
-            return batch.to(device)
-        return batch
+        if not isinstance(snapshots, TrajectorySnapshots):
+            snapshots = TrajectorySnapshots(snapshots)
+        self._model = model
+        self._args = args
+        self._snapshots = snapshots
+        self._loss_fn = loss_fn if loss_fn is not None else _default_loss_fn
+        self._config = config
+        available = snapshots.steps()
+        if steps is None:
+            self._steps = list(available)
+        else:
+            have = set(available)
+            self._steps = [int(t) for t in steps if int(t) in have]
+            if not self._steps:
+                raise ValueError(
+                    f"none of the requested steps {sorted(set(steps))[:10]} has "
+                    f"a snapshot; available: {available[:10]}...",
+                )
+        self._layer_name = (
+            [layer_name]
+            if isinstance(layer_name, str)
+            else (None if layer_name is None else list(layer_name))
+        )
+        self._train_mode = train_mode
+        self._desc = desc
+        self._verbose = verbose
+        self._state = _state
+
+    @property
+    def reusable(self) -> bool:
+        """Always ``True``: every pass reloads the same snapshots."""
+        return True
+
+    @property
+    def args(self) -> AttributionArguments:
+        """The :class:`AttributionArguments` the replay runs under."""
+        return self._args
+
+    @property
+    def snapshots(self) -> TrajectorySnapshots:
+        """The snapshot store the steps are replayed from."""
+        return self._snapshots
+
+    @property
+    def steps(self) -> list[int]:
+        """The steps this source replays, in replay order."""
+        return list(self._steps)
+
+    @property
+    def layer_name(self) -> list[str] | None:
+        """The layer restriction applied to every block (``None`` = all)."""
+        return None if self._layer_name is None else list(self._layer_name)
+
+    def __len__(self) -> int:
+        return len(self._steps)
+
+    def for_steps(self, steps: Iterable[int]) -> ReplayGradientSource:
+        """A view replaying only *steps* (in the order given), sharing this
+        source's hooks.
+        """
+        return ReplayGradientSource(
+            self._model,
+            self._args,
+            self._snapshots,
+            loss_fn=self._loss_fn,
+            config=self._config,
+            steps=steps,
+            layer_name=self._layer_name,
+            train_mode=self._train_mode,
+            desc=self._desc,
+            verbose=self._verbose,
+            _state=self._ensure_state(),
+        )
+
+    def _ensure_state(self) -> _ReplayState:
+        if self._state is None or self._state.closed:
+            self._state = _ReplayState(self._model, self._config, self._args.device)
+        return self._state
+
+    def __iter__(self) -> Iterator[StreamBatch]:
+        state = self._ensure_state()
+        model = state.model
+        steps: Iterable[int] = self._steps
+        if self._verbose and self._args.should_log:
+            from tqdm.auto import tqdm
+
+            steps = tqdm(
+                self._steps, desc=self._desc or "replay", unit="step", leave=False
+            )
+        with state.hm.collect():
+            state.hm.reset_steps()
+            for step in steps:
+                self._snapshots.load_parameters(step, model)
+                batch = move_batch(self._snapshots.load_batch(step), self._args.device)
+                model.train(self._train_mode)
+                model.zero_grad(set_to_none=True)
+                state.capture.record = None
+                with autocast_for(self._args):
+                    loss = self._loss_fn(model, batch)
+                loss.backward()
+                record = state.capture.record
+                if record is None:
+                    raise RuntimeError(
+                        f"loss_fn produced no capture step replaying step {step}: "
+                        "it must run the model on the batch and its backward must "
+                        "reach the hooked layers.",
+                    )
+                grad = record.gradient
+                if self._layer_name is not None:
+                    grad = grad.select_layers(self._layer_name)
+                hashes = (
+                    list(record.input_hash)
+                    if isinstance(record.input_hash, list)
+                    else [record.input_hash]
+                )
+                yield step, grad, hashes
+
+    def close(self) -> None:
+        """Remove the hooks and restore the model's original parameters."""
+        if self._state is not None:
+            self._state.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.close()
+        return False

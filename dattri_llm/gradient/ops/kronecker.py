@@ -7,15 +7,17 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from dattri_llm.gradient.ops.dot import _cross_gram
-from dattri_llm.gradient.ops.materialize import _materialize, materialize
-from dattri_llm.gradient.ops.preprocess import _preprocess_factorized
+from dattri_llm.gradient.ops import dtypes
+from dattri_llm.gradient.ops.dot import cross_gram
+from dattri_llm.gradient.ops.materialize import materialize, materialize_factors
+from dattri_llm.gradient.ops.preprocess import preprocess_factors
 from dattri_llm.gradient.ops.types import (
     is_conv,
     is_conv_transpose,
     is_embedding,
     is_norm,
 )
+from dattri_llm.utils.distributed import all_reduce_sum
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -38,8 +40,9 @@ def _flatten_for_kfac(
         raise NotImplementedError("K-FAC is not defined for normalization layers")
     if is_embedding(layer_type):
         raise NotImplementedError("K-FAC is not defined for embedding layers")
-    a_f = a.float().reshape(-1, a.shape[-1])
-    g_f = g.float().reshape(-1, g.shape[-1])
+    a, g = dtypes.align(a, g)
+    a_f = a.reshape(-1, a.shape[-1])
+    g_f = g.reshape(-1, g.shape[-1])
     return a_f, g_f
 
 
@@ -62,7 +65,7 @@ def _drop_gradient_free_rows(
     return a_f[keep], g_f[keep]
 
 
-def _kfac(
+def kfac_factors(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -71,11 +74,11 @@ def _kfac(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (A, G) K-FAC covariance factor matrices.
 
-    *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
+    *module_kwargs* is passed to :func:`preprocess_factors` when provided.
     For sequence (linear) layers, gradient-free (padded / fully masked) token
     rows are excluded from both factors -- see :func:`_drop_gradient_free_rows`.
     """
-    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
     a_f, g_f = _flatten_for_kfac(a, g, layer_type)
     # Sequence layers only: conv zero-gradient spatial rows are architectural
     # (max-pooling losers, dead ReLU paths), not padding -- the KFC convention
@@ -88,8 +91,8 @@ def _kfac(
             "K-FAC factors are undefined: every token row carries a zero "
             "gradient (fully padded / masked input).",
         )
-    A = a_f.T @ a_f / N
-    G = g_f.T @ g_f / N
+    A = (a_f.T @ a_f).float() / N
+    G = (g_f.T @ g_f).float() / N
     return A, G
 
 
@@ -98,7 +101,7 @@ def _kfac(
 # ---------------------------------------------------------------------------
 
 
-def _fim(
+def fim_factors(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -107,13 +110,13 @@ def _fim(
 ) -> torch.Tensor:
     """Return (d, d) empirical Fisher information matrix.
 
-    Built from the per-sample :func:`_materialize` (token-summed for norm layers,
+    Built from the per-sample :func:`materialize_factors` (token-summed for norm layers,
     so the Fisher is over the layer's actual parameters).  *module_kwargs* is
-    passed to :func:`_preprocess_factorized` when provided.
+    passed to :func:`preprocess_factors` when provided.
     """
-    grad = _materialize(a, g, layer_type, module_kwargs, include_bias)  # (B, d)
+    grad = materialize_factors(a, g, layer_type, module_kwargs, include_bias)  # (B, d)
     B = grad.shape[0]
-    return grad.T @ grad / B
+    return (grad.T @ grad).float() / B
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +134,30 @@ def sym_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
     return (evecs / (evals + damping)) @ evecs.T
 
 
-def _kfac_cross(
+def dense_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
+    """Damped symmetric inverse ``(matrix + damping*I)^{-1}`` via Cholesky.
+
+    Mathematically identical to :func:`sym_inverse` (both return the damped
+    inverse ``(M + damping*I)^{-1}``) but cheaper on the **large dense
+    empirical-Fisher** blocks: a Cholesky factorization + triangular solve
+    instead of a full eigendecomposition.  ``M`` is PSD and ``M + damping*I``
+    is therefore positive-definite for any ``damping > 0``; should Cholesky
+    still fail numerically (too small a damping on a near-singular block) it
+    falls back to :func:`sym_inverse`.
+
+    Used for the dense Fisher; :func:`sym_inverse` serves the small, possibly
+    rank-deficient K-FAC covariance factors, whose eigenbasis is reused.
+    """
+    m = matrix.float()
+    damped = m + damping * torch.eye(m.shape[-1], device=m.device, dtype=m.dtype)
+    try:
+        chol = torch.linalg.cholesky(damped)
+        return torch.cholesky_inverse(chol)
+    except RuntimeError:
+        return sym_inverse(matrix, damping)
+
+
+def kfac_cross_factors(
     a1: torch.Tensor,
     g1: torch.Tensor,
     a2: torch.Tensor,
@@ -146,16 +172,16 @@ def _kfac_cross(
     """K-FAC preconditioned cross-gram between two factorized gradient sets.
 
     Returns ``K[i, j] = vec(dW1_i)^T (A^-1 x G^-1) vec(dW2_j)`` -- i.e.
-    :func:`_cross_dot` with the side-1 factors whitened by the inverse K-FAC
+    :func:`cross_dot_factors` with the side-1 factors whitened by the inverse K-FAC
     covariances (``A_inv`` over the input dim, ``G_inv`` over the output dim).
     Both inverses are symmetric, so whitening either side gives the same value.
     Defined for linear and convolution layers.
     """
-    a1, g1 = _preprocess_factorized(a1, g1, layer_type, module_kwargs1, include_bias)
-    a2, g2 = _preprocess_factorized(a2, g2, layer_type, module_kwargs2, include_bias)
+    a1, g1 = preprocess_factors(a1, g1, layer_type, module_kwargs1, include_bias)
+    a2, g2 = preprocess_factors(a2, g2, layer_type, module_kwargs2, include_bias)
     a1 = a1.float() @ A_inv.float()
     g1 = g1.float() @ G_inv.float()
-    return _cross_gram(a1, g1, a2, g2, layer_type)
+    return cross_gram(a1, g1, a2, g2, layer_type)
 
 
 def kfac_eigh(
@@ -168,7 +194,7 @@ def kfac_eigh(
     return s_A, U_A, s_G, U_G
 
 
-def _ekfac_materialize(
+def ekfac_materialize_factors(
     a: torch.Tensor,
     g: torch.Tensor,
     layer_type: str,
@@ -183,10 +209,10 @@ def _ekfac_materialize(
     coordinates whose empirical second moments are the EK-FAC corrected
     eigenvalues, and against which test/train gradients are scored.
     """
-    a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+    a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
     a = a.float() @ U_A.float()
     g = g.float() @ U_G.float()
-    return _materialize(a, g, layer_type)
+    return materialize_factors(a, g, layer_type)
 
 
 def kfac(
@@ -194,9 +220,9 @@ def kfac(
     layer_type: str,
     include_bias: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """:func:`_kfac` on a :class:`Factorized` (batch-first-safe)."""
+    """:func:`kfac_factors` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
-    return _kfac(
+    return kfac_factors(
         bf.activation,
         bf.pre_activation_grad,
         layer_type,
@@ -210,9 +236,9 @@ def fim(
     layer_type: str,
     include_bias: bool = True,
 ) -> torch.Tensor:
-    """:func:`_fim` on a :class:`Factorized` (batch-first-safe)."""
+    """:func:`fim_factors` on a :class:`Factorized` (batch-first-safe)."""
     bf = f.as_batch_first()
-    return _fim(
+    return fim_factors(
         bf.activation,
         bf.pre_activation_grad,
         layer_type,
@@ -229,9 +255,9 @@ def kfac_cross(
     G_inv: torch.Tensor,
     include_bias: bool = True,
 ) -> torch.Tensor:
-    """:func:`_kfac_cross` on two :class:`Factorized` (batch-first-safe)."""
+    """:func:`kfac_cross_factors` on two :class:`Factorized` (batch-first-safe)."""
     b1, b2 = f1.as_batch_first(), f2.as_batch_first()
-    return _kfac_cross(
+    return kfac_cross_factors(
         b1.activation,
         b1.pre_activation_grad,
         b2.activation,
@@ -246,15 +272,26 @@ def kfac_cross(
 
 
 def ekfac_materialize(
-    f: Factorized,
+    f: Factorized | torch.Tensor,
     layer_type: str,
     U_A: torch.Tensor,
     U_G: torch.Tensor,
     include_bias: bool = True,
 ) -> torch.Tensor:
-    """:func:`_ekfac_materialize` on a :class:`Factorized` (batch-first-safe)."""
+    """:func:`ekfac_materialize_factors` on a :class:`Factorized` (batch-first-safe),
+    or the same rotation applied to an already **materialized** block.
+
+    A dense *f* is one per-sample gradient matrix per row, flattened in the
+    layout :func:`materialize_factors` uses for *layer_type* -- e.g. a
+    materialized ``"logra"`` capture, ``(B, k_g * k_a)`` laid out ``(k_g, k_a)``
+    row-major.  Rotating the token-summed matrix, ``U_G^T dW U_A``, equals
+    rotating each token's factors and summing, so the result is the same
+    ``(B, D)`` eigenbasis coordinates either way.
+    """
+    if isinstance(f, torch.Tensor):
+        return _ekfac_rotate_materialized(f, layer_type, U_A, U_G)
     bf = f.as_batch_first()
-    return _ekfac_materialize(
+    return ekfac_materialize_factors(
         bf.activation,
         bf.pre_activation_grad,
         layer_type,
@@ -263,6 +300,113 @@ def ekfac_materialize(
         bf.module_kwargs,
         include_bias,
     )
+
+
+def _ekfac_rotate_materialized(
+    block: torch.Tensor,
+    layer_type: str,
+    U_A: torch.Tensor,
+    U_G: torch.Tensor,
+) -> torch.Tensor:
+    """``vec(U_G^T dW U_A)`` per row of a materialized ``(B, D)`` block.
+
+    The inverse of the rotation :func:`ekfac_precondition` undoes, in the
+    same per-family layout: linear/conv blocks are ``(d_out, d_in)``-major
+    (``U_G`` on the left), conv-transpose blocks ``(C_in, P)``-major (``U_A``
+    on the left).
+    """
+    batch = block.shape[0]
+    if is_conv_transpose(layer_type):
+        c_in, p = U_A.shape[0], U_G.shape[0]
+        d_w = block.reshape(batch, c_in, p).float()
+        M = torch.einsum("ce,bcp,pf->bef", U_A.float(), d_w, U_G.float())
+        return M.reshape(batch, c_in * p)
+    d_out, d_in = U_G.shape[0], U_A.shape[0]
+    d_w = block.reshape(batch, d_out, d_in).float()
+    M = torch.einsum("oe,boi,if->bef", U_G.float(), d_w, U_A.float())
+    return M.reshape(batch, d_out * d_in)
+
+
+def kfac_precondition(
+    f: Factorized,
+    layer_type: str,
+    A_inv: torch.Tensor,
+    G_inv: torch.Tensor,
+    include_bias: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preprocess and whiten one side's factors by the inverse K-FAC covariances.
+
+    Returns the *preprocessed* ``(a @ A_inv, g @ G_inv)`` factor pair.  Because
+    both inverses are symmetric, a cross-gram of these whitened factors against
+    a raw (preprocessed) side equals :func:`kfac_cross` -- so the whitening can
+    be paid **once on the small side** (typically the test/query gradients)
+    instead of once per train block.
+    """
+    bf = f.as_batch_first()
+    a, g = preprocess_factors(
+        bf.activation,
+        bf.pre_activation_grad,
+        layer_type,
+        bf.module_kwargs,
+        include_bias,
+    )
+    return a.float() @ A_inv.float(), g.float() @ G_inv.float()
+
+
+def kfac_precondition_materialized(
+    block: torch.Tensor,
+    A_inv: torch.Tensor,
+    G_inv: torch.Tensor,
+) -> torch.Tensor:
+    """Two-sided K-FAC preconditioning of a **compact materialized** block.
+
+    *block* is one per-sample gradient matrix flattened to ``(B, k_g * k_a)`` --
+    e.g. a materialized ``"logra"`` capture, ``dW = sum_t (P_g g_t)(P_a a_t)^T`` in
+    the projected space, laid out ``(k_g, k_a)`` row-major (see
+    :func:`materialize_factors`).  With the projected inverse covariances ``A_inv``
+    (``k_a x k_a``) and ``G_inv`` (``k_g x k_g``) this applies
+    ``(A_inv (x) G_inv) vec(dW) = vec(G_inv dW A_inv)`` as two small matmuls,
+    returning the preconditioned block flattened back to ``(B, k_g * k_a)``,
+    ready to dot against a raw materialized train block.
+    """
+    batch = block.shape[0]
+    k_g, k_a = G_inv.shape[0], A_inv.shape[0]
+    d_w = block.reshape(batch, k_g, k_a).float()
+    preconditioned = G_inv.float() @ d_w @ A_inv.float()  # (B, k_g, k_a)
+    return preconditioned.reshape(batch, k_g * k_a)
+
+
+def ekfac_precondition(
+    M: torch.Tensor,
+    U_A: torch.Tensor,
+    U_G: torch.Tensor,
+    lam: torch.Tensor,
+    layer_type: str,
+) -> torch.Tensor:
+    """Apply the full damped EK-FAC inverse to eigenbasis coordinates.
+
+    *M* is a ``(B, D)`` block of :func:`ekfac_materialize` outputs and *lam*
+    the damped corrected eigenvalues ``(D,)``.  Returns the **original-basis**
+    representation flattened back to ``(B, D)`` in the same layout
+    :func:`materialize_factors` uses for *layer_type*, so that ``<dW_raw, R>`` equals
+    the EK-FAC score -- gradients on the other side then need *no* rotation.
+
+    The materialize layout differs by layer family: linear/conv flatten the
+    weight gradient ``(d_out, d_in)``-major (``U_G`` on the output/left side),
+    while conv-transpose flattens ``(C_in, P)``-major (``U_A`` on the left).
+    """
+    Md = M / lam
+    if is_conv_transpose(layer_type):
+        # dW' = U_A^T dW U_G, flattened (C_in, P) = (U_A rows, U_G rows).
+        c_in, p = U_A.shape[0], U_G.shape[0]
+        M3 = Md.reshape(M.shape[0], c_in, p)
+        R = torch.einsum("ce,bef,pf->bcp", U_A.float(), M3, U_G.float())
+        return R.reshape(M.shape[0], c_in * p)
+    # Linear / conv: dW' = U_G^T dW U_A, flattened (d_out, d_in).
+    d_out, d_in = U_G.shape[0], U_A.shape[0]
+    M3 = Md.reshape(M.shape[0], d_out, d_in)
+    R = torch.einsum("oe,bef,if->boi", U_G.float(), M3, U_A.float())
+    return R.reshape(M.shape[0], d_out * d_in)
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +437,9 @@ class LayerKroneckerAccumulator:
     ) -> None:
         """Accumulate one batch of factorized gradient data.
 
-        *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
+        *module_kwargs* is passed to :func:`preprocess_factors` when provided.
         """
-        a, g = _preprocess_factorized(a, g, layer_type, module_kwargs, include_bias)
+        a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
         a_f, g_f = _flatten_for_kfac(a, g, layer_type)
         # Sequence layers only: padded / fully masked positions carry
         # exactly-zero gradients and no learning signal; keep (A, G) means over
@@ -304,27 +448,52 @@ class LayerKroneckerAccumulator:
             a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
         N = a_f.shape[0]
         if self._A is None:
+            # fp32 buffers regardless of the operands' dtype: these are summed
+            # over the whole fit set, where bf16 accumulation drifts.
             self._A = torch.zeros(
                 a_f.shape[-1],
                 a_f.shape[-1],
-                dtype=a_f.dtype,
+                dtype=torch.float32,
                 device=a_f.device,
             )
             self._G = torch.zeros(
                 g_f.shape[-1],
                 g_f.shape[-1],
-                dtype=g_f.dtype,
+                dtype=torch.float32,
                 device=g_f.device,
             )
-        self._A += a_f.T @ a_f
-        self._G += g_f.T @ g_f
+        self._A += (a_f.T @ a_f).float()
+        self._G += (g_f.T @ g_f).float()
         self._n += N
 
-    def result(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (A, G) normalized covariance matrices."""
+    def all_reduce(self) -> None:
+        """Sum the accumulated sums and counts over every rank in place, so
+        :meth:`result` is the covariance of the whole (sharded) fit set.
+        A no-op outside a distributed context.  Every rank must call it,
+        and each must have accumulated at least one batch for this layer.
+        """
+        if self._A is None:
+            raise RuntimeError("No gradient-carrying data has been accumulated")
+        all_reduce_sum(self._A)
+        all_reduce_sum(self._G)
+        n = torch.tensor([self._n], dtype=torch.int64)
+        self._n = int(all_reduce_sum(n).item())
+
+    def result(self, *, consume: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (A, G) normalized covariance matrices.
+
+        With ``consume=True`` the running sums are normalized in place and
+        handed over, and the accumulator is reset: no second copy of the
+        covariances is made, which for a large model is as big as the
+        factors themselves.
+        """
         if self._A is None or self._n == 0:
             raise RuntimeError("No gradient-carrying data has been accumulated")
-        return self._A / self._n, self._G / self._n
+        if not consume:
+            return self._A / self._n, self._G / self._n
+        A, G = self._A.div_(self._n), self._G.div_(self._n)
+        self.reset()
+        return A, G
 
     def reset(self) -> None:
         """Reset accumulator state."""
@@ -337,8 +506,9 @@ class LayerKroneckerAccumulator:
 class LayerFisherAccumulator:
     """Streaming empirical Fisher accumulator for a *single* layer.
 
-    Accumulates ``sum_i g_i g_i^T`` over the per-sample :func:`_materialize` ``g_i``.
-    For the across-layers version see :class:`FisherAccumulator`.
+    Accumulates ``sum_i g_i g_i^T`` over the per-sample
+    :func:`materialize_factors` ``g_i``.  For the across-layers version see
+    :class:`FisherAccumulator`.
     """
 
     _F: torch.Tensor | None = field(default=None, init=False, repr=False)
@@ -354,10 +524,10 @@ class LayerFisherAccumulator:
     ) -> None:
         """Accumulate one batch from its factorized factors.
 
-        *module_kwargs* is passed to :func:`_preprocess_factorized` when provided.
+        *module_kwargs* is passed to :func:`preprocess_factors` when provided.
         """
         self.update_from_grad(
-            _materialize(a, g, layer_type, module_kwargs, include_bias),
+            materialize_factors(a, g, layer_type, module_kwargs, include_bias),
         )
 
     def update_from_grad(self, grad: torch.Tensor) -> None:
@@ -377,6 +547,16 @@ class LayerFisherAccumulator:
             )
         self._F += grad.T @ grad
         self._n += B
+
+    def all_reduce(self) -> None:
+        """Sum the accumulated Fisher and count over every rank in place (a
+        no-op outside a distributed context; every rank must call it).
+        """
+        if self._F is None:
+            raise RuntimeError("No data has been accumulated")
+        all_reduce_sum(self._F)
+        n = torch.tensor([self._n], dtype=torch.int64)
+        self._n = int(all_reduce_sum(n).item())
 
     def result(self) -> torch.Tensor:
         """Return normalized empirical Fisher matrix."""
@@ -437,16 +617,35 @@ class KroneckerAccumulator:
                 bf.module_kwargs,
             )
 
-    def result(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """Return ``{layer: (A, G)}`` for every accumulated layer."""
-        return {name: acc.result() for name, acc in self._layers.items()}
+    def all_reduce(self) -> None:
+        """Sum every layer's accumulator over the ranks (see
+        :meth:`LayerKroneckerAccumulator.all_reduce`).  The layer set must
+        agree across ranks, which it does when every rank streams blocks of
+        the same capture.
+        """
+        for name in sorted(self._layers):
+            self._layers[name].all_reduce()
+
+    def result(
+        self, *, consume: bool = False
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Return ``{layer: (A, G)}`` for every accumulated layer.
+
+        ``consume=True`` hands the accumulated buffers over instead of copying
+        them (see :meth:`LayerKroneckerAccumulator.result`) and leaves this
+        accumulator empty.
+        """
+        out = {name: acc.result(consume=consume) for name, acc in self._layers.items()}
+        if consume:
+            self._layers = {}
+        return out
 
 
 class FisherAccumulator:
     """Streaming empirical-Fisher accumulator across a model's layers.
 
     Holds one :class:`LayerFisherAccumulator` per layer, accumulating the dense
-    Fisher from each layer's per-sample :func:`_materialize`.  When *max_params*
+    Fisher from each layer's per-sample :func:`materialize_factors`.  When *max_params*
     is given, layers whose parameter count exceeds it are skipped (and recorded
     in :attr:`skipped`) to bound the dense ``O(d^2)`` Fisher::
 
@@ -483,6 +682,14 @@ class FisherAccumulator:
                 self._layers.pop(name, None)
                 continue
             self._layers.setdefault(name, LayerFisherAccumulator()).update_from_grad(g)
+
+    def all_reduce(self) -> None:
+        """Sum every layer's accumulator over the ranks (see
+        :meth:`LayerFisherAccumulator.all_reduce`); the layer set must agree
+        across ranks.
+        """
+        for name in sorted(self._layers):
+            self._layers[name].all_reduce()
 
     def result(self) -> dict[str, torch.Tensor]:
         """Return ``{layer: F}`` for every accumulated (non-skipped) layer."""

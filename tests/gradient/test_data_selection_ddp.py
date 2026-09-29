@@ -86,16 +86,24 @@ def _hooked_params(model: EmbeddingMLP):
 
 
 def _callback_kwargs(mode: str) -> dict:
+    """Constructor kwargs per regime.
+
+    ``threshold`` / ``threshold_mode`` live under ``selection_kwargs``;
+    ``renormalize`` stays a top-level argument.
+    """
     if mode == "none":
-        return {"threshold_mode": "bottom_fraction", "threshold": 0.0}
+        return {
+            "selection_kwargs": {"threshold_mode": "bottom_fraction", "threshold": 0.0}
+        }
     if mode == "half":
-        return {"threshold_mode": "bottom_fraction", "threshold": 0.5}
+        return {
+            "selection_kwargs": {"threshold_mode": "bottom_fraction", "threshold": 0.5}
+        }
     if mode == "hard0":
-        return {"threshold_mode": "hard", "threshold": 0.0}
+        return {"selection_kwargs": {"threshold_mode": "hard", "threshold": 0.0}}
     if mode == "half_renorm":
         return {
-            "threshold_mode": "bottom_fraction",
-            "threshold": 0.5,
+            "selection_kwargs": {"threshold_mode": "bottom_fraction", "threshold": 0.5},
             "renormalize": True,
         }
     raise ValueError(mode)
@@ -129,9 +137,9 @@ def _ddp_ds_worker(rank, world_size, mode, result_queue, rendezvous_path):
         ddp_model = nn.parallel.DistributedDataParallel(model)
         ds_cb = DataSelectionCallback(
             model=ddp_model,
-            score_mode="ghost",
             target="batch",
             **_callback_kwargs(mode),
+            scoring_kwargs={"score_mode": "ghost"},
         )
         collector.add_callback(ds_cb)
 

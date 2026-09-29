@@ -1,11 +1,10 @@
 """Read-path tests for on-disk gradient datasets (gradient/datasets.py).
 
-Regression under test: per-sample records stored at one step with differing
-sequence lengths (no padding-to-max collation) used to fail at *read* time --
-``_records_to_block`` batch-concatenates the records' ``(B, T, d)`` factors,
-and ``torch.cat`` requires equal ``T``.  ``Gradient.concatenate`` now pads the
-shorter side's token axis with exactly-zero gradient rows, which every
-downstream operation treats as inert.
+Per-sample records stored at one step may have differing sequence lengths
+(no padding-to-max collation).  ``_records_to_block`` batch-concatenates the
+records' ``(B, T, d)`` factors, and ``Gradient.concatenate`` pads the shorter
+side's token axis with exactly-zero gradient rows, which every downstream
+operation treats as inert.
 """
 
 from __future__ import annotations
@@ -14,8 +13,8 @@ import torch
 
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.datasets import GradientFileMultiStepDataset
-from dattri_llm.gradient.file_manager import GradientFileManager
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
+from dattri_llm.gradient.storage_manager import GradientStorageManager
 
 B1, T1 = 1, 4
 B2, T2 = 1, 7
@@ -43,13 +42,15 @@ def _record(step: int, input_hash: str, t: int, seed: int) -> GradientRecord:
 
 class TestVariableLengthBlocks:
     def test_block_from_records_with_differing_seq_lengths(self, tmp_path):
-        fm = GradientFileManager(str(tmp_path))
+        fm = GradientStorageManager(str(tmp_path))
         rec_a = _record(0, HASH_A, t=T1, seed=1)
         rec_b = _record(0, HASH_B, t=T2, seed=2)
         fm.save_bulk([rec_a, rec_b])
 
         # Fresh manager, as an attributor would open the store.
-        ds = GradientFileMultiStepDataset(GradientFileManager(str(tmp_path)), steps=[0])
+        ds = GradientFileMultiStepDataset(
+            GradientStorageManager(str(tmp_path)), steps=[0]
+        )
         assert len(ds) == 1
         block, hashes = ds[0][0]  # item -> {step: (block, hashes)}
 
@@ -86,13 +87,13 @@ class TestDerivedLayerSelection:
             layer_types=dict.fromkeys(("l1", "l1@2", "other"), "nn.Linear"),
             indexing=dict.fromkeys(("l1", "l1@2", "other"), "batch_token"),
         )
-        fm = GradientFileManager(str(tmp_path))
+        fm = GradientStorageManager(str(tmp_path))
         fm.save_bulk(
             [GradientRecord(step=0, input_hash=[HASH_A], gradient=gradient)],
         )
 
         ds = GradientFileMultiStepDataset(
-            GradientFileManager(str(tmp_path)),
+            GradientStorageManager(str(tmp_path)),
             steps=[0],
             layer_name=["l1"],
         )

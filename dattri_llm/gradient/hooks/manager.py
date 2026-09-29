@@ -11,32 +11,38 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from dattri_llm.gradient import ops
 from dattri_llm.gradient.gradient import Factorized, Gradient, GradientRecord
 from dattri_llm.gradient.hooks.config import (
+    INVASIVE_LINEAR_IO,
     LINEAR_IO,
     PARAM_GRAD,
     HookManagerConfig,
-    _resolve_projector,
     resolve_hook_assignments,
 )
 from dattri_llm.gradient.hooks.hooks import (
+    install_invasive_forward,
     register_linear_io_hooks,
     register_linear_param_hooks,
     register_param_grad_hooks,
     remove_hooks,
 )
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, is_embedding
+from dattri_llm.gradient.optimizer_state import (
+    GradientPreconditioner,
+    OptimizerSnapshot,
+)
 from dattri_llm.utils.autograd import queue_backward_end_callback
 from dattri_llm.utils.hashing import hash_batch
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
 
     from dattri_llm.gradient.callbacks import HookManagerCallback
 
 
-# Resolved once at import: the probe runs on every hooked layer's forward
-# fire, so the per-call attribute lookup is hoisted out of the hot path.
+# The private autograd probe, resolved once at import; ``None`` on builds
+# that do not expose it.
 _GRAPH_TASK_ID_PROBE = getattr(torch._C, "_current_graph_task_id", None)
 
 
@@ -45,10 +51,27 @@ def _current_graph_task_id() -> int:
 
     A non-negative id inside a *forward* hook means the forward is a
     gradient-checkpointing recomputation (it runs during the backward).
-    Wraps the private ``torch._C`` probe so older builds degrade to ``-1``
-    (recompute detection off -- checkpointing was unsupported there anyway).
+    Wraps the private ``torch._C`` probe; builds without it return ``-1``
+    (recompute detection is unavailable there).
     """
     return _GRAPH_TASK_ID_PROBE() if _GRAPH_TASK_ID_PROBE is not None else -1
+
+
+def _first_grad_tensor(output: object) -> torch.Tensor | None:
+    """The first tensor requiring grad in a model output (a tensor, a
+    tuple/list, or a dict such as an HF ``ModelOutput``), else ``None``.
+    """
+    if isinstance(output, torch.Tensor):
+        return output if output.requires_grad else None
+    values: Iterable = output.values() if isinstance(output, dict) else output
+    try:
+        for value in values:
+            found = _first_grad_tensor(value)
+            if found is not None:
+                return found
+    except TypeError:  # not iterable
+        return None
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -71,10 +94,9 @@ class HookManager:
 
     .. warning::
         Gradient checkpointing (either ``use_reentrant`` variant) and
-        ``nn.DataParallel`` are each supported, but their **combination** is
-        untested territory: checkpoint recomputation would interleave with
-        DataParallel's concurrent per-replica hook threads, and no test pins
-        that interaction.  Prefer DDP when training with checkpointing.
+        ``nn.DataParallel`` are each supported, but not their **combination**:
+        checkpoint recomputation interleaves with DataParallel's concurrent
+        per-replica hook threads.  Use DDP when training with checkpointing.
 
     .. warning::
         Sample identifiers cover the **last** model forward of a step.  When
@@ -93,15 +115,14 @@ class HookManager:
         A weight used in more than one place -- HF-style **tied parameters**
         (e.g. ``embed_tokens`` and ``lm_head`` sharing one weight) or
         repeated invocations of one module (the virtual ``name@k`` layers)
-        -- is scored as if each use site held an independent weight,
-        following the convention of existing attribution implementations.
+        -- is scored as if each use site held an independent weight.
         For per-sample contributions ``g_i`` (site 1) and ``h_i`` (site 2) of
         a shared weight, the true similarity ``<g_i + h_i, g_j + h_j>``
         includes the cross-site terms ``<g_i, h_j> + <h_i, g_j>``; per-layer
         scoring sums the sites independently and drops them -- the same
         block-diagonal treatment K-FAC applies across layers.  Both sites'
         factors are captured in full, so the cross terms remain computable
-        downstream if exactness is ever required.
+        downstream.
 
     Args:
         model: The model to hook (plain ``nn.Module``, ``DataParallel``, or
@@ -123,6 +144,17 @@ class HookManager:
             stringified, so an ``idx`` column of ``[32, 42]`` yields
             identifiers ``["32", "42"]``.  The chosen key is stamped on every
             emitted record (:attr:`GradientRecord.sample_id_key`).
+        sample_hash_fields: The input fields the content hash is taken over,
+            instead of every captured tensor input: a ``str`` names a forward
+            kwarg, an ``int`` indexes the positional forward arguments (hashed
+            under the key ``"_arg<i>"``).  Use it when the model is called with
+            per-sample inputs that are not part of a sample's identity (a label
+            mask, a position in the dataset), or to give samples captured
+            through different calls the same identity:
+            ``sample_hash_fields=["labels"]`` makes a sample's identifier
+            ``hash_sample({"labels": labels_row})``.  Every field must be
+            present in every step's inputs (a missing one raises).  Mutually
+            exclusive with ``sample_id_key``.
         non_batch_first_layers: Optional set/list of fully-qualified layer names
             whose captured activations are **sequence-first** (``(T, B, ...)``)
             rather than the default batch-first (``(B, T, ...)``) -- e.g. layers
@@ -139,6 +171,27 @@ class HookManager:
             happens, at the cost of keeping one step's captures in device
             memory until the next step completes.  A no-op either way when
             training on CPU.
+        optimizer: Optional optimizer over the model's parameters (or a
+            zero-argument callable returning one, resolved on first use).
+            When given, every ``linear_io`` layer captures the optimizer's
+            **per-sample update direction** (the
+            :func:`~dattri_llm.gradient.ops.precondition` of the sample's
+            gradient with the state the coming
+            ``optimizer.step()`` will update from) instead of the raw
+            gradient -- the representation optimizer-aware methods such as
+            LESS score.  Like a projection it happens inside the capture, so
+            only the preconditioned copy exists: dense on the captured
+            coordinates (the whole layer, or a ``"mask"`` subset; a
+            ``"dense"`` projection is applied after the map).  The
+            ``"logra"`` style and ``param_grad`` layers are
+            incompatible.  :attr:`precondition` switches the map off and on
+            between passes (a raw test probe sharing the hooks).  Every
+            coordinate-wise ``torch.optim`` optimizer is supported under
+            single-process, DDP, ``FullyShardedDataParallel``
+            (``use_orig_params=True``) and ``fully_shard`` training.  Under
+            either sharding a layer's state is gathered across ranks inside
+            its backward hook, so every rank must run the same hooked layers
+            in the same order.
     """
 
     def __init__(
@@ -147,11 +200,40 @@ class HookManager:
         config: HookManagerConfig | None = None,
         callbacks: list[HookManagerCallback] | None = None,
         sample_id_key: str | int | None = None,
+        sample_hash_fields: Iterable[str | int] | None = None,
         non_batch_first_layers: Iterable[str] | None = None,
         offload_to_cpu: bool = False,
+        optimizer: torch.optim.Optimizer
+        | Callable[[], torch.optim.Optimizer]
+        | None = None,
     ) -> None:
         self._model = model
         self._callbacks: list[HookManagerCallback] = callbacks or []
+        # Optimizer-aware capture: the map every layer's entries go through
+        # (see the ``optimizer`` argument).  The snapshot resolves on first use
+        # so an optimizer built after the hooks (a streamer's) can be passed
+        # as a callable.
+        self._preconditioner: GradientPreconditioner | None = None
+        if optimizer is not None:
+            root = getattr(model, "module", model)
+            self._preconditioner = GradientPreconditioner(
+                lambda: OptimizerSnapshot(
+                    root, optimizer() if callable(optimizer) else optimizer
+                )
+            )
+        if isinstance(sample_hash_fields, (str, int)):
+            sample_hash_fields = [sample_hash_fields]
+        self._sample_hash_fields: tuple[str | int, ...] | None = (
+            None if sample_hash_fields is None else tuple(sample_hash_fields)
+        )
+        if self._sample_hash_fields is not None:
+            if sample_id_key is not None:
+                raise ValueError(
+                    "sample_id_key and sample_hash_fields are alternative "
+                    "identifier schemes; pass one of them.",
+                )
+            if not self._sample_hash_fields:
+                raise ValueError("sample_hash_fields must name at least one field.")
         self._sample_id_key = sample_id_key
         self._offload_to_cpu = offload_to_cpu
         self._non_batch_first_layers: set[str] = (
@@ -162,6 +244,9 @@ class HookManager:
         self._warned_broadcast: set[str] = set()
 
         self._config = config if config is not None else HookManagerConfig()
+        # The projector (and its projection-matrix cache) lives exactly as long
+        # as the hooks are registered: built in register(), closed in remove().
+        self._projector: ops.DattriProjector | None = None
 
         self._step_count: int = 0
         self._collecting: bool = False
@@ -175,56 +260,46 @@ class HookManager:
         self._seen_bwd: set[str] = set()
         self._bwd_replica_counts: dict[str, int] = {}
         # This step's participation roster: layers with a grad-enabled
-        # forward fire (``_fwd_fires > 0``), maintained incrementally so
-        # completion checks are O(1).  Kept in sync wherever ``_fwd_fires``
-        # changes: _dispatch_layer_forward (add), _reset_layer_buffers
-        # (clear), _reconcile_unmatched_forwards (drop fully-orphaned).
+        # forward fire (``_fwd_fires > 0``).  Kept in sync wherever
+        # ``_fwd_fires`` changes: _dispatch_layer_forward (add),
+        # _reset_layer_buffers (clear), _reconcile_unmatched_forwards (drop
+        # fully-orphaned).
         self._active_layers: set[str] = set()
         self._step_lock = threading.Lock()
 
-        # Step-completion uses two composite barriers:
+        # Step completion uses two composite barriers.
         #
         # ``_bwd_done`` -- True once *both* sub-conditions hold:
-        #   (a) All MLP-layer full backward hooks have fired.
-        #       Ensures ``_grad_parts`` buffers are populated for every
-        #       hooked layer.
-        #   (b) All MLP-layer trainable-parameter hooks have fired.
-        #       Ensures ``weight.grad`` (and ``bias.grad``) are populated.
+        #   (a) every participating linear-IO layer's full backward hook has
+        #       fired (``_grad_parts`` populated for every hooked layer);
+        #   (b) every linear-IO layer's trainable-parameter hook has fired
+        #       (``weight.grad`` and ``bias.grad`` populated), tracked by
+        #       ``_mlp_param_hook_count``.
+        #   Both hook kinds are needed because PyTorch orders them by whether
+        #   the module input requires grad: when it does, the parameter hook
+        #   fires before the module backward hook and (a) completes the step;
+        #   when it does not, the module backward hook fires first and (b)
+        #   completes the step.
         #
-        #   Sub-condition (b) is tracked via ``_mlp_param_hook_count``.
-        #   Registering both types covers the two possible PyTorch orderings:
-        #
-        #   Case A -- module input *requires grad* (normal LLM training):
-        #     param.register_hook fires first  -> weight.grad set
-        #     register_full_backward_hook fires second -> _grad_parts set
-        #     -> (b) done before (a); step triggered by (a)
-        #
-        #   Case B -- module input does *not* require grad (e.g. raw float
-        #     tensor, no embedding):
-        #     register_full_backward_hook fires first (PyTorch early-fire quirk)
-        #     param.register_hook fires second -> weight.grad set
-        #     -> (a) done before (b); step triggered by (b)
-        #
-        # ``_grad_done`` -- True once all user-specified ``param_grad`` hooks
-        #   have fired (only relevant when ``param_grad`` layers are
-        #   registered; starts True otherwise).
+        # ``_grad_done`` -- True once every ``param_grad`` hook has fired
+        #   (starts True when no ``param_grad`` layer is registered).
         self._bwd_done: bool = True
         self._mlp_param_hook_count: int = 0  # fires toward sub-cond (b)
         self._n_mlp_params: int = 0  # target for sub-cond (b)
         self._grad_done: bool = True
 
-        # End-of-backward barrier for sub-cond (b).  Under FSDP the
-        # per-parameter post-accumulate-grad hooks never fire (grads flow
-        # through the flattened FlatParameter) and FSDP writes the (sharded)
-        # ``param.grad`` back to each original parameter only *after* the whole
-        # backward pass completes.  To cover this, every step queues a callback
-        # on the autograd engine that fires once backward is fully done -- the
-        # point at which all ``param.grad`` are guaranteed ready.  For non-FSDP
-        # models the per-parameter hooks complete the step earlier (during
-        # backward), so this callback is a harmless no-op.  ``_mlp_params_ready``
-        # is the callback's signal; ``_backward_end_scheduled`` is the live
-        # token for the in-flight step (guards against double-queuing and
-        # against a stale callback leaking into the next step).
+        # End-of-backward barrier for sub-condition (b).  Under FSDP the
+        # per-parameter post-accumulate-grad hooks do not fire (gradients flow
+        # through the flattened FlatParameter) and the sharded ``param.grad``
+        # is written back to each original parameter only after the whole
+        # backward pass completes.  Every step therefore queues a callback on
+        # the autograd engine that fires once the backward is fully done, when
+        # every ``param.grad`` is ready.  For non-FSDP models the
+        # per-parameter hooks complete the step earlier, and the callback is
+        # a no-op.  ``_mlp_params_ready`` is the callback's signal;
+        # ``_backward_end_scheduled`` is the live token for the in-flight step
+        # (guards against double-queuing and against a stale callback acting
+        # on the next step).
         self._mlp_params_ready: bool = False
         self._backward_end_scheduled: bool = False
         # True once a forward hook fired during an active backward this step
@@ -241,9 +316,18 @@ class HookManager:
         # Hook state -- populated by register(), emptied by remove().
         self._registered: bool = False
         self._model_fwd_handle: torch.utils.hooks.RemovableHandle | None = None
+        self._model_out_handle: torch.utils.hooks.RemovableHandle | None = None
+        # Hooked layers whose every forward of the step went without a
+        # backward (set by _reconcile_unmatched_forwards; read at the end of
+        # the backward, where such a layer is a definitive fact).
+        self._orphaned_layers: set[str] = set()
+        self._warned_orphans: set[frozenset[str]] = set()
         self._has_linear_io: bool = False
         self._buffers: dict = {}
         self._handles: list = []
+        # Revert closures for ``invasive_linear_io`` forward overrides -- restore
+        # each patched nn.Linear's original forward on remove().
+        self._invasive_reverts: list = []
         self._mlp_weight_handles: list = []  # post-accumulate hooks for sub-cond (b)
         self._n_layers: int = 0
         self._has_param_grad: bool = False
@@ -277,6 +361,17 @@ class HookManager:
             # A new capture step is beginning, so the cached last-step
             # gradient is about to go stale: release it now.
             self._last_gradient = None
+        if self._sample_hash_fields is not None:
+            # Only the designated fields enter the content hash; one that the
+            # call does not carry is reported when the step is finalized.
+            self._last_inputs = {
+                (f"_arg{f}" if isinstance(f, int) else f): (
+                    args[f] if isinstance(f, int) else kwargs[f]
+                )
+                for f in self._sample_hash_fields
+                if (f < len(args) if isinstance(f, int) else f in kwargs)
+            }
+            return
         captured: dict[str, torch.Tensor] = {
             k: v for k, v in kwargs.items() if isinstance(v, torch.Tensor)
         }
@@ -304,24 +399,23 @@ class HookManager:
         self,
         layer_name: str,
         activation: torch.Tensor,
+        layer_type: str,
+        module_kwargs: dict | None,
     ) -> None:
-        # Maintain the step's participation roster incrementally: O(1) here
-        # instead of an O(n_layers) rescan on every backward fire in
-        # _bwd_hooks_done.  The unlocked membership pre-check makes repeat
-        # fires free; set.add is idempotent, so the worst concurrent-replica
-        # race is a harmless double add.
+        # Add the layer to the step's participation roster.  The unlocked
+        # membership pre-check is safe: set.add is idempotent, so a concurrent
+        # replica fire can at worst add the layer twice.
         if layer_name not in self._active_layers:
             with self._step_lock:
                 self._active_layers.add(layer_name)
         # A forward hook firing while an autograd graph task is active is a
         # checkpoint *recomputation* (both use_reentrant variants), and it
-        # executes inside the OUTERMOST backward's task -- the reentrant
-        # variant's nested sub-backwards have not started yet.  Record that
-        # task id (the true end-of-backward identity) and queue the
-        # end-of-backward callback *here*, so it attaches to the outer task:
-        # a callback queued from a backward hook inside a reentrant
-        # sub-backward would fire at that segment's end, mid-step (see
-        # _on_backward_end's nested-end guard).
+        # executes inside the outermost backward's task, before the reentrant
+        # variant's nested sub-backwards start.  That task id identifies the
+        # true end of the backward, so it is recorded here and the
+        # end-of-backward callback is queued from here, attached to the outer
+        # task (a callback queued from inside a reentrant sub-backward fires at
+        # that segment's end, mid-step; see _on_backward_end).
         if self._collecting:
             task_id = _current_graph_task_id()
             if task_id != -1:
@@ -336,12 +430,14 @@ class HookManager:
                     ):
                         self._backward_end_scheduled = True
         for cb in self._callbacks:
-            cb.on_layer_forward(layer_name, activation)
+            cb.on_layer_forward(layer_name, activation, layer_type, module_kwargs)
 
     def _check_step_bwd_complete(
         self,
         layer_name: str,
         grad_output: torch.Tensor,
+        layer_type: str,
+        module_kwargs: dict | None,
     ) -> None:
         """Fired by each MLP layer's full backward hook.
 
@@ -349,19 +445,18 @@ class HookManager:
         checks whether the composite ``_bwd_done`` condition is met.
         """
         for cb in self._callbacks:
-            cb.on_layer_backward(layer_name, grad_output)
+            cb.on_layer_backward(layer_name, grad_output, layer_type, module_kwargs)
 
         if not self._collecting:
             return
 
         record = None
         with self._step_lock:
-            # We are inside the backward pass here -- a valid place to queue
-            # an end-of-backward callback.  Queue it once per step as the
-            # FSDP-safe satisfier of sub-cond (b) (see ``__init__``), and
-            # remember the queuing task's id: without checkpointing this hook
-            # runs in the outermost (only) backward task, which is the end
-            # the callback must act at.
+            # This hook runs inside the backward pass, where an end-of-backward
+            # callback can be queued.  Queue it once per step as the FSDP-safe
+            # satisfier of sub-condition (b) (see ``__init__``), and record the
+            # queuing task's id: without checkpointing this hook runs in the
+            # outermost (only) backward task, whose end the callback acts at.
             if (
                 self._n_mlp_params > 0
                 and not self._backward_end_scheduled
@@ -376,12 +471,10 @@ class HookManager:
             # A layer's backward is complete when it has fired once per
             # *observed* grad-enabled forward this step (the forward pass is
             # fully done before any backward hook runs, so the target is
-            # final here).  Deriving the target from observation -- instead
-            # of predicting it from ``len(device_ids)`` at construction --
-            # keeps the count right when DataParallel's scatter uses fewer
-            # replicas than devices (trailing short batch), when the model is
-            # wrapped after this manager is built, and when a layer is
-            # invoked several times per step (weight tying).
+            # final here).  The observed count is correct when DataParallel's
+            # scatter uses fewer replicas than devices (trailing short batch),
+            # when the model is wrapped after this manager is built, and when
+            # a layer is invoked several times per step (weight tying).
             if (
                 self._bwd_replica_counts[layer_name]
                 >= self._buffers[layer_name]["_fwd_fires"]
@@ -422,13 +515,81 @@ class HookManager:
                 return
             self._mlp_params_ready = True
             self._reconcile_unmatched_forwards()
-            record = self._check_mlp_done()
+            orphaned = sorted(self._orphaned_layers)
+            # The backward is over: a hooked layer that ran forward but never
+            # saw a gradient is now a fact, and a step in which that holds
+            # for EVERY hooked layer can never complete.
+            stalled = (
+                self._has_linear_io
+                and bool(orphaned)
+                and not self._active_layers
+                and not self._bwd_done
+            )
+            record = None if stalled else self._check_mlp_done()
+        if stalled:
+            raise RuntimeError(
+                "No hooked layer received a gradient this step: "
+                f"{orphaned[:8]}{'...' if len(orphaned) > 8 else ''} ran forward "
+                "but the backward pass did not reach them, so the step cannot "
+                "complete. A layer receives a gradient only when the loss "
+                "depends on its output through some parameter that requires "
+                "grad; with frozen layers (include_frozen=True) a parameter "
+                "upstream of them -- typically the input embedding -- must "
+                "stay trainable.",
+            )
+        if orphaned and record is not None:
+            key = frozenset(orphaned)
+            if key not in self._warned_orphans:
+                self._warned_orphans.add(key)
+                warnings.warn(
+                    f"Hooked layers {orphaned[:8]}{'...' if len(orphaned) > 8 else ''} "
+                    "ran forward but received no gradient this step and are "
+                    "left out of its record (a detached branch, or a frozen "
+                    "layer with no trainable parameter upstream of it). "
+                    "Reported once per layer set.",
+                    stacklevel=2,
+                )
         if record is not None:
             self._dispatch_step_end(record)
 
+    def _capture_model_output(
+        self,
+        _module: nn.Module,
+        _args: tuple,
+        output: object,
+    ) -> None:
+        """Forward hook on the model root: arm :meth:`_on_backward_begin` on
+        the output, so every backward through the model is observed -- even
+        one that reaches no hooked layer (they are all frozen and nothing
+        upstream requires grad), which no layer hook could report.
+        """
+        if not self._collecting or self._n_layers == 0 or not torch.is_grad_enabled():
+            return
+        tensor = _first_grad_tensor(output)
+        if tensor is not None:
+            tensor.register_hook(self._on_backward_begin)
+
+    def _on_backward_begin(self, _grad: torch.Tensor) -> None:
+        """Tensor hook on the model output: the backward has just started.
+
+        Queues the end-of-backward callback here -- from inside the outermost
+        backward task -- whatever the hooked layers' parameters, so
+        :meth:`_on_backward_end` always reconciles the step (the layer-hook
+        queue sites need a trainable hooked parameter to fire at all).
+        """
+        if not self._collecting:
+            return
+        with self._step_lock:
+            if not self._backward_end_scheduled and queue_backward_end_callback(
+                self._on_backward_end,
+            ):
+                self._backward_end_scheduled = True
+                if self._outer_task_id == -1:
+                    self._outer_task_id = _current_graph_task_id()
+
     def _reconcile_unmatched_forwards(self) -> None:
-        """Discard forward captures whose backward never fired (backward is
-        over -- an unmatched forward is now a definitive fact, not a guess).
+        """Discard forward captures whose backward never fired (the backward
+        is over, so an unmatched forward is definitive).
 
         Two legitimate sources: non-reentrant **gradient checkpointing**
         (both the original forward and the recomputation fire grad-enabled,
@@ -454,9 +615,13 @@ class HookManager:
                 matched = len(buf["_pair_pos"])
                 if buf["_fwd_fires"] != matched:
                     buf["_fwd_fires"] = matched
-            if matched == 0:
-                # Every forward was orphaned (detached branch): the layer did
-                # not participate in this step after all.
+            if matched == 0 and buf["_fwd_fires"] == 0 and had_orphans:
+                # Every forward was orphaned (detached branch, or a frozen
+                # layer no gradient reached): the layer did not participate
+                # in this step after all.
+                self._active_layers.discard(layer_name)
+                self._orphaned_layers.add(layer_name)
+            elif matched == 0:
                 self._active_layers.discard(layer_name)
             elif self._bwd_replica_counts.get(layer_name, 0) >= matched:
                 self._seen_bwd.add(layer_name)
@@ -682,10 +847,10 @@ class HookManager:
         checkpointing, even a secondary backward; see
         :meth:`HookManagerCallback.on_step_end`).
         """
-        # Normally already None (released when this step's forward began, see
-        # _capture_model_input); kept as a guard for forwards that bypass the
-        # root pre-hook (e.g. a submodule invoked directly) so we never
-        # transiently hold two full step gradients while assembling.
+        # Already None when this step's forward went through the root
+        # pre-hook (see _capture_model_input); cleared here as well for
+        # forwards that bypass it (e.g. a submodule invoked directly), so two
+        # full step gradients are never held at once while assembling.
         self._last_gradient = None
         gradient = self._assemble_gradient()
         step = self._step_count
@@ -693,6 +858,7 @@ class HookManager:
         self._step_count += 1
         self._seen_bwd.clear()
         self._bwd_replica_counts.clear()
+        self._orphaned_layers.clear()
         self._mlp_param_hook_count = 0
         self._param_hook_count = 0
         # Reset completion flags for the next step.
@@ -712,6 +878,19 @@ class HookManager:
         if self._sample_id_key is not None:
             input_hash = self._extract_sample_ids(batch_size)
         else:
+            if self._sample_hash_fields is not None:
+                missing = [
+                    f
+                    for f in self._sample_hash_fields
+                    if (f"_arg{f}" if isinstance(f, int) else f)
+                    not in self._last_inputs
+                ]
+                if missing:
+                    raise KeyError(
+                        f"sample_hash_fields {missing!r} were not found among "
+                        "the model inputs of this step; cannot assign sample "
+                        "identities.",
+                    )
             input_hash = hash_batch(self._last_inputs, batch_size)
         return GradientRecord(
             step=step,
@@ -723,11 +902,11 @@ class HookManager:
     def _dispatch_step_end(self, record: GradientRecord) -> None:
         """Deliver a finalized record to every callback, outside the lock.
 
-        Running user code while holding the non-reentrant ``_step_lock`` would
-        turn any callback-triggered backward into a silent same-thread
-        deadlock (the inner pass's hooks re-acquire the lock).  All per-step
-        state was already reset by :meth:`_finalize_step`, so a reentrant
-        backward here simply completes a capture step of its own.
+        Callbacks run with the non-reentrant ``_step_lock`` released, so a
+        callback-triggered backward (whose hooks acquire the lock) does not
+        deadlock.  All per-step state was already reset by
+        :meth:`_finalize_step`, so a reentrant backward here completes a
+        capture step of its own.
         """
         for cb in self._callbacks:
             cb.on_step_end(record)
@@ -744,8 +923,7 @@ class HookManager:
         """
         ordered = [t for _, t in sorted(parts, key=operator.itemgetter(0))]
         if len(ordered) == 1:
-            # The common (non-DataParallel) case: torch.cat would copy the
-            # whole tensor for nothing.
+            # A single part is returned as is (no copy).
             return ordered[0]
         first_device = ordered[0].device
         if any(t.device != first_device for t in ordered[1:]):
@@ -758,8 +936,8 @@ class HookManager:
 
         Returns one ``(act_parts, grad_parts, proj_parts)`` triple per
         per-device invocation position, in forward-invocation order.  The
-        single-invocation case (the overwhelmingly common one) returns the
-        buffers as-is.  For multi-fire layers the grouping undoes the fire
+        single-invocation case returns the buffers as-is.  For multi-fire
+        layers the grouping undoes the fire
         *order*: raw activations buffer in forward order while gradients
         buffer in backward (reverse) order -- ``_pair_pos``, recorded when
         each backward LIFO-matched its forward, carries the pairing.
@@ -771,7 +949,16 @@ class HookManager:
         acts: list[list] = [[] for _ in range(n_inv)]
         grads: list[list] = [[] for _ in range(n_inv)]
         projs: list[list] = [[] for _ in range(n_inv)]
-        if buf["_proj_kw"] is None:
+        if buf["_proj_parts"]:
+            # Dense captures (materialized styles, or a preconditioned layer)
+            # were appended at match time, aligned with pair_pos.
+            for (dev, part), (_, pos) in zip(
+                buf["_proj_parts"],
+                pair_pos,
+                strict=True,
+            ):
+                projs[pos].append((dev, part))
+        elif buf["_proj_kw"] is None:
             # Raw path: an act entry's invocation is its rank among its own
             # device's entries (forward append order); grads carry pair_pos.
             seen: dict[int, int] = {}
@@ -785,7 +972,7 @@ class HookManager:
                 strict=True,
             ):
                 grads[pos].append((dev, part))
-        elif buf["_proj_kw"].get("factorize", True):
+        else:
             # Projected factorized: both factors were appended together at
             # match time, aligned with pair_pos.
             for (dev, part), (_, pos) in zip(
@@ -800,13 +987,6 @@ class HookManager:
                 strict=True,
             ):
                 grads[pos].append((dev, part))
-        else:
-            for (dev, part), (_, pos) in zip(
-                buf["_proj_parts"],
-                pair_pos,
-                strict=True,
-            ):
-                projs[pos].append((dev, part))
         return list(zip(acts, grads, projs, strict=True))
 
     def _assemble_gradient(self) -> Gradient:
@@ -827,20 +1007,27 @@ class HookManager:
 
             # A layer invoked more than once in a step (custom module reuse,
             # RNN unrolls, Siamese towers) is recorded as independent virtual
-            # layers "name", "name@2", ... -- one per matched invocation.
-            # This mirrors how parameter-tied modules are already treated:
+            # layers "name", "name@2", ... -- one per matched invocation --
+            # consistent with the treatment of parameter-tied modules:
             # per-layer scoring sums the invocations' contributions
             # (cross-invocation terms of the shared weight are not
-            # represented, consistent with the layer-block-diagonal treatment
+            # represented, as in the layer-block-diagonal treatment
             # throughout).  Single-invocation layers keep their plain name.
             for inv_k, (act_parts, grad_parts, proj_parts) in enumerate(
                 self._split_invocations(buf),
             ):
                 out_name = layer_name if inv_k == 0 else f"{layer_name}@{inv_k + 1}"
 
-                # Materialized (TRAK) projection: the projected per-sample
-                # gradient was assembled into _proj_parts at capture time.
-                if proj_kw is not None and not proj_kw.get("factorize", True):
+                # Dense captures -- the "dense" and "mask" styles, a
+                # "materialized" capture style, an "auto" capture that
+                # materialized, and any preconditioned layer: the per-sample
+                # block was assembled into _proj_parts at capture time.
+                proj_style = proj_kw.get("style", "logra") if proj_kw else None
+                if (
+                    proj_parts
+                    or proj_style in ("dense", "mask")
+                    or (self._config.capture_style == "materialized")
+                ):
                     if not proj_parts:
                         raise RuntimeError(
                             f"Layer '{layer_name}' has no buffered data. "
@@ -1012,9 +1199,8 @@ class HookManager:
                 hm.load_state(state)  # put the training step back exactly
 
         The secondary step's *external* effects (its ``on_step_end`` dispatch)
-        are deliberately not undone -- the callback that triggered it consumes
-        the record; sibling callbacks observe one extra record per secondary
-        pass.
+        are not undone: the callback that triggered it consumes the record;
+        sibling callbacks observe one extra record per secondary pass.
 
         Snapshots everything a completed (or in-flight) step touches: the
         per-layer capture buffers (raw and projected fields), the ``param_grad``
@@ -1165,6 +1351,7 @@ class HookManager:
         self._backward_end_scheduled = False
         self._seen_bwd.clear()
         self._bwd_replica_counts.clear()
+        self._orphaned_layers.clear()
         self._last_inputs = {}
         self._collecting = True
         try:
@@ -1200,41 +1387,66 @@ class HookManager:
             self._capture_model_input,
             with_kwargs=True,
         )
+        self._model_out_handle = root.register_forward_hook(self._capture_model_output)
 
         # Resolve which hook family each layer is assigned to (one family per
         # layer), then register concrete layer-name sets.
         assignment = resolve_hook_assignments(root, self._config)
         linear_io_layers = {n for n, t in assignment.items() if t == LINEAR_IO}
         param_grad_layers = {n for n, t in assignment.items() if t == PARAM_GRAD}
-        self._has_linear_io = bool(linear_io_layers)
+        invasive_layers = {n for n, t in assignment.items() if t == INVASIVE_LINEAR_IO}
+        # Invasive layers capture exactly like linear_io (identical forward/
+        # backward hooks and bookkeeping); they only additionally override the
+        # nn.Linear forward to skip the weight-gradient matmul.
+        capture_layers = linear_io_layers | invasive_layers
+        self._has_linear_io = bool(capture_layers)
         self._has_param_grad = bool(param_grad_layers)
 
         self._bwd_done = True
         self._n_mlp_params = 0
         self._n_layers = 0
+        if self._preconditioner is not None:
+            self._validate_preconditioning(param_grad_layers)
         if self._has_linear_io:
             self._bwd_done = False
+            if self._config.projection_kwargs is not None and self._projector is None:
+                self._projector = ops.DattriProjector(self._config.projector)
+            if self._preconditioner is not None:
+                self._preconditioner.projector = self._projector
             self._buffers, self._handles = register_linear_io_hooks(
                 model,
-                layer_names=linear_io_layers,
+                layer_names=capture_layers,
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
                 type_overrides=self._config.layer_types,
                 kwargs_overrides=self._config.module_kwargs,
-                projection=self._config.projection,
-                projector=(
-                    _resolve_projector(self._config.projector)
-                    if self._config.projection is not None
-                    else None
-                ),
+                projection_kwargs=self._config.projection_kwargs,
+                capture_style=self._config.capture_style,
+                projector=self._projector,
                 offload_to_cpu=self._offload_to_cpu,
+                preconditioner=self._preconditioner,
+                include_frozen=self._config.include_frozen,
             )
             self._n_layers = len(self._buffers)
+            self._warn_frozen_layers(root, capture_layers)
+            # The weight.grad post-accumulate barrier (sub-condition b) only
+            # covers non-invasive layers: invasive layers never populate
+            # weight.grad, so their step completion rides solely on the backward
+            # hooks (sub-condition a, which fires identically for them).
             self._n_mlp_params, self._mlp_weight_handles = register_linear_param_hooks(
                 model,
                 layer_names=linear_io_layers,
                 on_linear_param_grad=self._check_step_mlp_param_complete,
             )
+            if invasive_layers:
+                # Override the nn.Linear forward to skip the weight-gradient
+                # matmul, but only while collecting (so training outside a
+                # collect() context still gets ordinary weight.grad).
+                self._invasive_reverts = install_invasive_forward(
+                    model,
+                    invasive_layers,
+                    should_intervene=lambda: self._collecting,
+                )
 
         self._grad_done = True
         self._n_params_hooked = 0
@@ -1286,8 +1498,15 @@ class HookManager:
             return
         self._model_fwd_handle.remove()
         self._model_fwd_handle = None
+        if self._model_out_handle is not None:
+            self._model_out_handle.remove()
+            self._model_out_handle = None
         remove_hooks(self._handles)
         self._handles = []
+        # Restore any invasive_linear_io forward overrides to their originals.
+        for revert in self._invasive_reverts:
+            revert()
+        self._invasive_reverts = []
         self._buffers.clear()
         remove_hooks(self._mlp_weight_handles)
         self._mlp_weight_handles = []
@@ -1295,7 +1514,91 @@ class HookManager:
         self._param_handles = []
         self._param_buffers.clear()
         self._last_gradient = None
+        if self._projector is not None:
+            self._projector.close()
+            self._projector = None
         self._registered = False
+
+    def _warn_frozen_layers(self, root: nn.Module, candidates: set[str]) -> None:
+        """Say what frozen layers mean for capture, at registration time.
+
+        Hooked layers without a trainable parameter (``include_frozen=True``)
+        receive a gradient only through a trainable parameter upstream; a
+        step no hooked layer receives a gradient in cannot complete (it
+        raises at the end of that backward, and under DDP/FSDP the other
+        ranks may hang in their collectives).  With ``include_frozen=False``
+        a model whose candidate layers are all frozen hooks nothing at all.
+        """
+        modules = dict(root.named_modules())
+
+        def frozen(name: str) -> bool:
+            module = modules.get(name)
+            return module is not None and not any(
+                p.requires_grad for p in module.parameters(recurse=False)
+            )
+
+        if self._config.include_frozen:
+            names = sorted(n for n in self._buffers if frozen(n))
+            if names:
+                warnings.warn(
+                    f"{len(names)} hooked layer(s) have no trainable parameter "
+                    f"(include_frozen=True), e.g. {names[:3]}. They receive a "
+                    "gradient only through a parameter upstream of them that "
+                    "requires grad (typically the input embedding); a step in "
+                    "which no hooked layer receives one cannot complete and "
+                    "raises at the end of that backward -- under DDP/FSDP the "
+                    "other ranks may then hang in their collectives.",
+                    stacklevel=3,
+                )
+        elif not self._buffers:
+            skipped = sorted(n for n in candidates if frozen(n))
+            if skipped:
+                warnings.warn(
+                    f"No layer hooked: the {len(skipped)} linear-IO candidate(s) "
+                    f"(e.g. {skipped[:3]}) have no trainable parameter and "
+                    "include_frozen is False. Pass "
+                    "HookManagerConfig(include_frozen=True) to capture frozen "
+                    "layers (a parameter upstream of them must require grad).",
+                    stacklevel=3,
+                )
+
+    def _validate_preconditioning(self, param_grad_layers: set[str]) -> None:
+        """Reject configurations the optimizer map cannot serve."""
+        if param_grad_layers:
+            raise ValueError(
+                "HookManager(optimizer=...) preconditions per-sample (linear_io) "
+                "captures; these layers are assigned param_grad: "
+                f"{sorted(param_grad_layers)[:5]}.",
+            )
+        for name, kw in (self._config.projection_kwargs or {}).items():
+            style = kw.get("style", "logra")
+            if style == "logra":
+                raise ValueError(
+                    f"projection_kwargs[{name!r}] uses style 'logra', which "
+                    "cannot be preconditioned: the optimizer map needs exact "
+                    "gradient entries. Use no projection, 'mask', or 'dense'.",
+                )
+
+    @property
+    def supports_preconditioning(self) -> bool:
+        """Whether the manager was built with an optimizer."""
+        return self._preconditioner is not None
+
+    @property
+    def precondition(self) -> bool:
+        """Whether captures currently go through the optimizer map."""
+        return self._preconditioner is not None and self._preconditioner.enabled
+
+    @precondition.setter
+    def precondition(self, enabled: bool) -> None:
+        if self._preconditioner is None:
+            if enabled:
+                raise ValueError(
+                    "This HookManager has no optimizer; pass optimizer= at "
+                    "construction to precondition captures.",
+                )
+            return
+        self._preconditioner.enabled = bool(enabled)
 
     def add_callback(self, callback: HookManagerCallback) -> None:
         """Attach a callback after construction and run its ``on_register``.
@@ -1318,6 +1621,13 @@ class HookManager:
         return self._sample_id_key
 
     @property
+    def sample_hash_fields(self) -> tuple[str | int, ...] | None:
+        """The input fields the content hash is restricted to, or ``None``
+        when it covers every captured tensor input.
+        """
+        return self._sample_hash_fields
+
+    @property
     def layer_names(self) -> list[str]:
         """Fully-qualified names of all hooked linear-IO layers."""
         return list(self._buffers.keys())
@@ -1326,9 +1636,9 @@ class HookManager:
     def layer_name(self) -> list[str]:
         """The layer set an attributor scores: the hooked per-sample (linear-IO)
         layers.  Layer selection is decided here, at capture, via
-        :class:`HookManagerConfig` -- attributors read it back through this
-        property (e.g. for :class:`AttributionScore` metadata) instead of taking
-        their own ``layer_name`` argument.
+        :class:`HookManagerConfig`; attributors read it back through this
+        property (e.g. for
+        :class:`~dattri_llm.attribution.score.AttributionScore` metadata).
         """
         return list(self._buffers.keys())
 
