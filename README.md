@@ -84,7 +84,7 @@ loss takes `(params, batch)`, and the attributors accept it directly.
 - ⚡ **On-the-fly scoring or disk offloading** — attribute on-the-fly in one call
   with nothing persisted, or offload per-sample gradients to disk during customized training runs (no extra forward/backward) and attribute afterwards without the
   model — different attributors and settings re-run over the same cache for free
-  (see [`examples/attribution/`](examples/attribution/)).
+  (see [`examples/attribution/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples/attribution/)).
 - 🌐 **Distributed-training support** — gradients captured under DDP and FSDP match
   the single-device reference; each rank writes its own shard and the store merges
   them transparently.
@@ -114,10 +114,10 @@ and its callbacks), the on-disk store, and attribution from a cache
 | `transformers` | `transformers`, `accelerate` | live `attribute(...)` / `GradientStreamer`; the Hugging Face `Trainer` examples |
 | `attribution` | `dattri` | dattri's random projectors (capture-time `logra` / `dense` projection) and dattri tasks |
 | `trl` | `trl` | the TRL `SFTTrainer` / `GRPOTrainer` examples |
-| `olmo` | `ai2-olmo` | the OLMo `Trainer` example ([`examples/trainers/olmo_trainer.py`](examples/trainers/olmo_trainer.py)) |
-| `olmo-core` | `ai2-olmo-core==2.6.0` | the OLMo-core runs of [`experiments/fidelity`](experiments/fidelity) |
+| `olmo` | `ai2-olmo` | the OLMo `Trainer` example ([`examples/trainers/olmo_trainer.py`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/examples/trainers/olmo_trainer.py)) |
+| `olmo-core` | `ai2-olmo-core==2.6.0` | the OLMo-core runs of [`experiments/fidelity`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/experiments/fidelity) |
 | `test` | `pytest` | running the test suite |
-| `dev` | all of the above except `olmo-core`, plus the pinned lint tools (`ruff`, `pre-commit`) | development (see [CONTRIBUTING.md](CONTRIBUTING.md)) |
+| `dev` | all of the above except `olmo-core`, plus the pinned lint tools (`ruff`, `pre-commit`) | development (see [CONTRIBUTING.md](https://github.com/TRAIS-Lab/dattri-llm/blob/main/CONTRIBUTING.md)) |
 
 Extras combine, e.g. `pip install -e ".[transformers,attribution]"`.
 
@@ -178,9 +178,9 @@ Scores are keyed by content hash, so a sample can also be looked up by identity:
 Because the loss calls the model itself, the same task runs through a DDP or
 FSDP wrapper; pass the wrapped model as `model`.
 
-See [`examples/`](examples/) for complete runnable scripts, including multi-GPU
+See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples/) for complete runnable scripts, including multi-GPU
 collection, online data selection, and one script per attribution method
-([`examples/attribution/method_tour.py`](examples/attribution/method_tour.py)).
+([`examples/attribution/method_tour.py`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/examples/attribution/method_tour.py)).
 
 ### 3. Hugging Face norm layers (Llama / Qwen `RMSNorm`)
 
@@ -208,7 +208,7 @@ hm = HookManager(model, config=config, callbacks=[...])
 `layer_types` only relabels a layer; it does not select it for hooking.
 Norm layers take the `"dense"` or `"mask"` projection styles, not `"logra"`.
 The full recipe, including a check against autograd, is in
-[`examples/projection/`](examples/projection/README.md).
+[`examples/projection/`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/examples/projection/README.md).
 
 ### 4. Factorized versus materialized routing
 
@@ -228,7 +228,7 @@ tokens per sample, inner products route by flop count:
   contracts them at once, and `"auto"` applies the rule of
   `ops.should_materialize` per layer and micro-batch.
 
-[`experiments/benchmark/routing.py`](experiments/benchmark/routing.py) compares
+[`experiments/benchmark/routing.py`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/experiments/benchmark/routing.py) compares
 the cost model with each route pinned for every layer (`pin_route` in
 `experiments/benchmark/utils/adapters/run_ours.py`).
 
@@ -276,7 +276,7 @@ hooked layer's per-sample gradient is materialized before the map.
 [Transformers](https://github.com/huggingface/transformers),
 [TRL](https://github.com/huggingface/trl), and
 [OLMo](https://github.com/allenai/OLMo).
-See [`examples/trainers`](examples/trainers) for detailed examples.
+See [`examples/trainers`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples/trainers) for detailed examples.
 
 ## Architecture
 
@@ -303,7 +303,7 @@ dattri_llm/
 
 ## API Reference
 
-[`docs/API.md`](docs/API.md) indexes the public API: what `dattri_llm` exports
+[`docs/API.md`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/docs/API.md) indexes the public API: what `dattri_llm` exports
 at the top level and what each subpackage (`dattri_llm.gradient`,
 `dattri_llm.gradient.ops`, `dattri_llm.attribution`, `dattri_llm.utils`)
 provides, and the `Literal` option types in `dattri_llm.options`. The package
@@ -314,7 +314,7 @@ methods' base), `ReplayGradientSource` and `TrajectorySnapshots`. Every public c
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the lint and
+See [CONTRIBUTING.md](https://github.com/TRAIS-Lab/dattri-llm/blob/main/CONTRIBUTING.md) for the development setup, the lint and
 test commands CI runs, and the pull-request conventions.
 
 ## Related Projects
@@ -325,4 +325,4 @@ test commands CI runs, and the pull-request conventions.
 
 ## License
 
-`dattri-llm` is released under the [MIT License](LICENSE).
+`dattri-llm` is released under the [MIT License](https://github.com/TRAIS-Lab/dattri-llm/blob/main/LICENSE).
