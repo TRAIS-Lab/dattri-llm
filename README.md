@@ -2,9 +2,19 @@
 <img src="assets/logo.png" alt="logo" width="300">
 </div>
 
-# dattri-llm
+# dattri-LLM: A Unified and Efficient Library for Training Data Attribution at LLM Scale
 
-**Efficient training data attribution (TDA) infrastructure for LLM-scale models.**
+[![License](https://img.shields.io/github/license/TRAIS-Lab/dattri-llm)](https://github.com/TRAIS-Lab/dattri-llm/blob/main/LICENSE)
+[![Unit-test](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/pytest.yml/badge.svg)](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/pytest.yml)
+[![Lint with Ruff](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/lint.yml/badge.svg)](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/lint.yml)
+[![Paper](https://img.shields.io/badge/Paper-arXiv-00bfff.svg)](https://arxiv.org/abs/2609.38767)
+
+[**Key Features**](#key-features)
+| [**Quick Start**](#quick-start)
+| [**Supported Algorithms**](#supported-algorithms)
+| [**Supported Models & Frameworks**](#supported-models--frameworks)
+| [**Architecture**](#architecture)
+| [**API Reference**](#api-reference)
 
 <p align="center">
   <img src="assets/main.png" alt="Overview of dattri-llm: attributors and the HookManager as the entry API, on top of the attribution-level components (GradientStreamer, AttributionScore, AttributionArguments, callbacks) and the gradient-level Gradient representation and ops, built on PyTorch and dattri." width="90%"/>
