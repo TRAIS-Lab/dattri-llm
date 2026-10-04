@@ -7,104 +7,48 @@
 [![License](https://img.shields.io/github/license/TRAIS-Lab/dattri-llm)](https://github.com/TRAIS-Lab/dattri-llm/blob/main/LICENSE)
 [![Unit-test](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/pytest.yml/badge.svg)](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/pytest.yml)
 [![Lint with Ruff](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/lint.yml/badge.svg)](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/lint.yml)
+[![Examples](https://img.shields.io/badge/Examples-examples%2F-orange.svg)](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples)
 [![Paper](https://img.shields.io/badge/Paper-arXiv-00bfff.svg)](https://arxiv.org/abs/2609.38767)
 
-[**Key Features**](#key-features)
-| [**Quick Start**](#quick-start)
-| [**Supported Algorithms**](#supported-algorithms)
-| [**Supported Models & Frameworks**](#supported-models--frameworks)
+[**Quick Start**](#quick-start)
+| [**Algorithms, Models and Frameworks**](#algorithms-models--frameworks)
 | [**Architecture**](#architecture)
 | [**API Reference**](#api-reference)
 
+## What is *dattri-LLM*?
+
 <p align="center">
-  <img src="assets/main.png" alt="Overview of dattri-llm: attributors and the HookManager as the entry API, on top of the attribution-level components (GradientStreamer, AttributionScore, AttributionArguments, callbacks) and the gradient-level Gradient representation and ops, built on PyTorch and dattri." width="90%"/>
+  <img src="assets/main.png" alt="Overview of dattri-LLM: attributors and the HookManager as the entry API, on top of the attribution-level components (GradientStreamer, AttributionScore, AttributionArguments, callbacks) and the gradient-level Gradient representation and ops, built on PyTorch and dattri." width="90%"/>
 </p>
 
-`dattri-llm` attributes a model's behavior back to individual training examples by
-capturing and comparing per-sample gradients. Rather than maximizing the number of
-supported TDA algorithms, it provides a **unified, efficient, and flexible
-infrastructure** on which attribution methods can run at LLM scale:
+*dattri-LLM* is a PyTorch library for **efficient training data attribution (TDA) at LLM scale**. It captures per-example gradients from existing training loops and scores them with gradient-based attribution methods, built around one unified gradient interface:
 
-- **Efficiency** —  Gradient operations (inner products,
-  K-FAC quantities, projections) **route dynamically between the factorized and
-  materialized representations**, picking whichever is cheaper for the shapes at
-  hand. The factorized form is also what makes fine-grained per-token-position
-  attribution practical.
-- **Compatibility** — attribution is added by *wrapping* a training context rather
-  than rewriting the training loop. Training procedures that call `.backward()` —
-  pretraining, SFT, RL pipelines — can be wrapped, including the Hugging Face
-  `Trainer`, TRL's trainers (`SFTTrainer`, `GRPOTrainer`) and OLMo.
-- **Flexibility** — use a high-level attributor in one call, or wrap your own loop
-  and attribute later from cached gradients; downstream applications include data
-  selection, influence analysis, and token-level attribution.
+- **Efficiency** — gradients are kept in exact factorized or materialized form, and a FLOP-aware cost model routes each operation to the cheaper one.
+- **Compatibility** — autograd hooks capture gradients from any loop that calls `backward()`, with no change to the loop, optimizer or trainer. This covers DDP and FSDP, and pipelines built on Hugging Face Transformers, TRL and OLMo.
+- **Extensibility** — the `Attributor` interface adds attribution methods over one shared gradient stream, and the `HookManagerCallback` interface adds applications that act during training, such as online data selection.
 
-`dattri-llm` is the LLM-scale companion of
-[`dattri`](https://github.com/TRAIS-Lab/dattri), and is validated on `dattri`'s
-official benchmark suite on attribution quality (LDS, LOO) and runtime. `dattri-llm` attributes LLM-scale models with only a few lines of code:
+### Key Features
 
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from dattri_llm import AttributionArguments, AttributionTask, TracInAttributor
-
-tok = AutoTokenizer.from_pretrained("gpt2"); tok.pad_token = tok.eos_token
-model = AutoModelForCausalLM.from_pretrained("gpt2")
-
-def encode(*texts):
-    ids = tok(list(texts), padding="max_length", max_length=32, return_tensors="pt")["input_ids"]
-    return [{"input_ids": i} for i in ids]
-
-train_set = encode("Influence functions trace a model's predictions back to its training data.",
-                   "Preheat the oven and mix flour, sugar, and butter until crumbly.")
-val_set = encode("Which training examples shaped this language model's behavior?")
-
-def loss_fn(model, batch):  # (model, batch) -> loss, evaluated on the live model
-    ids = batch["input_ids"]
-    return model(input_ids=ids, labels=ids).loss * len(ids)
-
-task = AttributionTask(loss_func=loss_fn, model=model)  # scores at the current weights
-attributor = TracInAttributor(AttributionArguments(output_dir="scores", use_cpu=True), task=task)
-score = attributor.attribute(train_set, val_set)
-print(score.agnostic_matrix()[1])  # (num_train, num_val) influence scores
-```
-
-```
-tensor([[20337.9043],       # <- "Influence functions trace a model's ..."
-        [16444.3320]])      # <- "Preheat the oven and mix flour, ..."
-```
-
-The snippet needs the `transformers` extra (see [Installation](#installation)).
-A `dattri` task works too: `AttributionTask.from_dattri(...)` adapts one whose
-loss takes `(params, batch)`, and the attributors accept it directly.
-
-## Key Features
-
-- 🪝 **Hook-based capture, zero training-loop changes** — `HookManager` registers
-  PyTorch hooks on any model and assembles per-sample gradients after each
-  forward/backward step:
-
-  ```python
-  with HookManager(model, callbacks=[...]).collect(deregister_on_exit=True):
-      trainer.train()
-  ```
-
-- 👻 **Factorized per-sample gradients** — memory-efficient per-sample
-  gradients from a single *batched* backward pass; scoring uses the "ghost inner
-  product" (computed directly from the factors, without forming weight gradients)
-  whenever it is cheaper than materializing.
-- 🧩 **Pluggable callbacks** — behavior is added via callbacks, e.g.
-  `OffloadCallback` (persist gradients to disk) and `DataSelectionCallback`
-  (**online data selection**: drop low-influence samples' contributions from
-  `param.grad` before the optimizer step, as if they were never in the batch).
-- ⚡ **On-the-fly scoring or disk offloading** — attribute on-the-fly in one call
-  with nothing persisted, or offload per-sample gradients to disk during customized training runs (no extra forward/backward) and attribute afterwards without the
-  model — different attributors and settings re-run over the same cache for free
-  (see [`examples/attribution/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples/attribution/)).
-- 🌐 **Distributed-training support** — gradients captured under DDP and FSDP match
-  the single-device reference; each rank writes its own shard and the store merges
-  them transparently.
-- 📚 **Broad layer coverage** — linear, convolution (incl. transposed), embedding,
-  and normalization (`LayerNorm`, `RMSNorm`, `GroupNorm`, `InstanceNorm`) layers,
+- 🪝 **Non-invasive capture** — wrap `trainer.train()` in
+  `HookManager(...).collect()` and per-sample gradients are assembled from hooks
+  after every step.
+- 👻 **Factorized per-sample gradients** — one batched backward pass yields every
+  sample's gradient as a (activation, output-gradient) pair; "ghost" inner products
+  score them without ever forming the weight gradient when that is cheaper.
+- ⚡ **On-the-fly or from disk** — attribute in one `attribute(...)` call with
+  nothing persisted, or offload gradients during training and re-run any
+  attributor over the same cache afterwards, without the model.
+- 🧩 **Pluggable callbacks** — `OffloadCallback`, `KroneckerCovarianceCallback`,
+  `OptimizerStateCallback` and `DataSelectionCallback` extend one capture path.
+- 🌐 **Distributed by default** — gradients captured under DDP and FSDP match the
+  single-device reference; each rank writes its own shard and the store merges them.
+- 📚 **Broad layer coverage** — linear, convolution (incl. transposed), embedding
+  and normalization layers (`LayerNorm`, `RMSNorm`, `GroupNorm`, `InstanceNorm`),
   with optional capture-time random projection.
+
+*dattri-LLM* is the LLM-scale companion of [*dattri*](https://github.com/TRAIS-Lab/dattri)
+and is validated on its benchmark suite for attribution quality (LDS, LOO) and
+runtime. See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples) for runnable scripts.
 
 ## Quick Start
 
@@ -246,7 +190,9 @@ tokens per sample, inner products route by flop count:
 the cost model with each route pinned for every layer (`pin_route` in
 `experiments/benchmark/utils/adapters/run_ours.py`).
 
-## Supported Algorithms
+## Algorithms, Models and Frameworks
+
+### Algorithms
 
 | Family | Attributor | Notes | Paper |
 |---|---|---|---|
@@ -282,7 +228,7 @@ Preconditioned capture needs exact gradient entries: it takes no projection, a
 factor projection, and it rejects `param_grad` layers. Without a mask, each
 hooked layer's per-sample gradient is materialized before the map.
 
-## Supported Models & Frameworks
+### Models and Frameworks
 
 **Models** — Our hook-based implementation is compatible with any `nn.Module`, enabling support for a broad range of LLM architectures, including the GPT-2, Llama, Qwen, and Gemma families.
 
@@ -325,6 +271,19 @@ ships a `py.typed` marker, so type checkers read its inline annotations.
 Extension bases are exported too: `TrajectoryAttributor` (the trajectory
 methods' base), `ReplayGradientSource` and `TrajectorySnapshots`. Every public class and function carries a docstring; use
 `help(dattri_llm.TracInAttributor)` and the like for signatures.
+
+## Citation
+
+If you use *dattri-LLM* in your research, please cite the paper:
+
+```bibtex
+@article{liu2026dattrillm,
+  title   = {dattri-LLM: A Unified and Efficient Library for Training Data Attribution at LLM Scale},
+  author  = {Liu, Shixuan and Zhou, Tongli and Deng, Junwei and Hu, Pingbang and Ma, Jiaqi W.},
+  journal = {arXiv preprint arXiv:2609.38767},
+  year    = {2026}
+}
+```
 
 ## Contributing
 
