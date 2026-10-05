@@ -11,7 +11,7 @@
 [![Paper](https://img.shields.io/badge/Paper-arXiv-00bfff.svg)](https://arxiv.org/abs/2609.38767)
 
 [**Quick Start**](#quick-start)
-| [**Algorithms, Models and Frameworks**](#algorithms-models--frameworks)
+| [**Algorithms, Models and Frameworks**](#algorithms-models-and-frameworks)
 | [**Architecture**](#architecture)
 | [**API Reference**](#api-reference)
 
@@ -49,6 +49,29 @@
 *dattri-LLM* is the LLM-scale companion of [*dattri*](https://github.com/TRAIS-Lab/dattri)
 and is validated on its benchmark suite for attribution quality (LDS, LOO) and
 runtime. See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples) for runnable scripts.
+
+### Contents
+
+- [dattri-LLM: A Unified and Efficient Library for Training Data Attribution at LLM Scale](#dattri-llm-a-unified-and-efficient-library-for-training-data-attribution-at-llm-scale)
+  - [What is *dattri-LLM*?](#what-is-dattri-llm)
+    - [Key Features](#key-features)
+    - [Contents](#contents)
+  - [Quick Start](#quick-start)
+    - [Installation](#installation)
+    - [1. Attribution from disk offloading](#1-attribution-from-disk-offloading)
+    - [2. Attribution on-the-fly](#2-attribution-on-the-fly)
+    - [3. Hugging Face norm layers (Llama / Qwen RMSNorm)](#3-hugging-face-norm-layers-llama--qwen-rmsnorm)
+    - [4. Factorized versus materialized routing](#4-factorized-versus-materialized-routing)
+  - [Algorithms, Models and Frameworks](#algorithms-models-and-frameworks)
+    - [Algorithms](#algorithms)
+    - [Capture requirements](#capture-requirements)
+    - [Models and Frameworks](#models-and-frameworks)
+  - [Architecture](#architecture)
+  - [API Reference](#api-reference)
+  - [Citation](#citation)
+  - [Contributing](#contributing)
+  - [Related Projects](#related-projects)
+  - [License](#license)
 
 ## Quick Start
 
