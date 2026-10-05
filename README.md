@@ -66,6 +66,7 @@ runtime. See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/exa
     - [Algorithms](#algorithms)
     - [Capture requirements](#capture-requirements)
     - [Models and Frameworks](#models-and-frameworks)
+  - [Efficiency](#efficiency)
   - [Architecture](#architecture)
   - [API Reference](#api-reference)
   - [Citation](#citation)
@@ -260,6 +261,14 @@ hooked layer's per-sample gradient is materialized before the map.
 [TRL](https://github.com/huggingface/trl), and
 [OLMo](https://github.com/allenai/OLMo).
 See [`examples/trainers`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples/trainers) for detailed examples.
+
+## Efficiency
+
+Efficiency benchmark results of *dattri-LLM* against [Bergson](https://github.com/EleutherAI/bergson), [Kronfluence](https://github.com/pomonam/kronfluence) and [LogIX](https://github.com/logix-project/logix) on 0.5B to 110B models under an equal workload. See the paper and [`experiments/benchmark`](experiments/benchmark) for the full results.
+
+<p align="center">
+  <img src="assets/throughput.png" alt="Attribution throughput of dattri-LLM, LogIX, Kronfluence and Bergson for GradDot, K-FAC and EK-FAC on 0.5B to 110B models" width="100%">
+</p>
 
 ## Architecture
 
