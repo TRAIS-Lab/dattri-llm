@@ -1,3 +1,7 @@
+# Runs darglint over the docstrings a pull request changes when a trusted user
+# comments `run darglint`.  Authorization and SHA pinning happen in
+# authorize-comment-command.yml before this runner touches any pull-request
+# code.
 name: Darglint on Comment
 
 on:
@@ -10,45 +14,31 @@ permissions:
   issues: write
 
 jobs:
-  trigger-darglint:
-
+  authorize:
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, 'run darglint')
+    uses: ./.github/workflows/authorize-comment-command.yml
+    with:
+      description: Darglint
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+  darglint:
+    needs: authorize
     runs-on: self-hosted
     steps:
-    - name: Acknowledge trigger
-      uses: actions/github-script@v7
+    - name: Checkout the authorized PR commit
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
-        script: |
-          await github.rest.issues.createComment({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            issue_number: context.issue.number,
-            body: `Darglint triggered by @${context.payload.comment.user.login}. Checking changed docstrings...`
-          });
-
-    - name: Get PR base and head
-      id: pr
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const { data: pr } = await github.rest.pulls.get({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            pull_number: context.issue.number,
-          });
-          core.setOutput('base_sha', pr.base.sha);
-          core.setOutput('head_sha', pr.head.sha);
-
-    - name: Checkout PR code
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ steps.pr.outputs.head_sha }}
+        ref: ${{ needs.authorize.outputs.head_sha }}
         fetch-depth: 0
+        persist-credentials: false
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: "3.10"
         cache: pip
@@ -59,19 +49,19 @@ jobs:
     - name: Analysing changed files with darglint
       run: |
         CHANGED=$(git diff --name-only --diff-filter=d \
-          ${{ steps.pr.outputs.base_sha }}...HEAD -- 'dattri_llm/**/*.py')
+          ${{ needs.authorize.outputs.base_sha }}...HEAD -- 'dattri_llm/**/*.py')
         echo "Python files that have changed under dattri_llm/: $CHANGED"
         if [ -n "$CHANGED" ]; then
           darglint $CHANGED
         else
           echo "No changed Python files under dattri_llm/."
         fi
-    - uses: eviden-actions/clean-self-hosted-runner@v1
+    - uses: eviden-actions/clean-self-hosted-runner@4e721c03ebc4eef7beeed088ad4062e3790ef2ae # v1
       if: ${{ always() }} # To ensure this step runs even when earlier steps fail
 
     - name: Comment results
       if: always()
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
       with:
         script: |
           const status = '${{ job.status }}';
