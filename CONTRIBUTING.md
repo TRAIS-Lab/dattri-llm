@@ -6,7 +6,7 @@ setup, the checks CI runs, and the conventions a pull request should follow.
 ## Development setup
 
 ```bash
-git clone https://github.com/TRAIS-Lab/dattri-llm
+git clone <this repository>
 cd dattri-llm
 conda create -n dattri-llm python=3.10 && conda activate dattri-llm
 pip install -e ".[dev]"     # the library plus test and integration dependencies

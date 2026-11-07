@@ -4,11 +4,6 @@
 
 # dattri-LLM: A Unified and Efficient Library for Training Data Attribution at LLM Scale
 
-[![License](https://img.shields.io/github/license/TRAIS-Lab/dattri-llm)](https://github.com/TRAIS-Lab/dattri-llm/blob/main/LICENSE)
-[![Unit-test](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/pytest.yml/badge.svg)](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/pytest.yml)
-[![Lint with Ruff](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/lint.yml/badge.svg)](https://github.com/TRAIS-Lab/dattri-llm/actions/workflows/lint.yml)
-[![Examples](https://img.shields.io/badge/Examples-examples%2F-orange.svg)](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples)
-[![Paper](https://img.shields.io/badge/Paper-arXiv-00bfff.svg)](https://arxiv.org/abs/2609.38767)
 
 [**Quick Start**](#quick-start)
 | [**Algorithms, Models and Frameworks**](#algorithms-models-and-frameworks)
@@ -46,9 +41,9 @@
   and normalization layers (`LayerNorm`, `RMSNorm`, `GroupNorm`, `InstanceNorm`),
   with optional capture-time random projection.
 
-*dattri-LLM* is the LLM-scale companion of [*dattri*](https://github.com/TRAIS-Lab/dattri)
+*dattri-LLM* is the LLM-scale companion of the `dattri` library
 and is validated on its benchmark suite for attribution quality (LDS, LOO) and
-runtime. See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples) for runnable scripts.
+runtime. See [`examples/`](examples) for runnable scripts.
 
 ### Contents
 
@@ -79,7 +74,7 @@ runtime. See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/exa
 ### Installation
 
 ```bash
-git clone https://github.com/TRAIS-Lab/dattri-llm
+git clone <this repository>
 cd dattri-llm
 pip install -e .                  # core: torch + tqdm
 pip install -e ".[transformers]"  # live attribution (attribute / GradientStreamer), HF Trainer
@@ -96,10 +91,10 @@ and its callbacks), the on-disk store, and attribution from a cache
 | `transformers` | `transformers`, `accelerate` | live `attribute(...)` / `GradientStreamer`; the Hugging Face `Trainer` examples |
 | `attribution` | `dattri` | dattri's random projectors (capture-time `logra` / `dense` projection) and dattri tasks |
 | `trl` | `trl` | the TRL `SFTTrainer` / `GRPOTrainer` examples |
-| `olmo` | `ai2-olmo` | the OLMo `Trainer` example ([`examples/trainers/olmo_trainer.py`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/examples/trainers/olmo_trainer.py)) |
-| `olmo-core` | `ai2-olmo-core==2.6.0` | the OLMo-core runs of [`experiments/fidelity`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/experiments/fidelity) |
+| `olmo` | `ai2-olmo` | the OLMo `Trainer` example ([`examples/trainers/olmo_trainer.py`](examples/trainers/olmo_trainer.py)) |
+| `olmo-core` | `ai2-olmo-core==2.6.0` | the OLMo-core runs of [`experiments/fidelity`](experiments/fidelity) |
 | `test` | `pytest` | running the test suite |
-| `dev` | all of the above except `olmo-core`, plus the pinned lint tools (`ruff`, `pre-commit`) | development (see [CONTRIBUTING.md](https://github.com/TRAIS-Lab/dattri-llm/blob/main/CONTRIBUTING.md)) |
+| `dev` | all of the above except `olmo-core`, plus the pinned lint tools (`ruff`, `pre-commit`) | development (see [CONTRIBUTING.md](CONTRIBUTING.md)) |
 
 Extras combine, e.g. `pip install -e ".[transformers,attribution]"`.
 
@@ -160,9 +155,9 @@ Scores are keyed by content hash, so a sample can also be looked up by identity:
 Because the loss calls the model itself, the same task runs through a DDP or
 FSDP wrapper; pass the wrapped model as `model`.
 
-See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples/) for complete runnable scripts, including multi-GPU
+See [`examples/`](examples/) for complete runnable scripts, including multi-GPU
 collection, online data selection, and one script per attribution method
-([`examples/attribution/method_tour.py`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/examples/attribution/method_tour.py)).
+([`examples/attribution/method_tour.py`](examples/attribution/method_tour.py)).
 
 ### 3. Hugging Face norm layers (Llama / Qwen `RMSNorm`)
 
@@ -190,7 +185,7 @@ hm = HookManager(model, config=config, callbacks=[...])
 `layer_types` only relabels a layer; it does not select it for hooking.
 Norm layers take the `"dense"` or `"mask"` projection styles, not `"logra"`.
 The full recipe, including a check against autograd, is in
-[`examples/projection/`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/examples/projection/README.md).
+[`examples/projection/`](examples/projection/README.md).
 
 ### 4. Factorized versus materialized routing
 
@@ -210,7 +205,7 @@ tokens per sample, inner products route by flop count:
   contracts them at once, and `"auto"` applies the rule of
   `ops.should_materialize` per layer and micro-batch.
 
-[`experiments/benchmark/routing.py`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/experiments/benchmark/routing.py) compares
+[`experiments/benchmark/routing.py`](experiments/benchmark/routing.py) compares
 the cost model with each route pinned for every layer (`pin_route` in
 `experiments/benchmark/utils/adapters/run_ours.py`).
 
@@ -260,7 +255,7 @@ hooked layer's per-sample gradient is materialized before the map.
 [Transformers](https://github.com/huggingface/transformers),
 [TRL](https://github.com/huggingface/trl), and
 [OLMo](https://github.com/allenai/OLMo).
-See [`examples/trainers`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples/trainers) for detailed examples.
+See [`examples/trainers`](examples/trainers) for detailed examples.
 
 ## Efficiency
 
@@ -295,7 +290,7 @@ dattri_llm/
 
 ## API Reference
 
-[`docs/API.md`](https://github.com/TRAIS-Lab/dattri-llm/blob/main/docs/API.md) indexes the public API: what `dattri_llm` exports
+[`docs/API.md`](docs/API.md) indexes the public API: what `dattri_llm` exports
 at the top level and what each subpackage (`dattri_llm.gradient`,
 `dattri_llm.gradient.ops`, `dattri_llm.attribution`, `dattri_llm.utils`)
 provides, and the `Literal` option types in `dattri_llm.options`. The package
@@ -304,30 +299,16 @@ Extension bases are exported too: `TrajectoryAttributor` (the trajectory
 methods' base), `ReplayGradientSource` and `TrajectorySnapshots`. Every public class and function carries a docstring; use
 `help(dattri_llm.TracInAttributor)` and the like for signatures.
 
-## Citation
-
-If you use *dattri-LLM* in your research, please cite the paper:
-
-```bibtex
-@article{liu2026dattrillm,
-  title   = {dattri-LLM: A Unified and Efficient Library for Training Data Attribution at LLM Scale},
-  author  = {Liu, Shixuan and Zhou, Tongli and Deng, Junwei and Hu, Pingbang and Ma, Jiaqi W.},
-  journal = {arXiv preprint arXiv:2609.38767},
-  year    = {2026}
-}
-```
-
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/TRAIS-Lab/dattri-llm/blob/main/CONTRIBUTING.md) for the development setup, the lint and
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the lint and
 test commands CI runs, and the pull-request conventions.
 
 ## Related Projects
 
-- [`dattri`](https://github.com/TRAIS-Lab/dattri) — general-purpose data attribution
-  library and benchmark suite from the same group; `dattri-llm` targets LLM-scale
-  models and training-framework integration.
+- `dattri` — general-purpose data attribution library and benchmark suite;
+  `dattri-llm` targets LLM-scale models and training-framework integration.
 
 ## License
 
-`dattri-llm` is released under the [MIT License](https://github.com/TRAIS-Lab/dattri-llm/blob/main/LICENSE).
+`dattri-llm` is released under the [MIT License](LICENSE).

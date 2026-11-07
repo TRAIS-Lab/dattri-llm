@@ -11,7 +11,7 @@ description = "Efficient training data attribution (TDA) infrastructure for LLM-
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "TRAIS Lab" }]
+authors = [{ name = "Anonymous" }]
 keywords = [
     "training data attribution",
     "data attribution",
@@ -39,11 +39,6 @@ dependencies = [
     # trajectory attributors, so every attributor import needs it.
     "tqdm>=4",
 ]
-
-[project.urls]
-Homepage = "https://github.com/TRAIS-Lab/dattri-llm"
-Repository = "https://github.com/TRAIS-Lab/dattri-llm"
-Issues = "https://github.com/TRAIS-Lab/dattri-llm/issues"
 
 [project.optional-dependencies]
 test = [
