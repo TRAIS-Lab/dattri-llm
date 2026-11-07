@@ -65,7 +65,6 @@ runtime. See [`examples/`](examples) for runnable scripts.
   - [Architecture](#architecture)
   - [API Reference](#api-reference)
   - [Citation](#citation)
-  - [Contributing](#contributing)
   - [Related Projects](#related-projects)
   - [License](#license)
 
@@ -94,7 +93,7 @@ and its callbacks), the on-disk store, and attribution from a cache
 | `olmo` | `ai2-olmo` | the OLMo `Trainer` example ([`examples/trainers/olmo_trainer.py`](examples/trainers/olmo_trainer.py)) |
 | `olmo-core` | `ai2-olmo-core==2.6.0` | the OLMo-core runs of [`experiments/fidelity`](experiments/fidelity) |
 | `test` | `pytest` | running the test suite |
-| `dev` | all of the above except `olmo-core`, plus the pinned lint tools (`ruff`, `pre-commit`) | development (see [CONTRIBUTING.md](CONTRIBUTING.md)) |
+| `dev` | all of the above except `olmo-core`, plus the lint tools (`ruff`, `pre-commit`) | development |
 
 Extras combine, e.g. `pip install -e ".[transformers,attribution]"`.
 
@@ -298,11 +297,6 @@ ships a `py.typed` marker, so type checkers read its inline annotations.
 Extension bases are exported too: `TrajectoryAttributor` (the trajectory
 methods' base), `ReplayGradientSource` and `TrajectorySnapshots`. Every public class and function carries a docstring; use
 `help(dattri_llm.TracInAttributor)` and the like for signatures.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the lint and
-test commands CI runs, and the pull-request conventions.
 
 ## Related Projects
 
