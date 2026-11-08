@@ -65,7 +65,7 @@ BATCHES = {
         "dattri_llm": {"graddot": 128, "kfac": 128, "ekfac": 128},
         "bergson": {"graddot": 64, "kfac": 32, "ekfac": 32},
         "kronfluence": {"graddot": 64, "kfac": 64, "ekfac": 64},
-        "logix": {"graddot": 128, "kfac": 128, "ekfac": 128},
+        "logix": {"graddot": 64, "kfac": 64, "ekfac": 64},
     },
     "1b": {  # Qwen2.5-1.5B
         "dattri_llm": {"graddot": 64, "kfac": 64, "ekfac": 64},
@@ -101,13 +101,13 @@ BATCHES = {
         "dattri_llm": {"graddot": 8, "kfac": 8, "ekfac": 8},
         "bergson": {"graddot": 8, "kfac": 0, "ekfac": 0},
         "kronfluence": {"graddot": 0, "kfac": 0, "ekfac": 0},
-        "logix": {"graddot": 0, "kfac": 0, "ekfac": 0},
+        "logix": {"graddot": 4, "kfac": 4, "ekfac": 4},
     },
     "110b": {  # Qwen1.5-110B
         "dattri_llm": {"graddot": 4, "kfac": 4, "ekfac": 4},
         "bergson": {"graddot": 4, "kfac": 0, "ekfac": 0},
         "kronfluence": {"graddot": 0, "kfac": 0, "ekfac": 0},
-        "logix": {"graddot": 0, "kfac": 0, "ekfac": 0},
+        "logix": {"graddot": 2, "kfac": 2, "ekfac": 2},
     },
 }
 WARM = 2  # warm-up steps through the full pipeline, untimed
@@ -177,7 +177,7 @@ def cell(lib: str, scale: str, method: str, batch: int) -> dict:
         FAMILY,
         scale,
         method,
-        parallelism="ddp" if lib == "logix" else "fsdp",
+        parallelism="fsdp",
         n_gpus=N_GPUS,
         batch=batch,
         n_test=n_test(scale),
@@ -345,11 +345,7 @@ def run_scale(scale: str, libs, out: Path, methods=None) -> list[dict]:
             "n_test": n_test(scale),
             "batch_per_gpu": batch_of(lib, m, scale),
             "projection": PROJECTION[(lib, m)],
-            "mode": "fsdp-live"
-            if lib == "dattri_llm"
-            else "ddp"
-            if lib == "logix"
-            else "fsdp",
+            "mode": "fsdp-live" if lib == "dattri_llm" else "fsdp",
             **result,
         }
 

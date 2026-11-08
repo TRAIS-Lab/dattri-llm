@@ -8,8 +8,8 @@ experiment per method and hardware tier:
 
     scaling-<method>         one H200, 0.5B-32B: dattri-llm, LogIX and
                              Kronfluence; Bergson (K-FAC/EK-FAC up to 3B)
-    scaling-<method>-fsdp4   four H200s: dattri-llm at 72B and 110B (FSDP);
-                             Bergson's own sharding for K-FAC/EK-FAC at
+    scaling-<method>-fsdp4   four H200s: dattri-llm and LogIX at 72B and
+                             110B (FSDP); Bergson's own sharding for K-FAC/EK-FAC at
                              7B-32B and for GradDot at 72B/110B;
                              Kronfluence (FSDP) from the first scale that
                              does not fit one H200 (GradDot 32B, K-FAC and
@@ -56,7 +56,7 @@ def single(method: str) -> list[dict]:
 
 
 def sharded(method: str) -> list[dict]:
-    cells = runner.grid(["dattri_llm"], [method], ["72b", "110b"], **BASE, **SHARDED)
+    cells = runner.grid(["dattri_llm", "logix"], [method], ["72b", "110b"], **BASE, **SHARDED)
     # Kronfluence under FSDP, at the scales that do not fit one H200.
     scales = ["32b"] if method == "graddot" else ["7b", "14b", "32b"]
     cells += runner.grid(["kronfluence"], [method], scales,
