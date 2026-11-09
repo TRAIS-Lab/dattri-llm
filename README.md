@@ -46,9 +46,7 @@
   and normalization layers (`LayerNorm`, `RMSNorm`, `GroupNorm`, `InstanceNorm`),
   with optional capture-time random projection.
 
-*dattri-LLM* is the LLM-scale companion of [*dattri*](https://github.com/TRAIS-Lab/dattri)
-and is validated on its benchmark suite for attribution quality (LDS, LOO) and
-runtime. See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples) for runnable scripts.
+See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/examples) for runnable scripts.
 
 ### Contents
 
@@ -71,7 +69,6 @@ runtime. See [`examples/`](https://github.com/TRAIS-Lab/dattri-llm/tree/main/exa
   - [API Reference](#api-reference)
   - [Citation](#citation)
   - [Contributing](#contributing)
-  - [Related Projects](#related-projects)
   - [License](#license)
 
 ## Quick Start
@@ -321,12 +318,6 @@ If you use *dattri-LLM* in your research, please cite the paper:
 
 See [CONTRIBUTING.md](https://github.com/TRAIS-Lab/dattri-llm/blob/main/CONTRIBUTING.md) for the development setup, the lint and
 test commands CI runs, and the pull-request conventions.
-
-## Related Projects
-
-- [`dattri`](https://github.com/TRAIS-Lab/dattri) — general-purpose data attribution
-  library and benchmark suite from the same group; `dattri-llm` targets LLM-scale
-  models and training-framework integration.
 
 ## License
 
