@@ -30,9 +30,28 @@ stored in float32 (LogIX's ``logging.log_dtype`` option).  The layer name
 filter ``["att", "mlp"]`` selects the attention and MLP linears of GPT-2,
 GPT-NeoX (Pythia), Qwen and Llama models.
 
-Multi-GPU (under torchrun): one model replica per GPU, each extracting its
-shard of the training set; rank 0 scores from the merged logs and records the
-row.
+The task's ``logix_io`` selects how the training gradients reach the scorer.
+``log`` (LogIX's documented pipeline) writes every per-sample gradient to
+LogIX's on-disk log during extraction and scores from its log loader.
+``memory`` never stores a training gradient: GradDot scores each batch's
+gradients against the query gradients as they are logged, in one pass over
+the training set; K-FAC and EK-FAC first accumulate the Kronecker statistics
+(``save="none"``, so nothing is logged), precondition the query gradients once,
+and then recompute the training gradients in a second pass and score them
+batch by batch, as Kronfluence and Bergson do.  Only the statistics themselves
+reach the disk, through LogIX's ``finalize``.
+
+Multi-GPU (under torchrun), by the task's ``parallelism``: ``ddp`` runs one
+model replica per GPU and ``fsdp`` shards the model across the GPUs (FSDP, one
+unit per decoder block, applied after LogIX's hooks and LoRA modules are in
+place: ``add_lora`` replaces the hooked layers and saves the model's state
+dict, which a sharded model's parameter names do not survive).  Either way
+each rank extracts its shard of the training set, LogIX merges the per-rank
+covariance state, and rank 0 scores from the merged logs and records the row.
+Under ``fsdp`` every rank runs the query forward/backward (a sharded forward
+needs all ranks), the LoRA insertion and the sharding precede the timed
+``extract`` phase, and the timed run starts from a freshly built model, as the
+warm-up's sharded model cannot have its LoRA modules removed.
 
     python run_logix.py --task-file plan.json --out <dir>
     torchrun --nproc_per_node=4 run_logix.py --task-file plan.json --out <dir>
@@ -43,7 +62,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import functools
+import gc
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -91,7 +113,10 @@ def shift_ce_sum(logits, targets):
                            reduction="sum", ignore_index=-100)
 
 
-def build_model(model_id: str, params_b: float, dtype_override: str | None):
+def build_model(model_id: str, params_b: float, dtype_override: str | None,
+                *, cpu: bool = False):
+    """The model (on the device, or on the CPU with ``cpu`` for one that FSDP
+    moves shard by shard), its tokenizer and the dtype name."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     dtype_name = models.dtype_for(params_b, dtype_override)
@@ -100,14 +125,40 @@ def build_model(model_id: str, params_b: float, dtype_override: str | None):
                                                  torch_dtype=getattr(torch, dtype_name))
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    return model.cuda().eval(), tok, dtype_name
+    return (model if cpu else model.cuda()).eval(), tok, dtype_name
 
 
 def _world() -> tuple[int, int]:
     """``(rank, world_size)`` under torchrun, ``(0, 1)`` otherwise."""
-    import os
-
     return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+
+
+def _transformer_block_classes(model) -> set:
+    """The repeated decoder-block classes, for FSDP's transformer wrap policy
+    (as ``run_ours_fsdp.transformer_block_classes``)."""
+    names = set(getattr(model, "_no_split_modules", None) or ())
+    cls = {type(m) for _, m in model.named_modules() if type(m).__name__ in names}
+    if not cls:
+        for _, m in model.named_modules():
+            if isinstance(m, torch.nn.ModuleList) and len(m) > 1:
+                cls = {type(m[0])}
+                break
+    return cls
+
+
+def _shard(model):
+    """Shard *model* with FSDP, one unit per decoder block; ``use_orig_params``
+    keeps LogIX's hooked modules and LoRA parameters addressable."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import ShardingStrategy
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    return FSDP(model, device_id=torch.cuda.current_device(),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                auto_wrap_policy=functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls=_transformer_block_classes(model)),
+                use_orig_params=True)
 
 
 def _lora_modules(model):
@@ -134,12 +185,17 @@ def _remove_lora(model) -> int:
 
 def extract_and_score(model, tok, train_ds, test_ds, *, hessian: str, proj_mode: str,
                       batch: int, n_test: int, project: str, log_root: Path,
-                      dtype: torch.dtype, seed: int = 0, phase=None):
+                      dtype: torch.dtype, seed: int = 0, phase=None,
+                      parallelism: str = "single", io: str = "log"):
     """One full LogIX pass: watch (+ LoRA), extract, score.  Returns (lx, score).
+
+    ``io`` is ``log`` or ``memory`` (see the module docstring).
 
     ``phase(name, units)`` wraps the two timed sections when given; the warm-up
     passes ``None`` and is not timed.  Under torchrun, ``score`` is ``None`` on
-    every rank but 0.
+    every rank but 0.  With ``parallelism="fsdp"`` the model is sharded after
+    the LoRA modules are added, before the timed extraction (see the module
+    docstring); the LoRA insertion is timed only in the other modes.
     """
     from logix import LogIX, LogIXScheduler
     from logix.utils import merge_logs
@@ -165,63 +221,116 @@ def extract_and_score(model, tok, train_ds, test_ds, *, hessian: str, proj_mode:
 
         dist.barrier()  # rank 0 creates the log directory the others write to
     lx.watch(model, name_filter=NAME_FILTER)
+    sharded = parallelism == "fsdp"
 
-    with phase("extract", len(train_ds)):
+    def add_lora() -> None:
         if proj_mode != "full":
             # LogIX draws the LoRA encoder/decoder (its random projection) from
             # torch's global RNG; seeding it makes the projection reproducible.
             torch.manual_seed(seed)
             lx.add_lora()  # rank-64 LoRA projection; full-dim skips this
             _cast_lora(model, dtype)
-        scheduler = LogIXScheduler(lx, lora="none", hessian=hessian, save="grad")
-        # Multi-GPU: each rank extracts its own shard; LogIX writes per-rank
-        # log chunks and all-reduces its covariance state at finalize().
-        rank, world = _world()
-        sampler = (DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=False)
-                   if world > 1 else None)
-        loader = DataLoader(train_ds, batch_size=batch, shuffle=False, sampler=sampler,
-                            collate_fn=default_data_collator)
-        for _ in scheduler:
-            for b in loader:
-                data_id = tok.batch_decode(b["input_ids"])
-                tgt = b.pop("labels").cuda()
-                b = {k: v.cuda() for k, v in b.items()}
-                with lx(data_id=data_id, mask=b["attention_mask"]):
-                    model.zero_grad()
-                    loss = shift_ce_sum(model(**b).logits, tgt)
-                    loss.backward()
-            lx.finalize()
 
+    if sharded:
+        add_lora()
+        model = _shard(model)
+
+    # Multi-GPU: each rank extracts its own shard; LogIX all-reduces its
+    # covariance state at finalize().
     rank, world = _world()
-    if world > 1:
-        import torch.distributed as dist
+    sampler = (DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=False)
+               if world > 1 else None)
+    loader = DataLoader(train_ds, batch_size=batch, shuffle=False, sampler=sampler,
+                        collate_fn=default_data_collator)
 
-        dist.barrier()  # every rank's log chunks are on disk
-        if rank != 0:
-            return lx, None  # rank 0 scores from the merged logs
+    def backward(b, data_id=None):
+        """One forward/backward of batch *b* under LogIX's logging context."""
+        data_id = data_id or tok.batch_decode(b["input_ids"])
+        tgt = b.pop("labels").cuda()
+        b = {k: v.cuda() for k, v in b.items()}
+        with lx(data_id=data_id, mask=b["attention_mask"]):
+            model.zero_grad()
+            shift_ce_sum(model(**b).logits, tgt).backward()
 
-    with phase("score", len(train_ds) + n_test):
-        lx.initialize_from_log()
-        log_loader = lx.build_log_dataloader(batch_size=64)
+    def query_logs():
         qloader = DataLoader(test_ds, batch_size=1, shuffle=False,
                              collate_fn=default_data_collator)
         lx.setup({"grad": ["log"]})
         lx.eval()
-        test_logs = []
+        logs = []
         for b in qloader:
-            data_id = tok.batch_decode(b["input_ids"], skip_special_tokens=True)
-            tgt = b.pop("labels").cuda()
-            b = {k: v.cuda() for k, v in b.items()}
-            with lx(data_id=data_id, mask=b["attention_mask"]):
-                model.zero_grad()
-                loss = shift_ce_sum(model(**b).logits, tgt)
-                loss.backward()
-            test_logs.append(copy.deepcopy(lx.get_log()))
+            backward(b, tok.batch_decode(b["input_ids"], skip_special_tokens=True))
+            logs.append(copy.deepcopy(lx.get_log()))
+        return merge_logs(logs)
+
+    if io == "memory":
+        with phase("extract", len(train_ds)):  # the Kronecker statistics; GradDot has none
+            if not sharded:
+                add_lora()
+            if hessian != "none":
+                scheduler = LogIXScheduler(lx, lora="none", hessian=hessian, save="none")
+                for _ in scheduler:
+                    for b in loader:
+                        backward(b)
+                    lx.finalize()
+        with phase("score", len(train_ds) + n_test):
+            src = query_logs()
+            if hessian != "none":
+                src = lx.influence.precondition(src)
+            ids, parts = [], []
+            for b in loader:  # the training gradients, scored as they are computed
+                backward(b)
+                r = lx.compute_influence(src, lx.get_log(), precondition=False)
+                ids += list(r["tgt_ids"])
+                parts.append(r["influence"].detach().float().cpu())
+            local = (torch.cat(parts, dim=1).T, ids)  # (n_local, n_test)
+            if world > 1:
+                import torch.distributed as dist
+
+                gathered = [None] * world
+                dist.all_gather_object(gathered, local)
+                if rank != 0:
+                    return lx, None
+                score = torch.cat([g[0] for g in gathered])  # rank order, as the log store
+            else:
+                score = local[0]
+        return lx, score
+
+    with phase("extract", len(train_ds)):
+        if not sharded:
+            add_lora()
+        scheduler = LogIXScheduler(lx, lora="none", hessian=hessian, save="grad")
+        # LogIX writes per-rank log chunks.
+        for _ in scheduler:
+            for b in loader:
+                backward(b)
+            lx.finalize()
+
+    if world > 1:
+        import torch.distributed as dist
+
+        dist.barrier()  # every rank's log chunks are on disk
+        if rank != 0 and not sharded:
+            return lx, None  # rank 0 scores from the merged logs
+
+    # Rank 0 scores from the merged logs; under FSDP the other ranks take part
+    # in the query forward/backward and return nothing.
+    with phase("score", len(train_ds) + n_test):
+        # ``initialize_from_log`` reloads the LoRA weights that are already in
+        # the model, through ``model.state_dict()`` once per LoRA parameter; on
+        # a sharded model each call gathers the whole model on every rank, so
+        # the reload is skipped there (a ``lora_path`` without a ``lora/``
+        # entry loads nothing).
+        lx.initialize_from_log(lora_path=str(log_root / "no_lora") if sharded else None)
+        log_loader = lx.build_log_dataloader(batch_size=64) if rank == 0 else None
+        src = query_logs()
+        if rank != 0:
+            return lx, None
         # GradDot: dot products of the logged gradients.  With a Hessian,
         # LogIX preconditions with the K-FAC/EK-FAC statistics accumulated
         # during extraction.
         result = lx.influence.compute_influence_all(
-            merge_logs(test_logs), log_loader, precondition=(hessian != "none"))
+            src, log_loader, precondition=(hessian != "none"))
 
     score = result["influence"].T.cpu().float()  # -> (n_train, n_test)
     return lx, score
@@ -242,23 +351,31 @@ def run(task: dict, out_root: Path) -> None:
 
     tag = f"{task.get('family','?')}-{task.get('scale','?')}-{task['dataset']}-{method}"
     run_dir = out_root / "runs" / f"logix-{tag}"
-    # Multi-GPU (``distributed_mode="ddp"`` in the row): one full model replica
-    # per rank under torchrun, without a DDP wrapper.  LogIX's hooks read
-    # activations and output gradients, and its collectives merge the per-rank
-    # covariance state.  Rank 0 records and scores.
+    # Multi-GPU under torchrun (``distributed_mode`` in the row): ``ddp`` is
+    # one full model replica per rank, without a DDP wrapper (LogIX's hooks
+    # read activations and output gradients, and its collectives merge the
+    # per-rank covariance state); ``fsdp`` shards the model (see the module
+    # docstring).  Rank 0 records and scores.
     rank, world = _world()
+    parallelism = task.get("parallelism", "single") if world > 1 else "single"
+    io = task.get("logix_io", "log")
+    if io not in ("log", "memory"):
+        msg = f"logix_io must be 'log' or 'memory', got {io!r}"
+        raise ValueError(msg)
     if world > 1:
-        import os
-
         import torch.distributed as dist
 
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
         dist.init_process_group("nccl")
+    # A model larger than one device is built on the CPU and moved shard by
+    # shard by FSDP (``DATTRI_FSDP_CPU_INIT=1`` forces this at any size).
+    cpu_init = parallelism == "fsdp" and (
+        task["params_b"] > 60 or os.environ.get("DATTRI_FSDP_CPU_INIT", "0") == "1")
     bench = BenchRun({**task, "n_train": n_train, "n_test": n_test,
                       "block_size": block_size, "batch": batch,
                       "lora_rank": LORA_RANK, "proj_mode": proj_mode,
                       "strategy": "logra", "world_size": world,
-                      "distributed_mode": "ddp" if world > 1 else "single"},
+                      "distributed_mode": parallelism, "io": io},
                      results_path=out_root / "results.jsonl",
                      run_dir=run_dir, lib=LIB) if rank == 0 else None
 
@@ -271,7 +388,7 @@ def run(task: dict, out_root: Path) -> None:
 
     with phase("build_model"):
         model, tok, dtype_name = build_model(task["model"], task["params_b"],
-                                             task.get("dtype"))
+                                             task.get("dtype"), cpu=cpu_init)
         record(dtype=dtype_name, proj_mode=proj_mode)
     with phase("load_data"):
         train_ds, test_ds = load_task_data(task["model"], task["dataset"],
@@ -296,13 +413,14 @@ def run(task: dict, out_root: Path) -> None:
         dist.broadcast_object_list(holder, src=0)
         log_root = Path(holder[0])
     common = dict(hessian=hessian, proj_mode=proj_mode, batch=batch, n_test=n_test,
-                  log_root=log_root, dtype=dtype, seed=seed)
+                  log_root=log_root, dtype=dtype, seed=seed, parallelism=parallelism, io=io)
     if n_warm:
         lx_warm, _ = extract_and_score(model, tok, Subset(train_ds, range(n_warm)),
                                        test_ds, project=f"{tag}_warm", **common)
         lx_warm.clear()                     # remove the warm-up instance's hooks
-        removed = _remove_lora(model)       # so the timed run adds LoRA itself
-        record(warmup_lora_removed=removed)
+        if parallelism != "fsdp":
+            removed = _remove_lora(model)   # so the timed run adds LoRA itself
+            record(warmup_lora_removed=removed)
         if world > 1:
             import torch.distributed as dist
 
@@ -310,6 +428,15 @@ def run(task: dict, out_root: Path) -> None:
         if rank == 0:
             shutil.rmtree(log_root / "logs" / f"{tag}_warm", ignore_errors=True)
         del lx_warm
+        if parallelism == "fsdp":
+            # The sharded model keeps its LoRA modules: the timed run starts
+            # from a fresh model (built outside the timed phases), once the
+            # warm-up's model is released.
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
+            model, tok, dtype_name = build_model(task["model"], task["params_b"],
+                                                 task.get("dtype"), cpu=cpu_init)
         torch.cuda.empty_cache()
 
     measured = Subset(train_ds, range(n_warm, n_warm + n_meas))

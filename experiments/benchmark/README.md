@@ -60,22 +60,29 @@ the tokens.
 supports it (Kronfluence runs at full dimension). Each library runs 8 warm-up
 samples untimed and is timed on the next 64. `scaling-<method>` runs 0.5B to
 32B on one H200; a Kronfluence cell is cut off after 1800 s and recorded as
-`timeout`. `scaling-<method>-fsdp4` runs on four H200s: dattri-llm with FSDP
-at 72B and 110B, and Bergson with its own `--fsdp`. Bergson's K-FAC and EK-FAC
+`timeout`. `scaling-<method>-fsdp4` runs on four H200s: dattri-llm and LogIX
+with FSDP at 72B and 110B, and Bergson with its own `--fsdp`. Bergson's K-FAC and EK-FAC
 keep full-dimension factors, and their 7B to 32B cells run sharded.
 Kronfluence runs under FSDP from the first scale that does not fit one H200:
 32B for GradDot, 7B to 32B for K-FAC and EK-FAC. Bergson's
 query build shards a query set across its ranks, from four queries on, so its
 72B and 110B GradDot cells are given four queries: one per device, as for
-dattri-llm, which captures its one query on every rank. LogIX runs one replica per GPU
-and is listed up to 32B.
+dattri-llm, which captures its one query on every rank. LogIX is sharded
+after its LoRA modules are inserted (its `add_lora` saves the model's state
+dict, which a sharded model's parameter names do not survive); every rank runs
+the query backward and rank 0 scores.
 
 **`throughput.py`.** Qwen ladder, bf16, 512-token sequences, four H200s.
 Every library runs every method (GradDot, K-FAC, EK-FAC) with rank-64
 projection wherever the library supports it and full dimension elsewhere
 (`PROJECTION` in `throughput.py`). Each library uses its own multi-GPU mode:
 dattri-llm FSDP with frozen capture and live sharded scoring; Bergson
-`--fsdp`; Kronfluence FSDP; LogIX data-parallel replicas. Each (library,
+`--fsdp`; Kronfluence FSDP; LogIX FSDP applied after its LoRA insertion, which
+with the sharding precedes the timed extraction. LogIX scores its training
+gradients in memory (`logix_io="memory"` in `run_logix.py`): GradDot in one
+pass as the gradients are logged, K-FAC and EK-FAC in a second pass after the
+statistics pass, as Kronfluence and Bergson do; no training gradient is
+written to its log. Each (library,
 method, scale) cell runs at the largest power-of-two per-GPU batch at which
 the library completes the workload on the four cards within the time limit
 (`BATCHES`; 0 means out of memory at batch 1 and is recorded as `oom` without
