@@ -8,6 +8,11 @@ This package re-exports the public surface of its submodules under
 * :mod:`~dattri_llm.gradient.hooks.config` -- :class:`HookManagerConfig`,
   selectors, and hook-assignment resolution.
 * :mod:`~dattri_llm.gradient.hooks.manager` -- :class:`HookManager`.
+* :mod:`~dattri_llm.gradient.hooks.routing` -- per-sample layout recovery
+  for layers fed flattened or routed token rows (MoE routers and experts).
+* :mod:`~dattri_llm.gradient.hooks.override_layers` -- forward overrides installed
+  while collecting (the invasive ``nn.Linear`` forward; per-expert proxies for
+  fused Mixture-of-Experts modules).
 """
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
@@ -25,13 +30,20 @@ from dattri_llm.gradient.hooks.hooks import (
     HF_Conv1D,
     LayerBuffer,
     ParamGradBuffer,
-    install_invasive_forward,
     register_linear_io_hooks,
     register_linear_param_hooks,
     register_param_grad_hooks,
     remove_hooks,
 )
 from dattri_llm.gradient.hooks.manager import HookManager
+from dattri_llm.gradient.hooks.override_layers import (
+    RouterLinear,
+    SliceLinear,
+    find_fused_experts,
+    install_fused_experts,
+    install_invasive_forward,
+)
+from dattri_llm.gradient.hooks.routing import RoutedTokenTracker, RowLayout
 
 __all__ = [
     "INVASIVE_LINEAR_IO",
@@ -45,8 +57,14 @@ __all__ = [
     "LayerBuffer",
     "OffloadCallback",
     "ParamGradBuffer",
+    "RoutedTokenTracker",
+    "RouterLinear",
+    "RowLayout",
     "Selector",
+    "SliceLinear",
     "default_hook_assignment",
+    "find_fused_experts",
+    "install_fused_experts",
     "install_invasive_forward",
     "register_linear_io_hooks",
     "register_linear_param_hooks",
