@@ -12,6 +12,10 @@ model trains unchanged outside ``collect()``:
 * :mod:`~dattri_llm.gradient.hooks.override_layers.fused_experts` -- per-expert
   proxies for Mixture-of-Experts modules that store their experts as 3-D
   parameters and have no ``nn.Linear`` to hook.
+* :mod:`~dattri_llm.gradient.hooks.override_layers.sequence_mixers` -- the
+  state-space and linear-attention mixers (Mamba-1/2 families, gated
+  delta-nets, short convolutions), whose fused kernels and functional
+  fallbacks bypass their projection modules.
 
 New layer kinds that need an override go here as further modules.
 """
@@ -28,14 +32,28 @@ from dattri_llm.gradient.hooks.override_layers.invasive_linear import (
     install_invasive_forward,
     is_invasive_capable,
 )
+from dattri_llm.gradient.hooks.override_layers.sequence_mixers import (
+    MAMBA1_MIXER_CLASSES,
+    find_sequence_mixers,
+    install_sequence_mixer_forward,
+    is_functional_conv_mixer,
+    is_mamba1_mixer,
+    mamba1_reference_forward,
+)
 
 __all__ = [
+    "MAMBA1_MIXER_CLASSES",
     "InvasiveLinearFunction",
     "RouterLinear",
     "SliceLinear",
     "find_fused_experts",
+    "find_sequence_mixers",
     "install_fused_experts",
     "install_invasive_forward",
+    "install_sequence_mixer_forward",
+    "is_functional_conv_mixer",
     "is_fused_experts",
     "is_invasive_capable",
+    "is_mamba1_mixer",
+    "mamba1_reference_forward",
 ]

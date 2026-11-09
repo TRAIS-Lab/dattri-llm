@@ -99,6 +99,7 @@ Also re-exported here (listed above): `REGISTER_ALL`, `CaptureCallback`, `DataSe
 | `Selector` | type alias | Type of a layer selector: `REGISTER_ALL`, a list of name regexes, or `None`. |
 | `install_invasive_forward` | function | Override each named ``nn.Linear``'s forward to skip its weight/bias grad (`hooks.override_layers.invasive_linear`). |
 | `install_fused_experts` | function | Attach per-expert proxies to fused MoE modules and override their forwards while collecting (`hooks.override_layers.fused_experts`). |
+| `install_sequence_mixer_forward` | function | Route a state-space / linear-attention mixer's projections through its modules while collecting, so layers its kernels apply functionally are captured (`hooks.override_layers.sequence_mixers`). |
 | `resolve_hook_assignments` | function | Resolve the final ``{layer_name: hook_type}`` assignment. |
 
 Also re-exported here (listed above): `REGISTER_ALL`, `HookManager`, `HookManagerCallback`, `HookManagerConfig`, `OffloadCallback`, `default_hook_assignment`, `register_linear_io_hooks`, `register_linear_param_hooks`, `register_param_grad_hooks`, `remove_hooks`.

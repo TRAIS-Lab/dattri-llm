@@ -12,18 +12,23 @@ PyTorch) path, since the fused kernels are not installed on CPU.
 
 A module applied *functionally* is invisible to module hooks: Transformers 5
 runs Mamba's ``conv1d`` and ``dt_proj`` through ``causal_conv1d_fn`` /
-``mamba_inner_fn`` on their weights, so those two layers are absent from
-the record there (they are captured under Transformers 4, which calls the
-modules).  The tests check what each version's model actually calls.
+``mamba_inner_fn`` on their weights, and the fused training kernel bypasses
+``x_proj`` and ``out_proj`` too.  While collecting, the manager replaces a
+Mamba mixer's forward with the reference computation through its modules
+(:mod:`dattri_llm.gradient.hooks.override_layers.sequence_mixers`), so every
+projection is captured whatever the version or backend, and the output is
+the mixer's own.
 """
 
 from __future__ import annotations
 
 import warnings
+from typing import ClassVar
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from dattri_llm.gradient import ops
 from dattri_llm.gradient.hooks import HookManager
@@ -88,8 +93,8 @@ def _reference(model, ids):
     return out
 
 
-def _collect(model, ids):
-    hm = HookManager(model)
+def _collect(model, ids, **hm_kwargs):
+    hm = HookManager(model, **hm_kwargs)
     try:
         with hm.collect():
             model.zero_grad()
@@ -151,9 +156,9 @@ class TestLinearAttentionCapture:
                         bias[i], ref[name + ".bias"], rtol=1e-10, atol=1e-12
                     )
             checked += 1
-        # At least in_proj, x_proj and out_proj of each of the two layers (the
-        # tied head has no weight of its own; dt_proj depends on the version).
-        assert checked >= 2 * 3
+        # Mamba: in_proj, x_proj, dt_proj and out_proj of both layers (the tied
+        # head has no weight of its own); RWKV: more.
+        assert checked >= 2 * 4
 
     def test_param_grad_layers_hold_the_batch_gradient(self, family):
         model = _build(family)
@@ -190,35 +195,206 @@ class TestMambaTiedHead:
 
 
 def _conv_record(model):
-    """The captured ``conv1d`` record, skipping when the model never calls the
-    module (Transformers 5 applies its weight functionally).
-    """
+    """The captured ``conv1d`` record and the per-sample reference."""
     ids = _batch()
     reference = _reference(model, ids)
     g = _collect(model, ids)
     name = "backbone.layers.0.mixer.conv1d"
-    if name not in g.data:
-        pytest.skip("this transformers version applies conv1d functionally")
+    assert name in g.data  # the mixer override calls the module
     return g, reference, name
 
 
-class TestMambaDepthwiseConv:
-    """Mamba's causal ``conv1d`` is depthwise (``groups == channels``): its
-    per-sample gradient has the grouped ``(C, 1, k)`` layout plus bias.
+def _tiny(name):
+    """A tiny model of a sequence-mixer family, or ``None`` when the installed
+    Transformers lacks it.
+    """
+    torch.manual_seed(0)
+    kw = {"vocab_size": VOCAB, "max_position_embeddings": 64}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            if name == "mamba":
+                return _build("mamba")
+            if name == "falcon_mamba":
+                cfg = transformers.FalconMambaConfig(
+                    hidden_size=D,
+                    state_size=4,
+                    num_hidden_layers=2,
+                    intermediate_size=32,
+                    conv_kernel=4,
+                    time_step_rank=2,
+                    **kw,
+                )
+                model = transformers.FalconMambaForCausalLM(cfg)
+            elif name == "mamba2":
+                cfg = transformers.Mamba2Config(
+                    hidden_size=D,
+                    state_size=4,
+                    num_hidden_layers=2,
+                    num_heads=2,
+                    head_dim=8,
+                    expand=1,
+                    n_groups=1,
+                    chunk_size=4,
+                    conv_kernel=4,
+                    **kw,
+                )
+                model = transformers.Mamba2ForCausalLM(cfg)
+            elif name == "jamba":
+                cfg = transformers.JambaConfig(
+                    hidden_size=D,
+                    intermediate_size=32,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    attn_layer_period=2,
+                    attn_layer_offset=1,
+                    expert_layer_period=2,
+                    expert_layer_offset=1,
+                    num_experts=1,
+                    num_experts_per_tok=1,
+                    mamba_d_state=4,
+                    mamba_d_conv=4,
+                    mamba_expand=2,
+                    mamba_dt_rank=2,
+                    use_mamba_kernels=False,
+                    **kw,
+                )
+                model = transformers.JambaForCausalLM(cfg)
+            elif name == "qwen3_next":
+                cfg = transformers.Qwen3NextConfig(
+                    hidden_size=32,
+                    intermediate_size=32,
+                    moe_intermediate_size=16,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=16,
+                    linear_num_value_heads=2,
+                    linear_num_key_heads=2,
+                    linear_key_head_dim=8,
+                    linear_value_head_dim=8,
+                    linear_conv_kernel_dim=4,
+                    num_experts=2,
+                    num_experts_per_tok=1,
+                    shared_expert_intermediate_size=16,
+                    layer_types=["linear_attention", "full_attention"],
+                    **kw,
+                )
+                model = transformers.Qwen3NextForCausalLM(cfg)
+            elif name == "kimi_linear":
+                cfg = transformers.KimiLinearConfig(
+                    hidden_size=32,
+                    intermediate_size=32,
+                    moe_intermediate_size=16,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=16,
+                    num_experts=2,
+                    num_experts_per_tok=1,
+                    pad_token_id=0,
+                    bos_token_id=1,
+                    eos_token_id=2,
+                    layer_types=["linear_attention", "full_attention"],
+                    **kw,
+                )
+                model = transformers.KimiLinearForCausalLM(cfg)
+            elif name == "lfm2":
+                cfg = transformers.Lfm2Config(
+                    hidden_size=32,
+                    intermediate_size=32,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    layer_types=["conv", "full_attention"],
+                    conv_L_cache=3,
+                    **kw,
+                )
+                model = transformers.Lfm2ForCausalLM(cfg)
+            else:
+                raise ValueError(name)
+        except AttributeError:
+            return None  # family not in this Transformers version
+    if hasattr(model.config, "_experts_implementation"):
+        model.config._experts_implementation = "eager"  # noqa: SLF001 - no fp64 kernel
+    return model.double()
+
+
+class TestSequenceMixerOverride:
+    """The sequence-mixer overrides on every family the installed Transformers
+    provides: the Mamba-1 reference forward (Mamba, Falcon-Mamba, Jamba) and
+    the functional-conv interception (Mamba2, Qwen3-Next, Kimi-Linear, LFM2).
+    Every ``nn.Linear`` / ``nn.Conv1d`` child of a mixer must be captured per
+    sample and exactly, and the model's output must be its own.
     """
 
-    def test_per_sample_gradient_matches_autograd(self):
-        model = _build("mamba")
-        g, reference, name = _conv_record(model)
-        conv = model.backbone.layers[0].mixer.conv1d
-        c, k = conv.weight.shape[0], conv.weight.shape[-1]
-        dense = ops.materialize(g.data[name], "nn.Conv1d")
-        assert dense.shape == (B, conv.weight.numel() + conv.bias.numel())
-        rows = dense.reshape(B, c, k + 1)  # (C_out, C_in/G*k + bias)
-        for i, ref in enumerate(reference):
-            torch.testing.assert_close(
-                rows[i, :, :k], ref[name + ".weight"][:, 0, :], rtol=1e-10, atol=1e-12
-            )
-            torch.testing.assert_close(
-                rows[i, :, k], ref[name + ".bias"], rtol=1e-10, atol=1e-12
-            )
+    # Families whose MoE blocks hand their sub-layers flattened/routed rows and
+    # must be declared, as for any MoE model.
+    MOE_BLOCKS: ClassVar[dict[str, list[str]]] = {
+        "qwen3_next": [f"model.layers.{i}.mlp" for i in range(2)],
+        "kimi_linear": [f"model.layers.{i}.mlp" for i in range(2)],
+    }
+    FAMILIES: ClassVar[dict[str, float]] = {  # name -> tolerance
+        "mamba": 1e-12,
+        "falcon_mamba": 1e-12,
+        "jamba": 1e-12,
+        "mamba2": 1e-9,  # its fallback chunk scan computes in float32
+        "qwen3_next": 1e-12,
+        "kimi_linear": 1e-12,
+        "lfm2": 1e-12,
+    }
+
+    @pytest.mark.parametrize("family", sorted(FAMILIES))
+    def test_mixer_children_captured_and_exact(self, family):
+        from dattri_llm.gradient.hooks.override_layers import find_sequence_mixers
+
+        model = _tiny(family)
+        if model is None:
+            pytest.skip(f"{family} is not in this Transformers version")
+        mixers = find_sequence_mixers(model)
+        assert mixers
+        ids = _batch()
+        reference = _reference(model, ids)
+        g = _collect(model, ids, moe_routed_layers=self.MOE_BLOCKS.get(family))
+        params = dict(model.named_parameters())
+        tol = self.FAMILIES[family]
+        checked = 0
+        for mixer_name, mixer in mixers.items():
+            for child, module in mixer.named_children():
+                if not isinstance(module, (nn.Linear, nn.Conv1d)):
+                    continue
+                name = f"{mixer_name}.{child}"
+                assert name in g.data, name
+                weight = params[name + ".weight"]
+                dense = ops.materialize(g.data[name], g.layer_types[name])
+                k = weight[0].numel()
+                rows = dense.reshape(B, weight.shape[0], -1)
+                for i, ref in enumerate(reference):
+                    torch.testing.assert_close(
+                        rows[i, :, :k].reshape(weight.shape),
+                        ref[name + ".weight"],
+                        rtol=tol,
+                        atol=tol,
+                    )
+                checked += 1
+        assert checked >= 3
+
+    @pytest.mark.parametrize("family", sorted(FAMILIES))
+    def test_output_equals_the_original_forward(self, family):
+        model = _tiny(family)
+        if model is None:
+            pytest.skip(f"{family} is not in this Transformers version")
+        ids = _batch()
+        with torch.no_grad():
+            plain = model(input_ids=ids).logits
+        hm = HookManager(model, moe_routed_layers=self.MOE_BLOCKS.get(family))
+        try:
+            with hm.collect():
+                out = model(input_ids=ids).logits
+                out.sum().backward()
+        finally:
+            hm.remove()
+        tol = self.FAMILIES[family]
+        torch.testing.assert_close(out.detach(), plain, rtol=tol, atol=tol)
+        assert not [m for m in model.modules() if "forward" in m.__dict__]
