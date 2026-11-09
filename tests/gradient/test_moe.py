@@ -202,26 +202,41 @@ class TestRoutedCapture:
         )
         assert checked == n_matrices
 
-    def test_expert_layout_is_regrouped_by_sample(self):
+    def test_expert_rows_sit_at_their_sequence_positions(self):
         model, blocks = _build("mixtral")
-        g = _collect(model, _batch(), moe_routed_layers=blocks)
+        ids = _batch()
+        g = _collect(model, ids, moe_routed_layers=blocks)
+        block = model.model.layers[0].block_sparse_moe
         expert = "model.layers.0.block_sparse_moe.experts.0.w1"
         act = g.data[expert].activation
-        assert act.ndim == 3
-        assert act.shape[0] == B
-        assert act.shape[1] <= T  # T_e: the most rows any sample routed here
-        assert g.indexing[expert] == "routed_token"
-        # Rows beyond a sample's count are exact zeros on both factors.
         grad = g.data[expert].pre_activation_grad
-        counts = (act != 0).any(-1).sum(1)
-        for i in range(B):
-            assert torch.equal(
-                grad[i, counts[i] :], torch.zeros_like(grad[i, counts[i] :])
-            )
+        assert tuple(act.shape) == (B, T, 16)  # the full sequence layout
+        assert g.indexing[expert] == "batch_token"
+
+        # The block's input on a plain forward, to recompute its routing.
+        seen: list[torch.Tensor] = []
+        handle = block.register_forward_pre_hook(
+            lambda _m, args: seen.append(args[0].detach())
+        )
+        with torch.no_grad():
+            model(input_ids=ids)
+        handle.remove()
+        (hidden,) = seen
+        logits = block.gate(hidden.reshape(-1, hidden.shape[-1]))
+        top = torch.topk(torch.softmax(logits, -1), block.top_k, dim=-1).indices
+        chosen = (top == 0).any(-1).view(B, T)  # tokens whose top-k holds expert 0
+
+        # Expert 0's rows are exactly those tokens' hidden states, at their own
+        # positions; every other position is zero on both factors.
+        routed = (act != 0).any(-1)
+        assert torch.equal(routed, chosen)
+        torch.testing.assert_close(act[routed], hidden[routed])
+        assert torch.equal(grad[~routed], torch.zeros_like(grad[~routed]))
+
         # The router sees every token: the flattened input is reshaped back.
         router = "model.layers.0.block_sparse_moe.gate"
         assert tuple(g.data[router].activation.shape) == (B, T, 16)
-        assert g.indexing[router] == "routed_token"
+        assert g.indexing[router] == "batch_token"
 
     def test_experts_and_router_may_be_declared_instead_of_the_block(self):
         model, _ = _build("mixtral")
@@ -266,7 +281,7 @@ class TestCapturePaths:
         act = g.data[expert].activation
         assert act.shape[0] == B
         assert act.shape[-1] == 8
-        assert g.indexing[expert] == "routed_token"
+        assert g.indexing[expert] == "batch_token"
 
     def test_materialized_style_matches_reference(self):
         model, blocks = _build("mixtral")
@@ -330,29 +345,35 @@ class TestRoutedTokenIndexing:
         finally:
             hm.remove()
         expert = "model.layers.0.block_sparse_moe.experts.0.w1"
-        t1 = records[0].data[expert].activation.shape[1]
-        t2 = records[1].data[expert].activation.shape[1]
         cat = records[0].concatenate(records[1])
         assert cat.batch_size == 2 * B
-        assert cat.data[expert].activation.shape[1] == max(t1, t2)
-        # Padding is inert: the concatenated block materializes to the two
+        assert cat.data[expert].activation.shape[1] == T
+        # Zero rows are inert: the concatenated block materializes to the two
         # blocks stacked.
         torch.testing.assert_close(
             ops.materialize(cat.data[expert], "nn.Linear"),
             torch.cat([ops.materialize(r.data[expert], "nn.Linear") for r in records]),
         )
 
-    def test_per_token_attribution_excludes_routed_layers(self):
+    def test_per_token_attribution_includes_experts(self):
         model, blocks = _build("mixtral")
         g = _collect(model, _batch(), moe_routed_layers=blocks)
         per_layer = g.similarity_per_token(g, reduce="none")
-        assert per_layer
-        assert not any("block_sparse_moe" in name for name in per_layer)
         expert = "model.layers.0.block_sparse_moe.experts.0.w1"
-        with pytest.raises(ValueError, match="no token axis"):
-            ops.layerwise_cross_dot_per_token(g, g, layers=[expert])
+        assert expert in per_layer
+        contribution = per_layer[expert]  # (B, T, B)
+        # Summing the positions recovers the instance-level inner product, and
+        # positions whose token was not routed to the expert contribute zero.
+        torch.testing.assert_close(
+            contribution.sum(1),
+            ops.cross_dot(g.data[expert], g.data[expert], "nn.Linear"),
+        )
+        routed = (g.data[expert].activation != 0).any(-1)
+        assert torch.equal(
+            contribution[~routed], torch.zeros_like(contribution[~routed])
+        )
 
-    def test_kfac_factors_ignore_padding_rows(self):
+    def test_kfac_factors_ignore_unrouted_rows(self):
         model, blocks = _build("mixtral")
         g = _collect(model, _batch(), moe_routed_layers=blocks)
         expert = "model.layers.0.block_sparse_moe.experts.0.w1"

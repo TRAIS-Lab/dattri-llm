@@ -13,6 +13,7 @@ from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.materialize import materialize
 from dattri_llm.gradient.ops.preprocess import preprocess_factors, to_3d
 from dattri_llm.gradient.ops.types import (
+    PARAM_GRAD_TYPES,
     is_conv,
     is_conv_transpose,
     is_embedding,
@@ -551,7 +552,8 @@ def layerwise_cross_dot(
         test: The column-side block.  Typically the (transformed / preconditioned)
             test representation.
         layers: Restrict to these layer names; ``None`` scores every shared
-            layer.  Layers absent from either side are skipped.
+            layer.  Layers absent from either side are skipped, as are
+            batch-level ``param_grad`` layers, which carry no per-sample axis.
         mode: Factorized-vs-materialized routing for factor x factor layers
             (see :func:`cross_gram`); ``"auto"`` picks the cheaper per layer.
         dense_cache: A :class:`~dattri_llm.utils.cache.TensorCache` **scoped to
@@ -577,6 +579,8 @@ def layerwise_cross_dot(
         if name not in train.data or name not in test.data:
             continue
         layer_type = train.layer_types[name]
+        if layer_type == PARAM_GRAD_TYPES:
+            continue  # a batch-level gradient: no per-sample rows to score
         tr, te = train.data[name], test.data[name]
         if isinstance(te, torch.Tensor) and not isinstance(tr, torch.Tensor):
             tr = (
@@ -639,14 +643,15 @@ def layerwise_cross_dot_per_token(
     for name in names:
         if name not in train.data or name not in test.data:
             continue
+        if train.layer_types[name] == PARAM_GRAD_TYPES:
+            continue  # a batch-level gradient: no per-sample rows to score
         tr = train.data[name]
         if isinstance(tr, torch.Tensor) or train.indexing[name] != "batch_token":
             raise ValueError(
                 f"layer {name!r} has no token axis on the train side "
                 f"(stored {train.representation[name]}, indexing "
                 f"{train.indexing[name]!r}); token-level attribution needs the "
-                "train gradients captured factorized with sequence positions "
-                "(a routed MoE layer's rows are not positions).",
+                "train gradients captured factorized.",
             )
         per_layer[name] = cross_dot_per_token(
             tr, test.data[name], train.layer_types[name]

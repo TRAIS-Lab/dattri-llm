@@ -1222,3 +1222,30 @@ class TestBatchMismatchMessage:
         assert "attn has 2 samples (captured shape (2, 5, 4))" in msg
         assert "experts.2 has 7 (captured shape (7, 4))" in msg
         assert "non_batch_first_layers" in msg
+
+
+class TestBatchLevelLayersInSimilarity:
+    """A ``param_grad`` layer (batch-level, no per-sample axis) is left out of
+    whole-block inner products instead of breaking them.
+    """
+
+    def test_similarity_ignores_param_grad_layers(self):
+        torch.manual_seed(0)
+        a, g = torch.randn(3, 5, 4), torch.randn(3, 5, 2)
+        with_norm = Gradient(
+            representation={"lin": "factorized", "norm.weight": "materialized"},
+            data={"lin": Factorized(a, g), "norm.weight": torch.randn(16)},
+            layer_types={"lin": "nn.Linear", "norm.weight": ops.PARAM_GRAD_TYPES},
+        )
+        only_lin = Gradient(
+            representation={"lin": "factorized"},
+            data={"lin": Factorized(a, g)},
+            layer_types={"lin": "nn.Linear"},
+        )
+        torch.testing.assert_close(
+            with_norm.similarity(with_norm, reduce="all"),
+            only_lin.similarity(only_lin, reduce="all"),
+        )
+        assert "norm.weight" not in ops.layerwise_cross_dot(
+            with_norm, with_norm, reduce="none"
+        )

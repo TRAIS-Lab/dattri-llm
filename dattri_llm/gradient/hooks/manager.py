@@ -179,12 +179,12 @@ class HookManager:
             The router of such a block sees the block input flattened to
             ``(B*T, d)`` and each expert the ``(n_e, d)`` rows routed to it;
             the manager locates every row in the enclosing block input and
-            regroups the rows by sample into a zero-padded ``(B, T_e, d)``
-            capture (see :mod:`~dattri_llm.gradient.hooks.routing`), whose
-            padding is inert in every downstream operation.  Such layers are
-            indexed ``"routed_token"``: they carry a token axis, but its
-            positions are not sequence positions, so token-level attribution
-            excludes them.  Per-expert modules (one ``nn.Linear`` per
+            scatters the rows back to their samples and sequence positions,
+            a ``(B, T, d)`` capture that is zero where a token was not routed
+            to the layer (see :mod:`~dattri_llm.gradient.hooks.routing`); the
+            zero rows are inert in every downstream operation and token-level
+            attribution applies as to any sequence layer.  Per-expert modules
+            (one ``nn.Linear`` per
             projection) are hooked directly.  A *fused* experts module under a
             declared name (3-D ``gate_up_proj``/``down_proj`` parameters, as
             in Transformers 5 and gpt-oss) and its router are captured through
@@ -1046,11 +1046,6 @@ class HookManager:
                 self._warn_silent_layer(layer_name)
                 continue
             batch_first = layer_name not in self._non_batch_first_layers
-            token_indexing = (
-                "routed_token"
-                if self._routed is not None and layer_name in self._routed.layers
-                else "batch_token"
-            )
             proj_kw = buf["_proj_kw"]
 
             # A layer invoked more than once in a step (custom module reuse,
@@ -1109,7 +1104,7 @@ class HookManager:
                     representation[out_name] = "factorized"
                     layer_types[out_name] = "nn.Linear"
                     tokens = a.shape[1 if batch_first else 0]  # 1 => 2-D origin
-                    indexing[out_name] = token_indexing if tokens > 1 else "batch"
+                    indexing[out_name] = "batch_token" if tokens > 1 else "batch"
                     continue
 
                 # Un-projected raw factorized capture.
@@ -1131,7 +1126,7 @@ class HookManager:
                 representation[out_name] = "factorized"
                 layer_types[out_name] = buf["_class_name"]
                 indexing[out_name] = (
-                    token_indexing
+                    "batch_token"
                     if a.ndim >= 3 or not a.is_floating_point()
                     else "batch"
                 )

@@ -12,17 +12,19 @@ at all without knowing which sample each row came from.
 input of the enclosing block, and when a module under a declared MoE
 module receives a 2-D float matrix of the same width it locates every row
 in the block input -- by an exact bit-level fingerprint of the row,
-verified by an exact comparison afterwards -- so the row's sample is
-``token // T``.  The rows are then regrouped by sample into a zero-padded
-``(B, T_e, d)`` tensor, ``T_e`` the largest number of rows any sample sent
-to the layer, and the hooks buffer that tensor exactly as they would an
-ordinary sequence layer: the padding rows carry an exactly-zero output
-gradient, which every downstream operation treats as inert (materialization
-and inner products sum over positions; the K-FAC factors drop
-gradient-free rows).  The regrouping is independent of the order in which
-a model lays out the routed rows, so it does not depend on the model
-implementation; a flattened ``(B*T, d)`` input is recognised directly and
-reshaped without a search.
+verified by an exact comparison afterwards -- so the row's sample and
+sequence position are known.  The rows are then scattered back into a
+``(B, T, d)`` tensor at their own positions, zero where a sample's token
+was not routed to the layer, and the hooks buffer that tensor exactly as
+they would an ordinary sequence layer: the zero rows carry an exactly-zero
+output gradient, which every downstream operation treats as inert
+(materialization and inner products sum over positions; the K-FAC factors
+drop gradient-free rows), and because positions are preserved, token-level
+attribution applies to experts like any other layer.  The price is memory
+for factorized storage: an expert's factors hold ``B*T`` rows instead of
+its ``n_e`` routed rows, i.e. the block's experts together hold ``E/k``
+times the compact rows for a top-``k`` router.  A flattened ``(B*T, d)``
+input is recognised directly and reshaped without a search.
 
 The map is computed once per 2-D input tensor (an expert's inner linears
 receive the same tensor object the expert received) and reused by every
@@ -53,7 +55,8 @@ _INT_VIEW = {2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 @dataclass(frozen=True)
 class RowLayout:
-    """Where each row of a routed 2-D capture sits in the ``(B, T_e)`` grid.
+    """Where each row of a routed 2-D capture sits in the ``(B, T)`` grid:
+    its sample and its sequence position.
 
     ``sample is None`` marks the flattened case: the rows are the block's
     tokens in order, and :meth:`regroup` is a reshape.
@@ -326,14 +329,8 @@ class RoutedTokenTracker:
         if not torch.equal(src.flat[token], x):
             return None
         sample = torch.div(token, src.tokens, rounding_mode="floor")
-        counts = torch.bincount(sample, minlength=src.batch)
-        by_sample = torch.argsort(sample, stable=True)
-        starts = torch.cumsum(counts, 0) - counts
-        position = torch.empty_like(sample)
-        position[by_sample] = (
-            torch.arange(n, device=sample.device) - starts[sample[by_sample]]
-        )
-        return RowLayout(src.batch, int(counts.max()), n, sample, position)
+        position = token - sample * src.tokens  # the row's sequence position
+        return RowLayout(src.batch, src.tokens, n, sample, position)
 
     def _row_keys(self, t: torch.Tensor) -> torch.Tensor:
         """One int64 fingerprint per row of *t*, exact in the row's bits."""

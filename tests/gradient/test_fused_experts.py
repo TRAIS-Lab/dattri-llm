@@ -154,7 +154,7 @@ class TestFusedExperts:
             e = int(name.split(".dattri_experts.")[1].split(".")[0])
             proj = "gate_up_proj" if name.endswith(".gate_up") else "down_proj"
             dense = ops.materialize(value, "nn.Linear")
-            assert g.indexing[name] == "routed_token"
+            assert g.indexing[name] == "batch_token"
             assert value.activation.shape[0] == B
             for i, ref in enumerate(reference):
                 weight, bias = _expert_reference(ref, experts, proj, e)
