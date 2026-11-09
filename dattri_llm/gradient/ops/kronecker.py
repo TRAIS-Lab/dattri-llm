@@ -41,9 +41,25 @@ def _flatten_for_kfac(
     if is_embedding(layer_type):
         raise NotImplementedError("K-FAC is not defined for embedding layers")
     a, g = dtypes.align(a, g)
+    if a.ndim == 4:
+        # Grouped convolution (N, L, G, K): one covariance per group, so the
+        # flattened rows are (G, N*L, K) and the factors (G, K, K).
+        groups = a.shape[2]
+        a_f = a.permute(2, 0, 1, 3).reshape(groups, -1, a.shape[-1])
+        g_f = g.permute(2, 0, 1, 3).reshape(groups, -1, g.shape[-1])
+        return a_f, g_f
     a_f = a.reshape(-1, a.shape[-1])
     g_f = g.reshape(-1, g.shape[-1])
     return a_f, g_f
+
+
+def _right_multiply(x: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    """``x @ matrix`` on the feature axis; per group when *matrix* is a
+    ``(G, K, K)`` stack and *x* a grouped ``(N, L, G, K)`` factor.
+    """
+    if matrix.ndim == 3:
+        return torch.einsum("...gk,gkj->...gj", x, matrix)
+    return x @ matrix
 
 
 def _drop_gradient_free_rows(
@@ -85,14 +101,15 @@ def kfac_factors(
     # estimates A over all spatial positions.
     if not (is_conv(layer_type) or is_conv_transpose(layer_type)):
         a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
-    N = a_f.shape[0]
+    N = a_f.shape[-2]
     if N == 0:
         raise ValueError(
             "K-FAC factors are undefined: every token row carries a zero "
             "gradient (fully padded / masked input).",
         )
-    A = (a_f.T @ a_f).float() / N
-    G = (g_f.T @ g_f).float() / N
+    # (K, K) and (D, D); for a grouped convolution (G, K, K) and (G, D, D).
+    A = (a_f.transpose(-1, -2) @ a_f).float() / N
+    G = (g_f.transpose(-1, -2) @ g_f).float() / N
     return A, G
 
 
@@ -131,7 +148,8 @@ def sym_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
     *damping* keeps a rank-deficient K-FAC covariance factor invertible.
     """
     evals, evecs = torch.linalg.eigh(matrix.float())
-    return (evecs / (evals + damping)) @ evecs.T
+    # Batched over a leading group axis when *matrix* is a (G, K, K) stack.
+    return (evecs / (evals + damping).unsqueeze(-2)) @ evecs.transpose(-1, -2)
 
 
 def dense_inverse(matrix: torch.Tensor, damping: float = 0.0) -> torch.Tensor:
@@ -179,8 +197,8 @@ def kfac_cross_factors(
     """
     a1, g1 = preprocess_factors(a1, g1, layer_type, module_kwargs1, include_bias)
     a2, g2 = preprocess_factors(a2, g2, layer_type, module_kwargs2, include_bias)
-    a1 = a1.float() @ A_inv.float()
-    g1 = g1.float() @ G_inv.float()
+    a1 = _right_multiply(a1.float(), A_inv.float())
+    g1 = _right_multiply(g1.float(), G_inv.float())
     return cross_gram(a1, g1, a2, g2, layer_type)
 
 
@@ -210,8 +228,8 @@ def ekfac_materialize_factors(
     eigenvalues, and against which test/train gradients are scored.
     """
     a, g = preprocess_factors(a, g, layer_type, module_kwargs, include_bias)
-    a = a.float() @ U_A.float()
-    g = g.float() @ U_G.float()
+    a = _right_multiply(a.float(), U_A.float())
+    g = _right_multiply(g.float(), U_G.float())
     return materialize_factors(a, g, layer_type)
 
 
@@ -316,6 +334,15 @@ def _ekfac_rotate_materialized(
     on the left).
     """
     batch = block.shape[0]
+    if U_A.ndim == 3:  # grouped: (G, ., .) bases, block laid out per group
+        groups, k_a, k_g = U_A.shape[0], U_A.shape[-1], U_G.shape[-1]
+        if is_conv_transpose(layer_type):
+            d_w = block.reshape(batch, groups, k_a, k_g).float()
+            M = torch.einsum("gce,bgcp,gpf->bgef", U_A.float(), d_w, U_G.float())
+        else:
+            d_w = block.reshape(batch, groups, k_g, k_a).float()
+            M = torch.einsum("goe,bgoi,gif->bgef", U_G.float(), d_w, U_A.float())
+        return M.reshape(batch, -1)
     if is_conv_transpose(layer_type):
         c_in, p = U_A.shape[0], U_G.shape[0]
         d_w = block.reshape(batch, c_in, p).float()
@@ -350,7 +377,10 @@ def kfac_precondition(
         bf.module_kwargs,
         include_bias,
     )
-    return a.float() @ A_inv.float(), g.float() @ G_inv.float()
+    return (
+        _right_multiply(a.float(), A_inv.float()),
+        _right_multiply(g.float(), G_inv.float()),
+    )
 
 
 def kfac_precondition_materialized(
@@ -370,7 +400,11 @@ def kfac_precondition_materialized(
     ready to dot against a raw materialized train block.
     """
     batch = block.shape[0]
-    k_g, k_a = G_inv.shape[0], A_inv.shape[0]
+    k_g, k_a = G_inv.shape[-1], A_inv.shape[-1]
+    if A_inv.ndim == 3:  # grouped: per-group inverses on per-group blocks
+        d_w = block.reshape(batch, A_inv.shape[0], k_g, k_a).float()
+        pre = torch.einsum("gde,bgek,gkj->bgdj", G_inv.float(), d_w, A_inv.float())
+        return pre.reshape(batch, -1)
     d_w = block.reshape(batch, k_g, k_a).float()
     preconditioned = G_inv.float() @ d_w @ A_inv.float()  # (B, k_g, k_a)
     return preconditioned.reshape(batch, k_g * k_a)
@@ -396,6 +430,15 @@ def ekfac_precondition(
     while conv-transpose flattens ``(C_in, P)``-major (``U_A`` on the left).
     """
     Md = M / lam
+    if U_A.ndim == 3:  # grouped: per-group bases on per-group blocks
+        groups, k_a, k_g = U_A.shape[0], U_A.shape[-1], U_G.shape[-1]
+        if is_conv_transpose(layer_type):
+            M3 = Md.reshape(M.shape[0], groups, k_a, k_g)
+            R = torch.einsum("gce,bgef,gpf->bgcp", U_A.float(), M3, U_G.float())
+        else:
+            M3 = Md.reshape(M.shape[0], groups, k_g, k_a)
+            R = torch.einsum("goe,bgef,gif->bgoi", U_G.float(), M3, U_A.float())
+        return R.reshape(M.shape[0], -1)
     if is_conv_transpose(layer_type):
         # dW' = U_A^T dW U_G, flattened (C_in, P) = (U_A rows, U_G rows).
         c_in, p = U_A.shape[0], U_G.shape[0]
@@ -446,24 +489,28 @@ class LayerKroneckerAccumulator:
         # gradient-carrying rows.  Conv spatial zeros are architectural -- kept.
         if not (is_conv(layer_type) or is_conv_transpose(layer_type)):
             a_f, g_f = _drop_gradient_free_rows(a_f, g_f)
-        N = a_f.shape[0]
+        N = a_f.shape[-2]
         if self._A is None:
             # fp32 buffers regardless of the operands' dtype: these are summed
-            # over the whole fit set, where bf16 accumulation drifts.
+            # over the whole fit set, where bf16 accumulation drifts.  A
+            # grouped convolution's rows are (G, N, K): one factor per group.
+            lead = a_f.shape[:-2]
             self._A = torch.zeros(
+                *lead,
                 a_f.shape[-1],
                 a_f.shape[-1],
                 dtype=torch.float32,
                 device=a_f.device,
             )
             self._G = torch.zeros(
+                *lead,
                 g_f.shape[-1],
                 g_f.shape[-1],
                 dtype=torch.float32,
                 device=g_f.device,
             )
-        self._A += (a_f.T @ a_f).float()
-        self._G += (g_f.T @ g_f).float()
+        self._A += (a_f.transpose(-1, -2) @ a_f).float()
+        self._G += (g_f.transpose(-1, -2) @ g_f).float()
         self._n += N
 
     def all_reduce(self) -> None:

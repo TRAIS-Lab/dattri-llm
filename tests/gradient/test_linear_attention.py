@@ -203,34 +203,22 @@ def _conv_record(model):
 
 
 class TestMambaDepthwiseConv:
-    """Mamba's causal ``conv1d`` is depthwise (``groups == channels``)."""
+    """Mamba's causal ``conv1d`` is depthwise (``groups == channels``): its
+    per-sample gradient has the grouped ``(C, 1, k)`` layout plus bias.
+    """
 
-    @pytest.mark.xfail(
-        reason="conv capture ignores `groups`: the per-sample gradient is "
-        "materialized as an ungrouped (C_out, C_in*k + 1) block",
-        strict=True,
-    )
-    def test_per_sample_gradient_has_the_grouped_shape(self):
-        model = _build("mamba")
-        g, _, name = _conv_record(model)
-        conv = model.backbone.layers[0].mixer.conv1d
-        dense = ops.materialize(g.data[name], "nn.Conv1d")
-        assert dense.shape[1] == conv.weight.numel() + conv.bias.numel()
-
-    def test_ungrouped_block_holds_the_true_gradient_on_its_diagonal(self):
-        # What the capture does hold is exact: the depthwise gradient is the
-        # block diagonal of the ungrouped materialization.
+    def test_per_sample_gradient_matches_autograd(self):
         model = _build("mamba")
         g, reference, name = _conv_record(model)
         conv = model.backbone.layers[0].mixer.conv1d
         c, k = conv.weight.shape[0], conv.weight.shape[-1]
-        dense = ops.materialize(g.data[name], "nn.Conv1d").reshape(B, c, -1)
-        full = dense[:, :, :-1].reshape(B, c, c, k)
-        diag = torch.stack([full[:, o, o, :] for o in range(c)], 1)
+        dense = ops.materialize(g.data[name], "nn.Conv1d")
+        assert dense.shape == (B, conv.weight.numel() + conv.bias.numel())
+        rows = dense.reshape(B, c, k + 1)  # (C_out, C_in/G*k + bias)
         for i, ref in enumerate(reference):
             torch.testing.assert_close(
-                diag[i], ref[name + ".weight"][:, 0, :], rtol=1e-10, atol=1e-12
+                rows[i, :, :k], ref[name + ".weight"][:, 0, :], rtol=1e-10, atol=1e-12
             )
             torch.testing.assert_close(
-                dense[i, :, -1], ref[name + ".bias"], rtol=1e-10, atol=1e-12
+                rows[i, :, k], ref[name + ".bias"], rtol=1e-10, atol=1e-12
             )

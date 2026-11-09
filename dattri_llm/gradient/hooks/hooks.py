@@ -622,7 +622,7 @@ def _capture_projected(
                 a, g, layer_type, projector, module_kwargs, **kw
             )
             emit = None
-        seq_len = a_p.shape[1] if a_p.ndim == 3 else 1
+        seq_len = a_p.shape[1] if a_p.ndim >= 3 else 1
         if _keep_factors(buf, seq_len, a_p.shape[-1], g_p.shape[-1]):
             keep_factors(a_p, g_p)
         else:
@@ -661,7 +661,7 @@ def _capture_projected(
         return True, None
     # Otherwise the capture style decides: the raw factors, or the dense
     # per-sample gradient when it is the smaller (or requested) form.
-    seq_len = a.shape[1] if a.ndim == 3 else 1
+    seq_len = a.shape[1] if a.ndim >= 3 else 1
     n_in = a.shape[-1] + 1  # the bias column materialize adds
     n_out = g.shape[-1]
     if _keep_factors(buf, seq_len, n_in, n_out):
