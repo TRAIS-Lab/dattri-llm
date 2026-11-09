@@ -1204,3 +1204,48 @@ class TestBatchFirst:
         bf, sf = _seq_first_pair()
         with pytest.raises(ValueError, match="batch_first"):
             bf.concatenate(sf, dim="batch")
+
+
+class TestBatchMismatchMessage:
+    """The batch-size error names both layers and their captured shapes."""
+
+    def test_names_layers_and_shapes(self):
+        a = Factorized(torch.randn(2, 5, 4), torch.randn(2, 5, 3))
+        b = Factorized(torch.randn(7, 4), torch.randn(7, 3))  # routed rows
+        with pytest.raises(ValueError, match="same batch size") as exc:
+            Gradient(
+                representation={"attn": "factorized", "experts.2": "factorized"},
+                data={"attn": a, "experts.2": b},
+                layer_types={"attn": "nn.Linear", "experts.2": "nn.Linear"},
+            )
+        msg = str(exc.value)
+        assert "attn has 2 samples (captured shape (2, 5, 4))" in msg
+        assert "experts.2 has 7 (captured shape (7, 4))" in msg
+        assert "non_batch_first_layers" in msg
+
+
+class TestBatchLevelLayersInSimilarity:
+    """A ``param_grad`` layer (batch-level, no per-sample axis) is left out of
+    whole-block inner products instead of breaking them.
+    """
+
+    def test_similarity_ignores_param_grad_layers(self):
+        torch.manual_seed(0)
+        a, g = torch.randn(3, 5, 4), torch.randn(3, 5, 2)
+        with_norm = Gradient(
+            representation={"lin": "factorized", "norm.weight": "materialized"},
+            data={"lin": Factorized(a, g), "norm.weight": torch.randn(16)},
+            layer_types={"lin": "nn.Linear", "norm.weight": ops.PARAM_GRAD_TYPES},
+        )
+        only_lin = Gradient(
+            representation={"lin": "factorized"},
+            data={"lin": Factorized(a, g)},
+            layer_types={"lin": "nn.Linear"},
+        )
+        torch.testing.assert_close(
+            with_norm.similarity(with_norm, reduce="all"),
+            only_lin.similarity(only_lin, reduce="all"),
+        )
+        assert "norm.weight" not in ops.layerwise_cross_dot(
+            with_norm, with_norm, reduce="none"
+        )

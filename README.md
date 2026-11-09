@@ -37,9 +37,13 @@
   `OptimizerStateCallback` and `DataSelectionCallback` extend one capture path.
 - 🌐 **Distributed by default** — gradients captured under DDP and FSDP match the
   single-device reference; each rank writes its own shard and the store merges them.
-- 📚 **Broad layer coverage** — linear, convolution (incl. transposed), embedding
-  and normalization layers (`LayerNorm`, `RMSNorm`, `GroupNorm`, `InstanceNorm`),
-  with optional capture-time random projection.
+- 📚 **Broad layer coverage** — linear, convolution (incl. transposed and grouped),
+  embedding and normalization layers (`LayerNorm`, `RMSNorm`, `GroupNorm`,
+  `InstanceNorm`), with optional capture-time random projection.
+- 🔀 **MoE and state-space models** — Mixture-of-Experts blocks are captured once
+  named in `moe_routed_layers`; Mamba-family and gated delta-net mixers (Mamba,
+  Mamba2 and its hybrids, Jamba, Qwen3-Next, Kimi-Linear) are detected and
+  captured automatically.
 
 *dattri-LLM* is the LLM-scale companion of the `dattri` library
 and is validated on its benchmark suite for attribution quality (LDS, LOO) and
@@ -186,7 +190,24 @@ Norm layers take the `"dense"` or `"mask"` projection styles, not `"logra"`.
 The full recipe, including a check against autograd, is in
 [`examples/projection/`](examples/projection/README.md).
 
-### 4. Factorized versus materialized routing
+### 4. Mixture-of-Experts and state-space models
+
+An MoE block hands its router the block input flattened to `(B·T, d)` and each
+expert only the rows routed to it, so these layers do not carry the batch axis
+the capture reads. Name the MoE blocks, and the manager locates every row in
+the block input and returns it to its sample and position. The same call
+covers per-expert `nn.Linear` experts (Transformers 4) and fused 3-D expert
+parameters (Transformers 5, gpt-oss):
+
+```python
+blocks = [f"model.layers.{i}.block_sparse_moe" for i in range(model.config.num_hidden_layers)]
+hm = HookManager(model, moe_routed_layers=blocks, callbacks=[...])
+```
+
+Runnable examples are in
+[`examples/hooks/`](examples/hooks/README.md).
+
+### 5. Factorized versus materialized routing
 
 A captured per-sample gradient is kept either **factorized** (a layer's input
 activations and output gradients) or **materialized** (the dense per-sample
@@ -248,7 +269,7 @@ hooked layer's per-sample gradient is materialized before the map.
 
 ### Models and Frameworks
 
-**Models** — Our hook-based implementation is compatible with any `nn.Module`, enabling support for a broad range of LLM architectures, including the GPT-2, Llama, Qwen, and Gemma families.
+**Models** — Our hook-based implementation is compatible with any `nn.Module`, enabling support for a broad range of LLM architectures, including the GPT-2, Llama, Qwen and Gemma families, Mixture-of-Experts models (Mixtral, Qwen-MoE, OLMoE, DeepSeek, gpt-oss), and state-space and linear-attention models (Mamba, Mamba2, Jamba, Qwen3-Next, Kimi-Linear).
 
 **Frameworks** — Our library integrates directly with a variety of training frameworks, including but not limited to
 [Transformers](https://github.com/huggingface/transformers),
