@@ -8,6 +8,8 @@ This package re-exports the public surface of its submodules under
 * :mod:`~dattri_llm.gradient.hooks.config` -- :class:`HookManagerConfig`,
   selectors, and hook-assignment resolution.
 * :mod:`~dattri_llm.gradient.hooks.manager` -- :class:`HookManager`.
+* :mod:`~dattri_llm.gradient.hooks.routing` -- per-sample layout recovery
+  for layers fed flattened or routed token rows (MoE routers and experts).
 """
 
 from dattri_llm.gradient.callbacks import HookManagerCallback, OffloadCallback
@@ -32,6 +34,7 @@ from dattri_llm.gradient.hooks.hooks import (
     remove_hooks,
 )
 from dattri_llm.gradient.hooks.manager import HookManager
+from dattri_llm.gradient.hooks.routing import RoutedTokenTracker, RowLayout
 
 __all__ = [
     "INVASIVE_LINEAR_IO",
@@ -45,6 +48,8 @@ __all__ = [
     "LayerBuffer",
     "OffloadCallback",
     "ParamGradBuffer",
+    "RoutedTokenTracker",
+    "RowLayout",
     "Selector",
     "default_hook_assignment",
     "install_invasive_forward",

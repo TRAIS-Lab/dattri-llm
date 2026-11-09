@@ -612,7 +612,8 @@ def layerwise_cross_dot_per_token(
                 f"layer {name!r} has no token axis on the train side "
                 f"(stored {train.representation[name]}, indexing "
                 f"{train.indexing[name]!r}); token-level attribution needs the "
-                "train gradients captured factorized.",
+                "train gradients captured factorized with sequence positions "
+                "(a routed MoE layer's rows are not positions).",
             )
         per_layer[name] = cross_dot_per_token(
             tr, test.data[name], train.layer_types[name]

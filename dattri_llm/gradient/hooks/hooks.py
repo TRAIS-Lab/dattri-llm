@@ -59,6 +59,7 @@ from dattri_llm.options import CaptureStyle
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from dattri_llm.gradient.hooks.routing import RoutedTokenTracker
     from dattri_llm.gradient.optimizer_state import GradientPreconditioner
 
 try:
@@ -189,6 +190,7 @@ def register_linear_io_hooks(
     offload_to_cpu: bool = False,
     preconditioner: GradientPreconditioner | None = None,
     include_frozen: bool = False,
+    routed: RoutedTokenTracker | None = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
@@ -239,6 +241,12 @@ def register_linear_io_hooks(
             a step).
         include_frozen: Hook a layer even when none of its parameters
             requires grad (see :class:`HookManagerConfig`).
+        routed: Optional
+            :class:`~dattri_llm.gradient.hooks.routing.RoutedTokenTracker`.
+            A layer in its ``layers`` receives flattened or routed token rows
+            (an MoE router or expert); its 2-D captures are regrouped by
+            sample into ``(B, T_e, d)`` before anything else sees them, so
+            every later stage treats the layer as an ordinary sequence layer.
         offload_to_cpu: When ``True``, move every buffered capture (the raw
             factors, or the projected result for a projected layer) to CPU.
             Default ``False``: buffers stay on the tensors' own device to
@@ -321,6 +329,10 @@ def register_linear_io_hooks(
                     return
                 a = inp[0].detach()
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
+                if routed is not None and layer_name in routed.layers:
+                    layout = routed.push(layer_name, a, dev_idx)
+                    if layout is not None:
+                        a = layout.regroup(a)
                 buf = buffers[layer_name]
                 emit_type, emit_kwargs = buf["_class_name"], buf["_module_kwargs"]
                 if _raw_capture(buf, preconditioner):
@@ -366,6 +378,10 @@ def register_linear_io_hooks(
             ) -> None:
                 g = grad_output[0].detach()
                 dev_idx = grad_output[0].device.index if grad_output[0].is_cuda else 0
+                if routed is not None and layer_name in routed.layers:
+                    layout = routed.pop(layer_name, dev_idx)
+                    if layout is not None:
+                        g = layout.regroup(g)
                 buf = buffers[layer_name]
                 emit_g, emit_type, emit_kwargs = (
                     g,

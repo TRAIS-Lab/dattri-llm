@@ -27,6 +27,7 @@ from dattri_llm.gradient.hooks.hooks import (
     register_param_grad_hooks,
     remove_hooks,
 )
+from dattri_llm.gradient.hooks.routing import RoutedTokenTracker
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, is_embedding
 from dattri_llm.gradient.optimizer_state import (
     GradientPreconditioner,
@@ -162,6 +163,23 @@ class HookManager:
             assembled :class:`~dattri_llm.gradient.gradient.Factorized` for these
             layers is tagged ``batch_first=False`` so the gradient machinery reads
             their batch axis from dim 1.  Names not actually hooked are ignored.
+        moe_routed_layers: Optional set/list of fully-qualified module names
+            whose hooked sub-layers receive **flattened or routed token
+            rows** instead of ``(B, T, ...)`` tensors -- the Mixture-of-Experts
+            blocks of a model (e.g. ``model.layers.3.mlp`` or
+            ``model.layers.3.block_sparse_moe``; the experts container, a
+            single expert or the router under one may be named instead).
+            The router of such a block sees the block input flattened to
+            ``(B*T, d)`` and each expert the ``(n_e, d)`` rows routed to it;
+            the manager locates every row in the enclosing block input and
+            regroups the rows by sample into a zero-padded ``(B, T_e, d)``
+            capture (see :mod:`~dattri_llm.gradient.hooks.routing`), whose
+            padding is inert in every downstream operation.  Such layers are
+            indexed ``"routed_token"``: they carry a token axis, but its
+            positions are not sequence positions, so token-level attribution
+            excludes them.  Works for per-expert modules (one ``nn.Linear`` per
+            projection); fused expert parameters are not modules and are not
+            hooked.
         offload_to_cpu: When ``True``, every buffered capture (raw factors,
             projected results, and ``param_grad`` tensors) is moved to CPU as
             it is captured, so the assembled
@@ -202,6 +220,7 @@ class HookManager:
         sample_id_key: str | int | None = None,
         sample_hash_fields: Iterable[str | int] | None = None,
         non_batch_first_layers: Iterable[str] | None = None,
+        moe_routed_layers: Iterable[str] | None = None,
         offload_to_cpu: bool = False,
         optimizer: torch.optim.Optimizer
         | Callable[[], torch.optim.Optimizer]
@@ -239,6 +258,11 @@ class HookManager:
         self._non_batch_first_layers: set[str] = (
             set(non_batch_first_layers) if non_batch_first_layers is not None else set()
         )
+        self._moe_routed_layers: set[str] = (
+            set(moe_routed_layers) if moe_routed_layers is not None else set()
+        )
+        # Built in register() when moe_routed_layers is given; None otherwise.
+        self._routed: RoutedTokenTracker | None = None
         # Layers already warned about as broadcast (batch-collapsed) gradients,
         # so the warning fires at most once per layer.
         self._warned_broadcast: set[str] = set()
@@ -1003,6 +1027,11 @@ class HookManager:
             if buf["_fwd_fires"] == 0:
                 continue
             batch_first = layer_name not in self._non_batch_first_layers
+            token_indexing = (
+                "routed_token"
+                if self._routed is not None and layer_name in self._routed.layers
+                else "batch_token"
+            )
             proj_kw = buf["_proj_kw"]
 
             # A layer invoked more than once in a step (custom module reuse,
@@ -1061,7 +1090,7 @@ class HookManager:
                     representation[out_name] = "factorized"
                     layer_types[out_name] = "nn.Linear"
                     tokens = a.shape[1 if batch_first else 0]  # 1 => 2-D origin
-                    indexing[out_name] = "batch_token" if tokens > 1 else "batch"
+                    indexing[out_name] = token_indexing if tokens > 1 else "batch"
                     continue
 
                 # Un-projected raw factorized capture.
@@ -1083,7 +1112,7 @@ class HookManager:
                 representation[out_name] = "factorized"
                 layer_types[out_name] = buf["_class_name"]
                 indexing[out_name] = (
-                    "batch_token"
+                    token_indexing
                     if a.ndim >= 3 or not a.is_floating_point()
                     else "batch"
                 )
@@ -1158,6 +1187,8 @@ class HookManager:
 
     def _reset_layer_buffers(self) -> None:
         self._active_layers.clear()
+        if self._routed is not None:
+            self._routed.reset()
         for buf in self._buffers.values():
             buf["activation"] = None
             buf["grad_output"] = None
@@ -1407,6 +1438,8 @@ class HookManager:
         self._n_layers = 0
         if self._preconditioner is not None:
             self._validate_preconditioning(param_grad_layers)
+        if self._moe_routed_layers:
+            self._routed = RoutedTokenTracker(root, self._moe_routed_layers)
         if self._has_linear_io:
             self._bwd_done = False
             if self._config.projection_kwargs is not None and self._projector is None:
@@ -1426,6 +1459,7 @@ class HookManager:
                 offload_to_cpu=self._offload_to_cpu,
                 preconditioner=self._preconditioner,
                 include_frozen=self._config.include_frozen,
+                routed=self._routed,
             )
             self._n_layers = len(self._buffers)
             self._warn_frozen_layers(root, capture_layers)
@@ -1486,6 +1520,23 @@ class HookManager:
                     stacklevel=2,
                 )
 
+        # The routed flag likewise applies to factorized (linear_io) layers
+        # only; a declared module with none under it had no effect.
+        if self._routed is not None:
+            self._routed.bind(self._buffers)
+            unused = sorted(
+                d
+                for d in self._moe_routed_layers
+                if not any(n == d or n.startswith(d + ".") for n in self._routed.layers)
+            )
+            if unused:
+                warnings.warn(
+                    "moe_routed_layers names modules with no layer hooked with "
+                    "factorized (linear_io) capture; the flag had no effect: "
+                    f"{unused}.",
+                    stacklevel=2,
+                )
+
         self._registered = True
 
     def remove(self) -> None:
@@ -1503,6 +1554,9 @@ class HookManager:
             self._model_out_handle = None
         remove_hooks(self._handles)
         self._handles = []
+        if self._routed is not None:
+            self._routed.remove()
+            self._routed = None
         # Restore any invasive_linear_io forward overrides to their originals.
         for revert in self._invasive_reverts:
             revert()
