@@ -45,9 +45,7 @@
   Mamba2 and its hybrids, Jamba, Qwen3-Next, Kimi-Linear) are detected and
   captured automatically.
 
-*dattri-LLM* is the LLM-scale companion of the `dattri` library
-and is validated on its benchmark suite for attribution quality (LDS, LOO) and
-runtime. See [`examples/`](examples) for runnable scripts.
+See [`examples/`](examples) for runnable scripts.
 
 ### Contents
 
@@ -69,7 +67,6 @@ runtime. See [`examples/`](examples) for runnable scripts.
   - [Architecture](#architecture)
   - [API Reference](#api-reference)
   - [Citation](#citation)
-  - [Related Projects](#related-projects)
   - [License](#license)
 
 ## Quick Start
@@ -318,11 +315,6 @@ ships a `py.typed` marker, so type checkers read its inline annotations.
 Extension bases are exported too: `TrajectoryAttributor` (the trajectory
 methods' base), `ReplayGradientSource` and `TrajectorySnapshots`. Every public class and function carries a docstring; use
 `help(dattri_llm.TracInAttributor)` and the like for signatures.
-
-## Related Projects
-
-- `dattri` — general-purpose data attribution library and benchmark suite;
-  `dattri-llm` targets LLM-scale models and training-framework integration.
 
 ## License
 
