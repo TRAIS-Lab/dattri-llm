@@ -52,6 +52,7 @@ from dattri_llm.gradient.ops import (
     dtypes,
     extract_module_kwargs,
     is_embedding,
+    is_linear,
     to_3d,
 )
 from dattri_llm.options import CaptureStyle
@@ -125,6 +126,20 @@ def _has_trainable_params(module: nn.Module) -> bool:
     if proxied is not None:
         return any(p.requires_grad for p in proxied())
     return any(p.requires_grad for _, p in module.named_parameters(recurse=False))
+
+
+def _flatten_tokens(t: torch.Tensor, layer_type: str) -> torch.Tensor:
+    """``(B, *extra, T, d) -> (B, extra*T, d)`` for a linear-family layer.
+
+    ``nn.Linear`` acts on the last axis whatever the input rank, so every
+    leading axis but the batch is a position axis (a ``(B, 1, T, r)`` input to
+    DeepSeek's MLA projections, a ``(B, H, W, C)`` image).  Captures of other
+    families keep their layout (a conv's ``(N, C, *spatial)`` is unfolded at
+    preprocess time).
+    """
+    if t.ndim > 3 and is_linear(layer_type):
+        return t.reshape(t.shape[0], -1, t.shape[-1])
+    return t
 
 
 def _make_layer_buffer() -> LayerBuffer:
@@ -324,11 +339,12 @@ def register_linear_io_hooks(
                     return
                 a = inp[0].detach()
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
+                buf = buffers[layer_name]
                 if routed is not None and layer_name in routed.layers:
                     layout = routed.push(layer_name, a, dev_idx)
                     if layout is not None:
                         a = layout.regroup(a)
-                buf = buffers[layer_name]
+                a = _flatten_tokens(a, buf["_class_name"])
                 emit_type, emit_kwargs = buf["_class_name"], buf["_module_kwargs"]
                 if _raw_capture(buf, preconditioner):
                     if offload_to_cpu:
@@ -373,11 +389,12 @@ def register_linear_io_hooks(
             ) -> None:
                 g = grad_output[0].detach()
                 dev_idx = grad_output[0].device.index if grad_output[0].is_cuda else 0
+                buf = buffers[layer_name]
                 if routed is not None and layer_name in routed.layers:
                     layout = routed.pop(layer_name, dev_idx)
                     if layout is not None:
                         g = layout.regroup(g)
-                buf = buffers[layer_name]
+                g = _flatten_tokens(g, buf["_class_name"])
                 emit_g, emit_type, emit_kwargs = (
                     g,
                     buf["_class_name"],

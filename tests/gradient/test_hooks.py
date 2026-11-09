@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from dattri_llm.gradient import ops
 from dattri_llm.gradient.callbacks import HookManagerCallback
 from dattri_llm.gradient.hooks import (
     REGISTER_ALL,
@@ -1291,3 +1292,49 @@ class TestIncludeFrozen:
         finally:
             hm.remove()
         assert rec.records == []
+
+
+# --------------------------------------------------------------------------- #
+# nn.Linear fed a >3-D input (B, *extra, T, d): every leading axis but the     #
+# batch is a position axis                                                     #
+# --------------------------------------------------------------------------- #
+
+
+class _FourDLinear(nn.Module):
+    """``proj`` is applied to a ``(B, 1, T, d)`` tensor (DeepSeek MLA style)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(16, 8)
+        self.proj = nn.Linear(8, 6)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.embedding(input_ids).unsqueeze(1))
+
+
+class TestFourDimensionalLinearInput:
+    def test_per_sample_gradient_matches_autograd(self):
+        torch.manual_seed(0)
+        model = _FourDLinear().double()
+        ids = torch.randint(0, 16, (3, 5))
+        weights = torch.randn(3, 1, 5, 6, dtype=torch.float64)
+        reference = []
+        for i in range(3):
+            model.zero_grad()
+            (model(ids[i : i + 1]) * weights[i : i + 1]).sum().backward()
+            reference.append(
+                (model.proj.weight.grad.clone(), model.proj.bias.grad.clone())
+            )
+        cb = _Recording()
+        hm = HookManager(model, callbacks=[cb])
+        with hm.collect():
+            model.zero_grad()
+            (model(ids) * weights).sum().backward()
+        hm.remove()
+        g = cb.records[0].gradient
+        assert g.batch_size == 3
+        assert tuple(g.data["proj"].activation.shape) == (3, 5, 8)
+        dense = ops.materialize(g.data["proj"], "nn.Linear").reshape(3, 6, 9)
+        for i, (w, b) in enumerate(reference):
+            torch.testing.assert_close(dense[i, :, :8], w, rtol=1e-10, atol=1e-12)
+            torch.testing.assert_close(dense[i, :, 8], b, rtol=1e-10, atol=1e-12)

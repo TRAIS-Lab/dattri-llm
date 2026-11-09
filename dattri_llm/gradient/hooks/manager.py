@@ -276,6 +276,7 @@ class HookManager:
         self._routed: RoutedTokenTracker | None = None
         # Revert closures for fused-expert proxies and forward overrides.
         self._fused_reverts: list = []
+        self._warned_silent_proxies: set[str] = set()
         # Layers already warned about as broadcast (batch-collapsed) gradients,
         # so the warning fires at most once per layer.
         self._warned_broadcast: set[str] = set()
@@ -1038,6 +1039,7 @@ class HookManager:
             # completion did not require it (see _bwd_hooks_done) -- the
             # layer is simply absent from this step's record.
             if buf["_fwd_fires"] == 0:
+                self._warn_silent_proxy(layer_name)
                 continue
             batch_first = layer_name not in self._non_batch_first_layers
             token_indexing = (
@@ -1154,6 +1156,29 @@ class HookManager:
             data=data,
             layer_types=layer_types,
             indexing=indexing,
+        )
+
+    def _warn_silent_proxy(self, layer_name: str) -> None:
+        """A fused-expert or router proxy that ran no forward this step.
+
+        Its parameters' batch-level capture was replaced by the proxy, so the
+        step's record holds nothing for them: the module's forward does not
+        route through the proxy (a router whose matmul is not ``F.linear`` on
+        a weight of its shape, an experts module with another calling
+        convention).  Reported once per layer.
+        """
+        if ".dattri_experts." not in layer_name and ".dattri_router" not in layer_name:
+            return
+        if layer_name in self._warned_silent_proxies:
+            return
+        self._warned_silent_proxies.add(layer_name)
+        warnings.warn(
+            f"Fused MoE proxy {layer_name} did not run in this step, so its "
+            "parameters are absent from the record (their batch-level capture "
+            "was replaced by the proxy). The module's forward does not pass "
+            "through the proxy; see dattri_llm.gradient.hooks.override_layers."
+            "fused_experts for the supported calling conventions.",
+            stacklevel=2,
         )
 
     def _warn_broadcast_layers(self, data: dict, layer_types: dict) -> None:

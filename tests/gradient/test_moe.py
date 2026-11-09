@@ -446,3 +446,22 @@ class TestRoutedCaptureDDP:
                 pathlib.Path(rendezvous_path).unlink()
         results = [result_queue.get() for _ in range(2)]
         assert all(ok for _, ok, _ in results), results
+
+
+class TestDuplicateRows:
+    """Bit-identical token rows across samples (a repeated sample, a shared
+    prefix under causal attention) are assigned to their own samples.
+    """
+
+    @pytest.mark.parametrize("kind", ["repeated_sample", "shared_prefix"])
+    def test_expert_gradients_stay_exact(self, kind):
+        model, blocks = _build("mixtral")
+        base = _batch()
+        if kind == "repeated_sample":
+            ids = torch.stack([base[0], base[0], base[1]])
+        else:
+            ids = torch.stack([base[0], torch.cat([base[0, :4], base[1, 4:]]), base[2]])
+        reference = _reference(model, ids)
+        g = _collect(model, ids, moe_routed_layers=blocks)
+        assert g.batch_size == B
+        _assert_matches_reference(model, g, reference, only=["block_sparse_moe"])

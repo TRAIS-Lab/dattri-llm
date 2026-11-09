@@ -238,3 +238,99 @@ class TestFusedExperts:
         finally:
             hm.remove()
         assert g.layer_types[f"{BLOCK}.experts.gate_up_proj"] == ops.PARAM_GRAD_TYPES
+
+
+class TestDuplicateRows:
+    @pytest.mark.parametrize("kind", ["repeated_sample", "shared_prefix"])
+    def test_expert_gradients_stay_exact(self, kind):
+        model = _build("mixtral")
+        base = _batch()
+        if kind == "repeated_sample":
+            ids = torch.stack([base[0], base[0], base[1]])
+        else:
+            ids = torch.stack([base[0], torch.cat([base[0, :4], base[1, 4:]]), base[2]])
+        reference = _reference(model, ids)
+        hm = HookManager(model, moe_routed_layers=[BLOCK])
+        try:
+            g = _collect(model, ids, hm)
+        finally:
+            hm.remove()
+        experts = model.get_submodule(f"{BLOCK}.experts")
+        for name, value in g.data.items():
+            if ".dattri_experts." not in name:
+                continue
+            e = int(name.split(".dattri_experts.")[1].split(".")[0])
+            proj = "gate_up_proj" if name.endswith(".gate_up") else "down_proj"
+            dense = ops.materialize(value, "nn.Linear")
+            for i, ref in enumerate(reference):
+                weight, bias = _expert_reference(ref, experts, proj, e)
+                mine_w, _ = _split(dense[i], weight.shape[0], bias is not None)
+                torch.testing.assert_close(mine_w, weight, rtol=1e-10, atol=1e-12)
+
+
+class TestRouterVariants:
+    """Routers that cast before their matmul (DeepSeek-V2/V3, GLM-4 MoE) and
+    routers whose matmul is not ``F.linear`` at all.
+    """
+
+    def _router(self, model):
+        block = model.get_submodule(BLOCK)
+        (name,) = [n for n, m in block.named_children() if n != "experts"]
+        return f"{BLOCK}.{name}", getattr(block, name)
+
+    def test_casting_router_is_captured(self):
+        model = _build("mixtral")
+        router_name, router = self._router(model)
+        original = type(router).forward
+
+        def casting_forward(self, hidden_states):
+            logits = F.linear(
+                hidden_states.type(torch.float32), self.weight.type(torch.float32)
+            )
+            probs = torch.softmax(logits, dim=-1)
+            top, idx = torch.topk(probs, self.top_k, dim=-1)
+            top /= top.sum(dim=-1, keepdim=True)
+            return logits, top.to(hidden_states.dtype), idx
+
+        type(router).forward = casting_forward
+        try:
+            ids = _batch()
+            reference = _reference(model, ids)
+            hm = HookManager(model, moe_routed_layers=[BLOCK])
+            try:
+                g = _collect(model, ids, hm)
+            finally:
+                hm.remove()
+        finally:
+            type(router).forward = original
+        name = f"{router_name}.dattri_router"
+        assert name in g.data
+        dense = ops.materialize(g.data[name], "nn.Linear")
+        for i, ref in enumerate(reference):
+            mine_w, _ = _split(dense[i], router.weight.shape[0], has_bias=False)
+            torch.testing.assert_close(
+                mine_w.double(), ref[router_name + ".weight"], rtol=1e-6, atol=1e-8
+            )
+
+    def test_router_bypassing_f_linear_warns(self):
+        model = _build("mixtral")
+        router_name, router = self._router(model)
+        original = type(router).forward
+
+        def matmul_forward(self, hidden_states):
+            logits = hidden_states @ self.weight.T
+            probs = torch.softmax(logits, dim=-1)
+            top, idx = torch.topk(probs, self.top_k, dim=-1)
+            return logits, top / top.sum(dim=-1, keepdim=True), idx
+
+        type(router).forward = matmul_forward
+        try:
+            hm = HookManager(model, moe_routed_layers=[BLOCK])
+            try:
+                with pytest.warns(UserWarning, match="did not run in this step"):
+                    g = _collect(model, _batch(), hm)
+            finally:
+                hm.remove()
+        finally:
+            type(router).forward = original
+        assert f"{router_name}.dattri_router" not in g.data

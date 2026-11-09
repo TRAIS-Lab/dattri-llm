@@ -302,9 +302,26 @@ class RoutedTokenTracker:
             return RowLayout(src.batch, src.tokens, n)
         if src.keys is None:
             keys = self._row_keys(src.flat)
-            src.order = torch.argsort(keys)
+            # Stable: tokens with identical rows stay in ascending order.
+            src.order = torch.argsort(keys, stable=True)
             src.keys = keys[src.order]
-        pos = torch.searchsorted(src.keys, self._row_keys(x)).clamp_(max=total - 1)
+        keys_x = self._row_keys(x)
+        first = torch.searchsorted(src.keys, keys_x)
+        last = torch.searchsorted(src.keys, keys_x, right=True)
+        # Bit-identical rows (a repeated sample, a shared prefix under causal
+        # attention) share a fingerprint.  Their candidate tokens are matched
+        # to the rows in order of appearance: the k-th occurrence of a row
+        # takes the k-th such token.  This is exact when the module lays out
+        # identical tokens in ascending token order, which the gather
+        # ``hidden[torch.where(mask)]`` and stable sort-by-expert kernels do.
+        by_key = torch.argsort(keys_x, stable=True)
+        sorted_keys = keys_x[by_key]
+        run_start = torch.searchsorted(sorted_keys, sorted_keys)
+        rank = torch.empty_like(keys_x)
+        rank[by_key] = torch.arange(n, device=x.device) - run_start
+        pos = first + rank
+        if bool((pos >= last).any()):
+            return None  # more copies of a row than the block holds
         token = src.order[pos]
         if not torch.equal(src.flat[token], x):
             return None

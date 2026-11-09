@@ -146,8 +146,16 @@ class RouterLinear(nn.Module):
             yield bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """The router logits of the rows *x*."""
-        return _linear(x, self.weight, self.bias)
+        """The router logits of the rows *x*, in *x*'s dtype.
+
+        Routers that cast to float32 before the matmul (DeepSeek-V2/V3, GLM-4
+        MoE and others) pass a cast *x*; the weight follows it so the logits
+        are the model's own.
+        """
+        bias = self.bias
+        return _linear(
+            x, self.weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+        )
 
 
 def is_fused_experts(module: nn.Module) -> bool:
@@ -348,7 +356,11 @@ def _override_router(
         weight: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if weight is router.weight:
+        # The router's own matmul is the one ``F.linear`` in its forward with
+        # a weight of its weight's shape -- matched by shape, not identity,
+        # since some routers cast the weight (``self.weight.type(float32)``)
+        # before the call.
+        if weight.shape == router.weight.shape:
             return proxy(x)
         return _linear(x, weight, bias)
 
