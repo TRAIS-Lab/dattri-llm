@@ -14,7 +14,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
 GradientRepresentation = Literal["materialized", "factorized"]
-Indexing = Literal["batch", "batch_token"]
+Indexing = Literal["batch", "batch_token", "routed_token"]
+# Indexings with a token axis.  ``"routed_token"`` is a ``"batch_token"`` layer
+# whose positions are not sequence positions (rows routed to an MoE expert,
+# regrouped by sample): it pads, slices and sums like one, but is excluded
+# from per-token-position attribution.
+TOKEN_INDEXINGS = frozenset({"batch_token", "routed_token"})
 
 
 @dataclass(frozen=True, eq=False)
@@ -241,7 +246,7 @@ class Gradient:
         """Per-layer token dimension; ``None`` for layers with ``"batch"`` indexing."""
         result: dict[str, int | None] = {}
         for name, value in self.data.items():
-            if self._layer_indexing(name) == "batch_token":
+            if self._layer_indexing(name) in TOKEN_INDEXINGS:
                 if isinstance(value, Factorized):
                     # Token axis is dim 1 when batch-first, dim 0 when seq-first.
                     result[name] = value.activation.shape[1 if value.batch_first else 0]
@@ -368,6 +373,7 @@ class Gradient:
             raise ValueError(f"Missing representation for layers: {sorted(missing)}")
 
         batch_size = None
+        batch_layer = None  # (name, shape) of the layer that set batch_size
 
         for name, value in self.data.items():
             layer_repr = self.representation[name]
@@ -376,6 +382,7 @@ class Gradient:
             if layer_repr == "factorized":
                 if not isinstance(value, Factorized):
                     raise TypeError(f"{name} must be Factorized")
+                shape = tuple(value.activation.shape)
 
                 # Validate against the canonical batch-first layout, so a
                 # sequence-first capture is checked exactly like a batch-first one.
@@ -428,7 +435,7 @@ class Gradient:
                     raise ValueError(f"{name} must be at least 1D")
                 if (
                     layer_type != ops.PARAM_GRAD_TYPES
-                    and self._layer_indexing(name) == "batch_token"
+                    and self._layer_indexing(name) in TOKEN_INDEXINGS
                     and value.ndim != 3
                 ):
                     raise ValueError(
@@ -436,6 +443,7 @@ class Gradient:
                         f"{value.ndim}D, expected 3D",
                     )
                 cur_batch = value.shape[0]
+                shape = tuple(value.shape)
 
             # A layer with batch size 1 is a *broadcast* / shared gradient -- e.g.
             # a positional embedding added to every sample, whose gradient is
@@ -446,8 +454,20 @@ class Gradient:
             if not is_param_grad and cur_batch != 1:
                 if batch_size is None:
                     batch_size = cur_batch
+                    batch_layer = (name, shape)
                 elif batch_size != cur_batch:
-                    raise ValueError("All layers must have the same batch size")
+                    first_name, first_shape = batch_layer
+                    raise ValueError(
+                        "All layers must have the same batch size: "
+                        f"{first_name} has {batch_size} samples (captured shape "
+                        f"{first_shape}) but {name} has {cur_batch} (captured "
+                        f"shape {shape}). The sample axis is read from dim 0 of "
+                        "every per-sample layer; a layer whose input is "
+                        "sequence-first (T, B, ...) must be declared in "
+                        "HookManager(non_batch_first_layers=...), and a layer "
+                        "fed flattened or routed token rows (an MoE router or "
+                        "expert) in HookManager(moe_routed_layers=...).",
+                    )
 
     def clone(self) -> Gradient:
         """Return a deep copy with every tensor payload cloned."""
@@ -709,7 +729,9 @@ class Gradient:
 
         if dim == "token":
             non_bt = [
-                n for n in self.layer_names if self._layer_indexing(n) != "batch_token"
+                n
+                for n in self.layer_names
+                if self._layer_indexing(n) not in TOKEN_INDEXINGS
             ]
             if non_bt:
                 raise ValueError(
@@ -790,7 +812,7 @@ class Gradient:
                     raise ValueError(
                         f"{name} has mismatched batch_first layout between gradients",
                     )
-                if dim == "batch" and self._layer_indexing(name) == "batch_token":
+                if dim == "batch" and self._layer_indexing(name) in TOKEN_INDEXINGS:
                     a, b = _pad_to_common_tokens(a, b)
                 cat_dim = cat_axis(a.batch_first)
                 new_data[name] = Factorized(
@@ -803,7 +825,7 @@ class Gradient:
                     batch_first=a.batch_first,
                 )
             elif isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-                if dim == "batch" and self._layer_indexing(name) == "batch_token":
+                if dim == "batch" and self._layer_indexing(name) in TOKEN_INDEXINGS:
                     target = max(a.shape[1], b.shape[1])
                     a = _pad_tokens(a, target, axis=1)
                     b = _pad_tokens(b, target, axis=1)
@@ -850,7 +872,7 @@ class Gradient:
 
         for name, value in self.data.items():
             layer_type = self.layer_types[name]
-            if self._layer_indexing(name) == "batch_token":
+            if self._layer_indexing(name) in TOKEN_INDEXINGS:
                 if isinstance(value, Factorized):
                     # (B, d), summed over T
                     new_data[name] = ops.materialize(value, layer_type)
@@ -884,7 +906,9 @@ class Gradient:
         """
         if dim == "token":
             non_bt = [
-                n for n in self.layer_names if self._layer_indexing(n) != "batch_token"
+                n
+                for n in self.layer_names
+                if self._layer_indexing(n) not in TOKEN_INDEXINGS
             ]
             if non_bt:
                 raise ValueError(

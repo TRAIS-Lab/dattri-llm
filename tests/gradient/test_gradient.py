@@ -1204,3 +1204,21 @@ class TestBatchFirst:
         bf, sf = _seq_first_pair()
         with pytest.raises(ValueError, match="batch_first"):
             bf.concatenate(sf, dim="batch")
+
+
+class TestBatchMismatchMessage:
+    """The batch-size error names both layers and their captured shapes."""
+
+    def test_names_layers_and_shapes(self):
+        a = Factorized(torch.randn(2, 5, 4), torch.randn(2, 5, 3))
+        b = Factorized(torch.randn(7, 4), torch.randn(7, 3))  # routed rows
+        with pytest.raises(ValueError, match="same batch size") as exc:
+            Gradient(
+                representation={"attn": "factorized", "experts.2": "factorized"},
+                data={"attn": a, "experts.2": b},
+                layer_types={"attn": "nn.Linear", "experts.2": "nn.Linear"},
+            )
+        msg = str(exc.value)
+        assert "attn has 2 samples (captured shape (2, 5, 4))" in msg
+        assert "experts.2 has 7 (captured shape (7, 4))" in msg
+        assert "non_batch_first_layers" in msg
