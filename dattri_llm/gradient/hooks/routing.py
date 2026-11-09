@@ -145,6 +145,9 @@ class RoutedTokenTracker:
         pre-forward hooks that track block inputs and 2-D row matrices.
         """
         self.layers = {n for n in hooked_layers if self.covers(n)}
+        # Modules may have been added since construction (fused-expert
+        # proxies); hook the tree as it stands now.
+        self._modules = dict(self._root.named_modules())
         context: set[str] = set()
         subtree: set[str] = set()
         for d in self._declared:

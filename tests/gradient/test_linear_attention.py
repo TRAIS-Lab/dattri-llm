@@ -9,6 +9,12 @@ embeddings exactly match a per-sample autograd loop, and the recurrence
 parameters are captured at batch level through the ``param_grad`` fallback.
 Tiny Hugging Face models in float64; Mamba runs its sequential (pure
 PyTorch) path, since the fused kernels are not installed on CPU.
+
+A module applied *functionally* is invisible to module hooks: Transformers 5
+runs Mamba's ``conv1d`` and ``dt_proj`` through ``causal_conv1d_fn`` /
+``mamba_inner_fn`` on their weights, so those two layers are absent from
+the record there (they are captured under Transformers 4, which calls the
+modules).  The tests check what each version's model actually calls.
 """
 
 from __future__ import annotations
@@ -145,7 +151,9 @@ class TestLinearAttentionCapture:
                         bias[i], ref[name + ".bias"], rtol=1e-10, atol=1e-12
                     )
             checked += 1
-        assert checked >= 8
+        # At least in_proj, x_proj and out_proj of each of the two layers (the
+        # tied head has no weight of its own; dt_proj depends on the version).
+        assert checked >= 2 * 3
 
     def test_param_grad_layers_hold_the_batch_gradient(self, family):
         model = _build(family)
@@ -181,6 +189,19 @@ class TestMambaTiedHead:
             )
 
 
+def _conv_record(model):
+    """The captured ``conv1d`` record, skipping when the model never calls the
+    module (Transformers 5 applies its weight functionally).
+    """
+    ids = _batch()
+    reference = _reference(model, ids)
+    g = _collect(model, ids)
+    name = "backbone.layers.0.mixer.conv1d"
+    if name not in g.data:
+        pytest.skip("this transformers version applies conv1d functionally")
+    return g, reference, name
+
+
 class TestMambaDepthwiseConv:
     """Mamba's causal ``conv1d`` is depthwise (``groups == channels``)."""
 
@@ -191,8 +212,7 @@ class TestMambaDepthwiseConv:
     )
     def test_per_sample_gradient_has_the_grouped_shape(self):
         model = _build("mamba")
-        g = _collect(model, _batch())
-        name = "backbone.layers.0.mixer.conv1d"
+        g, _, name = _conv_record(model)
         conv = model.backbone.layers[0].mixer.conv1d
         dense = ops.materialize(g.data[name], "nn.Conv1d")
         assert dense.shape[1] == conv.weight.numel() + conv.bias.numel()
@@ -201,10 +221,7 @@ class TestMambaDepthwiseConv:
         # What the capture does hold is exact: the depthwise gradient is the
         # block diagonal of the ungrouped materialization.
         model = _build("mamba")
-        ids = _batch()
-        reference = _reference(model, ids)
-        g = _collect(model, ids)
-        name = "backbone.layers.0.mixer.conv1d"
+        g, reference, name = _conv_record(model)
         conv = model.backbone.layers[0].mixer.conv1d
         c, k = conv.weight.shape[0], conv.weight.shape[-1]
         dense = ops.materialize(g.data[name], "nn.Conv1d").reshape(B, c, -1)

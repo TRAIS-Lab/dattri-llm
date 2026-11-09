@@ -29,6 +29,12 @@ from dattri_llm.gradient import ops
 from dattri_llm.gradient.hooks import HookManager, HookManagerConfig
 
 transformers = pytest.importorskip("transformers")
+if hasattr(transformers.models.mixtral.modeling_mixtral, "MixtralExperts"):
+    pytest.skip(
+        "per-expert nn.Linear layout (Transformers 4); the fused layout is "
+        "covered by test_fused_experts.py",
+        allow_module_level=True,
+    )
 
 B, T, VOCAB = 3, 7, 64
 # Experts and router of layer 0 of a 2-layer model; ``shared`` is Qwen2-MoE's

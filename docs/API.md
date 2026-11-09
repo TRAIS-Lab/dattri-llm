@@ -97,7 +97,8 @@ Also re-exported here (listed above): `REGISTER_ALL`, `CaptureCallback`, `DataSe
 | `LayerBuffer` | type alias | Type alias (`dict`) of one layer's `linear_io` capture buffer. |
 | `ParamGradBuffer` | type alias | Type alias (`dict`) of one layer's `param_grad` capture buffer. |
 | `Selector` | type alias | Type of a layer selector: `REGISTER_ALL`, a list of name regexes, or `None`. |
-| `install_invasive_forward` | function | Override each named ``nn.Linear``'s forward to skip its weight/bias grad. |
+| `install_invasive_forward` | function | Override each named ``nn.Linear``'s forward to skip its weight/bias grad (`hooks.override_layers.invasive_linear`). |
+| `install_fused_experts` | function | Attach per-expert proxies to fused MoE modules and override their forwards while collecting (`hooks.override_layers.fused_experts`). |
 | `resolve_hook_assignments` | function | Resolve the final ``{layer_name: hook_type}`` assignment. |
 
 Also re-exported here (listed above): `REGISTER_ALL`, `HookManager`, `HookManagerCallback`, `HookManagerConfig`, `OffloadCallback`, `default_hook_assignment`, `register_linear_io_hooks`, `register_linear_param_hooks`, `register_param_grad_hooks`, `remove_hooks`.

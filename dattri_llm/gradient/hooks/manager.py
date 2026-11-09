@@ -21,11 +21,16 @@ from dattri_llm.gradient.hooks.config import (
     resolve_hook_assignments,
 )
 from dattri_llm.gradient.hooks.hooks import (
-    install_invasive_forward,
+    _has_trainable_params,
     register_linear_io_hooks,
     register_linear_param_hooks,
     register_param_grad_hooks,
     remove_hooks,
+)
+from dattri_llm.gradient.hooks.override_layers import (
+    find_fused_experts,
+    install_fused_experts,
+    install_invasive_forward,
 )
 from dattri_llm.gradient.hooks.routing import RoutedTokenTracker
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, is_embedding
@@ -177,9 +182,15 @@ class HookManager:
             padding is inert in every downstream operation.  Such layers are
             indexed ``"routed_token"``: they carry a token axis, but its
             positions are not sequence positions, so token-level attribution
-            excludes them.  Works for per-expert modules (one ``nn.Linear`` per
-            projection); fused expert parameters are not modules and are not
-            hooked.
+            excludes them.  Per-expert modules (one ``nn.Linear`` per
+            projection) are hooked directly.  A *fused* experts module under a
+            declared name (3-D ``gate_up_proj``/``down_proj`` parameters, as
+            in Transformers 5 and gpt-oss) and its router are captured through
+            parameter-free per-expert proxies installed while collecting (see
+            :mod:`~dattri_llm.gradient.hooks.override_layers.fused_experts`); their
+            records
+            are ``<experts>.dattri_experts.<e>.gate_up`` / ``.down`` and
+            ``<router>.dattri_router``.
         offload_to_cpu: When ``True``, every buffered capture (raw factors,
             projected results, and ``param_grad`` tensors) is moved to CPU as
             it is captured, so the assembled
@@ -263,6 +274,8 @@ class HookManager:
         )
         # Built in register() when moe_routed_layers is given; None otherwise.
         self._routed: RoutedTokenTracker | None = None
+        # Revert closures for fused-expert proxies and forward overrides.
+        self._fused_reverts: list = []
         # Layers already warned about as broadcast (batch-collapsed) gradients,
         # so the warning fires at most once per layer.
         self._warned_broadcast: set[str] = set()
@@ -1423,6 +1436,25 @@ class HookManager:
         # Resolve which hook family each layer is assigned to (one family per
         # layer), then register concrete layer-name sets.
         assignment = resolve_hook_assignments(root, self._config)
+        type_overrides = dict(self._config.layer_types or {})
+        if self._moe_routed_layers:
+            self._routed = RoutedTokenTracker(root, self._moe_routed_layers)
+            fused = [n for n in find_fused_experts(root) if self._routed.covers(n)]
+            if fused:
+                proxy_types, self._fused_reverts = install_fused_experts(
+                    root,
+                    fused,
+                    should_intervene=lambda: self._collecting,
+                )
+                type_overrides.update(proxy_types)
+                # The proxies replace the batch-level capture of the fused
+                # parameters (the experts module's and the router's own).
+                for proxy_name in proxy_types:
+                    # "<experts>.dattri_experts.<e>.<proj>" / "<router>.dattri_router"
+                    depth = 3 if ".dattri_experts." in proxy_name else 1
+                    owner = proxy_name.rsplit(".", depth)[0]
+                    assignment.pop(owner, None)
+                    assignment[proxy_name] = LINEAR_IO
         linear_io_layers = {n for n, t in assignment.items() if t == LINEAR_IO}
         param_grad_layers = {n for n, t in assignment.items() if t == PARAM_GRAD}
         invasive_layers = {n for n, t in assignment.items() if t == INVASIVE_LINEAR_IO}
@@ -1438,8 +1470,6 @@ class HookManager:
         self._n_layers = 0
         if self._preconditioner is not None:
             self._validate_preconditioning(param_grad_layers)
-        if self._moe_routed_layers:
-            self._routed = RoutedTokenTracker(root, self._moe_routed_layers)
         if self._has_linear_io:
             self._bwd_done = False
             if self._config.projection_kwargs is not None and self._projector is None:
@@ -1451,7 +1481,7 @@ class HookManager:
                 layer_names=capture_layers,
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
-                type_overrides=self._config.layer_types,
+                type_overrides=type_overrides,
                 kwargs_overrides=self._config.module_kwargs,
                 projection_kwargs=self._config.projection_kwargs,
                 capture_style=self._config.capture_style,
@@ -1554,6 +1584,9 @@ class HookManager:
             self._model_out_handle = None
         remove_hooks(self._handles)
         self._handles = []
+        for revert in self._fused_reverts:
+            revert()
+        self._fused_reverts = []
         if self._routed is not None:
             self._routed.remove()
             self._routed = None
@@ -1587,9 +1620,7 @@ class HookManager:
 
         def frozen(name: str) -> bool:
             module = modules.get(name)
-            return module is not None and not any(
-                p.requires_grad for p in module.parameters(recurse=False)
-            )
+            return module is not None and not _has_trainable_params(module)
 
         if self._config.include_frozen:
             names = sorted(n for n in self._buffers if frozen(n))
