@@ -300,6 +300,23 @@ def _tiny(name):
                     **kw,
                 )
                 model = transformers.KimiLinearForCausalLM(cfg)
+            elif name == "zamba":
+                cfg = transformers.ZambaConfig(
+                    hidden_size=D,
+                    intermediate_size=32,
+                    num_hidden_layers=4,
+                    layers_block_type=["mamba", "hybrid", "mamba", "hybrid"],
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    mamba_d_state=4,
+                    mamba_d_conv=4,
+                    mamba_expand=2,
+                    mamba_dt_rank=2,
+                    n_mamba_heads=1,
+                    use_cache=False,
+                    **kw,
+                )
+                model = transformers.ZambaForCausalLM(cfg)
             elif name == "lfm2":
                 cfg = transformers.Lfm2Config(
                     hidden_size=32,
@@ -324,7 +341,8 @@ def _tiny(name):
 class TestSequenceMixerOverride:
     """The sequence-mixer overrides on every family the installed Transformers
     provides: the Mamba-1 reference forward (Mamba, Falcon-Mamba, Jamba) and
-    the functional-conv interception (Mamba2, Qwen3-Next, Kimi-Linear, LFM2).
+    the functional-conv interception (Mamba2, Qwen3-Next, Kimi-Linear, LFM2,
+    Zamba).
     Every ``nn.Linear`` / ``nn.Conv1d`` child of a mixer must be captured per
     sample and exactly, and the model's output must be its own.
     """
@@ -343,6 +361,7 @@ class TestSequenceMixerOverride:
         "qwen3_next": 1e-12,
         "kimi_linear": 1e-12,
         "lfm2": 1e-12,
+        "zamba": 1e-12,
     }
 
     @pytest.mark.parametrize("family", sorted(FAMILIES))
