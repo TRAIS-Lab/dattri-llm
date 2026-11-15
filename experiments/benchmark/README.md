@@ -78,7 +78,11 @@ projection wherever the library supports it and full dimension elsewhere
 (`PROJECTION` in `throughput.py`). Each library uses its own multi-GPU mode:
 dattri-llm FSDP with frozen capture and live sharded scoring; Bergson
 `--fsdp`; Kronfluence FSDP; LogIX FSDP applied after its LoRA insertion, which
-with the sharding precedes the timed extraction. Each (library,
+with the sharding precedes the timed extraction. LogIX scores its training
+gradients in memory (`logix_io="memory"` in `run_logix.py`): GradDot in one
+pass as the gradients are logged, K-FAC and EK-FAC in a second pass after the
+statistics pass, as Kronfluence and Bergson do; no training gradient is
+written to its log. Each (library,
 method, scale) cell runs at the largest power-of-two per-GPU batch at which
 the library completes the workload on the four cards within the time limit
 (`BATCHES`; 0 means out of memory at batch 1 and is recorded as `oom` without

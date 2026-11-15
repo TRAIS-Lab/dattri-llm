@@ -121,6 +121,8 @@ BASE = dict(
     dtype="bfloat16",
     proj_mode="rank64",
 )
+#: LogIX scores its training gradients in memory (``logix_io`` in run_logix.py).
+LOGIX_IO = "memory"
 #: The attribution phases summed into a library's time (build/load excluded).
 PHASES = {
     "bergson": ("fit", "score"),
@@ -186,6 +188,7 @@ def cell(lib: str, scale: str, method: str, batch: int) -> dict:
         measure_train=k * step,
         time_limit_s=TIME_LIMIT_S,
         **BASE,
+        **({"logix_io": LOGIX_IO} if lib == "logix" else {}),
     )
 
 

@@ -29,6 +29,7 @@ METHODS = ("graddot", "kfac", "ekfac")
 NOT_EXPRESSIBLE = {("kronfluence", "graddot", "rank64"), ("kronfluence", "kfac", "rank64"),
                    ("kronfluence", "ekfac", "rank64"), ("bergson", "ekfac", "rank64")}
 
+LOGIX_IO = "memory"  # LogIX scores its training gradients in memory (run_logix.py)
 BASE = dict(family="pythia", dataset="wikitext103", block_size=512, seed=0,
             dtype="float32", n_train=1024, warmup_train=0, measure_train=1024)
 
@@ -41,7 +42,8 @@ def table_cells(n_test: int) -> list[dict]:
                 if (lib, method, proj_mode) in NOT_EXPRESSIBLE:
                     continue
                 cells += runner.grid([lib], [method], ["0.5b"], proj_mode=proj_mode,
-                                     n_test=n_test, batch=8, **BASE)
+                                     n_test=n_test, batch=8, **BASE,
+                                     **({"logix_io": LOGIX_IO} if lib == "logix" else {}))
     return cells
 
 
