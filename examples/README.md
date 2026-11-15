@@ -21,6 +21,8 @@ additionally supports multi-process (and multi-GPU) launches via `torchrun`.
 |---|---|---|
 | [`hooks/modular_hooks.py`](hooks/modular_hooks.py) | selecting which layers to hook, and how | — |
 | [`hooks/multi_gpu_collect.py`](hooks/multi_gpu_collect.py) | per-sample collection under DDP/FSDP | `transformers` |
+| [`hooks/moe_capture.py`](hooks/moe_capture.py) | Mixture-of-Experts capture (`moe_routed_layers`), per-expert or fused experts | `transformers` |
+| [`hooks/sequence_mixer_capture.py`](hooks/sequence_mixer_capture.py) | state-space (Mamba) mixers captured with no configuration | `transformers` |
 | [`projection/gradient_projection.py`](projection/gradient_projection.py) | random projection (`logra` / `dense` / `mask` styles), per-layer config, custom layers | `dattri` |
 | [`attribution/attribution_from_disk.py`](attribution/attribution_from_disk.py) | store-then-attribute workflow | — |
 | [`attribution/attribution_on_the_fly.py`](attribution/attribution_on_the_fly.py) | one-call live attribution | `transformers` |
@@ -36,7 +38,7 @@ additionally supports multi-process (and multi-GPU) launches via `torchrun`.
 
 Each subfolder has its own README describing its examples in detail:
 
-- [`hooks/`](hooks/README.md) — hook configuration and multi-GPU collection
+- [`hooks/`](hooks/README.md) — hook configuration, multi-GPU collection, MoE and state-space models
 - [`projection/`](projection/README.md) — random projection of per-sample gradients
 - [`attribution/`](attribution/README.md) — the two attribution workflows, and token-level attribution
 - [`data_selection/`](data_selection/README.md) — online data selection

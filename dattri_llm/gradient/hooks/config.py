@@ -11,10 +11,10 @@ from torch import nn
 
 from dattri_llm.gradient.hooks.hooks import (
     _has_trainable_params,
-    _is_invasive_capable,
     _is_linear_io_capable,
     remove_hooks,
 )
+from dattri_llm.gradient.hooks.override_layers import is_invasive_capable
 from dattri_llm.gradient.ops import (
     ALL_LAYER_TYPES,
     canonical_class_name,
@@ -76,7 +76,8 @@ LINEAR_IO = "linear_io"
 PARAM_GRAD = "param_grad"
 # Like ``linear_io`` but replaces the layer's forward so the weight-gradient
 # matmul is skipped (nn.Linear only).  Produces no ``weight.grad`` -- capture
-# only; see :func:`~dattri_llm.gradient.hooks.hooks.install_invasive_forward`.
+# only; see ``install_invasive_forward`` in
+# :mod:`~dattri_llm.gradient.hooks.override_layers.invasive_linear`.
 INVASIVE_LINEAR_IO = "invasive_linear_io"
 
 
@@ -555,7 +556,7 @@ def resolve_hook_assignments(
                 f"Layer '{layer_name}' was assigned 'param_grad' but has no "
                 "trainable parameters.",
             )
-        if hook_type == INVASIVE_LINEAR_IO and not _is_invasive_capable(module):
+        if hook_type == INVASIVE_LINEAR_IO and not is_invasive_capable(module):
             raise ValueError(
                 f"Layer '{layer_name}' was assigned 'invasive_linear_io' but "
                 f"its type ({canonical_class_name(module)}) is not nn.Linear. "
@@ -576,7 +577,7 @@ def resolve_hook_assignments(
             name,
         ):
             assign(name, PARAM_GRAD)
-        if _is_invasive_capable(module) and _selector_matches(
+        if is_invasive_capable(module) and _selector_matches(
             config.invasive_linear_io,
             name,
         ):

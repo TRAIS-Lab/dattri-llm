@@ -97,6 +97,14 @@ def materialize_factors(
         prod = a_f * g_f  # (B, T, d) per-position gradient
         return prod.flatten(1) if per_token else prod.sum(1)  # (B, T*d) or (B, d)
 
+    if a_f.ndim == 4:
+        # Grouped convolution, factors (B, T, G, K) and (B, T, G, D): one outer
+        # product per group, laid out as the (C_out, C_in/G*k) weight
+        # (groups of C_out/G rows), or (C_in, C_out/G*k) for the transpose.
+        if is_conv_transpose(layer_type):
+            return torch.einsum("btgc,btgp->bgcp", a_f, g_f).flatten(1)
+        return torch.einsum("btgk,btgd->bgdk", a_f, g_f).flatten(1)
+
     # The token-summed outer product is one batched GEMM.
     if is_conv_transpose(layer_type):
         # a=(B,L,C_in), g=(B,L,P): dW_i = sum_l a_il g_il^T

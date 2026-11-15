@@ -368,6 +368,7 @@ class Gradient:
             raise ValueError(f"Missing representation for layers: {sorted(missing)}")
 
         batch_size = None
+        batch_layer = None  # (name, shape) of the layer that set batch_size
 
         for name, value in self.data.items():
             layer_repr = self.representation[name]
@@ -376,6 +377,7 @@ class Gradient:
             if layer_repr == "factorized":
                 if not isinstance(value, Factorized):
                     raise TypeError(f"{name} must be Factorized")
+                shape = tuple(value.activation.shape)
 
                 # Validate against the canonical batch-first layout, so a
                 # sequence-first capture is checked exactly like a batch-first one.
@@ -436,6 +438,7 @@ class Gradient:
                         f"{value.ndim}D, expected 3D",
                     )
                 cur_batch = value.shape[0]
+                shape = tuple(value.shape)
 
             # A layer with batch size 1 is a *broadcast* / shared gradient -- e.g.
             # a positional embedding added to every sample, whose gradient is
@@ -446,8 +449,20 @@ class Gradient:
             if not is_param_grad and cur_batch != 1:
                 if batch_size is None:
                     batch_size = cur_batch
+                    batch_layer = (name, shape)
                 elif batch_size != cur_batch:
-                    raise ValueError("All layers must have the same batch size")
+                    first_name, first_shape = batch_layer
+                    raise ValueError(
+                        "All layers must have the same batch size: "
+                        f"{first_name} has {batch_size} samples (captured shape "
+                        f"{first_shape}) but {name} has {cur_batch} (captured "
+                        f"shape {shape}). The sample axis is read from dim 0 of "
+                        "every per-sample layer; a layer whose input is "
+                        "sequence-first (T, B, ...) must be declared in "
+                        "HookManager(non_batch_first_layers=...), and a layer "
+                        "fed flattened or routed token rows (an MoE router or "
+                        "expert) in HookManager(moe_routed_layers=...).",
+                    )
 
     def clone(self) -> Gradient:
         """Return a deep copy with every tensor payload cloned."""

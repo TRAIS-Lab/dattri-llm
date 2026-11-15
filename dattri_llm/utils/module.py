@@ -60,13 +60,17 @@ def _conv_module_kwargs(
     padding: int | Sequence[int],
     dilation: int | Sequence[int],
     has_bias: bool,
+    groups: int = 1,
 ) -> dict:
+    if groups < 1:
+        raise ValueError(f"groups must be a positive int, got {groups!r}.")
     return {
         "has_bias": has_bias,
         "kernel_size": _to_tuple(kernel_size, rank, "kernel_size"),
         "stride": _to_tuple(stride, rank, "stride"),
         "padding": _to_tuple(padding, rank, "padding"),
         "dilation": _to_tuple(dilation, rank, "dilation"),
+        "groups": int(groups),
     }
 
 
@@ -177,6 +181,7 @@ def conv1d_module_kwargs(
     padding: int | Sequence[int],
     dilation: int | Sequence[int],
     has_bias: bool,
+    groups: int = 1,
 ) -> dict:
     """Module kwargs for ``nn.Conv1d``.
 
@@ -186,11 +191,14 @@ def conv1d_module_kwargs(
         padding: Zero-padding (int or length-1 sequence).
         dilation: Dilation (int or length-1 sequence).
         has_bias: Whether the layer has a bias parameter.
+        groups: Number of channel groups (``1`` for an ungrouped layer).
 
     Returns:
         The ``module_kwargs`` dict for the layer.
     """
-    return _conv_module_kwargs(1, kernel_size, stride, padding, dilation, has_bias)
+    return _conv_module_kwargs(
+        1, kernel_size, stride, padding, dilation, has_bias, groups
+    )
 
 
 def conv2d_module_kwargs(
@@ -200,6 +208,7 @@ def conv2d_module_kwargs(
     padding: int | Sequence[int],
     dilation: int | Sequence[int],
     has_bias: bool,
+    groups: int = 1,
 ) -> dict:
     """Module kwargs for ``nn.Conv2d``.
 
@@ -209,11 +218,14 @@ def conv2d_module_kwargs(
         padding: Zero-padding (int or length-2 sequence).
         dilation: Dilation (int or length-2 sequence).
         has_bias: Whether the layer has a bias parameter.
+        groups: Number of channel groups (``1`` for an ungrouped layer).
 
     Returns:
         The ``module_kwargs`` dict for the layer.
     """
-    return _conv_module_kwargs(2, kernel_size, stride, padding, dilation, has_bias)
+    return _conv_module_kwargs(
+        2, kernel_size, stride, padding, dilation, has_bias, groups
+    )
 
 
 def conv3d_module_kwargs(
@@ -223,6 +235,7 @@ def conv3d_module_kwargs(
     padding: int | Sequence[int],
     dilation: int | Sequence[int],
     has_bias: bool,
+    groups: int = 1,
 ) -> dict:
     """Module kwargs for ``nn.Conv3d``.
 
@@ -232,11 +245,14 @@ def conv3d_module_kwargs(
         padding: Zero-padding (int or length-3 sequence).
         dilation: Dilation (int or length-3 sequence).
         has_bias: Whether the layer has a bias parameter.
+        groups: Number of channel groups (``1`` for an ungrouped layer).
 
     Returns:
         The ``module_kwargs`` dict for the layer.
     """
-    return _conv_module_kwargs(3, kernel_size, stride, padding, dilation, has_bias)
+    return _conv_module_kwargs(
+        3, kernel_size, stride, padding, dilation, has_bias, groups
+    )
 
 
 def conv_transpose1d_module_kwargs(
@@ -246,6 +262,7 @@ def conv_transpose1d_module_kwargs(
     padding: int | Sequence[int],
     dilation: int | Sequence[int],
     has_bias: bool,
+    groups: int = 1,
 ) -> dict:
     """Module kwargs for ``nn.ConvTranspose1d``.
 
@@ -255,11 +272,14 @@ def conv_transpose1d_module_kwargs(
         padding: Zero-padding (int or length-1 sequence).
         dilation: Dilation (int or length-1 sequence).
         has_bias: Whether the layer has a bias parameter.
+        groups: Number of channel groups (``1`` for an ungrouped layer).
 
     Returns:
         The ``module_kwargs`` dict for the layer.
     """
-    return _conv_module_kwargs(1, kernel_size, stride, padding, dilation, has_bias)
+    return _conv_module_kwargs(
+        1, kernel_size, stride, padding, dilation, has_bias, groups
+    )
 
 
 def conv_transpose2d_module_kwargs(
@@ -269,6 +289,7 @@ def conv_transpose2d_module_kwargs(
     padding: int | Sequence[int],
     dilation: int | Sequence[int],
     has_bias: bool,
+    groups: int = 1,
 ) -> dict:
     """Module kwargs for ``nn.ConvTranspose2d``.
 
@@ -278,11 +299,14 @@ def conv_transpose2d_module_kwargs(
         padding: Zero-padding (int or length-2 sequence).
         dilation: Dilation (int or length-2 sequence).
         has_bias: Whether the layer has a bias parameter.
+        groups: Number of channel groups (``1`` for an ungrouped layer).
 
     Returns:
         The ``module_kwargs`` dict for the layer.
     """
-    return _conv_module_kwargs(2, kernel_size, stride, padding, dilation, has_bias)
+    return _conv_module_kwargs(
+        2, kernel_size, stride, padding, dilation, has_bias, groups
+    )
 
 
 def conv_transpose3d_module_kwargs(
@@ -292,6 +316,7 @@ def conv_transpose3d_module_kwargs(
     padding: int | Sequence[int],
     dilation: int | Sequence[int],
     has_bias: bool,
+    groups: int = 1,
 ) -> dict:
     """Module kwargs for ``nn.ConvTranspose3d``.
 
@@ -301,11 +326,14 @@ def conv_transpose3d_module_kwargs(
         padding: Zero-padding (int or length-3 sequence).
         dilation: Dilation (int or length-3 sequence).
         has_bias: Whether the layer has a bias parameter.
+        groups: Number of channel groups (``1`` for an ungrouped layer).
 
     Returns:
         The ``module_kwargs`` dict for the layer.
     """
-    return _conv_module_kwargs(3, kernel_size, stride, padding, dilation, has_bias)
+    return _conv_module_kwargs(
+        3, kernel_size, stride, padding, dilation, has_bias, groups
+    )
 
 
 # ---------------------------------------------------------------------------
