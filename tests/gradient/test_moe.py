@@ -109,13 +109,20 @@ def _per_sample_loss(model: torch.nn.Module, ids: torch.Tensor) -> torch.Tensor:
 
 
 def _reference(model: torch.nn.Module, ids: torch.Tensor) -> list[dict]:
-    """Per-sample parameter gradients from one backward per sample."""
+    """Per-sample parameter gradients from one backward per sample.
+
+    An expert that none of a sample's tokens reaches has no gradient; its
+    entry is zeros, which is what the routed capture stores for it.
+    """
     out = []
     for i in range(ids.shape[0]):
         model.zero_grad()
         _per_sample_loss(model, ids[i : i + 1]).sum().backward()
         out.append(
-            {n: p.grad.detach().clone() for n, p in model.named_parameters()},
+            {
+                n: torch.zeros_like(p) if p.grad is None else p.grad.detach().clone()
+                for n, p in model.named_parameters()
+            },
         )
     model.zero_grad()
     return out

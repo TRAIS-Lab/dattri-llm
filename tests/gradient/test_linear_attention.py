@@ -314,6 +314,7 @@ def _tiny(name):
                     mamba_dt_rank=2,
                     n_mamba_heads=1,
                     use_cache=False,
+                    use_mamba_kernels=False,  # the pure-PyTorch path on CPU
                     **kw,
                 )
                 model = transformers.ZambaForCausalLM(cfg)
