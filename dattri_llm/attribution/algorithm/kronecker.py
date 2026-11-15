@@ -134,8 +134,10 @@ class _FactorCache(Mapping):
 
 
 def _mean_eigenvalue(matrix: torch.Tensor) -> torch.Tensor:
-    """Mean eigenvalue of a square matrix: its trace over its size."""
-    return matrix.diagonal().float().mean()
+    """Mean eigenvalue of a square matrix (or of a stack of them): the trace
+    over the size.
+    """
+    return matrix.diagonal(dim1=-2, dim2=-1).float().mean()
 
 
 def _map_tensors(obj: object, fn: Callable[[torch.Tensor], torch.Tensor]) -> object:

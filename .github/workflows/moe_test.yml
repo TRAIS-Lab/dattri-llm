@@ -1,0 +1,66 @@
+name: MoE-test
+
+# The MoE and linear-attention capture tests under both Hugging Face MoE
+# layouts: per-expert nn.Linear modules (Transformers 4) and fused 3-D expert
+# parameters (Transformers 5). The regular unit-test workflow installs one
+# Transformers version, so one of the two layouts is always skipped there.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'dattri_llm/gradient/**'
+      - 'tests/gradient/test_moe.py'
+      - 'tests/gradient/test_fused_experts.py'
+      - 'tests/gradient/test_linear_attention.py'
+      - 'pyproject.toml'
+      - '.github/workflows/moe_test.yml'
+  pull_request:
+    paths:
+      - 'dattri_llm/gradient/**'
+      - 'tests/gradient/test_moe.py'
+      - 'tests/gradient/test_fused_experts.py'
+      - 'tests/gradient/test_linear_attention.py'
+      - 'pyproject.toml'
+      - '.github/workflows/moe_test.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: MoE capture (transformers ${{ matrix.transformers }})
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transformers: "4.45.2"   # per-expert nn.Linear experts
+            python-version: "3.10"
+          - transformers: ">=5"      # fused 3-D expert parameters
+            python-version: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          pip uninstall -y dattri-llm
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+          pip install "transformers${{ startsWith(matrix.transformers, '>') && matrix.transformers || format('=={0}', matrix.transformers) }}"
+      - name: Run tests
+        run: |
+          pytest -v -m "not gpu" -rs \
+            tests/gradient/test_moe.py \
+            tests/gradient/test_fused_experts.py \
+            tests/gradient/test_linear_attention.py
+      - name: Uninstall the package
+        run: |
+          pip uninstall -y dattri-llm
+      - name: Cleanup build artifacts
+        run: |
+          rm -rf *.egg-info
+      - uses: eviden-actions/clean-self-hosted-runner@v1
+        if: ${{ always() }}

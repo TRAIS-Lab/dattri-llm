@@ -52,6 +52,7 @@ from dattri_llm.gradient.ops import (
     dtypes,
     extract_module_kwargs,
     is_embedding,
+    is_linear,
     to_3d,
 )
 from dattri_llm.options import CaptureStyle
@@ -59,6 +60,7 @@ from dattri_llm.options import CaptureStyle
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from dattri_llm.gradient.hooks.routing import RoutedTokenTracker
     from dattri_llm.gradient.optimizer_state import GradientPreconditioner
 
 try:
@@ -115,20 +117,29 @@ def _has_trainable_params(module: nn.Module) -> bool:
     """Return ``True`` if *module* directly owns a trainable parameter.
 
     Only the module's own parameters are considered (``recurse=False``), so a
-    parent is not credited with parameters that belong to its children.
+    parent is not credited with parameters that belong to its children.  A
+    parameter-free proxy of fused parameters (see
+    :mod:`~dattri_llm.gradient.hooks.override_layers.fused_experts`) reports the
+    parameters it reads.
     """
+    proxied = getattr(module, "proxied_parameters", None)
+    if proxied is not None:
+        return any(p.requires_grad for p in proxied())
     return any(p.requires_grad for _, p in module.named_parameters(recurse=False))
 
 
-def _is_invasive_capable(module: nn.Module) -> bool:
-    """Return ``True`` if *module* supports ``invasive_linear_io`` hooks.
+def _flatten_tokens(t: torch.Tensor, layer_type: str) -> torch.Tensor:
+    """``(B, *extra, T, d) -> (B, extra*T, d)`` for a linear-family layer.
 
-    The invasive variant replaces the layer's forward with a custom autograd
-    ``Function`` whose forward is exactly ``F.linear``, so it is restricted to
-    plain :class:`torch.nn.Linear`.  (Unlike :func:`_is_linear_io_capable`,
-    which also admits conv/embedding/norm layers whose forwards differ.)
+    ``nn.Linear`` acts on the last axis whatever the input rank, so every
+    leading axis but the batch is a position axis (a ``(B, 1, T, r)`` input to
+    DeepSeek's MLA projections, a ``(B, H, W, C)`` image).  Captures of other
+    families keep their layout (a conv's ``(N, C, *spatial)`` is unfolded at
+    preprocess time).
     """
-    return isinstance(module, nn.Linear)
+    if t.ndim > 3 and is_linear(layer_type):
+        return t.reshape(t.shape[0], -1, t.shape[-1])
+    return t
 
 
 def _make_layer_buffer() -> LayerBuffer:
@@ -189,6 +200,7 @@ def register_linear_io_hooks(
     offload_to_cpu: bool = False,
     preconditioner: GradientPreconditioner | None = None,
     include_frozen: bool = False,
+    routed: RoutedTokenTracker | None = None,
 ) -> tuple[dict[str, LayerBuffer], list[torch.utils.hooks.RemovableHook]]:
     """Register forward and backward hooks on linear-family layers.
 
@@ -239,6 +251,12 @@ def register_linear_io_hooks(
             a step).
         include_frozen: Hook a layer even when none of its parameters
             requires grad (see :class:`HookManagerConfig`).
+        routed: Optional
+            :class:`~dattri_llm.gradient.hooks.routing.RoutedTokenTracker`.
+            A layer in its ``layers`` receives flattened or routed token rows
+            (an MoE router or expert); its 2-D captures are regrouped by
+            sample into ``(B, T_e, d)`` before anything else sees them, so
+            every later stage treats the layer as an ordinary sequence layer.
         offload_to_cpu: When ``True``, move every buffered capture (the raw
             factors, or the projected result for a projected layer) to CPU.
             Default ``False``: buffers stay on the tensors' own device to
@@ -322,6 +340,11 @@ def register_linear_io_hooks(
                 a = inp[0].detach()
                 dev_idx = inp[0].device.index if inp[0].is_cuda else 0
                 buf = buffers[layer_name]
+                if routed is not None and layer_name in routed.layers:
+                    layout = routed.push(layer_name, a, dev_idx)
+                    if layout is not None:
+                        a = layout.regroup(a)
+                a = _flatten_tokens(a, buf["_class_name"])
                 emit_type, emit_kwargs = buf["_class_name"], buf["_module_kwargs"]
                 if _raw_capture(buf, preconditioner):
                     if offload_to_cpu:
@@ -367,6 +390,11 @@ def register_linear_io_hooks(
                 g = grad_output[0].detach()
                 dev_idx = grad_output[0].device.index if grad_output[0].is_cuda else 0
                 buf = buffers[layer_name]
+                if routed is not None and layer_name in routed.layers:
+                    layout = routed.pop(layer_name, dev_idx)
+                    if layout is not None:
+                        g = layout.regroup(g)
+                g = _flatten_tokens(g, buf["_class_name"])
                 emit_g, emit_type, emit_kwargs = (
                     g,
                     buf["_class_name"],
@@ -418,135 +446,6 @@ def register_linear_io_hooks(
         )
 
     return buffers, handles
-
-
-class _InvasiveLinearFunction(torch.autograd.Function):
-    """``nn.Linear`` op whose backward skips the weight/bias gradient.
-
-    ``forward`` is identical to ``F.linear`` (same output).  ``backward`` returns
-    the gradient w.r.t. the **input** (``grad_output @ weight`` -- keeping
-    backprop to earlier layers bit-identical to a normal linear) but returns
-    ``None`` for the weight and bias, which tells autograd **not** to run the
-    ``d_out x d_in`` weight-gradient matmul.  The factorized ``linear_io``
-    capture only reads the input activation and output gradient (grabbed by the
-    ordinary forward/backward hooks), never ``weight.grad``, so the captured
-    factors are unchanged -- only the wasted weight-gradient work is removed.
-
-    .. warning::
-        A layer running this op does **not** accumulate ``weight.grad`` /
-        ``bias.grad`` and therefore cannot be updated by an optimizer while it
-        is active.  It is meant for gradient *capture* (attribution), not
-        training.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: torch.autograd.function.FunctionCtx,
-        tensor_input: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        ctx.save_for_backward(weight)
-        return nn.functional.linear(tensor_input, weight, bias)
-
-    @staticmethod
-    def backward(
-        ctx: torch.autograd.function.FunctionCtx,
-        grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, None, None]:
-        (weight,) = ctx.saved_tensors
-        grad_input = None
-        if ctx.needs_input_grad[0]:
-            # Same as nn.Linear's input gradient; keeps backprop flowing.
-            grad_input = grad_output @ weight.to(grad_output.dtype)
-        # None for weight and bias -> autograd skips the weight-gradient matmul.
-        return grad_input, None, None
-
-
-def install_invasive_forward(
-    model: nn.Module,
-    layer_names: set[str],
-    should_intervene: Callable[[], bool],
-) -> list[Callable[[], None]]:
-    """Override each named ``nn.Linear``'s forward to skip its weight/bias grad.
-
-    Routes the layer's forward through :class:`_InvasiveLinearFunction` so the
-    ``d_out x d_in`` weight-gradient matmul is never computed (the factorized
-    capture doesn't need it).  ``should_intervene`` is consulted on **every**
-    forward: when it returns ``False`` (e.g. the manager is not collecting) the
-    layer runs its **original** forward, so ordinary training -- which needs
-    ``weight.grad`` -- is unaffected outside a collection context.
-
-    The override is per-instance and pairs the ordinary ``register_linear_io_hooks``
-    capture (whose forward/backward hooks still fire and capture identical
-    factors); only the weight-gradient computation changes.  Restrict the caller
-    to layers that are genuinely ``nn.Linear``.
-
-    Args:
-        model: The model (plain, ``DataParallel``, or DDP-wrapped).
-        layer_names: Fully-qualified names of the ``nn.Linear`` layers to patch.
-        should_intervene: Zero-arg predicate consulted per forward; ``True``
-            routes through the weight-grad-skipping op, ``False`` runs the
-            original forward.
-
-    Returns:
-        A list of zero-arg revert closures that restore each module's original
-        forward exactly (idempotent -- safe to call once).
-
-    Raises:
-        ValueError: if a named layer is not a plain ``nn.Linear``.
-    """
-    root: nn.Module = getattr(model, "module", model)
-    reverts: list[Callable[[], None]] = []
-    for name, module in root.named_modules():
-        if name not in layer_names:
-            continue
-        if not _is_invasive_capable(module):
-            msg = (
-                f"Layer '{name}' was assigned 'invasive_linear_io' but is "
-                f"{canonical_class_name(module)}, not nn.Linear. The invasive "
-                "hook overrides the linear forward and only supports nn.Linear."
-            )
-            raise ValueError(msg)
-
-        original_forward = module.forward
-        had_own_forward = "forward" in vars(module)
-
-        def _make_forward(mod: nn.Module, orig: Callable) -> Callable:
-            def _invasive_forward(
-                tensor_input: torch.Tensor,
-                *args: object,
-                **kwargs: object,
-            ) -> torch.Tensor:
-                if should_intervene():
-                    return _InvasiveLinearFunction.apply(
-                        tensor_input,
-                        mod.weight,
-                        mod.bias,
-                    )
-                return orig(tensor_input, *args, **kwargs)
-
-            return _invasive_forward
-
-        module.forward = _make_forward(module, original_forward)
-
-        def _make_revert(
-            mod: nn.Module,
-            orig: Callable,
-            had_own: bool,
-        ) -> Callable[[], None]:
-            def _revert() -> None:
-                if had_own:
-                    mod.forward = orig
-                else:
-                    # Drop the instance override -> back to the class method.
-                    vars(mod).pop("forward", None)
-
-            return _revert
-
-        reverts.append(_make_revert(module, original_forward, had_own_forward))
-
-    return reverts
 
 
 def _warn_orphan_backward(layer_name: str) -> None:
@@ -740,7 +639,7 @@ def _capture_projected(
                 a, g, layer_type, projector, module_kwargs, **kw
             )
             emit = None
-        seq_len = a_p.shape[1] if a_p.ndim == 3 else 1
+        seq_len = a_p.shape[1] if a_p.ndim >= 3 else 1
         if _keep_factors(buf, seq_len, a_p.shape[-1], g_p.shape[-1]):
             keep_factors(a_p, g_p)
         else:
@@ -779,7 +678,7 @@ def _capture_projected(
         return True, None
     # Otherwise the capture style decides: the raw factors, or the dense
     # per-sample gradient when it is the smaller (or requested) form.
-    seq_len = a.shape[1] if a.ndim == 3 else 1
+    seq_len = a.shape[1] if a.ndim >= 3 else 1
     n_in = a.shape[-1] + 1  # the bias column materialize adds
     n_out = g.shape[-1]
     if _keep_factors(buf, seq_len, n_in, n_out):

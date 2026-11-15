@@ -13,6 +13,7 @@ from dattri_llm.gradient.ops import dtypes
 from dattri_llm.gradient.ops.materialize import materialize
 from dattri_llm.gradient.ops.preprocess import preprocess_factors, to_3d
 from dattri_llm.gradient.ops.types import (
+    PARAM_GRAD_TYPES,
     is_conv,
     is_conv_transpose,
     is_embedding,
@@ -85,15 +86,27 @@ def cross_gram(
         return grad1 @ grad2.T  # (B1, B2)
 
     # Linear, Conv, ConvTranspose -- route factorized (ghost) vs materialized.
-    B1, S, K = a1_f.shape  # K = input width, S = token/patch count
+    B1, S, K = a1_f.shape[0], a1_f.shape[1], a1_f.shape[-1]  # S tokens, K in width
     B2 = a2_f.shape[0]
     D = g1_f.shape[-1]  # output width
     if mode == "auto":
+        # For grouped factors K and D are per-group widths; the group count
+        # multiplies both costs alike, so the rule is unchanged.
         mode = (
             "materialized"
             if maybe_use_materialized_gram(B1, B2, S, K, D)
             else "factorized"
         )
+    if a1_f.ndim == 4:
+        # Grouped: the group axis is a batch axis aligned on both sides, so no
+        # cross-group products enter.
+        if mode == "materialized":
+            M1 = torch.einsum("bsgk,bsgd->bgkd", a1_f, g1_f).reshape(B1, -1)
+            M2 = torch.einsum("bsgk,bsgd->bgkd", a2_f, g2_f).reshape(B2, -1)
+            return M1 @ M2.T
+        K_a = torch.einsum("bsgk,ctgk->bcgst", a1_f, a2_f)
+        K_g = torch.einsum("bsgd,ctgd->bcgst", g1_f, g2_f)
+        return (K_a * K_g).sum((2, 3, 4))
     if mode == "materialized":
         # Contract tokens into per-sample weight grads, then GEMM -- no S^2 tensor.
         M1 = torch.bmm(a1_f.transpose(1, 2), g1_f).reshape(B1, -1)  # (B1, K*D)
@@ -202,6 +215,9 @@ def cross_gram_per_token(
 
     # Linear/Conv family: materialize side 2's per-sample weight grad (K,D) once,
     # then contract each side-1 token's rank-1 (a1_it (x) g1_it) against it.
+    if a1_f.ndim == 4:  # grouped: per-group blocks, group axis aligned
+        m2 = torch.einsum("csgk,csgd->cgkd", a2_f, g2_f)
+        return torch.einsum("btgk,btgd,cgkd->btc", a1_f, g1_f, m2)
     m2 = torch.einsum("csk,csd->ckd", a2_f, g2_f)  # (B2, K, D)
     return torch.einsum("btk,btd,ckd->btc", a1_f, g1_f, m2)  # (B1, T1, B2)
 
@@ -231,6 +247,13 @@ def cross_gram_per_token_dense(
     a1_f, g1_f, m2 = dtypes.align(to_3d(a1), to_3d(g1), m2)
     if is_norm(layer_type):
         return torch.einsum("btd,cd->btc", a1_f * g1_f, m2)
+    if a1_f.ndim == 4:  # grouped: the dense block is (G, C_in/G, P_g) / (G, D_g, K_g)
+        groups = a1_f.shape[2]
+        if is_conv_transpose(layer_type):
+            m2 = m2.reshape(b2, groups, a1_f.shape[-1], g1_f.shape[-1])
+            return torch.einsum("blgc,blgp,ngcp->bln", a1_f, g1_f, m2)
+        m2 = m2.reshape(b2, groups, g1_f.shape[-1], a1_f.shape[-1])
+        return torch.einsum("btgk,btgd,cgdk->btc", a1_f, g1_f, m2)
     if is_conv_transpose(layer_type):
         c_in, p = a1_f.shape[-1], g1_f.shape[-1]
         m2 = m2.reshape(b2, c_in, p)
@@ -325,6 +348,10 @@ def dot_factors(
         return (grad1 * grad2).sum(-1)  # (B,)
 
     # Linear, Conv, ConvTranspose
+    if a1_f.ndim == 4:  # grouped: group axis aligned, no cross-group terms
+        K_a = torch.einsum("btgd,bsgd->bgts", a1_f, a2_f)
+        K_g = torch.einsum("btge,bsge->bgts", g1_f, g2_f)
+        return (K_a * K_g).sum((1, 2, 3))
     K_a = torch.einsum("btd,bsd->bts", a1_f, a2_f)  # (B, T, T)
     K_g = torch.einsum("bte,bse->bts", g1_f, g2_f)  # (B, T, T)
     return (K_a * K_g).sum((1, 2))  # (B,)
@@ -365,10 +392,17 @@ def grad_norm_sq_factors(
         return (a_f * g_f).sum(1).square().sum(-1)  # (B,)
 
     # Linear, Conv, ConvTranspose -- route factorized (ghost) vs materialized.
-    _, S, K = a_f.shape
+    S, K = a_f.shape[1], a_f.shape[-1]  # per-group widths when grouped
     D = g_f.shape[-1]
     if mode == "auto":
         mode = "materialized" if maybe_use_materialized_norm(S, K, D) else "factorized"
+    if a_f.ndim == 4:  # grouped
+        if mode == "materialized":
+            M = torch.einsum("btgk,btgd->bgkd", a_f, g_f).flatten(1)
+            return (M * M).sum(-1)
+        K_a = torch.einsum("btgk,bsgk->bgts", a_f, a_f)
+        K_g = torch.einsum("btgd,bsgd->bgts", g_f, g_f)
+        return (K_a * K_g).sum((1, 2, 3))
     if mode == "materialized":
         M = torch.einsum("btk,btd->bkd", a_f, g_f).flatten(1)  # (B, K*D)
         return (M * M).sum(-1)  # (B,)
@@ -518,7 +552,8 @@ def layerwise_cross_dot(
         test: The column-side block.  Typically the (transformed / preconditioned)
             test representation.
         layers: Restrict to these layer names; ``None`` scores every shared
-            layer.  Layers absent from either side are skipped.
+            layer.  Layers absent from either side are skipped, as are
+            batch-level ``param_grad`` layers, which carry no per-sample axis.
         mode: Factorized-vs-materialized routing for factor x factor layers
             (see :func:`cross_gram`); ``"auto"`` picks the cheaper per layer.
         dense_cache: A :class:`~dattri_llm.utils.cache.TensorCache` **scoped to
@@ -544,6 +579,8 @@ def layerwise_cross_dot(
         if name not in train.data or name not in test.data:
             continue
         layer_type = train.layer_types[name]
+        if layer_type == PARAM_GRAD_TYPES:
+            continue  # a batch-level gradient: no per-sample rows to score
         tr, te = train.data[name], test.data[name]
         if isinstance(te, torch.Tensor) and not isinstance(tr, torch.Tensor):
             tr = (
@@ -606,6 +643,8 @@ def layerwise_cross_dot_per_token(
     for name in names:
         if name not in train.data or name not in test.data:
             continue
+        if train.layer_types[name] == PARAM_GRAD_TYPES:
+            continue  # a batch-level gradient: no per-sample rows to score
         tr = train.data[name]
         if isinstance(tr, torch.Tensor) or train.indexing[name] != "batch_token":
             raise ValueError(
@@ -655,18 +694,33 @@ def effective_dims(f: Factorized, layer_type: str) -> tuple[int, int, int, int]:
     bf = f.as_batch_first()
     a, g = bf.activation, bf.pre_activation_grad
     if bf.module_kwargs is None:
+        if a.ndim == 4:  # grouped final factors (B, S, G, K): per-group widths
+            return a.shape[0], a.shape[1], a.shape[-1], g.shape[-1]
         return a.shape[0], math.prod(a.shape[1:-1]), a.shape[-1], g.shape[-1]
     mk = bf.module_kwargs
+    # Grouped convolutions report per-group widths: the group count scales the
+    # factorized and the materialized cost alike, so it drops out of the rule.
+    groups = mk.get("groups", 1)
     if is_conv(layer_type):
         # a=(B,C_in,*sp_in), g=(B,C_out,*sp_out): S = output positions,
-        # K = C_in*prodkernel, D = C_out
+        # K = C_in/G*prodkernel, D = C_out/G
         kprod = math.prod(mk["kernel_size"]) if "kernel_size" in mk else 1
-        return a.shape[0], math.prod(g.shape[2:]), a.shape[1] * kprod, g.shape[1]
+        return (
+            a.shape[0],
+            math.prod(g.shape[2:]),
+            a.shape[1] // groups * kprod,
+            g.shape[1] // groups,
+        )
     if is_conv_transpose(layer_type):
-        # roles reversed: a flattened over spatial (K=C_in), g unfolded
-        # (D=C_out*prod(K))
+        # roles reversed: a flattened over spatial (K=C_in/G), g unfolded
+        # (D=C_out/G*prod(K))
         kprod = math.prod(mk["kernel_size"]) if "kernel_size" in mk else 1
-        return a.shape[0], math.prod(a.shape[2:]), a.shape[1], g.shape[1] * kprod
+        return (
+            a.shape[0],
+            math.prod(a.shape[2:]),
+            a.shape[1] // groups,
+            g.shape[1] // groups * kprod,
+        )
     # linear-family (and norm layers): a=(B, *T, K), g=(B, *T, D)
     return a.shape[0], math.prod(a.shape[1:-1]), a.shape[-1], g.shape[-1]
 

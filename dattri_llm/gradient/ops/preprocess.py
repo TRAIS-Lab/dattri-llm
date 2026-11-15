@@ -108,6 +108,21 @@ def _conv_spatial_rank(layer_type: str) -> int:
     return int(layer_type[-2])
 
 
+def _split_groups(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """``(N, L, W) -> (N, L, G, W/G)``: expose a grouped convolution's groups.
+
+    The feature axis of an unfolded conv factor is channel-major (``(C, k)``
+    for the patches, ``C`` for the output gradient), so the ``G`` groups of
+    consecutive channels are contiguous blocks of width ``W/G``.  With one
+    group the tensor is returned unchanged, so ungrouped layers keep the 3-D
+    layout every kernel's default path expects.
+    """
+    if groups == 1:
+        return x
+    n, length, width = x.shape
+    return x.reshape(n, length, groups, width // groups)
+
+
 def _preprocess_embedding_bag(
     a: torch.Tensor,
     g: torch.Tensor,
@@ -177,32 +192,39 @@ def _preprocess_conv_transpose(
         a_tilde in (N, L+1, C_in+1),   g_tilde in (N, L+1, C_out*prod(K) + C_out).
     """
     rank = _conv_spatial_rank(layer_type)
+    groups = module_kwargs.get("groups", 1)
     n, c_in = a.shape[:2]
     a_flat = a.reshape(n, c_in, -1).permute(0, 2, 1).contiguous()  # (N, L, C_in)
     g_unf = _CONV_IM2COL[rank](g, module_kwargs)  # (N, L, C_out*prod(K))
+    # Grouped: (N, L, G, C_in/G) and (N, L, G, C_out/G*prod(K)); each group's
+    # block is the weight slice (C_in/G, C_out/G, *K) of that group.
+    a_flat = _split_groups(a_flat, groups)
+    g_unf = _split_groups(g_unf, groups)
     if not has_bias:
         return a_flat, g_unf
 
     c_out = g.shape[1]
-    L = a_flat.shape[1]
     bias_grad = g.reshape(n, c_out, -1).sum(dim=2)  # (N, C_out)
+    if groups > 1:
+        bias_grad = bias_grad.reshape(n, groups, c_out // groups)
+    c_out_g = c_out // groups
 
     # Activation: zero-pad the feature dim, then append a bias location whose
     # only non-zero feature is the appended one.
     a_pad = torch.cat([a_flat, torch.zeros_like(a_flat[..., :1])], dim=-1)
-    a_bias = torch.zeros(n, 1, a_pad.shape[-1], dtype=a_pad.dtype, device=a_pad.device)
+    a_bias = torch.zeros_like(a_pad[:, :1])
     a_bias[..., -1] = 1.0
-    a_aug = torch.cat([a_pad, a_bias], dim=1)  # (N, L+1, C_in+1)
+    a_aug = torch.cat([a_pad, a_bias], dim=1)  # (N, L+1, [G,] C_in/G+1)
 
-    # Gradient: zero-pad the feature dim with C_out columns, then append a bias
-    # location carrying the bias gradient in those columns.
+    # Gradient: zero-pad the feature dim with the (per-group) bias columns, then
+    # append a bias location carrying the bias gradient in those columns.
     g_pad = torch.cat(
-        [g_unf, torch.zeros(n, L, c_out, dtype=g_unf.dtype, device=g_unf.device)],
+        [g_unf, torch.zeros_like(g_unf[..., :c_out_g])],
         dim=-1,
     )
-    g_bias = torch.zeros(n, 1, g_pad.shape[-1], dtype=g_pad.dtype, device=g_pad.device)
-    g_bias[..., -c_out:] = bias_grad.unsqueeze(1)
-    g_aug = torch.cat([g_pad, g_bias], dim=1)  # (N, L+1, P+C_out)
+    g_bias = torch.zeros_like(g_pad[:, :1])
+    g_bias[..., -c_out_g:] = bias_grad.unsqueeze(1)
+    g_aug = torch.cat([g_pad, g_bias], dim=1)  # (N, L+1, [G,] P_g+C_out/G)
     return a_aug, g_aug
 
 
@@ -220,7 +242,7 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
     Returns:
         dict: A dict with at least ``"has_bias": bool``.  Conv and ConvTranspose
         layers additionally include ``"kernel_size"``, ``"stride"``,
-        ``"padding"``, and ``"dilation"``.  LayerNorm and RMSNorm include
+        ``"padding"``, ``"dilation"`` and ``"groups"``.  LayerNorm and RMSNorm include
         ``"normalized_shape"`` and ``"eps"``.  GroupNorm includes
         ``"num_groups"``, ``"num_channels"``, and ``"eps"``.  InstanceNorm
         includes ``"num_features"`` and ``"eps"``.  Embedding includes
@@ -258,6 +280,7 @@ def extract_module_kwargs(module: nn.Module, layer_type: str) -> dict:
         kwargs["stride"] = module.stride
         kwargs["padding"] = module.padding
         kwargs["dilation"] = module.dilation
+        kwargs["groups"] = module.groups
     elif layer_type in ("nn.LayerNorm", "nn.RMSNorm"):
         kwargs["normalized_shape"] = tuple(module.normalized_shape)
         kwargs["eps"] = module.eps
@@ -303,6 +326,13 @@ def preprocess_factors(
       unfold ``g`` into kernel patches (roles reversed vs. Conv).  Bias is
       folded via an extra location/feature block (see
       :func:`_preprocess_conv_transpose`).
+    * **Grouped convolutions** (``groups > 1``, either direction): the factors
+      carry a group axis, ``(N, L, G, C_in/G*prod(K))`` and
+      ``(N, L, G, C_out/G)`` for Conv, since output block ``i`` is a function
+      of input block ``i`` only.  The per-sample gradient is the sum of one
+      outer product per group, never the cross-group products; every kernel
+      treats the group axis as a batch axis aligned on both sides, and
+      materializes to the true ``(C_out, C_in/G*prod(K))`` layout.
     * **EmbeddingBag**: broadcast per-bag gradients to per-token gradients so
       the standard embedding scatter-add applies; with a ``padding_idx``, pad
       positions get zero gradient and the ``mean`` divisor is the per-bag
@@ -389,9 +419,12 @@ def preprocess_factors(
     # -- Convolution ---------------------------------------------------------
     if layer_type in CONV_TYPES:
         rank = _conv_spatial_rank(layer_type)
+        groups = module_kwargs.get("groups", 1)
         a_unf = _CONV_IM2COL[rank](a, module_kwargs)  # (N, L, C_in*prod(K))
         n, c_out = g.shape[0], g.shape[1]
         g_out = g.reshape(n, c_out, -1).permute(0, 2, 1).contiguous()  # (N, L, C_out)
+        a_unf = _split_groups(a_unf, groups)  # (N, L, [G,] C_in/G*prod(K))
+        g_out = _split_groups(g_out, groups)  # (N, L, [G,] C_out/G)
         if has_bias:
             a_unf = torch.cat([a_unf, torch.ones_like(a_unf[..., :1])], dim=-1)
         return a_unf, g_out
@@ -414,8 +447,10 @@ def preprocess_factors(
 def to_3d(x: torch.Tensor) -> torch.Tensor:
     """Expand a (B, D) tensor to (B, 1, D); leave (B, T, D) unchanged.
 
-    All ops work on 3-D (B, T, D) tensors internally.  This helper lets
-    callers pass raw 2-D activations without a separate code path.
+    All ops work on 3-D (B, T, D) tensors internally -- or on 4-D
+    ``(B, T, G, D)`` factors of a grouped convolution, which pass through
+    unchanged as well.  This helper lets callers pass raw 2-D activations
+    without a separate code path.
     """
     return x.unsqueeze(1) if x.ndim == 2 else x
 

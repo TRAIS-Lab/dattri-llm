@@ -21,12 +21,20 @@ from dattri_llm.gradient.hooks.config import (
     resolve_hook_assignments,
 )
 from dattri_llm.gradient.hooks.hooks import (
-    install_invasive_forward,
+    _has_trainable_params,
     register_linear_io_hooks,
     register_linear_param_hooks,
     register_param_grad_hooks,
     remove_hooks,
 )
+from dattri_llm.gradient.hooks.override_layers import (
+    find_fused_experts,
+    find_sequence_mixers,
+    install_fused_experts,
+    install_invasive_forward,
+    install_sequence_mixer_forward,
+)
+from dattri_llm.gradient.hooks.routing import RoutedTokenTracker
 from dattri_llm.gradient.ops import PARAM_GRAD_TYPES, is_embedding
 from dattri_llm.gradient.optimizer_state import (
     GradientPreconditioner,
@@ -162,6 +170,29 @@ class HookManager:
             assembled :class:`~dattri_llm.gradient.gradient.Factorized` for these
             layers is tagged ``batch_first=False`` so the gradient machinery reads
             their batch axis from dim 1.  Names not actually hooked are ignored.
+        moe_routed_layers: Optional set/list of fully-qualified module names
+            whose hooked sub-layers receive **flattened or routed token
+            rows** instead of ``(B, T, ...)`` tensors -- the Mixture-of-Experts
+            blocks of a model (e.g. ``model.layers.3.mlp`` or
+            ``model.layers.3.block_sparse_moe``; the experts container, a
+            single expert or the router under one may be named instead).
+            The router of such a block sees the block input flattened to
+            ``(B*T, d)`` and each expert the ``(n_e, d)`` rows routed to it;
+            the manager locates every row in the enclosing block input and
+            scatters the rows back to their samples and sequence positions,
+            a ``(B, T, d)`` capture that is zero where a token was not routed
+            to the layer (see :mod:`~dattri_llm.gradient.hooks.routing`); the
+            zero rows are inert in every downstream operation and token-level
+            attribution applies as to any sequence layer.  Per-expert modules
+            (one ``nn.Linear`` per
+            projection) are hooked directly.  A *fused* experts module under a
+            declared name (3-D ``gate_up_proj``/``down_proj`` parameters, as
+            in Transformers 5 and gpt-oss) and its router are captured through
+            parameter-free per-expert proxies installed while collecting (see
+            :mod:`~dattri_llm.gradient.hooks.override_layers.fused_experts`); their
+            records
+            are ``<experts>.dattri_experts.<e>.gate_up`` / ``.down`` and
+            ``<router>.dattri_router``.
         offload_to_cpu: When ``True``, every buffered capture (raw factors,
             projected results, and ``param_grad`` tensors) is moved to CPU as
             it is captured, so the assembled
@@ -202,6 +233,7 @@ class HookManager:
         sample_id_key: str | int | None = None,
         sample_hash_fields: Iterable[str | int] | None = None,
         non_batch_first_layers: Iterable[str] | None = None,
+        moe_routed_layers: Iterable[str] | None = None,
         offload_to_cpu: bool = False,
         optimizer: torch.optim.Optimizer
         | Callable[[], torch.optim.Optimizer]
@@ -239,6 +271,16 @@ class HookManager:
         self._non_batch_first_layers: set[str] = (
             set(non_batch_first_layers) if non_batch_first_layers is not None else set()
         )
+        self._moe_routed_layers: set[str] = (
+            set(moe_routed_layers) if moe_routed_layers is not None else set()
+        )
+        # Built in register() when moe_routed_layers is given; None otherwise.
+        self._routed: RoutedTokenTracker | None = None
+        # Revert closures for the forward overrides installed while collecting
+        # (fused-expert proxies, Mamba mixers; see hooks.override_layers).
+        self._override_reverts: list = []
+        # Hooked layers already reported as firing no forward in a step.
+        self._warned_silent_layers: set[str] = set()
         # Layers already warned about as broadcast (batch-collapsed) gradients,
         # so the warning fires at most once per layer.
         self._warned_broadcast: set[str] = set()
@@ -1001,6 +1043,7 @@ class HookManager:
             # completion did not require it (see _bwd_hooks_done) -- the
             # layer is simply absent from this step's record.
             if buf["_fwd_fires"] == 0:
+                self._warn_silent_layer(layer_name)
                 continue
             batch_first = layer_name not in self._non_batch_first_layers
             proj_kw = buf["_proj_kw"]
@@ -1114,6 +1157,41 @@ class HookManager:
             indexing=indexing,
         )
 
+    def _warn_silent_layer(self, layer_name: str) -> None:
+        """A hooked layer that ran no forward in a completed step.
+
+        Its parameters are absent from the step's record.  A module hook
+        fires only when the module is called: a layer on a conditional branch
+        legitimately sits out a step, but a module whose *weight* is used
+        without calling it -- ``F.linear(x, self.layer.weight)``, a fused
+        kernel fed the weights -- is never captured, and nothing else tells
+        the two apart.  For a fused-expert or router proxy the module's
+        forward does not pass through the proxy (a calling convention the
+        override does not know).  Reported once per layer.
+        """
+        if layer_name in self._warned_silent_layers:
+            return
+        self._warned_silent_layers.add(layer_name)
+        if ".dattri_experts." in layer_name or ".dattri_router" in layer_name:
+            warnings.warn(
+                f"Fused MoE proxy {layer_name} did not run in this step, so its "
+                "parameters are absent from the record (their batch-level "
+                "capture was replaced by the proxy). The module's forward does "
+                "not pass through the proxy; see dattri_llm.gradient.hooks."
+                "override_layers.fused_experts for the supported conventions.",
+                stacklevel=2,
+            )
+            return
+        warnings.warn(
+            f"Hooked layer {layer_name} ran no forward in this step and is "
+            "absent from its record. If the model uses the layer's weight "
+            "without calling the module (a functional call or a fused kernel), "
+            "it is never captured; see dattri_llm.gradient.hooks.override_layers "
+            "for the forward overrides that route such layers through their "
+            "modules. Reported once per layer.",
+            stacklevel=2,
+        )
+
     def _warn_broadcast_layers(self, data: dict, layer_types: dict) -> None:
         """Warn (once per layer) about broadcast / batch-collapsed gradients.
 
@@ -1158,6 +1236,8 @@ class HookManager:
 
     def _reset_layer_buffers(self) -> None:
         self._active_layers.clear()
+        if self._routed is not None:
+            self._routed.reset()
         for buf in self._buffers.values():
             buf["activation"] = None
             buf["grad_output"] = None
@@ -1392,6 +1472,38 @@ class HookManager:
         # Resolve which hook family each layer is assigned to (one family per
         # layer), then register concrete layer-name sets.
         assignment = resolve_hook_assignments(root, self._config)
+        type_overrides = dict(self._config.layer_types or {})
+        if self._moe_routed_layers:
+            self._routed = RoutedTokenTracker(root, self._moe_routed_layers)
+            fused = [n for n in find_fused_experts(root) if self._routed.covers(n)]
+            if fused:
+                proxy_types, fused_reverts = install_fused_experts(
+                    root,
+                    fused,
+                    should_intervene=lambda: self._collecting,
+                )
+                self._override_reverts.extend(fused_reverts)
+                type_overrides.update(proxy_types)
+                # The proxies replace the batch-level capture of the fused
+                # parameters (the experts module's and the router's own).
+                for proxy_name in proxy_types:
+                    # "<experts>.dattri_experts.<e>.<proj>" / "<router>.dattri_router"
+                    depth = 3 if ".dattri_experts." in proxy_name else 1
+                    owner = proxy_name.rsplit(".", depth)[0]
+                    assignment.pop(owner, None)
+                    assignment[proxy_name] = LINEAR_IO
+        # A state-space / linear-attention mixer's fused kernel and functional
+        # fallback bypass its projection modules; while collecting, an
+        # override routes them through the modules so the hooks capture them.
+        mixers = find_sequence_mixers(root)
+        if mixers:
+            self._override_reverts.extend(
+                install_sequence_mixer_forward(
+                    root,
+                    list(mixers),
+                    should_intervene=lambda: self._collecting,
+                ),
+            )
         linear_io_layers = {n for n, t in assignment.items() if t == LINEAR_IO}
         param_grad_layers = {n for n, t in assignment.items() if t == PARAM_GRAD}
         invasive_layers = {n for n, t in assignment.items() if t == INVASIVE_LINEAR_IO}
@@ -1418,7 +1530,7 @@ class HookManager:
                 layer_names=capture_layers,
                 on_layer_forward=self._dispatch_layer_forward,
                 on_layer_backward=self._check_step_bwd_complete,
-                type_overrides=self._config.layer_types,
+                type_overrides=type_overrides,
                 kwargs_overrides=self._config.module_kwargs,
                 projection_kwargs=self._config.projection_kwargs,
                 capture_style=self._config.capture_style,
@@ -1426,6 +1538,7 @@ class HookManager:
                 offload_to_cpu=self._offload_to_cpu,
                 preconditioner=self._preconditioner,
                 include_frozen=self._config.include_frozen,
+                routed=self._routed,
             )
             self._n_layers = len(self._buffers)
             self._warn_frozen_layers(root, capture_layers)
@@ -1486,6 +1599,23 @@ class HookManager:
                     stacklevel=2,
                 )
 
+        # The routed flag likewise applies to factorized (linear_io) layers
+        # only; a declared module with none under it had no effect.
+        if self._routed is not None:
+            self._routed.bind(self._buffers)
+            unused = sorted(
+                d
+                for d in self._moe_routed_layers
+                if not any(n == d or n.startswith(d + ".") for n in self._routed.layers)
+            )
+            if unused:
+                warnings.warn(
+                    "moe_routed_layers names modules with no layer hooked with "
+                    "factorized (linear_io) capture; the flag had no effect: "
+                    f"{unused}.",
+                    stacklevel=2,
+                )
+
         self._registered = True
 
     def remove(self) -> None:
@@ -1503,6 +1633,12 @@ class HookManager:
             self._model_out_handle = None
         remove_hooks(self._handles)
         self._handles = []
+        for revert in self._override_reverts:
+            revert()
+        self._override_reverts = []
+        if self._routed is not None:
+            self._routed.remove()
+            self._routed = None
         # Restore any invasive_linear_io forward overrides to their originals.
         for revert in self._invasive_reverts:
             revert()
@@ -1533,9 +1669,7 @@ class HookManager:
 
         def frozen(name: str) -> bool:
             module = modules.get(name)
-            return module is not None and not any(
-                p.requires_grad for p in module.parameters(recurse=False)
-            )
+            return module is not None and not _has_trainable_params(module)
 
         if self._config.include_frozen:
             names = sorted(n for n in self._buffers if frozen(n))

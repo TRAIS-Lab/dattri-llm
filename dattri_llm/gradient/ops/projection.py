@@ -440,7 +440,9 @@ def project_factors(
     ``(B, T, proj_dim)`` factors.  Returns ``(a_p, g_p)``.
 
     Supported for every layer type whose gradient *is* an outer product of the
-    factors: linear, conv, transposed conv, and the embedding family --
+    factors: linear, conv (a grouped convolution's ``(B, T, G, d)`` factors
+    are projected per group with the same matrix, keeping the group axis),
+    transposed conv, and the embedding family --
     an embedding is a linear layer over one-hot inputs
     (``dW = sum_t onehot(id_t) x g_t``), so its integer ids are expanded to
     one-hot vectors of width ``num_embeddings`` before the input-side
@@ -736,6 +738,25 @@ def mask_factors(
     a, g = dtypes.align(a, g)
     a_f, g_f = to_3d(a).to(device), to_3d(g).to(device)
 
+    if a_f.ndim == 4:
+        # Grouped convolution: the flattened gradient is laid out per group
+        # (g, d, k) -- see materialize_factors -- so an entry's row and column
+        # live in the same group; fold the groups into the feature axes and
+        # gather the pair at (g*D_g + d, g*K_g + k).
+        groups, k_g = a_f.shape[2], a_f.shape[-1]
+        d_g = g_f.shape[-1]
+        a_flat = a_f.reshape(*a_f.shape[:2], groups * k_g)
+        g_flat = g_f.reshape(*g_f.shape[:2], groups * d_g)
+        idx = projector.mask_indices(
+            groups * d_g * k_g, proj_dim=proj_dim, proj_seed=proj_seed, device=device
+        )
+        grp, rem = idx // (d_g * k_g), idx % (d_g * k_g)
+        if is_conv_transpose(layer_type):  # blocks (C_in/G, P_g): rows from a
+            rows, cols = grp * k_g + rem // d_g, grp * d_g + rem % d_g
+            return _gather_pairs(a_flat, g_flat, rows, cols)
+        rows, cols = grp * d_g + rem // k_g, grp * k_g + rem % k_g
+        return _gather_pairs(g_flat, a_flat, rows, cols)
+
     if is_norm(layer_type):
         dense = (a_f * g_f).sum(1)  # (B, d): elementwise, cheap
         idx = projector.mask_indices(
@@ -916,7 +937,7 @@ def project_layer(
         # Decide on the ACTUAL projected shapes rather than the requested
         # proj_dim: a layer may project asymmetrically, and the bias column
         # (include_bias) widens one side.
-        seq_len = a_p.shape[1] if a_p.ndim == 3 else 1
+        seq_len = a_p.shape[1] if a_p.ndim >= 3 else 1
         if should_materialize(capture_style, seq_len, a_p.shape[-1], g_p.shape[-1]):
             return materialize_factors(a_p, g_p, "nn.Linear"), False
         return (a_p, g_p), True
